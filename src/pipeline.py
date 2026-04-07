@@ -68,26 +68,30 @@ class TradingPipeline:
         macro_summary = self.macro.get_macro_summary()
         logger.info("Macro: VIX=%s", macro_summary.get("vix", {}).get("current"))
 
-        # 3. Run technical analysis on each symbol in universe
-        analyses: list[TechAnalysisResult] = []
+        # 3. Collect data for all symbols, then batch analyze in ONE LLM call
+        symbols_data = []
         for symbol in self.config.trading.universe:
             bars = self.market.get_ohlcv(symbol, self.config.trading.lookback_days)
             if not bars:
                 logger.warning("No data for %s, skipping", symbol)
                 continue
             indicators = compute_indicators(symbol, bars)
-            analysis = self.tech_analyst.analyze(symbol=symbol, bars=bars, indicators=indicators)
-            if analysis:
-                analyses.append(analysis)
-                self.db.insert_agent_log(
-                    agent_name="tech_analyst", run_id=run_id,
-                    input_summary=f"{symbol} OHLCV + indicators",
-                    output_summary=f"{symbol}: {analysis.rating}",
-                    full_response=analysis.model_dump_json(),
-                    model=self.config.llm.analyst_model,
-                    tokens_used=0,
-                )
-        logger.info("Technical analysis complete: %d symbols analyzed", len(analyses))
+            symbols_data.append({"symbol": symbol, "bars": bars, "indicators": indicators})
+
+        # Single LLM call for all symbols
+        analyses_map = self.tech_analyst.analyze_batch(symbols_data) if symbols_data else {}
+        analyses: list[TechAnalysisResult] = list(analyses_map.values())
+
+        for analysis in analyses:
+            self.db.insert_agent_log(
+                agent_name="tech_analyst", run_id=run_id,
+                input_summary=f"Batch: {', '.join(a.symbol for a in analyses)}",
+                output_summary=f"{analysis.symbol}: {analysis.rating}",
+                full_response=analysis.model_dump_json(),
+                model=self.config.llm.analyst_model,
+                tokens_used=0,
+            )
+        logger.info("Technical analysis complete: %d symbols in 1 LLM call", len(analyses))
 
         if not analyses:
             logger.warning("No analyses produced, skipping trading")

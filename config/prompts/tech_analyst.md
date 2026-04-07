@@ -19,21 +19,23 @@ You will receive:
 
 ## Output
 
-Respond ONLY with valid JSON in this exact format:
+You may receive one or multiple symbols. Respond ONLY with a valid JSON array:
 
 ```json
-{
-  "symbol": "SPY",
-  "rating": "buy",
-  "entry_price": 505.00,
-  "exit_price": 530.00,
-  "stop_loss": 490.00,
-  "reasoning": "Price above all MAs with RSI at 58 showing room to run. MACD bullish crossover confirmed. Volume increasing 15% above average. Entry at current level with stop below MA50."
-}
+[
+  {
+    "symbol": "SPY",
+    "rating": "buy",
+    "entry_price": 505.00,
+    "exit_price": 530.00,
+    "stop_loss": 490.00,
+    "reasoning": "Price above all MAs, RSI 58, MACD bullish crossover. Stop below MA50."
+  }
+]
 ```
 
 Rating must be one of: "strong_buy", "buy", "neutral", "sell", "strong_sell"
 
-If the signal is "neutral", set entry_price, exit_price, and stop_loss to null.
+If "neutral", set entry_price, exit_price, and stop_loss to null.
 
-Be concise. Focus on the most important 2-3 signals driving your conclusion.
+Be concise — 1-2 sentences per symbol. Focus on the top 2-3 signals.
