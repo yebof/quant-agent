@@ -9,6 +9,8 @@ from src.data.technical import compute_indicators
 from src.agents.tech_analyst import TechAnalystAgent
 from src.agents.portfolio_manager import PortfolioManagerAgent
 from src.agents.risk_manager import RiskManagerAgent
+from src.agents.midday_reviewer import MiddayReviewerAgent
+from src.agents.evening_analyst import EveningAnalystAgent
 from src.risk.rules import RiskRuleEngine
 from src.execution.broker import AlpacaBroker
 from src.storage.db import Database
@@ -44,6 +46,16 @@ class TradingPipeline:
             max_sector_pct=config.risk.max_sector_pct,
             require_stop_loss=config.risk.require_stop_loss,
         ))
+        self.midday_reviewer = MiddayReviewerAgent(
+            api_key=config.api_keys.anthropic,
+            model=config.llm.decision_model,
+            max_tokens=config.llm.max_tokens,
+        )
+        self.evening_analyst = EveningAnalystAgent(
+            api_key=config.api_keys.anthropic,
+            model=config.llm.decision_model,
+            max_tokens=config.llm.max_tokens,
+        )
         self.broker = AlpacaBroker(
             api_key=config.api_keys.alpaca_key,
             secret_key=config.api_keys.alpaca_secret,
@@ -191,8 +203,11 @@ class TradingPipeline:
         run_id = f"midday-{uuid.uuid4().hex[:8]}"
         logger.info("=== Midday check: %s ===", run_id)
 
+        # 1. Sync positions
         account = self.broker.get_account()
         positions = self.broker.get_positions()
+        cash = account["cash"]
+        total_value = account["portfolio_value"]
 
         for p in positions:
             self.db.upsert_position(
@@ -201,15 +216,61 @@ class TradingPipeline:
                 unrealized_pnl=p.unrealized_pnl, sector=p.sector,
             )
 
-        logger.info("Midday: %d positions synced, total value $%.2f",
-                     len(positions), account["portfolio_value"])
-        return {"status": "checked", "positions": len(positions)}
+        # 2. LLM midday review — assess positions and recommend actions
+        macro_summary = self.macro.get_macro_summary()
+        review = None
+        orders = []
+        if positions:
+            review = self.midday_reviewer.review(
+                positions=positions,
+                macro_summary=macro_summary,
+                cash_balance=cash,
+                total_value=total_value,
+            )
+            self.db.insert_agent_log(
+                agent_name="midday_reviewer", run_id=run_id,
+                input_summary=f"{len(positions)} positions, ${total_value:.0f} total",
+                output_summary=review.get("overall_assessment", "N/A") if review else "parse_error",
+                full_response=str(review),
+                model=self.config.llm.decision_model, tokens_used=0,
+            )
+
+            # 3. Execute urgent actions (SELL/REDUCE only)
+            if review and review.get("actions"):
+                for action in review["actions"]:
+                    if action.get("action") in ("SELL", "REDUCE"):
+                        symbol = action["symbol"]
+                        existing = [p for p in positions if p.symbol == symbol]
+                        if not existing:
+                            continue
+                        qty = int(existing[0].qty)
+                        if action["action"] == "REDUCE":
+                            qty = max(1, qty // 2)
+                        order = self.broker.submit_order(symbol=symbol, qty=qty, side="sell")
+                        orders.append(order)
+                        self.db.insert_trade(
+                            symbol=symbol, action=action["action"], qty=qty,
+                            price=existing[0].current_price,
+                            reasoning=action.get("reason", "midday review"),
+                            run_id=run_id,
+                        )
+                        logger.info("Midday action: %s %d %s — %s",
+                                     action["action"], qty, symbol, action.get("reason"))
+
+        logger.info("Midday: %d positions, risk=%s, %d orders",
+                     len(positions),
+                     review.get("risk_level", "N/A") if review else "no_positions",
+                     len(orders))
+        return {"status": "reviewed", "positions": len(positions),
+                "review": review, "orders": orders, "run_id": run_id}
 
     def run_evening(self) -> dict:
         run_id = f"evening-{uuid.uuid4().hex[:8]}"
         logger.info("=== Evening report: %s ===", run_id)
 
+        # 1. Record daily PnL
         account = self.broker.get_account()
+        positions = self.broker.get_positions()
         total_value = account["portfolio_value"]
 
         recent_pnl = self.db.get_daily_pnl(limit=1)
@@ -228,11 +289,37 @@ class TradingPipeline:
             daily_return_pct=daily_return_pct,
         )
 
-        logger.info("Evening: value=$%.2f, daily PnL=$%.2f (%.2f%%)",
-                     total_value, daily_pnl, daily_return_pct)
+        # 2. LLM evening analysis — daily review and tomorrow outlook
+        macro_summary = self.macro.get_macro_summary()
+        today_trades = self.db.get_trades(limit=20)  # today's trades
+        analysis = self.evening_analyst.analyze(
+            positions=positions,
+            macro_summary=macro_summary,
+            total_value=total_value,
+            daily_pnl=daily_pnl,
+            daily_return_pct=daily_return_pct,
+            today_trades=today_trades,
+        )
+
+        self.db.insert_agent_log(
+            agent_name="evening_analyst", run_id=run_id,
+            input_summary=f"${total_value:.0f} total, PnL ${daily_pnl:.2f}",
+            output_summary=analysis.get("daily_summary", "N/A") if analysis else "parse_error",
+            full_response=str(analysis),
+            model=self.config.llm.decision_model, tokens_used=0,
+        )
+
+        logger.info("Evening: value=$%.2f, PnL=$%.2f (%.2f%%), risk=%s",
+                     total_value, daily_pnl, daily_return_pct,
+                     analysis.get("risk_rating", "N/A") if analysis else "error")
+        if analysis:
+            logger.info("Summary: %s", analysis.get("daily_summary", ""))
+            logger.info("Tomorrow: %s", analysis.get("tomorrow_outlook", ""))
         return {
-            "status": "recorded",
+            "status": "analyzed",
             "total_value": total_value,
             "daily_pnl": daily_pnl,
             "daily_return_pct": daily_return_pct,
+            "analysis": analysis,
+            "run_id": run_id,
         }
