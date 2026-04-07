@@ -9,9 +9,9 @@ alpaca:
   paper: true
 
 llm:
-  analyst_model: "claude-sonnet-4-6-20250514"
-  decision_model: "claude-opus-4-6-20250725"
-  risk_model: "claude-opus-4-6-20250725"
+  analyst_model: "claude-sonnet-4-6"
+  decision_model: "claude-opus-4-6"
+  risk_model: "claude-opus-4-6"
   max_tokens: 4096
 
 risk:

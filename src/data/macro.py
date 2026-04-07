@@ -1,13 +1,24 @@
+import logging
+
 import pandas as pd
 from fredapi import Fred
+
+logger = logging.getLogger(__name__)
 
 
 class MacroDataProvider:
     def __init__(self, api_key: str):
         self.fred = Fred(api_key=api_key)
 
+    def _safe_get_series(self, series_id: str, **kwargs) -> pd.Series:
+        try:
+            return self.fred.get_series(series_id, **kwargs)
+        except Exception as e:
+            logger.warning("FRED API error for %s: %s", series_id, e)
+            return pd.Series(dtype=float)
+
     def get_vix(self, lookback_days: int = 30) -> dict:
-        series = self.fred.get_series(
+        series = self._safe_get_series(
             "VIXCLS",
             observation_start=pd.Timestamp.now() - pd.Timedelta(days=lookback_days),
         )
@@ -24,11 +35,11 @@ class MacroDataProvider:
         return {"current": current, "mean_5d": mean_5d, "trend": trend}
 
     def get_treasury_yields(self) -> dict:
-        us2y_series = self.fred.get_series(
+        us2y_series = self._safe_get_series(
             "DGS2",
             observation_start=pd.Timestamp.now() - pd.Timedelta(days=7),
         )
-        us10y_series = self.fred.get_series(
+        us10y_series = self._safe_get_series(
             "DGS10",
             observation_start=pd.Timestamp.now() - pd.Timedelta(days=7),
         )
@@ -43,7 +54,7 @@ class MacroDataProvider:
         }
 
     def get_fed_funds_rate(self) -> float | None:
-        series = self.fred.get_series(
+        series = self._safe_get_series(
             "FEDFUNDS",
             observation_start=pd.Timestamp.now() - pd.Timedelta(days=60),
         )
