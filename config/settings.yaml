@@ -9,10 +9,10 @@ alpaca:
   paper: true
 
 llm:
-  analyst_model: "claude-haiku-4-5-20251001"
-  decision_model: "claude-sonnet-4-6-20250514"
-  risk_model: "claude-sonnet-4-6-20250514"
-  max_tokens: 2048
+  analyst_model: "claude-sonnet-4-6-20250514"
+  decision_model: "claude-opus-4-6-20250725"
+  risk_model: "claude-opus-4-6-20250725"
+  max_tokens: 4096
 
 risk:
   max_position_pct: 20
@@ -22,7 +22,7 @@ risk:
   require_stop_loss: true
 
 trading:
-  universe: ["SPY", "QQQ", "NVDA"]
+  universe: ["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META"]
   lookback_days: 120
   schedule:
     morning: "06:00"
