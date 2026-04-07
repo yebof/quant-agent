@@ -62,7 +62,10 @@ def _substitute_env_vars(value: str) -> str:
     """Replace ${VAR_NAME} with environment variable values."""
     def replacer(match):
         var_name = match.group(1)
-        return os.environ.get(var_name, match.group(0))
+        env_value = os.environ.get(var_name)
+        if env_value is None:
+            raise ValueError(f"Environment variable '{var_name}' is not set")
+        return env_value
     return re.sub(r"\$\{(\w+)\}", replacer, value)
 
 

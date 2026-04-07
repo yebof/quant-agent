@@ -84,3 +84,42 @@ storage:
     from src.config import load_config
     cfg = load_config(config_file)
     assert cfg.api_keys.anthropic == "env-key-123"
+
+
+def test_load_config_missing_env_var_raises(tmp_path):
+    yaml_content = """
+api_keys:
+  anthropic: "${MISSING_VAR_THAT_DOES_NOT_EXIST}"
+  fred: "key"
+  alpaca_key: "ak"
+  alpaca_secret: "as"
+alpaca:
+  base_url: "https://paper-api.alpaca.markets"
+  paper: true
+llm:
+  analyst_model: "m"
+  decision_model: "m"
+  risk_model: "m"
+  max_tokens: 4096
+risk:
+  max_position_pct: 20
+  max_total_position_pct: 90
+  max_daily_loss_pct: 3
+  max_sector_pct: 40
+  require_stop_loss: true
+trading:
+  universe: ["SPY"]
+  lookback_days: 60
+  schedule:
+    morning: "06:00"
+    midday: "12:00"
+    evening: "16:30"
+storage:
+  db_path: "data/test.db"
+"""
+    config_file = tmp_path / "settings.yaml"
+    config_file.write_text(yaml_content)
+
+    from src.config import load_config
+    with pytest.raises(ValueError, match="Environment variable"):
+        load_config(config_file)
