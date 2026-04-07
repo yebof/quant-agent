@@ -5,5 +5,8 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+.venv/
 data/
 .env
+.DS_Store
+*.log
