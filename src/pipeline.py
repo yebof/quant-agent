@@ -168,7 +168,13 @@ class TradingPipeline:
         orders = []
         for decision in portfolio_decision.decisions:
             if decision.action in ("BUY", "SELL"):
-                qty = int((total_value * decision.allocation_pct / 100) / decision.entry_price)
+                if decision.action == "BUY" and decision.entry_price <= 0:
+                    logger.warning("Invalid entry_price for %s, skipping", decision.symbol)
+                    continue
+                if decision.action == "BUY":
+                    qty = int((total_value * decision.allocation_pct / 100) / decision.entry_price)
+                else:
+                    qty = 0  # will be set from existing position below
                 if qty <= 0 and decision.action == "BUY":
                     logger.warning("Calculated qty=0 for %s, skipping", decision.symbol)
                     continue
