@@ -70,7 +70,7 @@ def test_news_provider_format_max_items():
 
 # === NewsAnalystAgent tests ===
 
-@patch("src.agents.base.Anthropic")
+@patch("anthropic.Anthropic")
 def test_news_analyst_analyze(mock_cls):
     response_json = json.dumps({
         "market_sentiment": "bullish",
@@ -118,7 +118,7 @@ def test_news_analyst_analyze(mock_cls):
     assert agent_result.tokens_used == 2500
 
 
-@patch("src.agents.base.Anthropic")
+@patch("anthropic.Anthropic")
 def test_news_analyst_bad_response(mock_cls):
     mock_client = MagicMock()
     mock_response = MagicMock()

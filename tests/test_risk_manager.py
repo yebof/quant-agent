@@ -29,7 +29,7 @@ def mock_risk_response():
     })
 
 
-@patch("src.agents.base.Anthropic")
+@patch("anthropic.Anthropic")
 def test_risk_manager_approve(mock_cls, sample_portfolio_decision, mock_risk_response):
     mock_client = MagicMock()
     mock_response = MagicMock()
@@ -51,7 +51,7 @@ def test_risk_manager_approve(mock_cls, sample_portfolio_decision, mock_risk_res
     assert agent_result.tokens_used > 0
 
 
-@patch("src.agents.base.Anthropic")
+@patch("anthropic.Anthropic")
 def test_risk_manager_with_violations(mock_cls, sample_portfolio_decision):
     rejection = json.dumps({
         "approved": False,

@@ -31,18 +31,26 @@ class TradingPipeline:
         self.config = config
         self.market = MarketDataProvider()
         self.macro = MacroDataProvider(api_key=config.api_keys.fred)
+
+        def _key_for(model: str) -> str:
+            """Return the right API key based on model name."""
+            from src.agents.base import _is_openai_model
+            if _is_openai_model(model):
+                return config.api_keys.openai
+            return config.api_keys.anthropic
+
         self.tech_analyst = TechAnalystAgent(
-            api_key=config.api_keys.anthropic,
+            api_key=_key_for(config.llm.analyst_model),
             model=config.llm.analyst_model,
             max_tokens=config.llm.max_tokens,
         )
         self.portfolio_manager = PortfolioManagerAgent(
-            api_key=config.api_keys.anthropic,
+            api_key=_key_for(config.llm.decision_model),
             model=config.llm.decision_model,
             max_tokens=config.llm.max_tokens,
         )
         self.risk_manager = RiskManagerAgent(
-            api_key=config.api_keys.anthropic,
+            api_key=_key_for(config.llm.risk_model),
             model=config.llm.risk_model,
             max_tokens=config.llm.max_tokens,
         )
@@ -54,28 +62,28 @@ class TradingPipeline:
             require_stop_loss=config.risk.require_stop_loss,
         ))
         self.midday_reviewer = MiddayReviewerAgent(
-            api_key=config.api_keys.anthropic,
+            api_key=_key_for(config.llm.decision_model),
             model=config.llm.decision_model,
             max_tokens=config.llm.max_tokens,
         )
         self.evening_analyst = EveningAnalystAgent(
-            api_key=config.api_keys.anthropic,
+            api_key=_key_for(config.llm.decision_model),
             model=config.llm.decision_model,
             max_tokens=config.llm.max_tokens,
         )
         self.news_analyst = NewsAnalystAgent(
-            api_key=config.api_keys.anthropic,
+            api_key=_key_for(config.llm.analyst_model),
             model=config.llm.analyst_model,
             max_tokens=config.llm.max_tokens,
         )
         self.macro_analyst = MacroAnalystAgent(
-            api_key=config.api_keys.anthropic,
+            api_key=_key_for(config.llm.analyst_model),
             model=config.llm.analyst_model,
             max_tokens=config.llm.max_tokens,
         )
         self.news_provider = NewsDataProvider()
         self.earnings_analyst = EarningsAnalystAgent(
-            api_key=config.api_keys.anthropic,
+            api_key=_key_for(config.llm.earnings_model),
             model=config.llm.earnings_model,
             max_tokens=config.llm.max_tokens,
         )

@@ -58,7 +58,7 @@ def mock_pm_response():
     })
 
 
-@patch("src.agents.base.Anthropic")
+@patch("anthropic.Anthropic")
 def test_portfolio_manager_decide(mock_cls, sample_analyses, sample_positions, sample_macro, mock_pm_response):
     mock_client = MagicMock()
     mock_response = MagicMock()
@@ -85,7 +85,7 @@ def test_portfolio_manager_decide(mock_cls, sample_analyses, sample_positions, s
     assert agent_result.user_message != ""
 
 
-@patch("src.agents.base.Anthropic")
+@patch("anthropic.Anthropic")
 def test_portfolio_manager_bad_response(mock_cls, sample_analyses, sample_positions, sample_macro):
     mock_client = MagicMock()
     mock_response = MagicMock()

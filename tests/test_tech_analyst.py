@@ -44,7 +44,7 @@ def mock_llm_response():
     })
 
 
-@patch("src.agents.base.Anthropic")
+@patch("anthropic.Anthropic")
 def test_tech_analyst_run(mock_cls, sample_indicators, sample_bars, mock_llm_response):
     mock_client = MagicMock()
     mock_response = MagicMock()
@@ -63,7 +63,7 @@ def test_tech_analyst_run(mock_cls, sample_indicators, sample_bars, mock_llm_res
     assert result.stop_loss == 490.0
 
 
-@patch("src.agents.base.Anthropic")
+@patch("anthropic.Anthropic")
 def test_tech_analyst_bad_response(mock_cls, sample_indicators, sample_bars):
     mock_client = MagicMock()
     mock_response = MagicMock()
@@ -80,7 +80,7 @@ def test_tech_analyst_bad_response(mock_cls, sample_indicators, sample_bars):
 
 
 def test_build_user_message(sample_indicators, sample_bars):
-    with patch("src.agents.base.Anthropic"):
+    with patch("anthropic.Anthropic"):
         agent = TechAnalystAgent(api_key="test", model="claude-sonnet-4-6-20250514")
         msg = agent.build_user_message(symbol="SPY", bars=sample_bars, indicators=sample_indicators)
         assert "SPY" in msg

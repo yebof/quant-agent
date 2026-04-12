@@ -1,5 +1,6 @@
 api_keys:
   anthropic: "${ANTHROPIC_API_KEY}"
+  openai: "${OPENAI_API_KEY}"
   fred: "${FRED_API_KEY}"
   alpaca_key: "${ALPACA_API_KEY}"
   alpaca_secret: "${ALPACA_SECRET_KEY}"

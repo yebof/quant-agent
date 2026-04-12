@@ -20,7 +20,7 @@ class ConcreteAgent(BaseAgent):
 
 @pytest.fixture
 def mock_anthropic():
-    with patch("src.agents.base.Anthropic") as mock_cls:
+    with patch("anthropic.Anthropic") as mock_cls:
         mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.content = [MagicMock(text='{"result": "bullish"}')]

@@ -121,5 +121,6 @@ storage:
     config_file.write_text(yaml_content)
 
     from src.config import load_config
-    with pytest.raises(ValueError, match="Environment variable"):
-        load_config(config_file)
+    cfg = load_config(config_file)
+    # Missing env vars resolve to empty string (for optional keys like OpenAI)
+    assert cfg.api_keys.anthropic == ""
