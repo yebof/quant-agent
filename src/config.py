@@ -22,6 +22,7 @@ class LLMConfig(BaseModel):
     analyst_model: str
     decision_model: str
     risk_model: str
+    earnings_model: str = "claude-opus-4-6"
     max_tokens: int
 
 

@@ -12,6 +12,7 @@ llm:
   analyst_model: "claude-sonnet-4-6"
   decision_model: "claude-opus-4-6"
   risk_model: "claude-opus-4-6"
+  earnings_model: "claude-opus-4-6"
   max_tokens: 16384
 
 risk:

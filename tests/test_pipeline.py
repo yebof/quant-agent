@@ -36,6 +36,8 @@ def mock_config():
 
 
 @patch("src.pipeline.AlpacaBroker")
+@patch("src.pipeline.EarningsDataProvider")
+@patch("src.pipeline.EarningsAnalystAgent")
 @patch("src.pipeline.NewsDataProvider")
 @patch("src.pipeline.NewsAnalystAgent")
 @patch("src.pipeline.MacroAnalystAgent")
@@ -47,9 +49,11 @@ def mock_config():
 @patch("src.pipeline.compute_indicators")
 def test_pipeline_morning_run_buy(
     mock_ci, mock_ta_cls, mock_pm_cls, mock_rm_cls, mock_market_cls, mock_macro_cls,
-    mock_maa_cls, mock_na_cls, mock_ndp_cls, mock_broker_cls, mock_config, tmp_path
+    mock_maa_cls, mock_na_cls, mock_ndp_cls, mock_ea_cls, mock_edp_cls,
+    mock_broker_cls, mock_config, tmp_path
 ):
     mock_config.storage.db_path = str(tmp_path / "test.db")
+    mock_config.llm.earnings_model = "claude-opus-4-6-20250725"
 
     # Tech Analyst batch returns buy for SPY
     mock_ta = MagicMock()
@@ -123,6 +127,14 @@ def test_pipeline_morning_run_buy(
     mock_ndp.format_for_prompt.return_value = "No news."
     mock_ndp_cls.return_value = mock_ndp
 
+    # Earnings
+    mock_ea = MagicMock()
+    mock_ea.analyze_reports.return_value = []
+    mock_ea_cls.return_value = mock_ea
+    mock_edp = MagicMock()
+    mock_edp.check_and_fetch.return_value = []
+    mock_edp_cls.return_value = mock_edp
+
     pipeline = TradingPipeline(mock_config)
     result = pipeline.run_morning()
 
@@ -132,6 +144,8 @@ def test_pipeline_morning_run_buy(
 
 
 @patch("src.pipeline.AlpacaBroker")
+@patch("src.pipeline.EarningsDataProvider")
+@patch("src.pipeline.EarningsAnalystAgent")
 @patch("src.pipeline.NewsDataProvider")
 @patch("src.pipeline.NewsAnalystAgent")
 @patch("src.pipeline.MacroAnalystAgent")
@@ -143,9 +157,11 @@ def test_pipeline_morning_run_buy(
 @patch("src.pipeline.compute_indicators")
 def test_pipeline_risk_rejected(
     mock_ci, mock_ta_cls, mock_pm_cls, mock_rm_cls, mock_market_cls, mock_macro_cls,
-    mock_maa_cls, mock_na_cls, mock_ndp_cls, mock_broker_cls, mock_config, tmp_path
+    mock_maa_cls, mock_na_cls, mock_ndp_cls, mock_ea_cls, mock_edp_cls,
+    mock_broker_cls, mock_config, tmp_path
 ):
     mock_config.storage.db_path = str(tmp_path / "test.db")
+    mock_config.llm.earnings_model = "claude-opus-4-6-20250725"
 
     mock_ta = MagicMock()
     spy_analysis = TechAnalysisResult(
@@ -206,6 +222,14 @@ def test_pipeline_risk_rejected(
     mock_ndp.fetch_news.return_value = []
     mock_ndp.format_for_prompt.return_value = "No news."
     mock_ndp_cls.return_value = mock_ndp
+
+    # Earnings
+    mock_ea = MagicMock()
+    mock_ea.analyze_reports.return_value = []
+    mock_ea_cls.return_value = mock_ea
+    mock_edp = MagicMock()
+    mock_edp.check_and_fetch.return_value = []
+    mock_edp_cls.return_value = mock_edp
 
     pipeline = TradingPipeline(mock_config)
     result = pipeline.run_morning()

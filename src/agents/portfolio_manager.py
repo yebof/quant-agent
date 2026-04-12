@@ -28,6 +28,7 @@ class PortfolioManagerAgent(BaseAgent):
         cash_balance: float = kwargs["cash_balance"]
         total_value: float = kwargs["total_value"]
         news_analysis: NewsAnalysisResult | None = kwargs.get("news_analysis")
+        earnings_analyses: list[dict] = kwargs.get("earnings_analyses", [])
 
         analyses_text = "\n".join(
             f"- {a.symbol}: {a.rating} | Entry: {a.entry_price} | Stop: {a.stop_loss} | Target: {a.exit_price}\n  Reasoning: {a.reasoning}"
@@ -109,6 +110,35 @@ class PortfolioManagerAgent(BaseAgent):
         else:
             news_section = "## News Analysis\nNo news data available."
 
+        # Format earnings analysis section
+        if earnings_analyses:
+            earnings_items = []
+            for ea in earnings_analyses:
+                analysis = ea.get("analysis")
+                if not analysis:
+                    continue
+                sym = ea.get("symbol", "?")
+                impl = analysis.get("investment_implications", {})
+                rev = analysis.get("revenue", {})
+                prof = analysis.get("profitability", {})
+                guidance = analysis.get("guidance", "N/A")
+                filing_label = f"{ea.get('form_type', '?')} ({ea.get('filing_date', '?')})"
+                source_note = " [from cache]" if not ea.get("is_new") else " [new filing]"
+
+                earnings_items.append(
+                    f"### {sym} — {filing_label}{source_note}\n"
+                    f"- Revenue: {rev.get('total', 'N/A')} (YoY: {rev.get('yoy_growth', 'N/A')})\n"
+                    f"- Margins: Gross {prof.get('gross_margin', 'N/A')}, Operating {prof.get('operating_margin', 'N/A')}\n"
+                    f"- EPS: {prof.get('eps', 'N/A')}\n"
+                    f"- Guidance: {guidance}\n"
+                    f"- Sentiment: {impl.get('sentiment', 'N/A')} ({impl.get('conviction', 'N/A')})\n"
+                    f"- Thesis: {impl.get('key_thesis', 'N/A')}\n"
+                    f"- Data quality: {analysis.get('data_quality', 'N/A')}"
+                )
+            earnings_section = "## Earnings Analysis (from SEC Filings)\n\n" + "\n\n".join(earnings_items)
+        else:
+            earnings_section = "## Earnings Analysis\nNo recent earnings filings available."
+
         return f"""## Account Status
 - Total Value: ${total_value:,.2f}
 - Cash Balance: ${cash_balance:,.2f}
@@ -121,6 +151,8 @@ class PortfolioManagerAgent(BaseAgent):
 
 {news_section}
 
+{earnings_section}
+
 ## Technical Analysis Reports
 {analyses_text}
 
@@ -129,7 +161,8 @@ Based on all the above (macro analysis, news, and technical signals), what trade
     def decide(self, analyses: list[TechAnalysisResult], positions: list[Position],
                macro_analysis: dict | None = None, cash_balance: float = 0,
                total_value: float = 0,
-               news_analysis: NewsAnalysisResult | None = None) -> tuple[PortfolioDecision | None, "AgentResult"]:
+               news_analysis: NewsAnalysisResult | None = None,
+               earnings_analyses: list[dict] | None = None) -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
             analyses=analyses,
             positions=positions,
@@ -137,6 +170,7 @@ Based on all the above (macro analysis, news, and technical signals), what trade
             cash_balance=cash_balance,
             total_value=total_value,
             news_analysis=news_analysis,
+            earnings_analyses=earnings_analyses or [],
         )
         parsed = result.parse_json()
         if parsed is None:
