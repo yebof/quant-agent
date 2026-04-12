@@ -1,6 +1,7 @@
 import logging
+import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 from src.config import AppConfig, RiskConfig
@@ -132,13 +133,35 @@ class TradingPipeline:
             return {}, None
 
         def _run_earnings():
+            """Check for filings, return cached analyses immediately.
+            New filings are downloaded but analyzed in a background thread
+            so they don't block the trading decision. Results are cached
+            for the next run."""
             reports = self.earnings_provider.check_and_fetch(self.config.trading.universe)
             if not reports:
                 return [], []
-            results = self.earnings_analyst.analyze_reports(reports)
-            return reports, results
 
-        logger.info("Starting parallel: macro_analyst + news_analyst + tech_analyst + earnings_analyst")
+            new_reports = [r for r in reports if r.is_new]
+            cached_reports = [r for r in reports if not r.is_new]
+
+            # Read cached analyses immediately (fast — disk reads only)
+            cached_results = self.earnings_analyst.analyze_reports(cached_reports)
+
+            # Kick off new filing analysis in background (non-blocking)
+            if new_reports:
+                symbols = ", ".join(r.symbol for r in new_reports)
+                logger.info("Background: queued %d new filings for analysis (%s). "
+                            "Results will be cached for next run.", len(new_reports), symbols)
+                bg = threading.Thread(
+                    target=self.earnings_analyst.analyze_reports,
+                    args=(new_reports,),
+                    name="earnings-bg-analysis",
+                )
+                bg.start()
+
+            return reports, cached_results
+
+        logger.info("Starting parallel: macro_analyst + news_analyst + tech_analyst + earnings_check")
         with ThreadPoolExecutor(max_workers=4) as executor:
             macro_future = executor.submit(_run_macro)
             news_future = executor.submit(_run_news)
@@ -196,25 +219,11 @@ class TradingPipeline:
             )
         logger.info("Technical analysis complete: %d symbols in 1 LLM call", len(analyses))
 
-        # Collect earnings results
+        # Collect earnings results (only cached analyses — new filings analyze in background)
         earnings_reports, earnings_results = earnings_future.result()
-        for er in earnings_results:
-            if er.get("agent_result"):
-                ar = er["agent_result"]
-                analysis = er.get("analysis", {})
-                impl = analysis.get("investment_implications", {}) if analysis else {}
-                self.db.insert_agent_log(
-                    agent_name="earnings_analyst", run_id=run_id,
-                    input_summary=f"{er['symbol']} {er['form_type']} ({er['filing_date']})",
-                    input_message=ar.user_message[:2000],  # Truncate — filing text is huge
-                    output_summary=f"{er['symbol']}: {impl.get('sentiment', 'N/A')} ({impl.get('conviction', 'N/A')})",
-                    full_response=ar.raw_text,
-                    model=self.config.llm.earnings_model,
-                    tokens_used=ar.tokens_used,
-                )
-        new_count = sum(1 for r in earnings_results if r.get("is_new"))
-        logger.info("Earnings analysis: %d reports (%d new filings analyzed, %d from cache)",
-                     len(earnings_results), new_count, len(earnings_results) - new_count)
+        new_filings = sum(1 for r in earnings_reports if r.is_new)
+        logger.info("Earnings: %d cached analyses for PM, %d new filings analyzing in background",
+                     len(earnings_results), new_filings)
 
         if not analyses:
             logger.warning("No analyses produced, skipping trading")
