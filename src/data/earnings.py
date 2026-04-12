@@ -27,7 +27,7 @@ REQUEST_DELAY = 0.12  # SEC rate limit: 10 req/s
 
 # ETFs don't have SEC filings
 ETFS = {"SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLV", "XLI", "XLP",
-        "XLY", "XLU", "XLRE", "XLB"}
+        "XLY", "XLU", "XLRE", "XLB", "SMH", "DRAM", "SH", "SDS", "PSQ", "SQQQ"}
 
 
 @dataclass

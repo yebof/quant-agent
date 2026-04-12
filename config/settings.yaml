@@ -39,6 +39,13 @@ trading:
     - XLU    # Utilities
     - XLRE   # Real Estate
     - XLB    # Materials
+    - SMH    # Semiconductor (VanEck)
+    - DRAM   # Memory/Storage Semiconductor (Roundhill)
+    # Inverse / Short ETF
+    - SH     # Short S&P 500
+    - SDS    # 2x Short S&P 500
+    - PSQ    # Short Nasdaq 100
+    - SQQQ   # 3x Short Nasdaq 100
     # Tech
     - AAPL
     - MSFT
@@ -50,12 +57,15 @@ trading:
     - CRM
     - AMD
     - ORCL
+    - MU
+    - NET
     # Finance
     - JPM
     - GS
     - V
     - MA
     - BAC
+    - BRK-B
     # Healthcare
     - UNH
     - JNJ
@@ -66,6 +76,7 @@ trading:
     - XOM
     - CVX
     - COP
+    - EQNR   # Equinor (Norwegian energy)
     # Consumer
     - COST
     - WMT
@@ -82,14 +93,26 @@ trading:
     - UPS
     - BA
     - DE
+    - AGX
+    - DXPE
+    - RKLB   # Rocket Lab
+    # Cybersecurity
+    - ZS     # Zscaler
+    # Wireless / IoT
+    - ONDS   # Ondas
     # Communication & Entertainment
     - NFLX
     - DIS
     - CMCSA
-    # Materials & Utilities
+    # Materials & Utilities & Nuclear
     - LIN
+    - MP     # MP Materials (rare earth)
     - NEE
+    - VST    # Vistra (power/nuclear)
+    - OKLO   # Oklo (nuclear)
     # Real Estate
+    - WDC
+    - SNDK
     - AMT
     - PLD
   lookback_days: 120
