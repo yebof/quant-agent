@@ -20,9 +20,14 @@ def mock_config():
     cfg.api_keys.alpaca_key = "alp-key"
     cfg.api_keys.alpaca_secret = "alp-secret"
     cfg.alpaca.paper = True
-    cfg.llm.analyst_model = "claude-sonnet-4-6-20250514"
-    cfg.llm.decision_model = "claude-opus-4-6-20250725"
-    cfg.llm.risk_model = "claude-opus-4-6-20250725"
+    cfg.llm.tech_analyst_model = "claude-sonnet-4-6-20250514"
+    cfg.llm.news_analyst_model = "claude-sonnet-4-6-20250514"
+    cfg.llm.macro_analyst_model = "claude-sonnet-4-6-20250514"
+    cfg.llm.earnings_analyst_model = "claude-opus-4-6-20250725"
+    cfg.llm.portfolio_manager_model = "claude-opus-4-6-20250725"
+    cfg.llm.risk_manager_model = "claude-opus-4-6-20250725"
+    cfg.llm.midday_reviewer_model = "claude-opus-4-6-20250725"
+    cfg.llm.evening_analyst_model = "claude-opus-4-6-20250725"
     cfg.llm.max_tokens = 4096
     cfg.risk.max_position_pct = 20
     cfg.risk.max_total_position_pct = 90
@@ -53,7 +58,7 @@ def test_pipeline_morning_run_buy(
     mock_broker_cls, mock_config, tmp_path
 ):
     mock_config.storage.db_path = str(tmp_path / "test.db")
-    mock_config.llm.earnings_model = "claude-opus-4-6-20250725"
+    mock_config.llm.earnings_analyst_model = "claude-opus-4-6-20250725"
 
     # Tech Analyst batch returns buy for SPY
     mock_ta = MagicMock()
@@ -161,7 +166,7 @@ def test_pipeline_risk_rejected(
     mock_broker_cls, mock_config, tmp_path
 ):
     mock_config.storage.db_path = str(tmp_path / "test.db")
-    mock_config.llm.earnings_model = "claude-opus-4-6-20250725"
+    mock_config.llm.earnings_analyst_model = "claude-opus-4-6-20250725"
 
     mock_ta = MagicMock()
     spy_analysis = TechAnalysisResult(

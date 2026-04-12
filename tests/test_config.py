@@ -14,9 +14,7 @@ alpaca:
   base_url: "https://paper-api.alpaca.markets"
   paper: true
 llm:
-  analyst_model: "claude-sonnet-4-6-20250514"
-  decision_model: "claude-opus-4-6-20250725"
-  risk_model: "claude-opus-4-6-20250725"
+  tech_analyst_model: "claude-sonnet-4-6"
   max_tokens: 4096
 risk:
   max_position_pct: 20
@@ -58,9 +56,7 @@ alpaca:
   base_url: "https://paper-api.alpaca.markets"
   paper: true
 llm:
-  analyst_model: "claude-sonnet-4-6-20250514"
-  decision_model: "claude-opus-4-6-20250725"
-  risk_model: "claude-opus-4-6-20250725"
+  tech_analyst_model: "claude-sonnet-4-6"
   max_tokens: 4096
 risk:
   max_position_pct: 20
@@ -97,9 +93,7 @@ alpaca:
   base_url: "https://paper-api.alpaca.markets"
   paper: true
 llm:
-  analyst_model: "m"
-  decision_model: "m"
-  risk_model: "m"
+  tech_analyst_model: "m"
   max_tokens: 4096
 risk:
   max_position_pct: 20

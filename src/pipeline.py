@@ -40,18 +40,18 @@ class TradingPipeline:
             return config.api_keys.anthropic
 
         self.tech_analyst = TechAnalystAgent(
-            api_key=_key_for(config.llm.analyst_model),
-            model=config.llm.analyst_model,
+            api_key=_key_for(config.llm.tech_analyst_model),
+            model=config.llm.tech_analyst_model,
             max_tokens=config.llm.max_tokens,
         )
         self.portfolio_manager = PortfolioManagerAgent(
-            api_key=_key_for(config.llm.decision_model),
-            model=config.llm.decision_model,
+            api_key=_key_for(config.llm.portfolio_manager_model),
+            model=config.llm.portfolio_manager_model,
             max_tokens=config.llm.max_tokens,
         )
         self.risk_manager = RiskManagerAgent(
-            api_key=_key_for(config.llm.risk_model),
-            model=config.llm.risk_model,
+            api_key=_key_for(config.llm.risk_manager_model),
+            model=config.llm.risk_manager_model,
             max_tokens=config.llm.max_tokens,
         )
         self.risk_engine = RiskRuleEngine(RiskConfig(
@@ -62,29 +62,29 @@ class TradingPipeline:
             require_stop_loss=config.risk.require_stop_loss,
         ))
         self.midday_reviewer = MiddayReviewerAgent(
-            api_key=_key_for(config.llm.decision_model),
-            model=config.llm.decision_model,
+            api_key=_key_for(config.llm.midday_reviewer_model),
+            model=config.llm.midday_reviewer_model,
             max_tokens=config.llm.max_tokens,
         )
         self.evening_analyst = EveningAnalystAgent(
-            api_key=_key_for(config.llm.decision_model),
-            model=config.llm.decision_model,
+            api_key=_key_for(config.llm.evening_analyst_model),
+            model=config.llm.evening_analyst_model,
             max_tokens=config.llm.max_tokens,
         )
         self.news_analyst = NewsAnalystAgent(
-            api_key=_key_for(config.llm.analyst_model),
-            model=config.llm.analyst_model,
+            api_key=_key_for(config.llm.news_analyst_model),
+            model=config.llm.news_analyst_model,
             max_tokens=config.llm.max_tokens,
         )
         self.macro_analyst = MacroAnalystAgent(
-            api_key=_key_for(config.llm.analyst_model),
-            model=config.llm.analyst_model,
+            api_key=_key_for(config.llm.macro_analyst_model),
+            model=config.llm.macro_analyst_model,
             max_tokens=config.llm.max_tokens,
         )
         self.news_provider = NewsDataProvider()
         self.earnings_analyst = EarningsAnalystAgent(
-            api_key=_key_for(config.llm.earnings_model),
-            model=config.llm.earnings_model,
+            api_key=_key_for(config.llm.earnings_analyst_model),
+            model=config.llm.earnings_analyst_model,
             max_tokens=config.llm.max_tokens,
         )
         self.earnings_provider = EarningsDataProvider()
@@ -184,7 +184,7 @@ class TradingPipeline:
             input_message=ma_result.user_message,
             output_summary=f"regime={macro_analysis.get('regime')}, outlook={macro_analysis.get('equity_outlook')}" if macro_analysis else "parse_error",
             full_response=ma_result.raw_text,
-            model=self.config.llm.analyst_model,
+            model=self.config.llm.macro_analyst_model,
             tokens_used=ma_result.tokens_used,
         )
         if macro_analysis:
@@ -202,7 +202,7 @@ class TradingPipeline:
             input_message=na_result.user_message,
             output_summary=f"sentiment={news_analysis.market_sentiment}, events={len(news_analysis.key_events)}" if news_analysis else "parse_error",
             full_response=na_result.raw_text,
-            model=self.config.llm.analyst_model,
+            model=self.config.llm.news_analyst_model,
             tokens_used=na_result.tokens_used,
         )
         if news_analysis:
@@ -222,7 +222,7 @@ class TradingPipeline:
                 input_message=ta_result.user_message,
                 output_summary=", ".join(f"{a.symbol}:{a.rating}" for a in analyses),
                 full_response=ta_result.raw_text,
-                model=self.config.llm.analyst_model,
+                model=self.config.llm.tech_analyst_model,
                 tokens_used=ta_result.tokens_used,
             )
         logger.info("Technical analysis complete: %d symbols in 1 LLM call", len(analyses))
@@ -254,7 +254,7 @@ class TradingPipeline:
             input_message=pm_result.user_message,
             output_summary=portfolio_decision.portfolio_view if portfolio_decision else "no trades",
             full_response=pm_result.raw_text,
-            model=self.config.llm.decision_model,
+            model=self.config.llm.portfolio_manager_model,
             tokens_used=pm_result.tokens_used,
         )
 
@@ -288,7 +288,7 @@ class TradingPipeline:
             input_message=rm_result.user_message,
             output_summary=f"Approved: {verdict.approved if verdict else 'error'}",
             full_response=rm_result.raw_text,
-            model=self.config.llm.risk_model,
+            model=self.config.llm.risk_manager_model,
             tokens_used=rm_result.tokens_used,
         )
 
@@ -372,7 +372,7 @@ class TradingPipeline:
                 input_message=md_result.user_message,
                 output_summary=review.get("overall_assessment", "N/A") if review else "parse_error",
                 full_response=md_result.raw_text,
-                model=self.config.llm.decision_model,
+                model=self.config.llm.midday_reviewer_model,
                 tokens_used=md_result.tokens_used,
             )
 
@@ -448,7 +448,7 @@ class TradingPipeline:
             input_message=ev_result.user_message,
             output_summary=analysis.get("daily_summary", "N/A") if analysis else "parse_error",
             full_response=ev_result.raw_text,
-            model=self.config.llm.decision_model,
+            model=self.config.llm.evening_analyst_model,
             tokens_used=ev_result.tokens_used,
         )
 

@@ -20,10 +20,14 @@ class AlpacaConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    analyst_model: str
-    decision_model: str
-    risk_model: str
-    earnings_model: str = "claude-opus-4-6"
+    tech_analyst_model: str = "claude-sonnet-4-6"
+    news_analyst_model: str = "claude-sonnet-4-6"
+    macro_analyst_model: str = "claude-sonnet-4-6"
+    earnings_analyst_model: str = "claude-opus-4-6"
+    portfolio_manager_model: str = "claude-opus-4-6"
+    risk_manager_model: str = "claude-opus-4-6"
+    midday_reviewer_model: str = "claude-opus-4-6"
+    evening_analyst_model: str = "claude-opus-4-6"
     max_tokens: int
 
 

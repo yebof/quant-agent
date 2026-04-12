@@ -10,10 +10,14 @@ alpaca:
   paper: true
 
 llm:
-  analyst_model: "claude-sonnet-4-6"
-  decision_model: "claude-opus-4-6"
-  risk_model: "claude-opus-4-6"
-  earnings_model: "claude-opus-4-6"
+  tech_analyst_model: "claude-sonnet-4-6"
+  news_analyst_model: "claude-sonnet-4-6"
+  macro_analyst_model: "claude-sonnet-4-6"
+  earnings_analyst_model: "claude-opus-4-6"
+  portfolio_manager_model: "claude-opus-4-6"
+  risk_manager_model: "claude-opus-4-6"
+  midday_reviewer_model: "claude-opus-4-6"
+  evening_analyst_model: "claude-opus-4-6"
   max_tokens: 16384
 
 risk:
