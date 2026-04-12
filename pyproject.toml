@@ -13,6 +13,7 @@ dependencies = [
     "apscheduler>=3.10.0",
     "pydantic>=2.7.0",
     "pyyaml>=6.0",
+    "feedparser>=6.0",
 ]
 
 [project.optional-dependencies]

@@ -40,7 +40,7 @@ def test_risk_manager_approve(mock_cls, sample_portfolio_decision, mock_risk_res
     mock_cls.return_value = mock_client
 
     agent = RiskManagerAgent(api_key="test", model="claude-opus-4-6-20250725")
-    verdict = agent.review(
+    verdict, agent_result = agent.review(
         portfolio_decision=sample_portfolio_decision,
         positions=[],
         macro_summary={"vix": {"current": 18.0}},
@@ -48,6 +48,7 @@ def test_risk_manager_approve(mock_cls, sample_portfolio_decision, mock_risk_res
     )
     assert verdict is not None
     assert verdict.approved is True
+    assert agent_result.tokens_used > 0
 
 
 @patch("src.agents.base.Anthropic")
@@ -70,7 +71,7 @@ def test_risk_manager_with_violations(mock_cls, sample_portfolio_decision):
     ]
 
     agent = RiskManagerAgent(api_key="test", model="claude-opus-4-6-20250725")
-    verdict = agent.review(
+    verdict, agent_result = agent.review(
         portfolio_decision=sample_portfolio_decision,
         positions=[],
         macro_summary={"vix": {"current": 25.0}},
@@ -78,3 +79,4 @@ def test_risk_manager_with_violations(mock_cls, sample_portfolio_decision):
     )
     assert verdict is not None
     assert verdict.approved is False
+    assert agent_result is not None

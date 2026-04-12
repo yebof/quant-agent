@@ -2,9 +2,14 @@ import pytest
 import json
 from unittest.mock import patch, MagicMock, AsyncMock
 from src.pipeline import TradingPipeline
+from src.agents.base import AgentResult
 from src.models import (
     TechAnalysisResult, PortfolioDecision, TradeDecision, RiskVerdict, Position,
+    NewsAnalysisResult,
 )
+
+def _mock_agent_result(raw_text="{}"):
+    return AgentResult(raw_text=raw_text, tokens_used=100, model="test", user_message="test input")
 
 
 @pytest.fixture
@@ -31,6 +36,9 @@ def mock_config():
 
 
 @patch("src.pipeline.AlpacaBroker")
+@patch("src.pipeline.NewsDataProvider")
+@patch("src.pipeline.NewsAnalystAgent")
+@patch("src.pipeline.MacroAnalystAgent")
 @patch("src.pipeline.MacroDataProvider")
 @patch("src.pipeline.MarketDataProvider")
 @patch("src.pipeline.RiskManagerAgent")
@@ -38,7 +46,8 @@ def mock_config():
 @patch("src.pipeline.TechAnalystAgent")
 @patch("src.pipeline.compute_indicators")
 def test_pipeline_morning_run_buy(
-    mock_ci, mock_ta_cls, mock_pm_cls, mock_rm_cls, mock_market_cls, mock_macro_cls, mock_broker_cls, mock_config, tmp_path
+    mock_ci, mock_ta_cls, mock_pm_cls, mock_rm_cls, mock_market_cls, mock_macro_cls,
+    mock_maa_cls, mock_na_cls, mock_ndp_cls, mock_broker_cls, mock_config, tmp_path
 ):
     mock_config.storage.db_path = str(tmp_path / "test.db")
 
@@ -48,12 +57,12 @@ def test_pipeline_morning_run_buy(
         symbol="SPY", rating="buy", entry_price=507.0,
         exit_price=530.0, stop_loss=490.0, reasoning="Bullish",
     )
-    mock_ta.analyze_batch.return_value = {"SPY": spy_analysis}
+    mock_ta.analyze_batch.return_value = ({"SPY": spy_analysis}, _mock_agent_result())
     mock_ta_cls.return_value = mock_ta
 
     # Portfolio Manager returns BUY decision
     mock_pm = MagicMock()
-    mock_pm.decide.return_value = PortfolioDecision(
+    mock_pm.decide.return_value = (PortfolioDecision(
         decisions=[
             TradeDecision(
                 action="BUY", symbol="SPY", allocation_pct=10.0,
@@ -62,14 +71,14 @@ def test_pipeline_morning_run_buy(
             )
         ],
         portfolio_view="Bullish",
-    )
+    ), _mock_agent_result())
     mock_pm_cls.return_value = mock_pm
 
     # Risk Manager approves
     mock_rm = MagicMock()
-    mock_rm.review.return_value = RiskVerdict(
+    mock_rm.review.return_value = (RiskVerdict(
         approved=True, modifications=[], reasoning="Approved",
-    )
+    ), _mock_agent_result())
     mock_rm_cls.return_value = mock_rm
 
     # Market data
@@ -95,6 +104,25 @@ def test_pipeline_morning_run_buy(
     mock_broker.submit_order.return_value = {"id": "order-1", "status": "accepted", "symbol": "SPY"}
     mock_broker_cls.return_value = mock_broker
 
+    # Macro analyst
+    mock_maa = MagicMock()
+    mock_maa.analyze.return_value = ({"regime": "risk-on", "equity_outlook": "bullish",
+        "confidence": "medium", "summary": "Bullish macro"}, _mock_agent_result())
+    mock_maa_cls.return_value = mock_maa
+
+    # News
+    mock_na = MagicMock()
+    mock_na.analyze.return_value = (NewsAnalysisResult(
+        market_sentiment="bullish", confidence="medium",
+        key_events=[], sector_impacts=[], symbol_alerts=[],
+        summary="Bullish news",
+    ), _mock_agent_result())
+    mock_na_cls.return_value = mock_na
+    mock_ndp = MagicMock()
+    mock_ndp.fetch_news.return_value = []
+    mock_ndp.format_for_prompt.return_value = "No news."
+    mock_ndp_cls.return_value = mock_ndp
+
     pipeline = TradingPipeline(mock_config)
     result = pipeline.run_morning()
 
@@ -104,6 +132,9 @@ def test_pipeline_morning_run_buy(
 
 
 @patch("src.pipeline.AlpacaBroker")
+@patch("src.pipeline.NewsDataProvider")
+@patch("src.pipeline.NewsAnalystAgent")
+@patch("src.pipeline.MacroAnalystAgent")
 @patch("src.pipeline.MacroDataProvider")
 @patch("src.pipeline.MarketDataProvider")
 @patch("src.pipeline.RiskManagerAgent")
@@ -111,7 +142,8 @@ def test_pipeline_morning_run_buy(
 @patch("src.pipeline.TechAnalystAgent")
 @patch("src.pipeline.compute_indicators")
 def test_pipeline_risk_rejected(
-    mock_ci, mock_ta_cls, mock_pm_cls, mock_rm_cls, mock_market_cls, mock_macro_cls, mock_broker_cls, mock_config, tmp_path
+    mock_ci, mock_ta_cls, mock_pm_cls, mock_rm_cls, mock_market_cls, mock_macro_cls,
+    mock_maa_cls, mock_na_cls, mock_ndp_cls, mock_broker_cls, mock_config, tmp_path
 ):
     mock_config.storage.db_path = str(tmp_path / "test.db")
 
@@ -120,11 +152,11 @@ def test_pipeline_risk_rejected(
         symbol="SPY", rating="buy", entry_price=507.0,
         exit_price=530.0, stop_loss=490.0, reasoning="Bullish",
     )
-    mock_ta.analyze_batch.return_value = {"SPY": spy_analysis}
+    mock_ta.analyze_batch.return_value = ({"SPY": spy_analysis}, _mock_agent_result())
     mock_ta_cls.return_value = mock_ta
 
     mock_pm = MagicMock()
-    mock_pm.decide.return_value = PortfolioDecision(
+    mock_pm.decide.return_value = (PortfolioDecision(
         decisions=[
             TradeDecision(
                 action="BUY", symbol="SPY", allocation_pct=10.0,
@@ -133,14 +165,14 @@ def test_pipeline_risk_rejected(
             )
         ],
         portfolio_view="Bullish",
-    )
+    ), _mock_agent_result())
     mock_pm_cls.return_value = mock_pm
 
     # Risk Manager REJECTS
     mock_rm = MagicMock()
-    mock_rm.review.return_value = RiskVerdict(
+    mock_rm.review.return_value = (RiskVerdict(
         approved=False, modifications=[], reasoning="Too risky",
-    )
+    ), _mock_agent_result())
     mock_rm_cls.return_value = mock_rm
 
     mock_market = MagicMock()
@@ -155,6 +187,25 @@ def test_pipeline_risk_rejected(
     mock_broker.get_account.return_value = {"cash": 10000.0, "portfolio_value": 10000.0}
     mock_broker.get_positions.return_value = []
     mock_broker_cls.return_value = mock_broker
+
+    # Macro analyst
+    mock_maa = MagicMock()
+    mock_maa.analyze.return_value = ({"regime": "risk-off", "equity_outlook": "bearish",
+        "confidence": "high", "summary": "Bearish macro"}, _mock_agent_result())
+    mock_maa_cls.return_value = mock_maa
+
+    # News
+    mock_na = MagicMock()
+    mock_na.analyze.return_value = (NewsAnalysisResult(
+        market_sentiment="bearish", confidence="high",
+        key_events=[], sector_impacts=[], symbol_alerts=[],
+        summary="Bearish news",
+    ), _mock_agent_result())
+    mock_na_cls.return_value = mock_na
+    mock_ndp = MagicMock()
+    mock_ndp.fetch_news.return_value = []
+    mock_ndp.format_for_prompt.return_value = "No news."
+    mock_ndp_cls.return_value = mock_ndp
 
     pipeline = TradingPipeline(mock_config)
     result = pipeline.run_morning()

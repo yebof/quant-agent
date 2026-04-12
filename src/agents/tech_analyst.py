@@ -52,20 +52,20 @@ Current: {recent_bars[-1].close if recent_bars else 'N/A'}""")
 
     def analyze(self, symbol: str, bars: list[OHLCV], indicators: TechnicalIndicators) -> TechAnalysisResult | None:
         """Single symbol analysis (legacy, still works)."""
-        results = self.analyze_batch([{"symbol": symbol, "bars": bars, "indicators": indicators}])
+        results, _ = self.analyze_batch([{"symbol": symbol, "bars": bars, "indicators": indicators}])
         return results.get(symbol)
 
-    def analyze_batch(self, symbols_data: list[dict]) -> dict[str, TechAnalysisResult]:
-        """Batch analyze multiple symbols in ONE LLM call. Returns {symbol: result}."""
+    def analyze_batch(self, symbols_data: list[dict]) -> tuple[dict[str, TechAnalysisResult], "AgentResult | None"]:
+        """Batch analyze multiple symbols in ONE LLM call. Returns ({symbol: result}, agent_result)."""
         if not symbols_data:
-            return {}
+            return {}, None
 
         result = self.run(symbols_data=symbols_data)
         parsed = result.parse_json()
 
         if parsed is None:
             logger.error("Tech analyst returned non-JSON for batch analysis")
-            return {}
+            return {}, result
 
         # Handle both array response and single object
         items = parsed if isinstance(parsed, list) else [parsed]
@@ -76,4 +76,4 @@ Current: {recent_bars[-1].close if recent_bars else 'N/A'}""")
                 analyses[analysis.symbol] = analysis
             except Exception as e:
                 logger.error("Failed to parse tech analysis item: %s", e)
-        return analyses
+        return analyses, result

@@ -69,10 +69,10 @@ def test_portfolio_manager_decide(mock_cls, sample_analyses, sample_positions, s
     mock_cls.return_value = mock_client
 
     agent = PortfolioManagerAgent(api_key="test", model="claude-opus-4-6-20250725")
-    result = agent.decide(
+    result, agent_result = agent.decide(
         analyses=sample_analyses,
         positions=sample_positions,
-        macro_summary=sample_macro,
+        macro_analysis=sample_macro,
         cash_balance=5000.0,
         total_value=10000.0,
     )
@@ -81,6 +81,8 @@ def test_portfolio_manager_decide(mock_cls, sample_analyses, sample_positions, s
     assert len(result.decisions) == 1
     assert result.decisions[0].symbol == "SPY"
     assert result.decisions[0].action == "BUY"
+    assert agent_result.tokens_used > 0
+    assert agent_result.user_message != ""
 
 
 @patch("src.agents.base.Anthropic")
@@ -94,11 +96,12 @@ def test_portfolio_manager_bad_response(mock_cls, sample_analyses, sample_positi
     mock_cls.return_value = mock_client
 
     agent = PortfolioManagerAgent(api_key="test", model="claude-opus-4-6-20250725")
-    result = agent.decide(
+    result, agent_result = agent.decide(
         analyses=sample_analyses,
         positions=sample_positions,
-        macro_summary=sample_macro,
+        macro_analysis=sample_macro,
         cash_balance=5000.0,
         total_value=10000.0,
     )
     assert result is None
+    assert agent_result is not None

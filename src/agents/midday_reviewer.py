@@ -48,7 +48,7 @@ class MiddayReviewerAgent(BaseAgent):
 Review each position and recommend actions. Respond as JSON."""
 
     def review(self, positions: list[Position], macro_summary: dict,
-               cash_balance: float, total_value: float) -> dict | None:
+               cash_balance: float, total_value: float) -> tuple[dict | None, "AgentResult"]:
         result = self.run(
             positions=positions,
             macro_summary=macro_summary,
@@ -58,5 +58,5 @@ Review each position and recommend actions. Respond as JSON."""
         parsed = result.parse_json()
         if parsed is None:
             logger.error("Midday reviewer returned non-JSON response")
-            return None
-        return parsed
+            return None, result
+        return parsed, result

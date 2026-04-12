@@ -1,20 +1,24 @@
 import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import date
 
 from src.config import AppConfig, RiskConfig
 from src.data.market import MarketDataProvider
 from src.data.macro import MacroDataProvider
+from src.data.news import NewsDataProvider
 from src.data.technical import compute_indicators
 from src.agents.tech_analyst import TechAnalystAgent
 from src.agents.portfolio_manager import PortfolioManagerAgent
 from src.agents.risk_manager import RiskManagerAgent
 from src.agents.midday_reviewer import MiddayReviewerAgent
 from src.agents.evening_analyst import EveningAnalystAgent
+from src.agents.news_analyst import NewsAnalystAgent
+from src.agents.macro_analyst import MacroAnalystAgent
 from src.risk.rules import RiskRuleEngine
 from src.execution.broker import AlpacaBroker
 from src.storage.db import Database
-from src.models import TechAnalysisResult, PortfolioDecision, RiskVerdict
+from src.models import TechAnalysisResult, PortfolioDecision, RiskVerdict, NewsAnalysisResult
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,17 @@ class TradingPipeline:
             model=config.llm.decision_model,
             max_tokens=config.llm.max_tokens,
         )
+        self.news_analyst = NewsAnalystAgent(
+            api_key=config.api_keys.anthropic,
+            model=config.llm.analyst_model,
+            max_tokens=config.llm.max_tokens,
+        )
+        self.macro_analyst = MacroAnalystAgent(
+            api_key=config.api_keys.anthropic,
+            model=config.llm.analyst_model,
+            max_tokens=config.llm.max_tokens,
+        )
+        self.news_provider = NewsDataProvider()
         self.broker = AlpacaBroker(
             api_key=config.api_keys.alpaca_key,
             secret_key=config.api_keys.alpaca_secret,
@@ -76,32 +91,92 @@ class TradingPipeline:
         logger.info("Account: $%.2f total, $%.2f cash, %d positions",
                      total_value, cash, len(positions))
 
-        # 2. Get macro data
-        macro_summary = self.macro.get_macro_summary()
-        logger.info("Macro: VIX=%s", macro_summary.get("vix", {}).get("current"))
+        # 2. Parallel: Macro Analyst + News Analyst + Tech Analyst
+        def _run_macro():
+            macro_summary = self.macro.get_macro_summary()
+            logger.info("Macro data: VIX=%s", macro_summary.get("vix", {}).get("current"))
+            analysis, result = self.macro_analyst.analyze(
+                macro_summary=macro_summary,
+                universe=self.config.trading.universe,
+            )
+            return macro_summary, analysis, result
 
-        # 3. Collect data for all symbols, then batch analyze in ONE LLM call
-        symbols_data = []
-        for symbol in self.config.trading.universe:
-            bars = self.market.get_ohlcv(symbol, self.config.trading.lookback_days)
-            if not bars:
-                logger.warning("No data for %s, skipping", symbol)
-                continue
-            indicators = compute_indicators(symbol, bars)
-            symbols_data.append({"symbol": symbol, "bars": bars, "indicators": indicators})
+        def _run_news():
+            news_items = self.news_provider.fetch_news()
+            news_text = self.news_provider.format_for_prompt(news_items)
+            analysis, result = self.news_analyst.analyze(
+                news_text=news_text,
+                universe=self.config.trading.universe,
+            )
+            return news_items, analysis, result
 
-        # Single LLM call for all symbols
-        analyses_map = self.tech_analyst.analyze_batch(symbols_data) if symbols_data else {}
+        def _run_tech():
+            symbols_data = []
+            for symbol in self.config.trading.universe:
+                bars = self.market.get_ohlcv(symbol, self.config.trading.lookback_days)
+                if not bars:
+                    logger.warning("No data for %s, skipping", symbol)
+                    continue
+                indicators = compute_indicators(symbol, bars)
+                symbols_data.append({"symbol": symbol, "bars": bars, "indicators": indicators})
+            if symbols_data:
+                return self.tech_analyst.analyze_batch(symbols_data)
+            return {}, None
+
+        logger.info("Starting parallel: macro_analyst + news_analyst + tech_analyst")
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            macro_future = executor.submit(_run_macro)
+            news_future = executor.submit(_run_news)
+            tech_future = executor.submit(_run_tech)
+
+        # Collect macro results
+        macro_summary, macro_analysis, ma_result = macro_future.result()
+        self.db.insert_agent_log(
+            agent_name="macro_analyst", run_id=run_id,
+            input_summary=f"VIX={macro_summary.get('vix', {}).get('current')}",
+            input_message=ma_result.user_message,
+            output_summary=f"regime={macro_analysis.get('regime')}, outlook={macro_analysis.get('equity_outlook')}" if macro_analysis else "parse_error",
+            full_response=ma_result.raw_text,
+            model=self.config.llm.analyst_model,
+            tokens_used=ma_result.tokens_used,
+        )
+        if macro_analysis:
+            logger.info("Macro analysis: regime=%s, outlook=%s, exposure=%s",
+                         macro_analysis.get("regime"), macro_analysis.get("equity_outlook"),
+                         macro_analysis.get("position_guidance", {}).get("overall_exposure"))
+        else:
+            logger.warning("Macro analysis failed, continuing without macro context")
+
+        # Collect news results
+        news_items, news_analysis, na_result = news_future.result()
+        self.db.insert_agent_log(
+            agent_name="news_analyst", run_id=run_id,
+            input_summary=f"{len(news_items)} news items",
+            input_message=na_result.user_message,
+            output_summary=f"sentiment={news_analysis.market_sentiment}, events={len(news_analysis.key_events)}" if news_analysis else "parse_error",
+            full_response=na_result.raw_text,
+            model=self.config.llm.analyst_model,
+            tokens_used=na_result.tokens_used,
+        )
+        if news_analysis:
+            logger.info("News analysis: sentiment=%s, confidence=%s, %d key events, %d symbol alerts",
+                         news_analysis.market_sentiment, news_analysis.confidence,
+                         len(news_analysis.key_events), len(news_analysis.symbol_alerts))
+        else:
+            logger.warning("News analysis failed, continuing without news context")
+
+        # Collect tech results
+        analyses_map, ta_result = tech_future.result()
         analyses: list[TechAnalysisResult] = list(analyses_map.values())
-
-        for analysis in analyses:
+        if ta_result:
             self.db.insert_agent_log(
                 agent_name="tech_analyst", run_id=run_id,
-                input_summary=f"Batch: {', '.join(a.symbol for a in analyses)}",
-                output_summary=f"{analysis.symbol}: {analysis.rating}",
-                full_response=analysis.model_dump_json(),
+                input_summary=f"Batch: {len(analyses)} symbols analyzed",
+                input_message=ta_result.user_message,
+                output_summary=", ".join(f"{a.symbol}:{a.rating}" for a in analyses),
+                full_response=ta_result.raw_text,
                 model=self.config.llm.analyst_model,
-                tokens_used=0,
+                tokens_used=ta_result.tokens_used,
             )
         logger.info("Technical analysis complete: %d symbols in 1 LLM call", len(analyses))
 
@@ -109,26 +184,29 @@ class TradingPipeline:
             logger.warning("No analyses produced, skipping trading")
             return {"status": "no_data", "orders": []}
 
-        # 4. Portfolio Manager decision
-        portfolio_decision = self.portfolio_manager.decide(
+        # 5. Portfolio Manager decision
+        portfolio_decision, pm_result = self.portfolio_manager.decide(
             analyses=analyses,
             positions=positions,
-            macro_summary=macro_summary,
+            macro_analysis=macro_analysis,
             cash_balance=cash,
             total_value=total_value,
+            news_analysis=news_analysis,
         )
-        if not portfolio_decision or not portfolio_decision.decisions:
-            logger.info("Portfolio manager: no trades suggested")
-            return {"status": "no_trades", "orders": []}
 
         self.db.insert_agent_log(
             agent_name="portfolio_manager", run_id=run_id,
             input_summary=f"{len(analyses)} analyses, ${total_value:.0f} total",
-            output_summary=portfolio_decision.portfolio_view,
-            full_response=portfolio_decision.model_dump_json(),
+            input_message=pm_result.user_message,
+            output_summary=portfolio_decision.portfolio_view if portfolio_decision else "no trades",
+            full_response=pm_result.raw_text,
             model=self.config.llm.decision_model,
-            tokens_used=0,
+            tokens_used=pm_result.tokens_used,
         )
+
+        if not portfolio_decision or not portfolio_decision.decisions:
+            logger.info("Portfolio manager: no trades suggested")
+            return {"status": "no_trades", "orders": []}
 
         # 5. Hard risk rule checks
         all_violations = []
@@ -143,7 +221,7 @@ class TradingPipeline:
             all_violations.extend(violations)
 
         # 6. Risk Manager LLM review
-        verdict = self.risk_manager.review(
+        verdict, rm_result = self.risk_manager.review(
             portfolio_decision=portfolio_decision,
             positions=positions,
             macro_summary=macro_summary,
@@ -153,10 +231,11 @@ class TradingPipeline:
         self.db.insert_agent_log(
             agent_name="risk_manager", run_id=run_id,
             input_summary=f"{len(portfolio_decision.decisions)} trades, {len(all_violations)} violations",
+            input_message=rm_result.user_message,
             output_summary=f"Approved: {verdict.approved if verdict else 'error'}",
-            full_response=verdict.model_dump_json() if verdict else "parse_error",
+            full_response=rm_result.raw_text,
             model=self.config.llm.risk_model,
-            tokens_used=0,
+            tokens_used=rm_result.tokens_used,
         )
 
         if not verdict or not verdict.approved:
@@ -227,7 +306,7 @@ class TradingPipeline:
         review = None
         orders = []
         if positions:
-            review = self.midday_reviewer.review(
+            review, md_result = self.midday_reviewer.review(
                 positions=positions,
                 macro_summary=macro_summary,
                 cash_balance=cash,
@@ -236,9 +315,11 @@ class TradingPipeline:
             self.db.insert_agent_log(
                 agent_name="midday_reviewer", run_id=run_id,
                 input_summary=f"{len(positions)} positions, ${total_value:.0f} total",
+                input_message=md_result.user_message,
                 output_summary=review.get("overall_assessment", "N/A") if review else "parse_error",
-                full_response=str(review),
-                model=self.config.llm.decision_model, tokens_used=0,
+                full_response=md_result.raw_text,
+                model=self.config.llm.decision_model,
+                tokens_used=md_result.tokens_used,
             )
 
             # 3. Execute urgent actions (SELL/REDUCE only)
@@ -298,7 +379,7 @@ class TradingPipeline:
         # 2. LLM evening analysis — daily review and tomorrow outlook
         macro_summary = self.macro.get_macro_summary()
         today_trades = self.db.get_trades(limit=20)  # today's trades
-        analysis = self.evening_analyst.analyze(
+        analysis, ev_result = self.evening_analyst.analyze(
             positions=positions,
             macro_summary=macro_summary,
             total_value=total_value,
@@ -310,9 +391,11 @@ class TradingPipeline:
         self.db.insert_agent_log(
             agent_name="evening_analyst", run_id=run_id,
             input_summary=f"${total_value:.0f} total, PnL ${daily_pnl:.2f}",
+            input_message=ev_result.user_message,
             output_summary=analysis.get("daily_summary", "N/A") if analysis else "parse_error",
-            full_response=str(analysis),
-            model=self.config.llm.decision_model, tokens_used=0,
+            full_response=ev_result.raw_text,
+            model=self.config.llm.decision_model,
+            tokens_used=ev_result.tokens_used,
         )
 
         logger.info("Evening: value=$%.2f, PnL=$%.2f (%.2f%%), risk=%s",

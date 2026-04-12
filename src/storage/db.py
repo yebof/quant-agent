@@ -41,6 +41,7 @@ class Database:
                 agent_name TEXT NOT NULL,
                 run_id TEXT NOT NULL,
                 input_summary TEXT,
+                input_message TEXT,
                 output_summary TEXT,
                 full_response TEXT,
                 model TEXT,
@@ -57,6 +58,15 @@ class Database:
             );
         """)
         self.conn.commit()
+        self._migrate()
+
+    def _migrate(self):
+        """Add columns that may be missing in older databases."""
+        cursor = self.conn.execute("PRAGMA table_info(agent_logs)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "input_message" not in columns:
+            self.conn.execute("ALTER TABLE agent_logs ADD COLUMN input_message TEXT DEFAULT ''")
+            self.conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         return self.conn.execute(sql, params)
@@ -107,11 +117,11 @@ class Database:
 
     def insert_agent_log(self, agent_name: str, run_id: str, input_summary: str,
                          output_summary: str, full_response: str, model: str,
-                         tokens_used: int):
+                         tokens_used: int, input_message: str = ""):
         self.conn.execute(
-            """INSERT INTO agent_logs (agent_name, run_id, input_summary, output_summary,
-               full_response, model, tokens_used) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (agent_name, run_id, input_summary, output_summary, full_response, model, tokens_used),
+            """INSERT INTO agent_logs (agent_name, run_id, input_summary, input_message,
+               output_summary, full_response, model, tokens_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (agent_name, run_id, input_summary, input_message, output_summary, full_response, model, tokens_used),
         )
         self.conn.commit()
 

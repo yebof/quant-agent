@@ -65,6 +65,36 @@ class RiskVerdict(BaseModel):
     reasoning: str
 
 
+class NewsEvent(BaseModel):
+    headline: str
+    impact: str  # "high" | "medium" | "low"
+    affected_sectors: list[str] = []
+    affected_symbols: list[str] = []
+    sentiment: str  # "bullish" | "bearish" | "neutral"
+    explanation: str
+
+
+class SectorImpact(BaseModel):
+    sector: str
+    sentiment: str  # "bullish" | "bearish" | "neutral"
+    reason: str
+
+
+class SymbolAlert(BaseModel):
+    symbol: str
+    sentiment: str  # "bullish" | "bearish" | "neutral"
+    reason: str
+
+
+class NewsAnalysisResult(BaseModel):
+    market_sentiment: str  # "bullish" | "bearish" | "neutral"
+    confidence: str  # "high" | "medium" | "low"
+    key_events: list[NewsEvent] = []
+    sector_impacts: list[SectorImpact] = []
+    symbol_alerts: list[SymbolAlert] = []
+    summary: str
+
+
 class Position(BaseModel):
     symbol: str
     qty: float

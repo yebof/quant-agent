@@ -59,7 +59,7 @@ Provide your end-of-day analysis as JSON."""
 
     def analyze(self, positions: list[Position], macro_summary: dict,
                 total_value: float, daily_pnl: float, daily_return_pct: float,
-                today_trades: list[dict] | None = None) -> dict | None:
+                today_trades: list[dict] | None = None) -> tuple[dict | None, "AgentResult"]:
         result = self.run(
             positions=positions,
             macro_summary=macro_summary,
@@ -71,5 +71,5 @@ Provide your end-of-day analysis as JSON."""
         parsed = result.parse_json()
         if parsed is None:
             logger.error("Evening analyst returned non-JSON response")
-            return None
-        return parsed
+            return None, result
+        return parsed, result

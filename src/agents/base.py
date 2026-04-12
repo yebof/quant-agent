@@ -13,6 +13,7 @@ class AgentResult:
     raw_text: str
     tokens_used: int
     model: str
+    user_message: str = ""
 
     def parse_json(self) -> dict | None:
         try:
@@ -51,6 +52,7 @@ class BaseAgent(ABC):
     def run(self, **kwargs) -> AgentResult:
         user_message = self.build_user_message(**kwargs)
         logger.info("Agent %s running with model %s", self.name, self.model)
+        logger.info("Agent %s input:\n%s", self.name, user_message)
 
         response = self.client.messages.create(
             model=self.model,
@@ -60,7 +62,11 @@ class BaseAgent(ABC):
         )
 
         raw_text = response.content[0].text
-        tokens = response.usage.input_tokens + response.usage.output_tokens
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+        tokens = input_tokens + output_tokens
 
-        logger.info("Agent %s completed, tokens: %d", self.name, tokens)
-        return AgentResult(raw_text=raw_text, tokens_used=tokens, model=self.model)
+        logger.info("Agent %s completed, input_tokens: %d, output_tokens: %d, total: %d",
+                     self.name, input_tokens, output_tokens, tokens)
+        logger.info("Agent %s output:\n%s", self.name, raw_text)
+        return AgentResult(raw_text=raw_text, tokens_used=tokens, model=self.model, user_message=user_message)

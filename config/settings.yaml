@@ -12,7 +12,7 @@ llm:
   analyst_model: "claude-sonnet-4-6"
   decision_model: "claude-opus-4-6"
   risk_model: "claude-opus-4-6"
-  max_tokens: 4096
+  max_tokens: 16384
 
 risk:
   max_position_pct: 20
@@ -22,7 +22,75 @@ risk:
   require_stop_loss: true
 
 trading:
-  universe: ["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META"]
+  universe:
+    # Index ETF
+    - SPY    # S&P 500
+    - QQQ    # Nasdaq 100
+    - IWM    # Russell 2000
+    - DIA    # Dow Jones
+    # Sector ETF
+    - XLF    # Financial
+    - XLE    # Energy
+    - XLV    # Healthcare
+    - XLI    # Industrial
+    - XLP    # Consumer Staples
+    - XLY    # Consumer Discretionary
+    - XLU    # Utilities
+    - XLRE   # Real Estate
+    - XLB    # Materials
+    # Tech
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - NVDA
+    - META
+    - AVGO
+    - CRM
+    - AMD
+    - ORCL
+    # Finance
+    - JPM
+    - GS
+    - V
+    - MA
+    - BAC
+    # Healthcare
+    - UNH
+    - JNJ
+    - LLY
+    - PFE
+    - ABT
+    # Energy
+    - XOM
+    - CVX
+    - COP
+    # Consumer
+    - COST
+    - WMT
+    - MCD
+    - PG
+    - KO
+    - SBUX
+    - NKE
+    - HD
+    # Industrial
+    - CAT
+    - GE
+    - HON
+    - UPS
+    - BA
+    - DE
+    # Communication & Entertainment
+    - NFLX
+    - DIS
+    - CMCSA
+    # Materials & Utilities
+    - LIN
+    - NEE
+    # Real Estate
+    - AMT
+    - PLD
   lookback_days: 120
   schedule:
     morning: "06:00"

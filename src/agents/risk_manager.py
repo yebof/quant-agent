@@ -61,7 +61,7 @@ Portfolio View: {portfolio_decision.portfolio_view}
 Review these proposed trades and provide your verdict as JSON."""
 
     def review(self, portfolio_decision: PortfolioDecision, positions: list[Position],
-               macro_summary: dict, rule_violations: list[RiskViolation]) -> RiskVerdict | None:
+               macro_summary: dict, rule_violations: list[RiskViolation]) -> tuple[RiskVerdict | None, "AgentResult"]:
         result = self.run(
             portfolio_decision=portfolio_decision,
             positions=positions,
@@ -71,9 +71,9 @@ Review these proposed trades and provide your verdict as JSON."""
         parsed = result.parse_json()
         if parsed is None:
             logger.error("Risk manager returned non-JSON response")
-            return None
+            return None, result
         try:
-            return RiskVerdict(**parsed)
+            return RiskVerdict(**parsed), result
         except Exception as e:
             logger.error("Failed to parse risk verdict: %s", e)
-            return None
+            return None, result
