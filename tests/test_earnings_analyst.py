@@ -37,7 +37,16 @@ def _valid_analysis(report: EarningsReport) -> dict:
         },
         "management_highlights": ["Demand remained stable across core products"],
         "guidance": "Management did not provide numeric guidance",
-        "risk_flags": ["FX volatility remains a headwind"],
+        "strategic_direction": {
+            "key_initiatives": ["Expanding into cloud services"],
+            "capital_allocation": "50% buybacks, 30% R&D, 20% debt reduction",
+            "competitive_positioning": "Market leader with 35% share in core segment",
+        },
+        "risk_flags": {
+            "strategic_risks": ["Cloud expansion faces entrenched competitors"],
+            "operational_risks": ["FX volatility remains a headwind"],
+        },
+        "strategy_consistency": "Consistent with prior quarter — cloud expansion on track",
         "investment_implications": {
             "sentiment": "bullish",
             "conviction": "medium",

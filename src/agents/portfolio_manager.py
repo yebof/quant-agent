@@ -125,12 +125,35 @@ class PortfolioManagerAgent(BaseAgent):
                 filing_label = f"{ea.get('form_type', '?')} ({ea.get('filing_date', '?')})"
                 source_note = " [from cache]" if not ea.get("is_new") else " [new filing]"
 
+                # Strategic direction
+                strat = analysis.get("strategic_direction", {})
+                initiatives = strat.get("key_initiatives", [])
+                initiatives_text = "; ".join(initiatives[:3]) if initiatives else "not disclosed"
+                competitive = strat.get("competitive_positioning", "not disclosed")
+
+                # Risk flags (structured or legacy list)
+                risks = analysis.get("risk_flags", {})
+                if isinstance(risks, dict):
+                    strat_risks = risks.get("strategic_risks", [])
+                    ops_risks = risks.get("operational_risks", [])
+                    strat_risks_text = "; ".join(strat_risks[:2]) if strat_risks else "none flagged"
+                    ops_risks_text = "; ".join(ops_risks[:2]) if ops_risks else "none flagged"
+                    risk_line = f"- Strategic risks: {strat_risks_text}\n- Operational risks: {ops_risks_text}"
+                else:
+                    risk_line = f"- Risk flags: {'; '.join(risks[:3]) if risks else 'none flagged'}"
+
+                consistency = analysis.get("strategy_consistency", "")
+                consistency_line = f"\n- Strategy consistency: {consistency}" if consistency else ""
+
                 earnings_items.append(
                     f"### {sym} — {filing_label}{source_note}\n"
                     f"- Filing metrics: Revenue {rev.get('total', 'N/A')} (YoY: {rev.get('yoy_growth', 'N/A')}), "
                     f"Gross margin {prof.get('gross_margin', 'N/A')}, Operating margin {prof.get('operating_margin', 'N/A')}, "
                     f"EPS {prof.get('eps', 'N/A')}\n"
                     f"- Filing guidance: {guidance}\n"
+                    f"- Strategy: {initiatives_text}\n"
+                    f"- Competitive positioning: {competitive}\n"
+                    f"{risk_line}{consistency_line}\n"
                     f"- Analyst synthesis: {impl.get('sentiment', 'N/A')} ({impl.get('conviction', 'N/A')}) — {impl.get('key_thesis', 'N/A')}\n"
                     f"- Data quality: {analysis.get('data_quality', 'N/A')}"
                 )

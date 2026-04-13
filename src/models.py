@@ -184,6 +184,17 @@ class EarningsBalanceSheet(BaseModel):
     assessment: str = "not disclosed"
 
 
+class EarningsStrategicDirection(BaseModel):
+    key_initiatives: list[str] = []
+    capital_allocation: str = "not disclosed"
+    competitive_positioning: str = "not disclosed"
+
+
+class EarningsRiskFlags(BaseModel):
+    strategic_risks: list[str] = []
+    operational_risks: list[str] = []
+
+
 class EarningsInvestmentImplications(BaseModel):
     sentiment: Literal["bullish", "bearish", "neutral"]
     conviction: Literal["high", "medium", "low"]
@@ -202,7 +213,9 @@ class EarningsAnalysis(BaseModel):
     balance_sheet: EarningsBalanceSheet
     management_highlights: list[str] = []
     guidance: str
-    risk_flags: list[str] = []
+    strategic_direction: EarningsStrategicDirection = EarningsStrategicDirection()
+    risk_flags: EarningsRiskFlags | list[str] = EarningsRiskFlags()
+    strategy_consistency: str = "No prior filing available for comparison"
     investment_implications: EarningsInvestmentImplications
     data_quality: str
 

@@ -25,8 +25,14 @@ You will receive:
 4. **Balance Sheet Health**: Cash position, total debt, debt-to-equity, current ratio
 5. **Management Discussion (MD&A)**: Key themes management is highlighting — growth drivers, headwinds, strategic initiatives
 6. **Forward Guidance**: Any guidance provided for next quarter/year — revenue, earnings, margins
-7. **Risk Factors**: New or escalated risks mentioned in the filing
-8. **Competitive Position**: Market share commentary, competitive dynamics, pricing power signals
+7. **Strategic Direction**: What is the company's forward strategy? Extract from MD&A and risk factors:
+   - Key strategic initiatives (new markets, M&A, R&D focus, product roadmap, partnerships)
+   - Capital allocation priorities (buybacks vs reinvestment vs debt reduction)
+   - Competitive positioning signals (market share, pricing power, moat commentary)
+8. **Risk Analysis**: Separate risks into two categories:
+   - **Strategic risks**: Risks to the strategy itself (execution risk, market timing, competitive response, technology bet failure)
+   - **Operational risks**: Business-as-usual risks (FX, regulation, supply chain, macro sensitivity)
+9. **Strategy Consistency** (if prior analysis is provided): Compare current strategic messaging to prior filing — are they executing what they said? Any pivots, abandoned initiatives, or new directions?
 
 ## Output
 
@@ -66,10 +72,25 @@ Respond ONLY with valid JSON:
     "China revenue declined 3% due to competitive pressure"
   ],
   "guidance": "Management expects similar seasonal patterns; no specific numeric guidance provided",
-  "risk_flags": [
-    "Increasing regulatory scrutiny on App Store fees in EU",
-    "Foreign exchange headwinds expected to persist"
-  ],
+  "strategic_direction": {
+    "key_initiatives": [
+      "AI integration across product line — Apple Intelligence expanding to more devices and languages",
+      "Vision Pro spatial computing platform — early stage, investing in developer ecosystem"
+    ],
+    "capital_allocation": "Prioritizing share buybacks ($20B authorized) while maintaining R&D at 7% of revenue; no M&A signaled",
+    "competitive_positioning": "Leveraging installed base of 2.2B active devices for services monetization; premium pricing maintained with no discounting signals"
+  },
+  "risk_flags": {
+    "strategic_risks": [
+      "Vision Pro adoption slower than expected — significant R&D investment with uncertain consumer demand timeline",
+      "AI feature parity risk vs Google/Samsung if on-device models underperform cloud competitors"
+    ],
+    "operational_risks": [
+      "Increasing regulatory scrutiny on App Store fees in EU",
+      "Foreign exchange headwinds expected to persist"
+    ]
+  },
+  "strategy_consistency": "Consistent with prior quarter — Services and AI remain top priorities. No abandoned initiatives. New emphasis on Vision Pro developer tools suggests pivot from consumer launch to ecosystem building.",
   "investment_implications": {
     "sentiment": "bullish",
     "conviction": "medium",
@@ -86,6 +107,10 @@ Respond ONLY with valid JSON:
 - `investment_implications.sentiment`: "bullish", "bearish", "neutral"
 - `investment_implications.conviction`: "high", "medium", "low"
 - `data_quality`: Always note if the filing text was truncated or if key sections were missing
+- `strategy_consistency`: If no prior analysis provided, say "No prior filing available for comparison"
+- `risk_flags.strategic_risks`: Focus on risks that threaten the company's strategic bets, not generic macro risks
+- `risk_flags.operational_risks`: Standard business risks (FX, regulation, supply chain, etc.)
+- `strategic_direction.key_initiatives`: Only include initiatives explicitly mentioned in the filing — do not infer from product announcements
 - Keep segment breakdowns concise — top 3-4 segments only
 - Compare to prior period where data is available in the filing
 - If this is a 10-K, also note full-year trends vs the quarterly view
