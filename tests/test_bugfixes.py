@@ -5,11 +5,13 @@ from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from src.agents.base import AgentResult
+from src.pipeline import TradingPipeline
 from src.risk.rules import RiskRuleEngine, RiskViolation
 from src.config import RiskConfig
-from src.models import TradeDecision, Position
+from src.models import RiskModification, TradeDecision, Position
 
 
 # === Fix 1: Hard risk rules actually block trades ===
@@ -89,6 +91,32 @@ def test_sell_orders_skip_risk_check(risk_engine):
     assert violations == []
 
 
+def test_sector_cap_counts_pending_same_sector_buys():
+    engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=30,
+        max_total_position_pct=90,
+        max_daily_loss_pct=3,
+        max_sector_pct=40,
+        require_stop_loss=True,
+    ))
+    decision = TradeDecision(
+        action="BUY", symbol="MSFT", allocation_pct=25,
+        entry_price=500, stop_loss=480, take_profit=530, reasoning="test",
+    )
+
+    with patch("src.execution.broker._get_sector", return_value="Technology"):
+        violations = engine.check(
+            decision=decision,
+            positions=[],
+            total_value=100000,
+            daily_pnl=0,
+            pending_sector_investment={"Technology": 25000},
+        )
+
+    rules = [v.rule for v in violations]
+    assert "max_sector_pct" in rules
+
+
 # === Fix 7: JSON parsing robustness ===
 
 def test_parse_json_direct():
@@ -156,6 +184,103 @@ def test_pm_invested_pct_zero_total():
             cash_balance=0, total_value=0,
         )
         assert "0.0%" in msg
+
+
+def test_trade_decision_validates_assignment():
+    decision = TradeDecision(
+        action="BUY", symbol="SPY", allocation_pct=10,
+        entry_price=500, stop_loss=480, take_profit=530, reasoning="test",
+    )
+
+    with pytest.raises(ValidationError):
+        decision.allocation_pct = 150
+
+
+def test_pipeline_hard_risk_filter_blocks_missing_stop_loss():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.risk_engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=20,
+        max_total_position_pct=90,
+        max_daily_loss_pct=3,
+        max_sector_pct=40,
+        require_stop_loss=True,
+    ))
+
+    decisions = [
+        TradeDecision(
+            action="BUY", symbol="SPY", allocation_pct=10,
+            entry_price=500, stop_loss=0, take_profit=530, reasoning="test",
+        )
+    ]
+
+    allowed, violations, blocked = pipeline._filter_hard_risk_decisions(
+        decisions, positions=[], total_value=100000, daily_pnl=0,
+    )
+
+    assert allowed == []
+    assert violations == []
+    assert any("no stop loss" in reason for reason in blocked)
+
+
+def test_pipeline_hard_risk_filter_blocks_second_same_sector_buy():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.risk_engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=30,
+        max_total_position_pct=90,
+        max_daily_loss_pct=3,
+        max_sector_pct=40,
+        require_stop_loss=True,
+    ))
+    decisions = [
+        TradeDecision(
+            action="BUY", symbol="AAPL", allocation_pct=25,
+            entry_price=200, stop_loss=190, take_profit=220, reasoning="test",
+        ),
+        TradeDecision(
+            action="BUY", symbol="MSFT", allocation_pct=25,
+            entry_price=400, stop_loss=380, take_profit=430, reasoning="test",
+        ),
+    ]
+
+    with patch("src.pipeline._get_sector", return_value="Technology"), patch(
+        "src.execution.broker._get_sector", return_value="Technology"
+    ):
+        allowed, violations, blocked = pipeline._filter_hard_risk_decisions(
+            decisions, positions=[], total_value=100000, daily_pnl=0,
+        )
+
+    assert [d.symbol for d in allowed] == ["AAPL"]
+    assert violations == []
+    assert any("Technology" in reason for reason in blocked)
+
+
+def test_pipeline_ignores_invalid_risk_modification():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    decision = TradeDecision(
+        action="BUY", symbol="SPY", allocation_pct=10,
+        entry_price=500, stop_loss=480, take_profit=530, reasoning="test",
+    )
+    modifications = [
+        RiskModification(
+            symbol="SPY",
+            field="allocation_pct",
+            original_value=10,
+            new_value=150,
+            reason="bad mod",
+        )
+    ]
+
+    updated = pipeline._apply_risk_modifications([decision], modifications)
+
+    assert updated[0].allocation_pct == 10
+
+
+def test_fractional_sell_helpers_preserve_position_size():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+
+    assert pipeline._full_sell_qty(0.4) == pytest.approx(0.4)
+    assert pipeline._reduce_sell_qty(0.4) == pytest.approx(0.2)
+    assert pipeline._reduce_sell_qty(5.0) == pytest.approx(2.0)
 
 
 # === Fix 9: get_trades today_only filter ===
