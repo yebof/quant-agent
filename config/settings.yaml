@@ -10,15 +10,15 @@ alpaca:
   paper: true
 
 llm:
-  tech_analyst_model: "claude-sonnet-4-6"
-  news_analyst_model: "claude-sonnet-4-6"
-  macro_analyst_model: "claude-sonnet-4-6"
-  earnings_analyst_model: "claude-opus-4-6"
-  portfolio_manager_model: "claude-opus-4-6"
-  risk_manager_model: "claude-opus-4-6"
-  midday_reviewer_model: "claude-opus-4-6"
-  evening_analyst_model: "claude-opus-4-6"
-  max_tokens: 16384
+  tech_analyst_model: "gpt-5.4"
+  news_analyst_model: "gpt-5.4"
+  macro_analyst_model: "gpt-5.4"
+  earnings_analyst_model: "gpt-5.4"
+  portfolio_manager_model: "gpt-5.4"
+  risk_manager_model: "gpt-5.4"
+  midday_reviewer_model: "gpt-5.4"
+  evening_analyst_model: "gpt-5.4"
+  max_tokens: 65536
 
 risk:
   max_position_pct: 20

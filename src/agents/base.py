@@ -93,7 +93,7 @@ class BaseAgent(ABC):
     def _call_openai(self, user_message: str) -> tuple[str, int, int]:
         response = self.client.chat.completions.create(
             model=self.model,
-            max_tokens=self.max_tokens,
+            max_completion_tokens=self.max_tokens,
             messages=[
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": user_message},
