@@ -50,6 +50,9 @@ class TradingScheduler:
 
     def _run_safe(self, func, name: str):
         try:
+            if not self.pipeline.broker.is_trading_day():
+                logger.info("[%s] Skipped: market closed for non-trading day", name)
+                return
             result = func()
             logger.info("[%s] Completed: %s", name, result.get("status", "unknown"))
         except Exception:

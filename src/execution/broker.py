@@ -1,5 +1,6 @@
 import logging
 import threading
+from datetime import date
 
 import yfinance as yf
 from alpaca.trading.client import TradingClient
@@ -29,7 +30,10 @@ def _get_sector(symbol: str) -> str:
 
 class AlpacaBroker:
     def __init__(self, api_key: str, secret_key: str, paper: bool = True):
+        self.api_key = api_key
+        self.secret_key = secret_key
         self.client = TradingClient(api_key, secret_key, paper=paper)
+        self._data_client = None
 
     def get_account(self) -> dict:
         acct = self.client.get_account()
@@ -53,6 +57,65 @@ class AlpacaBroker:
                 sector=_get_sector(p.symbol),
             ))
         return positions
+
+    def is_trading_day(self, on_date: date | None = None) -> bool:
+        target_date = on_date or date.today()
+        try:
+            from alpaca.trading.requests import GetCalendarRequest
+
+            calendar = self.client.get_calendar(
+                GetCalendarRequest(start=target_date, end=target_date)
+            )
+            return bool(calendar)
+        except Exception as exc:
+            logger.warning(
+                "Failed to confirm trading calendar for %s; assuming market closed: %s",
+                target_date, exc,
+            )
+            return False
+
+    def get_latest_price(self, symbol: str) -> float | None:
+        try:
+            if self._data_client is None:
+                from alpaca.data.historical.stock import StockHistoricalDataClient
+
+                self._data_client = StockHistoricalDataClient(self.api_key, self.secret_key)
+
+            from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
+
+            trade_data = self._data_client.get_stock_latest_trade(
+                StockLatestTradeRequest(symbol_or_symbols=symbol)
+            )
+            trade = self._extract_symbol_payload(trade_data, symbol)
+            trade_price = float(getattr(trade, "price", 0) or 0)
+            if trade_price > 0:
+                return trade_price
+
+            quote_data = self._data_client.get_stock_latest_quote(
+                StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            )
+            quote = self._extract_symbol_payload(quote_data, symbol)
+            ask_price = float(getattr(quote, "ask_price", 0) or 0)
+            bid_price = float(getattr(quote, "bid_price", 0) or 0)
+            if ask_price > 0 and bid_price > 0:
+                return (ask_price + bid_price) / 2
+            if ask_price > 0:
+                return ask_price
+            if bid_price > 0:
+                return bid_price
+        except Exception as exc:
+            logger.warning("Failed to fetch latest price for %s: %s", symbol, exc)
+
+        return None
+
+    @staticmethod
+    def _extract_symbol_payload(payload, symbol: str):
+        if isinstance(payload, dict):
+            return payload.get(symbol)
+        try:
+            return payload[symbol]
+        except Exception:
+            return getattr(payload, symbol, None)
 
     def submit_order(self, symbol: str, qty: float, side: str, limit_price: float | None = None) -> dict:
         order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL

@@ -108,6 +108,8 @@ def test_pipeline_morning_run_buy(
 
     # Broker
     mock_broker = MagicMock()
+    mock_broker.is_trading_day.return_value = True
+    mock_broker.get_latest_price.return_value = 507.0
     mock_broker.get_account.return_value = {"cash": 10000.0, "portfolio_value": 10000.0}
     mock_broker.get_positions.return_value = []
     mock_broker.submit_order.return_value = {"id": "order-1", "status": "accepted", "symbol": "SPY"}
@@ -160,7 +162,7 @@ def test_pipeline_morning_run_buy(
 @patch("src.pipeline.PortfolioManagerAgent")
 @patch("src.pipeline.TechAnalystAgent")
 @patch("src.pipeline.compute_indicators")
-def test_pipeline_market_order_sizes_from_latest_market_price(
+def test_pipeline_market_order_sizes_from_live_market_price(
     mock_ci, mock_ta_cls, mock_pm_cls, mock_rm_cls, mock_market_cls, mock_macro_cls,
     mock_maa_cls, mock_na_cls, mock_ndp_cls, mock_ea_cls, mock_edp_cls,
     mock_broker_cls, mock_config, tmp_path
@@ -198,7 +200,7 @@ def test_pipeline_market_order_sizes_from_latest_market_price(
 
     mock_market = MagicMock()
     mock_market.get_ohlcv.return_value = [
-        MagicMock(date="2026-04-07", open=99, high=101, low=98, close=100, volume=1000000)
+        MagicMock(date="2026-04-07", open=84, high=86, low=83, close=85, volume=1000000)
     ]
     mock_market_cls.return_value = mock_market
 
@@ -211,6 +213,8 @@ def test_pipeline_market_order_sizes_from_latest_market_price(
     mock_macro_cls.return_value = mock_macro
 
     mock_broker = MagicMock()
+    mock_broker.is_trading_day.return_value = True
+    mock_broker.get_latest_price.return_value = 100.0
     mock_broker.get_account.return_value = {"cash": 10000.0, "portfolio_value": 10000.0}
     mock_broker.get_positions.return_value = []
     mock_broker.submit_order.return_value = {"id": "order-1", "status": "accepted", "symbol": "SPY"}
@@ -247,6 +251,7 @@ def test_pipeline_market_order_sizes_from_latest_market_price(
     mock_broker.submit_order.assert_called_once_with(
         symbol="SPY", qty=10, side="buy", limit_price=None,
     )
+    mock_broker.get_latest_price.assert_called_once_with("SPY")
 
 
 @patch("src.pipeline.AlpacaBroker")
@@ -306,6 +311,8 @@ def test_pipeline_risk_rejected(
     mock_macro_cls.return_value = mock_macro
 
     mock_broker = MagicMock()
+    mock_broker.is_trading_day.return_value = True
+    mock_broker.get_latest_price.return_value = 507.0
     mock_broker.get_account.return_value = {"cash": 10000.0, "portfolio_value": 10000.0}
     mock_broker.get_positions.return_value = []
     mock_broker_cls.return_value = mock_broker
@@ -342,3 +349,33 @@ def test_pipeline_risk_rejected(
 
     assert result["status"] == "rejected"
     mock_broker.submit_order.assert_not_called()
+
+
+@patch("src.pipeline.AlpacaBroker")
+@patch("src.pipeline.EarningsDataProvider")
+@patch("src.pipeline.EarningsAnalystAgent")
+@patch("src.pipeline.NewsDataProvider")
+@patch("src.pipeline.NewsAnalystAgent")
+@patch("src.pipeline.MacroAnalystAgent")
+@patch("src.pipeline.MacroDataProvider")
+@patch("src.pipeline.MarketDataProvider")
+@patch("src.pipeline.RiskManagerAgent")
+@patch("src.pipeline.PortfolioManagerAgent")
+@patch("src.pipeline.TechAnalystAgent")
+@patch("src.pipeline.compute_indicators")
+def test_pipeline_skips_non_trading_day(
+    mock_ci, mock_ta_cls, mock_pm_cls, mock_rm_cls, mock_market_cls, mock_macro_cls,
+    mock_maa_cls, mock_na_cls, mock_ndp_cls, mock_ea_cls, mock_edp_cls,
+    mock_broker_cls, mock_config, tmp_path
+):
+    mock_config.storage.db_path = str(tmp_path / "test.db")
+
+    mock_broker = MagicMock()
+    mock_broker.is_trading_day.return_value = False
+    mock_broker_cls.return_value = mock_broker
+
+    pipeline = TradingPipeline(mock_config)
+    result = pipeline.run_morning()
+
+    assert result["status"] == "market_holiday"
+    mock_broker.get_account.assert_not_called()

@@ -78,3 +78,15 @@ def test_submit_limit_order(mock_tc_cls):
     order = broker.submit_order(symbol="SPY", qty=5, side="buy", limit_price=505.0)
     assert order["id"] == "order-456"
     mock_client.submit_order.assert_called_once()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_is_trading_day_uses_calendar(mock_tc_cls):
+    mock_client = MagicMock()
+    mock_client.get_calendar.return_value = [MagicMock()]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+
+    assert broker.is_trading_day() is True
+    mock_client.get_calendar.assert_called_once()
