@@ -22,16 +22,28 @@ class AgentResult:
 
     def parse_json(self) -> dict | None:
         try:
-            # Handle cases where LLM wraps JSON in markdown code blocks
             text = self.raw_text.strip()
-            if text.startswith("```"):
-                lines = text.split("\n")
-                # Remove first and last lines (``` markers)
-                text = "\n".join(lines[1:-1])
+            # Try direct parse first
             return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        try:
+            # Extract JSON from ```json ... ``` code blocks (LLM may add preamble)
+            import re
+            match = re.search(r"```(?:json)?\s*\n(.*?)\n```", self.raw_text, re.DOTALL)
+            if match:
+                return json.loads(match.group(1))
+            # Try finding first { or [ and parse from there
+            for i, ch in enumerate(self.raw_text):
+                if ch in "{[":
+                    try:
+                        return json.loads(self.raw_text[i:])
+                    except json.JSONDecodeError:
+                        continue
         except (json.JSONDecodeError, IndexError):
-            logger.warning("Failed to parse agent response as JSON: %s", self.raw_text[:200])
-            return None
+            pass
+        logger.warning("Failed to parse agent response as JSON: %s", self.raw_text[:200])
+        return None
 
 
 class BaseAgent(ABC):

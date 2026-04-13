@@ -139,10 +139,13 @@ class PortfolioManagerAgent(BaseAgent):
         else:
             earnings_section = "## Earnings Analysis\nNo recent earnings filings available."
 
+        invested = total_value - cash_balance
+        invested_pct = (invested / total_value * 100) if total_value else 0
+
         return f"""## Account Status
 - Total Value: ${total_value:,.2f}
 - Cash Balance: ${cash_balance:,.2f}
-- Invested: ${total_value - cash_balance:,.2f} ({(total_value - cash_balance) / total_value * 100:.1f}%)
+- Invested: ${invested:,.2f} ({invested_pct:.1f}%)
 
 ## Current Positions
 {positions_text}

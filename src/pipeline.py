@@ -176,62 +176,71 @@ class TradingPipeline:
             tech_future = executor.submit(_run_tech)
             earnings_future = executor.submit(_run_earnings)
 
-        # Collect macro results
-        macro_summary, macro_analysis, ma_result = macro_future.result()
-        self.db.insert_agent_log(
-            agent_name="macro_analyst", run_id=run_id,
-            input_summary=f"VIX={macro_summary.get('vix', {}).get('current')}",
-            input_message=ma_result.user_message,
-            output_summary=f"regime={macro_analysis.get('regime')}, outlook={macro_analysis.get('equity_outlook')}" if macro_analysis else "parse_error",
-            full_response=ma_result.raw_text,
-            model=self.config.llm.macro_analyst_model,
-            tokens_used=ma_result.tokens_used,
-        )
-        if macro_analysis:
-            logger.info("Macro analysis: regime=%s, outlook=%s, exposure=%s",
-                         macro_analysis.get("regime"), macro_analysis.get("equity_outlook"),
-                         macro_analysis.get("position_guidance", {}).get("overall_exposure"))
-        else:
-            logger.warning("Macro analysis failed, continuing without macro context")
-
-        # Collect news results
-        news_items, news_analysis, na_result = news_future.result()
-        self.db.insert_agent_log(
-            agent_name="news_analyst", run_id=run_id,
-            input_summary=f"{len(news_items)} news items",
-            input_message=na_result.user_message,
-            output_summary=f"sentiment={news_analysis.market_sentiment}, events={len(news_analysis.key_events)}" if news_analysis else "parse_error",
-            full_response=na_result.raw_text,
-            model=self.config.llm.news_analyst_model,
-            tokens_used=na_result.tokens_used,
-        )
-        if news_analysis:
-            logger.info("News analysis: sentiment=%s, confidence=%s, %d key events, %d symbol alerts",
-                         news_analysis.market_sentiment, news_analysis.confidence,
-                         len(news_analysis.key_events), len(news_analysis.symbol_alerts))
-        else:
-            logger.warning("News analysis failed, continuing without news context")
-
-        # Collect tech results
-        analyses_map, ta_result = tech_future.result()
-        analyses: list[TechAnalysisResult] = list(analyses_map.values())
-        if ta_result:
+        # Collect results — each with error isolation so one failure doesn't crash all
+        macro_analysis = None
+        try:
+            macro_summary, macro_analysis, ma_result = macro_future.result()
             self.db.insert_agent_log(
-                agent_name="tech_analyst", run_id=run_id,
-                input_summary=f"Batch: {len(analyses)} symbols analyzed",
-                input_message=ta_result.user_message,
-                output_summary=", ".join(f"{a.symbol}:{a.rating}" for a in analyses),
-                full_response=ta_result.raw_text,
-                model=self.config.llm.tech_analyst_model,
-                tokens_used=ta_result.tokens_used,
+                agent_name="macro_analyst", run_id=run_id,
+                input_summary=f"VIX={macro_summary.get('vix', {}).get('current')}",
+                input_message=ma_result.user_message,
+                output_summary=f"regime={macro_analysis.get('regime')}, outlook={macro_analysis.get('equity_outlook')}" if macro_analysis else "parse_error",
+                full_response=ma_result.raw_text,
+                model=self.config.llm.macro_analyst_model,
+                tokens_used=ma_result.tokens_used,
             )
-        logger.info("Technical analysis complete: %d symbols in 1 LLM call", len(analyses))
+            if macro_analysis:
+                logger.info("Macro analysis: regime=%s, outlook=%s, exposure=%s",
+                             macro_analysis.get("regime"), macro_analysis.get("equity_outlook"),
+                             macro_analysis.get("position_guidance", {}).get("overall_exposure"))
+        except Exception as e:
+            logger.error("Macro analyst failed: %s. Continuing without macro.", e)
 
-        # Collect earnings results (only cached analyses — new filings analyze in background)
-        earnings_reports, earnings_results = earnings_future.result()
-        new_filings = sum(1 for r in earnings_reports if r.is_new)
-        logger.info("Earnings: %d cached analyses for PM, %d new filings analyzing in background",
-                     len(earnings_results), new_filings)
+        news_analysis = None
+        try:
+            news_items, news_analysis, na_result = news_future.result()
+            self.db.insert_agent_log(
+                agent_name="news_analyst", run_id=run_id,
+                input_summary=f"{len(news_items)} news items",
+                input_message=na_result.user_message,
+                output_summary=f"sentiment={news_analysis.market_sentiment}, events={len(news_analysis.key_events)}" if news_analysis else "parse_error",
+                full_response=na_result.raw_text,
+                model=self.config.llm.news_analyst_model,
+                tokens_used=na_result.tokens_used,
+            )
+            if news_analysis:
+                logger.info("News analysis: sentiment=%s, confidence=%s, %d key events, %d symbol alerts",
+                             news_analysis.market_sentiment, news_analysis.confidence,
+                             len(news_analysis.key_events), len(news_analysis.symbol_alerts))
+        except Exception as e:
+            logger.error("News analyst failed: %s. Continuing without news.", e)
+
+        analyses: list[TechAnalysisResult] = []
+        try:
+            analyses_map, ta_result = tech_future.result()
+            analyses = list(analyses_map.values())
+            if ta_result:
+                self.db.insert_agent_log(
+                    agent_name="tech_analyst", run_id=run_id,
+                    input_summary=f"Batch: {len(analyses)} symbols analyzed",
+                    input_message=ta_result.user_message,
+                    output_summary=", ".join(f"{a.symbol}:{a.rating}" for a in analyses),
+                    full_response=ta_result.raw_text,
+                    model=self.config.llm.tech_analyst_model,
+                    tokens_used=ta_result.tokens_used,
+                )
+            logger.info("Technical analysis complete: %d symbols in 1 LLM call", len(analyses))
+        except Exception as e:
+            logger.error("Tech analyst failed: %s. Continuing without technical data.", e)
+
+        earnings_results = []
+        try:
+            earnings_reports, earnings_results = earnings_future.result()
+            new_filings = sum(1 for r in earnings_reports if r.is_new)
+            logger.info("Earnings: %d cached analyses for PM, %d new filings analyzing in background",
+                         len(earnings_results), new_filings)
+        except Exception as e:
+            logger.error("Earnings check failed: %s. Continuing without earnings.", e)
 
         if not analyses:
             logger.warning("No analyses produced, skipping trading")
@@ -262,7 +271,7 @@ class TradingPipeline:
             logger.info("Portfolio manager: no trades suggested")
             return {"status": "no_trades", "orders": []}
 
-        # 5. Hard risk rule checks
+        # 5. Hard risk rule checks — these are non-negotiable circuit breakers
         all_violations = []
         daily_pnl = sum(p.unrealized_pnl for p in positions)
         for decision in portfolio_decision.decisions:
@@ -274,7 +283,15 @@ class TradingPipeline:
             )
             all_violations.extend(violations)
 
-        # 6. Risk Manager LLM review
+        # Hard block: if daily loss limit or total exposure violated, reject ALL trades
+        critical_rules = {"max_daily_loss_pct", "max_total_position_pct"}
+        critical_violations = [v for v in all_violations if v.rule in critical_rules]
+        if critical_violations:
+            reasons = "; ".join(v.message for v in critical_violations)
+            logger.warning("HARD RISK BLOCK: %s", reasons)
+            return {"status": "hard_risk_block", "orders": [], "reason": reasons}
+
+        # 6. Risk Manager LLM review (with remaining violations as advisory)
         verdict, rm_result = self.risk_manager.review(
             portfolio_decision=portfolio_decision,
             positions=positions,
@@ -297,43 +314,56 @@ class TradingPipeline:
                         verdict.reasoning if verdict else "parse error")
             return {"status": "rejected", "orders": [], "reason": verdict.reasoning if verdict else "error"}
 
+        # Build a map of current prices from positions for price validation
+        price_map = {p.symbol: p.current_price for p in positions}
+
         # 7. Execute approved trades
         orders = []
         for decision in portfolio_decision.decisions:
-            if decision.action in ("BUY", "SELL"):
-                if decision.action == "BUY" and decision.entry_price <= 0:
-                    logger.warning("Invalid entry_price for %s, skipping", decision.symbol)
-                    continue
+            if decision.action not in ("BUY", "SELL"):
+                continue
+            try:
                 if decision.action == "BUY":
-                    qty = int((total_value * decision.allocation_pct / 100) / decision.entry_price)
-                else:
-                    qty = 0  # will be set from existing position below
-                if qty <= 0 and decision.action == "BUY":
-                    logger.warning("Calculated qty=0 for %s, skipping", decision.symbol)
-                    continue
-                side = decision.action.lower()
-                if decision.action == "SELL":
-                    existing = [p for p in positions if p.symbol == decision.symbol]
-                    if existing:
-                        qty = int(existing[0].qty)
-                    else:
+                    # Use current market price for qty calculation (not LLM's entry_price)
+                    # LLM entry_price is only used as limit price for the order
+                    market_price = price_map.get(decision.symbol)
+                    if not market_price or market_price <= 0:
+                        # Fallback to LLM price if no position exists yet
+                        market_price = decision.entry_price
+                    if market_price <= 0:
+                        logger.warning("Invalid price for %s, skipping", decision.symbol)
                         continue
-                order = self.broker.submit_order(
-                    symbol=decision.symbol,
-                    qty=qty,
-                    side=side,
-                    limit_price=decision.entry_price if decision.action == "BUY" else None,
-                )
-                orders.append(order)
-                self.db.insert_trade(
-                    symbol=decision.symbol,
-                    action=decision.action,
-                    qty=qty,
-                    price=decision.entry_price,
-                    reasoning=decision.reasoning,
-                    run_id=run_id,
-                )
-                logger.info("Executed: %s %d %s @ $%.2f", side, qty, decision.symbol, decision.entry_price)
+                    qty = int((total_value * decision.allocation_pct / 100) / market_price)
+                    if qty <= 0:
+                        logger.warning("Calculated qty=0 for %s, skipping", decision.symbol)
+                        continue
+                    order = self.broker.submit_order(
+                        symbol=decision.symbol, qty=qty, side="buy",
+                        limit_price=decision.entry_price if decision.entry_price > 0 else None,
+                    )
+                    orders.append(order)
+                    self.db.insert_trade(
+                        symbol=decision.symbol, action="BUY", qty=qty,
+                        price=decision.entry_price, reasoning=decision.reasoning, run_id=run_id,
+                    )
+                    logger.info("Executed: buy %d %s @ limit $%.2f", qty, decision.symbol, decision.entry_price)
+
+                elif decision.action == "SELL":
+                    existing = [p for p in positions if p.symbol == decision.symbol]
+                    if not existing or existing[0].qty <= 0:
+                        continue
+                    qty = max(1, int(existing[0].qty))
+                    sell_price = existing[0].current_price
+                    order = self.broker.submit_order(symbol=decision.symbol, qty=qty, side="sell")
+                    orders.append(order)
+                    self.db.insert_trade(
+                        symbol=decision.symbol, action="SELL", qty=qty,
+                        price=sell_price, reasoning=decision.reasoning, run_id=run_id,
+                    )
+                    logger.info("Executed: sell %d %s @ $%.2f", qty, decision.symbol, sell_price)
+
+            except Exception as e:
+                logger.error("Order failed for %s %s: %s", decision.action, decision.symbol, e)
 
         logger.info("=== Morning run complete: %d orders executed ===", len(orders))
         return {"status": "executed", "orders": orders, "run_id": run_id}
@@ -432,7 +462,7 @@ class TradingPipeline:
 
         # 2. LLM evening analysis — daily review and tomorrow outlook
         macro_summary = self.macro.get_macro_summary()
-        today_trades = self.db.get_trades(limit=20)  # today's trades
+        today_trades = self.db.get_trades(limit=20, today_only=True)
         analysis, ev_result = self.evening_analyst.analyze(
             positions=positions,
             macro_summary=macro_summary,

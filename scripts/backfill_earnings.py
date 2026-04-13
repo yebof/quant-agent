@@ -28,9 +28,12 @@ def main():
 
     # Use 365-day lookback to find at least one filing per stock
     provider = EarningsDataProvider(lookback_days=365)
+    from src.agents.base import _is_openai_model
+    model = config.llm.earnings_analyst_model
+    api_key = config.api_keys.openai if _is_openai_model(model) else config.api_keys.anthropic
     analyst = EarningsAnalystAgent(
-        api_key=config.api_keys.anthropic,
-        model=config.llm.earnings_model,
+        api_key=api_key,
+        model=model,
         max_tokens=config.llm.max_tokens,
     )
 

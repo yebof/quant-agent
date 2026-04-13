@@ -38,7 +38,7 @@ class AlpacaBroker:
     def submit_order(self, symbol: str, qty: float, side: str, limit_price: float | None = None) -> dict:
         order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
-        if limit_price:
+        if limit_price is not None:
             request = LimitOrderRequest(
                 symbol=symbol,
                 qty=qty,

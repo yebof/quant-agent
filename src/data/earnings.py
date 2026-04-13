@@ -213,8 +213,11 @@ class EarningsDataProvider:
         last_known = self.manifest.get(manifest_key, {}).get("filing_date")
 
         if last_known == latest.filing_date:
-            # Already processed this filing — return existing analysis
-            return self._get_existing_analysis(symbol)
+            # Already processed this filing — return existing analysis if it exists
+            existing = self._get_existing_analysis(symbol)
+            if existing:
+                return existing
+            # Analysis file missing (e.g. killed mid-analysis) — re-download
 
         # New filing — download it
         local_path = self._download_filing(cik, latest)

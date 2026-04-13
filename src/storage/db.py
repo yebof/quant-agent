@@ -79,16 +79,20 @@ class Database:
         )
         self.conn.commit()
 
-    def get_trades(self, symbol: str | None = None, limit: int = 100) -> list[dict]:
+    def get_trades(self, symbol: str | None = None, limit: int = 100,
+                    today_only: bool = False) -> list[dict]:
+        conditions = []
+        params: list = []
         if symbol:
-            rows = self.conn.execute(
-                "SELECT * FROM trades WHERE symbol = ? ORDER BY timestamp DESC LIMIT ?",
-                (symbol, limit),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT * FROM trades ORDER BY timestamp DESC LIMIT ?", (limit,)
-            ).fetchall()
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        if today_only:
+            conditions.append("date(timestamp) = date('now')")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM trades {where} ORDER BY timestamp DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
         return [dict(row) for row in rows]
 
     def upsert_position(self, symbol: str, qty: float, avg_entry: float,

@@ -26,18 +26,23 @@ class MiddayReviewerAgent(BaseAgent):
         cash_balance: float = kwargs["cash_balance"]
         total_value: float = kwargs["total_value"]
 
+        def _pnl_pct(p):
+            cost = p.avg_entry * p.qty
+            return f"{p.unrealized_pnl / cost * 100:.1f}%" if cost else "N/A"
+
         positions_text = "\n".join(
-            f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Now: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} ({p.unrealized_pnl / (p.avg_entry * p.qty) * 100:.1f}%) | Sector: {p.sector}"
+            f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Now: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} ({_pnl_pct(p)}) | Sector: {p.sector}"
             for p in positions
         ) if positions else "No open positions."
 
         vix = macro_summary.get("vix", {})
+        cash_pct = f"{cash_balance / total_value * 100:.1f}%" if total_value else "N/A"
 
         return f"""## Midday Position Review
 
 ### Account
 - Total Value: ${total_value:,.2f}
-- Cash: ${cash_balance:,.2f} ({cash_balance / total_value * 100:.1f}%)
+- Cash: ${cash_balance:,.2f} ({cash_pct})
 
 ### Open Positions
 {positions_text}
