@@ -64,8 +64,19 @@ class EarningsDataProvider:
             return json.loads(self.manifest_path.read_text())
         return {}
 
-    def _save_manifest(self):
+    def save_manifest(self):
         self.manifest_path.write_text(json.dumps(self.manifest, indent=2))
+
+    def confirm_filing(self, report: "EarningsReport"):
+        """Mark a filing as processed in the manifest. Call after analysis file is written."""
+        manifest_key = f"{report.symbol}_{report.form_type}"
+        self.manifest[manifest_key] = {
+            "filing_date": report.filing_date,
+            "form_type": report.form_type,
+            "local_path": report.filing_path,
+            "analysis_path": report.analysis_path,
+        }
+        self.save_manifest()
 
     def _sec_get(self, url: str) -> bytes:
         """GET with SEC-required headers and rate limiting."""
@@ -193,7 +204,6 @@ class EarningsDataProvider:
 
         logger.info("Earnings check: %d reports (%d new) from %d stocks",
                      len(reports), sum(1 for r in reports if r.is_new), len(stocks))
-        self._save_manifest()
         return reports
 
     def _check_symbol(self, symbol: str) -> EarningsReport | None:
@@ -226,15 +236,6 @@ class EarningsDataProvider:
 
         text = self._extract_text(local_path)
         analysis_path = self._get_analysis_path(symbol, latest.form_type, latest.filing_date)
-
-        # Update manifest
-        self.manifest[manifest_key] = {
-            "filing_date": latest.filing_date,
-            "accession_number": latest.accession_number,
-            "form_type": latest.form_type,
-            "local_path": local_path,
-            "analysis_path": analysis_path,
-        }
 
         return EarningsReport(
             symbol=symbol,

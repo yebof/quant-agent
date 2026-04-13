@@ -382,7 +382,6 @@ def test_evening_return_pct_handles_zero_previous_value():
     pipeline.evening_analyst = MagicMock()
     pipeline.config = MagicMock()
     pipeline.config.llm.evening_analyst_model = "test-model"
-    pipeline.broker.is_trading_day.return_value = True
 
     pipeline.broker.get_account.return_value = {"portfolio_value": 1000.0}
     pipeline.broker.get_positions.return_value = []

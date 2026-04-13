@@ -253,20 +253,9 @@ class TradingPipeline:
 
         return updated_decisions
 
-    def _is_trading_day(self) -> bool:
-        try:
-            return self.broker.is_trading_day()
-        except Exception as exc:
-            logger.warning("Trading-day check failed; assuming market closed: %s", exc)
-            return False
-
     def run_morning(self) -> dict:
         run_id = f"run-{uuid.uuid4().hex[:8]}"
         logger.info("=== Morning run started: %s ===", run_id)
-
-        if not self._is_trading_day():
-            logger.info("Morning run skipped: market closed for non-trading day")
-            return {"status": "market_holiday", "orders": [], "run_id": run_id}
 
         # 1. Get account state
         account = self.broker.get_account()
@@ -331,7 +320,11 @@ class TradingPipeline:
 
                 def _bg_analyze(reports):
                     try:
-                        self.earnings_analyst.analyze_reports(reports)
+                        results = self.earnings_analyst.analyze_reports(reports)
+                        # Update manifest only after analysis files are written to disk
+                        for r in reports:
+                            if any(res["symbol"] == r.symbol and res["is_new"] for res in results):
+                                self.earnings_provider.confirm_filing(r)
                     except Exception as e:
                         logger.error("Background earnings analysis failed: %s", e, exc_info=True)
 
@@ -610,10 +603,6 @@ class TradingPipeline:
         run_id = f"midday-{uuid.uuid4().hex[:8]}"
         logger.info("=== Midday check: %s ===", run_id)
 
-        if not self._is_trading_day():
-            logger.info("Midday run skipped: market closed for non-trading day")
-            return {"status": "market_holiday", "positions": 0, "orders": [], "run_id": run_id}
-
         # 1. Sync positions
         account = self.broker.get_account()
         positions = self.broker.get_positions()
@@ -717,10 +706,6 @@ class TradingPipeline:
     def run_evening(self) -> dict:
         run_id = f"evening-{uuid.uuid4().hex[:8]}"
         logger.info("=== Evening report: %s ===", run_id)
-
-        if not self._is_trading_day():
-            logger.info("Evening run skipped: market closed for non-trading day")
-            return {"status": "market_holiday", "analysis": None, "run_id": run_id}
 
         # 1. Record daily PnL
         account = self.broker.get_account()

@@ -351,31 +351,6 @@ def test_pipeline_risk_rejected(
     mock_broker.submit_order.assert_not_called()
 
 
-@patch("src.pipeline.AlpacaBroker")
-@patch("src.pipeline.EarningsDataProvider")
-@patch("src.pipeline.EarningsAnalystAgent")
-@patch("src.pipeline.NewsDataProvider")
-@patch("src.pipeline.NewsAnalystAgent")
-@patch("src.pipeline.MacroAnalystAgent")
-@patch("src.pipeline.MacroDataProvider")
-@patch("src.pipeline.MarketDataProvider")
-@patch("src.pipeline.RiskManagerAgent")
-@patch("src.pipeline.PortfolioManagerAgent")
-@patch("src.pipeline.TechAnalystAgent")
-@patch("src.pipeline.compute_indicators")
-def test_pipeline_skips_non_trading_day(
-    mock_ci, mock_ta_cls, mock_pm_cls, mock_rm_cls, mock_market_cls, mock_macro_cls,
-    mock_maa_cls, mock_na_cls, mock_ndp_cls, mock_ea_cls, mock_edp_cls,
-    mock_broker_cls, mock_config, tmp_path
-):
-    mock_config.storage.db_path = str(tmp_path / "test.db")
-
-    mock_broker = MagicMock()
-    mock_broker.is_trading_day.return_value = False
-    mock_broker_cls.return_value = mock_broker
-
-    pipeline = TradingPipeline(mock_config)
-    result = pipeline.run_morning()
-
-    assert result["status"] == "market_holiday"
-    mock_broker.get_account.assert_not_called()
+def test_pipeline_no_longer_checks_trading_day():
+    """Trading day check is the scheduler's responsibility, not the pipeline's."""
+    assert not hasattr(TradingPipeline, "_is_trading_day")

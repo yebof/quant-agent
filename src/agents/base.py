@@ -84,10 +84,23 @@ class BaseAgent(ABC):
         logger.info("Agent %s running with model %s", self.name, self.model)
         logger.info("Agent %s input:\n%s", self.name, user_message)
 
-        if self._use_openai:
-            raw_text, input_tokens, output_tokens = self._call_openai(user_message)
+        last_exc = None
+        for attempt in range(3):
+            try:
+                if self._use_openai:
+                    raw_text, input_tokens, output_tokens = self._call_openai(user_message)
+                else:
+                    raw_text, input_tokens, output_tokens = self._call_anthropic(user_message)
+                break
+            except Exception as e:
+                last_exc = e
+                wait = 2 ** attempt
+                logger.warning("Agent %s attempt %d failed: %s. Retrying in %ds...",
+                               self.name, attempt + 1, e, wait)
+                import time
+                time.sleep(wait)
         else:
-            raw_text, input_tokens, output_tokens = self._call_anthropic(user_message)
+            raise last_exc
 
         tokens = input_tokens + output_tokens
         logger.info("Agent %s completed, input_tokens: %d, output_tokens: %d, total: %d",
