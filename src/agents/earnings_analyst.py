@@ -6,6 +6,7 @@ For existing filings: returns previously saved analysis.
 
 import json
 import logging
+import re
 from pathlib import Path
 
 from src.agents.base import BaseAgent, AgentResult
@@ -133,7 +134,7 @@ Analyze this filing and respond with JSON. Cite specific numbers from the text a
         """Load previously saved analysis from markdown file."""
         text = Path(path).read_text()
         # Extract JSON from ```json ... ``` block
-        match = __import__("re").search(r"```json\s*\n(.*?)\n```", text, __import__("re").DOTALL)
+        match = re.search(r"```json\s*\n(.*?)\n```", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(1))

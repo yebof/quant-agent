@@ -45,7 +45,7 @@ class MacroDataProvider:
         )
         us2y = float(us2y_series.dropna().iloc[-1]) if not us2y_series.dropna().empty else None
         us10y = float(us10y_series.dropna().iloc[-1]) if not us10y_series.dropna().empty else None
-        spread = (us10y - us2y) if us2y and us10y else None
+        spread = (us10y - us2y) if us2y is not None and us10y is not None else None
         return {
             "us2y": us2y,
             "us10y": us10y,

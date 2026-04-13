@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 class ApiKeysConfig(BaseModel):
@@ -12,6 +12,15 @@ class ApiKeysConfig(BaseModel):
     fred: str
     alpaca_key: str
     alpaca_secret: str
+
+    @model_validator(mode="after")
+    def _check_required_keys(self):
+        for field_name in ("alpaca_key", "alpaca_secret", "fred"):
+            if not getattr(self, field_name):
+                raise ValueError(f"Required API key '{field_name}' is empty — check your .env file")
+        if not self.anthropic and not self.openai:
+            raise ValueError("At least one of 'anthropic' or 'openai' API key must be set")
+        return self
 
 
 class AlpacaConfig(BaseModel):

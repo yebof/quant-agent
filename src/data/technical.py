@@ -64,7 +64,7 @@ def compute_indicators(symbol: str, bars: list[OHLCV]) -> TechnicalIndicators:
     # Volume change %
     if len(df) >= 6:
         recent_vol = df["volume"].tail(5).mean()
-        prev_vol = df["volume"].iloc[-10:-5].mean() if len(df) >= 10 else df["volume"].mean()
+        prev_vol = df["volume"].iloc[-10:-5].mean() if len(df) >= 10 else df["volume"].iloc[:-5].mean()
         if prev_vol > 0:
             result.volume_change_pct = round(float((recent_vol - prev_vol) / prev_vol * 100), 2)
 

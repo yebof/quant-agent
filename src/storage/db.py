@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 from datetime import datetime
 
 
@@ -6,9 +7,10 @@ class Database:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.conn: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
 
     def initialize(self):
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._create_tables()
 
@@ -69,15 +71,17 @@ class Database:
             self.conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
-        return self.conn.execute(sql, params)
+        with self._lock:
+            return self.conn.execute(sql, params)
 
     def insert_trade(self, symbol: str, action: str, qty: float, price: float,
                      reasoning: str, run_id: str):
-        self.conn.execute(
-            "INSERT INTO trades (symbol, action, qty, price, reasoning, run_id) VALUES (?, ?, ?, ?, ?, ?)",
-            (symbol, action, qty, price, reasoning, run_id),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO trades (symbol, action, qty, price, reasoning, run_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (symbol, action, qty, price, reasoning, run_id),
+            )
+            self.conn.commit()
 
     def get_trades(self, symbol: str | None = None, limit: int = 100,
                     today_only: bool = False) -> list[dict]:
@@ -89,65 +93,72 @@ class Database:
         if today_only:
             conditions.append("date(timestamp) = date('now')")
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        rows = self.conn.execute(
-            f"SELECT * FROM trades {where} ORDER BY timestamp DESC LIMIT ?",
-            (*params, limit),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT * FROM trades {where} ORDER BY timestamp DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def upsert_position(self, symbol: str, qty: float, avg_entry: float,
                         current_price: float, market_value: float,
                         unrealized_pnl: float, sector: str):
-        self.conn.execute(
-            """INSERT INTO positions (symbol, qty, avg_entry, current_price, market_value, unrealized_pnl, sector, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-               ON CONFLICT(symbol) DO UPDATE SET
-                 qty=excluded.qty, avg_entry=excluded.avg_entry,
-                 current_price=excluded.current_price, market_value=excluded.market_value,
-                 unrealized_pnl=excluded.unrealized_pnl, sector=excluded.sector,
-                 updated_at=datetime('now')""",
-            (symbol, qty, avg_entry, current_price, market_value, unrealized_pnl, sector),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO positions (symbol, qty, avg_entry, current_price, market_value, unrealized_pnl, sector, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                   ON CONFLICT(symbol) DO UPDATE SET
+                     qty=excluded.qty, avg_entry=excluded.avg_entry,
+                     current_price=excluded.current_price, market_value=excluded.market_value,
+                     unrealized_pnl=excluded.unrealized_pnl, sector=excluded.sector,
+                     updated_at=datetime('now')""",
+                (symbol, qty, avg_entry, current_price, market_value, unrealized_pnl, sector),
+            )
+            self.conn.commit()
 
     def get_positions(self, open_only: bool = False) -> list[dict]:
-        if open_only:
-            rows = self.conn.execute(
-                "SELECT * FROM positions WHERE qty > 0"
-            ).fetchall()
-        else:
-            rows = self.conn.execute("SELECT * FROM positions").fetchall()
+        with self._lock:
+            if open_only:
+                rows = self.conn.execute(
+                    "SELECT * FROM positions WHERE qty > 0"
+                ).fetchall()
+            else:
+                rows = self.conn.execute("SELECT * FROM positions").fetchall()
         return [dict(row) for row in rows]
 
     def insert_agent_log(self, agent_name: str, run_id: str, input_summary: str,
                          output_summary: str, full_response: str, model: str,
                          tokens_used: int, input_message: str = ""):
-        self.conn.execute(
-            """INSERT INTO agent_logs (agent_name, run_id, input_summary, input_message,
-               output_summary, full_response, model, tokens_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (agent_name, run_id, input_summary, input_message, output_summary, full_response, model, tokens_used),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO agent_logs (agent_name, run_id, input_summary, input_message,
+                   output_summary, full_response, model, tokens_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (agent_name, run_id, input_summary, input_message, output_summary, full_response, model, tokens_used),
+            )
+            self.conn.commit()
 
     def get_agent_logs(self, run_id: str) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT * FROM agent_logs WHERE run_id = ? ORDER BY timestamp", (run_id,)
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM agent_logs WHERE run_id = ? ORDER BY timestamp", (run_id,)
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def insert_daily_pnl(self, date: str, total_value: float, daily_pnl: float,
                          daily_return_pct: float):
-        self.conn.execute(
-            """INSERT OR REPLACE INTO daily_pnl (date, total_value, daily_pnl, daily_return_pct)
-               VALUES (?, ?, ?, ?)""",
-            (date, total_value, daily_pnl, daily_return_pct),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO daily_pnl (date, total_value, daily_pnl, daily_return_pct)
+                   VALUES (?, ?, ?, ?)""",
+                (date, total_value, daily_pnl, daily_return_pct),
+            )
+            self.conn.commit()
 
     def get_daily_pnl(self, limit: int = 30) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT * FROM daily_pnl ORDER BY date DESC LIMIT ?", (limit,)
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM daily_pnl ORDER BY date DESC LIMIT ?", (limit,)
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def close(self):

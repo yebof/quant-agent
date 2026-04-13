@@ -33,13 +33,17 @@ class AgentResult:
             match = re.search(r"```(?:json)?\s*\n(.*?)\n```", self.raw_text, re.DOTALL)
             if match:
                 return json.loads(match.group(1))
-            # Try finding first { or [ and parse from there
+            # Try finding first { or [ and match with last corresponding } or ]
             for i, ch in enumerate(self.raw_text):
                 if ch in "{[":
-                    try:
-                        return json.loads(self.raw_text[i:])
-                    except json.JSONDecodeError:
-                        continue
+                    closing = "}" if ch == "{" else "]"
+                    for j in range(len(self.raw_text) - 1, i, -1):
+                        if self.raw_text[j] == closing:
+                            try:
+                                return json.loads(self.raw_text[i:j + 1])
+                            except json.JSONDecodeError:
+                                continue
+                    break
         except (json.JSONDecodeError, IndexError):
             pass
         logger.warning("Failed to parse agent response as JSON: %s", self.raw_text[:200])
@@ -96,6 +100,9 @@ class BaseAgent(ABC):
             system=self.system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
+        if not response.content or not hasattr(response.content[0], "text"):
+            logger.warning("Anthropic returned empty content (stop_reason=%s)", response.stop_reason)
+            return ("", response.usage.input_tokens, response.usage.output_tokens)
         return (
             response.content[0].text,
             response.usage.input_tokens,
@@ -111,8 +118,13 @@ class BaseAgent(ABC):
                 {"role": "user", "content": user_message},
             ],
         )
+        content = response.choices[0].message.content or ""
+        if not content:
+            refusal = getattr(response.choices[0].message, "refusal", None)
+            logger.warning("OpenAI returned empty content (refusal=%s)", refusal)
+        usage = response.usage
         return (
-            response.choices[0].message.content,
-            response.usage.prompt_tokens,
-            response.usage.completion_tokens,
+            content,
+            usage.prompt_tokens if usage else 0,
+            usage.completion_tokens if usage else 0,
         )

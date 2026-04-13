@@ -160,10 +160,18 @@ class TradingPipeline:
                 symbols = ", ".join(r.symbol for r in new_reports)
                 logger.info("Background: queued %d new filings for analysis (%s). "
                             "Results will be cached for next run.", len(new_reports), symbols)
+
+                def _bg_analyze(reports):
+                    try:
+                        self.earnings_analyst.analyze_reports(reports)
+                    except Exception as e:
+                        logger.error("Background earnings analysis failed: %s", e, exc_info=True)
+
                 bg = threading.Thread(
-                    target=self.earnings_analyst.analyze_reports,
+                    target=_bg_analyze,
                     args=(new_reports,),
                     name="earnings-bg-analysis",
+                    daemon=True,
                 )
                 bg.start()
 
@@ -178,6 +186,7 @@ class TradingPipeline:
 
         # Collect results — each with error isolation so one failure doesn't crash all
         macro_analysis = None
+        macro_summary = {}
         try:
             macro_summary, macro_analysis, ma_result = macro_future.result()
             self.db.insert_agent_log(
@@ -273,23 +282,32 @@ class TradingPipeline:
 
         # 5. Hard risk rule checks — these are non-negotiable circuit breakers
         all_violations = []
-        daily_pnl = sum(p.unrealized_pnl for p in positions)
+        daily_pnl = sum(p.unrealized_intraday_pnl for p in positions)
+        pending_investment = 0.0
         for decision in portfolio_decision.decisions:
             violations = self.risk_engine.check(
                 decision=decision,
                 positions=positions,
                 total_value=total_value,
                 daily_pnl=daily_pnl,
+                pending_investment=pending_investment,
             )
             all_violations.extend(violations)
+            if decision.action == "BUY":
+                pending_investment += total_value * (decision.allocation_pct / 100)
 
-        # Hard block: if daily loss limit or total exposure violated, reject ALL trades
-        critical_rules = {"max_daily_loss_pct", "max_total_position_pct"}
+        # Hard block: critical violations block BUY orders, but SELL orders pass through
+        # (when over-exposed, you need to be able to sell to reduce risk)
+        critical_rules = {"max_daily_loss_pct", "max_total_position_pct", "max_position_pct"}
         critical_violations = [v for v in all_violations if v.rule in critical_rules]
         if critical_violations:
-            reasons = "; ".join(v.message for v in critical_violations)
-            logger.warning("HARD RISK BLOCK: %s", reasons)
-            return {"status": "hard_risk_block", "orders": [], "reason": reasons}
+            reasons = "; ".join(set(v.message for v in critical_violations))
+            logger.warning("HARD RISK BLOCK (BUY blocked): %s", reasons)
+            portfolio_decision.decisions = [d for d in portfolio_decision.decisions if d.action != "BUY"]
+            if not portfolio_decision.decisions:
+                return {"status": "hard_risk_block", "orders": [], "reason": reasons}
+            logger.info("Allowing %d SELL orders through to reduce exposure",
+                        sum(1 for d in portfolio_decision.decisions if d.action == "SELL"))
 
         # 6. Risk Manager LLM review (with remaining violations as advisory)
         verdict, rm_result = self.risk_manager.review(
@@ -314,6 +332,19 @@ class TradingPipeline:
                         verdict.reasoning if verdict else "parse error")
             return {"status": "rejected", "orders": [], "reason": verdict.reasoning if verdict else "error"}
 
+        # Apply risk manager modifications to decisions
+        _modifiable_fields = {"allocation_pct", "entry_price", "stop_loss", "take_profit"}
+        if verdict.modifications:
+            for mod in verdict.modifications:
+                if mod.field not in _modifiable_fields:
+                    logger.warning("Risk mod ignored: unknown field '%s'", mod.field)
+                    continue
+                for d in portfolio_decision.decisions:
+                    if d.symbol == mod.symbol:
+                        logger.info("Risk mod applied: %s.%s %.4f -> %.4f (%s)",
+                                    mod.symbol, mod.field, mod.original_value, mod.new_value, mod.reason)
+                        setattr(d, mod.field, mod.new_value)
+
         # Build a map of current prices from positions for price validation
         price_map = {p.symbol: p.current_price for p in positions}
 
@@ -333,13 +364,22 @@ class TradingPipeline:
                     if market_price <= 0:
                         logger.warning("Invalid price for %s, skipping", decision.symbol)
                         continue
+                    # Sanity check: reject limit prices >10% away from market price
+                    limit_price = None
+                    if decision.entry_price > 0:
+                        deviation = abs(decision.entry_price - market_price) / market_price
+                        if deviation > 0.10:
+                            logger.warning("LLM entry_price $%.2f for %s is %.1f%% away from market $%.2f, using market order",
+                                           decision.entry_price, decision.symbol, deviation * 100, market_price)
+                        else:
+                            limit_price = decision.entry_price
                     qty = int((total_value * decision.allocation_pct / 100) / market_price)
                     if qty <= 0:
                         logger.warning("Calculated qty=0 for %s, skipping", decision.symbol)
                         continue
                     order = self.broker.submit_order(
                         symbol=decision.symbol, qty=qty, side="buy",
-                        limit_price=decision.entry_price if decision.entry_price > 0 else None,
+                        limit_price=limit_price,
                     )
                     orders.append(order)
                     self.db.insert_trade(
@@ -407,7 +447,7 @@ class TradingPipeline:
             )
 
             # 3. Risk check: if daily loss limit breached, force-sell all positions
-            daily_pnl = sum(p.unrealized_pnl for p in positions)
+            daily_pnl = sum(p.unrealized_intraday_pnl for p in positions)
             loss_violation = self.risk_engine.check_daily_loss(total_value, daily_pnl)
             if loss_violation:
                 logger.warning("MIDDAY RISK ALERT: %s — force-closing all positions", loss_violation.message)

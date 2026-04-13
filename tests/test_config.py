@@ -114,7 +114,8 @@ storage:
     config_file = tmp_path / "settings.yaml"
     config_file.write_text(yaml_content)
 
+    import pytest
     from src.config import load_config
-    cfg = load_config(config_file)
-    # Missing env vars resolve to empty string (for optional keys like OpenAI)
-    assert cfg.api_keys.anthropic == ""
+    # Missing required API keys now raise ValidationError
+    with pytest.raises(Exception, match="API key"):
+        load_config(config_file)

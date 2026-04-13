@@ -1,5 +1,7 @@
 from datetime import datetime, date
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 
 class OHLCV(BaseModel):
@@ -29,7 +31,7 @@ class TechnicalIndicators(BaseModel):
 
 class TechAnalysisResult(BaseModel):
     symbol: str
-    rating: str  # "strong_buy" | "buy" | "neutral" | "sell" | "strong_sell"
+    rating: Literal["strong_buy", "buy", "neutral", "sell", "strong_sell"]
     entry_price: float | None = None
     exit_price: float | None = None
     stop_loss: float | None = None
@@ -37,9 +39,9 @@ class TechAnalysisResult(BaseModel):
 
 
 class TradeDecision(BaseModel):
-    action: str  # "BUY" | "SELL" | "HOLD"
+    action: Literal["BUY", "SELL", "HOLD"]
     symbol: str
-    allocation_pct: float
+    allocation_pct: float = Field(ge=0, le=100)
     entry_price: float
     stop_loss: float
     take_profit: float
@@ -102,6 +104,7 @@ class Position(BaseModel):
     current_price: float
     market_value: float
     unrealized_pnl: float
+    unrealized_intraday_pnl: float = 0.0
     sector: str
 
 

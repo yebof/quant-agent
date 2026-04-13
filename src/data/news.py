@@ -107,16 +107,23 @@ class NewsDataProvider:
         return None
 
     def _deduplicate(self, items: list[NewsItem]) -> list[NewsItem]:
-        """Remove near-duplicate headlines."""
-        seen_titles: set[str] = set()
+        """Remove near-duplicate headlines using word-level Jaccard similarity."""
         unique: list[NewsItem] = []
+        seen_word_sets: list[set[str]] = []
 
         for item in items:
-            # Normalize: lowercase, strip punctuation for comparison
-            normalized = item.title.lower().strip()
-            # Simple dedup: exact title match after normalization
-            if normalized not in seen_titles:
-                seen_titles.add(normalized)
+            words = set(item.title.lower().split())
+            if not words:
+                continue
+            is_dup = False
+            for seen in seen_word_sets:
+                intersection = len(words & seen)
+                union = len(words | seen)
+                if union > 0 and intersection / union > 0.7:
+                    is_dup = True
+                    break
+            if not is_dup:
+                seen_word_sets.append(words)
                 unique.append(item)
 
         return unique
