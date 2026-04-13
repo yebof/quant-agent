@@ -1,5 +1,5 @@
 import pytest
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from src.storage.db import Database
 
 
@@ -90,6 +90,19 @@ def test_insert_daily_pnl(db):
     pnl = db.get_daily_pnl(limit=1)
     assert len(pnl) == 1
     assert pnl[0]["daily_pnl"] == 150.0
+
+
+def test_get_daily_pnl_before_date_excludes_current_day(db):
+    today_str = str(date.today())
+    prev_day = str(date.today() - timedelta(days=1))
+
+    db.insert_daily_pnl(date=prev_day, total_value=9500.0, daily_pnl=100.0, daily_return_pct=1.06)
+    db.insert_daily_pnl(date=today_str, total_value=10000.0, daily_pnl=500.0, daily_return_pct=5.26)
+
+    pnl = db.get_daily_pnl(limit=1, before_date=today_str)
+
+    assert len(pnl) == 1
+    assert pnl[0]["date"] == prev_day
 
 
 def test_get_open_positions(db):

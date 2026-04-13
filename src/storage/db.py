@@ -154,10 +154,17 @@ class Database:
             )
             self.conn.commit()
 
-    def get_daily_pnl(self, limit: int = 30) -> list[dict]:
+    def get_daily_pnl(self, limit: int = 30, before_date: str | None = None) -> list[dict]:
+        conditions = []
+        params: list = []
+        if before_date:
+            conditions.append("date < ?")
+            params.append(before_date)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._lock:
             rows = self.conn.execute(
-                "SELECT * FROM daily_pnl ORDER BY date DESC LIMIT ?", (limit,)
+                f"SELECT * FROM daily_pnl {where} ORDER BY date DESC LIMIT ?",
+                (*params, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 

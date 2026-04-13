@@ -3,7 +3,6 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
-from numbers import Real
 
 from pydantic import ValidationError
 
@@ -212,9 +211,20 @@ class TradingPipeline:
 
         return updated_decisions
 
+    def _is_trading_day(self) -> bool:
+        try:
+            return self.broker.is_trading_day()
+        except Exception as exc:
+            logger.warning("Trading-day check failed; assuming market closed: %s", exc)
+            return False
+
     def run_morning(self) -> dict:
         run_id = f"run-{uuid.uuid4().hex[:8]}"
         logger.info("=== Morning run started: %s ===", run_id)
+
+        if not self._is_trading_day():
+            logger.info("Morning run skipped: market closed for non-trading day")
+            return {"status": "market_holiday", "orders": [], "run_id": run_id}
 
         # 1. Get account state
         account = self.broker.get_account()
@@ -245,21 +255,16 @@ class TradingPipeline:
 
         def _run_tech():
             symbols_data = []
-            latest_prices = {}
             for symbol in self.config.trading.universe:
                 bars = self.market.get_ohlcv(symbol, self.config.trading.lookback_days)
                 if not bars:
                     logger.warning("No data for %s, skipping", symbol)
                     continue
-                latest_close = getattr(bars[-1], "close", None)
-                if isinstance(latest_close, Real) and latest_close > 0:
-                    latest_prices[symbol] = latest_close
                 indicators = compute_indicators(symbol, bars)
                 symbols_data.append({"symbol": symbol, "bars": bars, "indicators": indicators})
             if symbols_data:
-                analyses_map, ta_result = self.tech_analyst.analyze_batch(symbols_data)
-                return analyses_map, latest_prices, ta_result
-            return {}, {}, None
+                return self.tech_analyst.analyze_batch(symbols_data)
+            return {}, None
 
         def _run_earnings():
             """Check for filings, return cached analyses immediately.
@@ -346,9 +351,8 @@ class TradingPipeline:
             logger.error("News analyst failed: %s. Continuing without news.", e)
 
         analyses: list[TechAnalysisResult] = []
-        latest_prices = {}
         try:
-            analyses_map, latest_prices, ta_result = tech_future.result()
+            analyses_map, ta_result = tech_future.result()
             analyses = list(analyses_map.values())
             if ta_result:
                 self.db.insert_agent_log(
@@ -459,9 +463,8 @@ class TradingPipeline:
                 if not portfolio_decision.decisions:
                     return {"status": "hard_risk_block", "orders": [], "reason": reasons}
 
-        # Build a map of current prices from positions for price validation
-        price_map = dict(latest_prices)
-        price_map.update({p.symbol: p.current_price for p in positions})
+        # Build a map of current prices from broker state for price validation
+        price_map = {p.symbol: p.current_price for p in positions}
 
         # 7. Execute approved trades
         orders = []
@@ -470,25 +473,43 @@ class TradingPipeline:
                 continue
             try:
                 if decision.action == "BUY":
-                    # Use current market price for qty calculation (not LLM's entry_price)
-                    # LLM entry_price is only used as limit price for the order
+                    # Use executable pricing from the broker when available.
                     market_price = price_map.get(decision.symbol)
                     if not market_price or market_price <= 0:
-                        # Fallback to LLM price if no position exists yet
-                        market_price = decision.entry_price
-                    if market_price <= 0:
+                        live_price = self.broker.get_latest_price(decision.symbol)
+                        if live_price and live_price > 0:
+                            market_price = live_price
+                            price_map[decision.symbol] = live_price
+
+                    limit_price = None
+                    sizing_price = None
+                    if decision.entry_price > 0:
+                        limit_price = decision.entry_price
+
+                    if market_price and market_price > 0:
+                        if limit_price is not None:
+                            deviation = abs(limit_price - market_price) / market_price
+                            if deviation > 0.10:
+                                logger.warning("LLM entry_price $%.2f for %s is %.1f%% away from market $%.2f, using market order",
+                                               decision.entry_price, decision.symbol, deviation * 100, market_price)
+                                limit_price = None
+                                sizing_price = market_price
+                            else:
+                                sizing_price = max(market_price, limit_price)
+                        else:
+                            sizing_price = market_price
+                    elif limit_price is not None:
+                        logger.warning(
+                            "No live market price for %s; sizing and submitting as a limit order at $%.2f",
+                            decision.symbol,
+                            limit_price,
+                        )
+                        sizing_price = limit_price
+                    else:
                         logger.warning("Invalid price for %s, skipping", decision.symbol)
                         continue
-                    # Sanity check: reject limit prices >10% away from market price
-                    limit_price = None
-                    if decision.entry_price > 0:
-                        deviation = abs(decision.entry_price - market_price) / market_price
-                        if deviation > 0.10:
-                            logger.warning("LLM entry_price $%.2f for %s is %.1f%% away from market $%.2f, using market order",
-                                           decision.entry_price, decision.symbol, deviation * 100, market_price)
-                        else:
-                            limit_price = decision.entry_price
-                    qty = int((total_value * decision.allocation_pct / 100) / market_price)
+
+                    qty = int((total_value * decision.allocation_pct / 100) / sizing_price)
                     if qty <= 0:
                         logger.warning("Calculated qty=0 for %s, skipping", decision.symbol)
                         continue
@@ -531,6 +552,10 @@ class TradingPipeline:
     def run_midday(self) -> dict:
         run_id = f"midday-{uuid.uuid4().hex[:8]}"
         logger.info("=== Midday check: %s ===", run_id)
+
+        if not self._is_trading_day():
+            logger.info("Midday run skipped: market closed for non-trading day")
+            return {"status": "market_holiday", "positions": 0, "orders": [], "run_id": run_id}
 
         # 1. Sync positions
         account = self.broker.get_account()
@@ -636,12 +661,17 @@ class TradingPipeline:
         run_id = f"evening-{uuid.uuid4().hex[:8]}"
         logger.info("=== Evening report: %s ===", run_id)
 
+        if not self._is_trading_day():
+            logger.info("Evening run skipped: market closed for non-trading day")
+            return {"status": "market_holiday", "analysis": None, "run_id": run_id}
+
         # 1. Record daily PnL
         account = self.broker.get_account()
         positions = self.broker.get_positions()
         total_value = account["portfolio_value"]
+        today_str = str(date.today())
 
-        recent_pnl = self.db.get_daily_pnl(limit=1)
+        recent_pnl = self.db.get_daily_pnl(limit=1, before_date=today_str)
         if recent_pnl:
             prev_value = recent_pnl[0]["total_value"]
             daily_pnl = total_value - prev_value
@@ -651,7 +681,7 @@ class TradingPipeline:
             daily_return_pct = 0.0
 
         self.db.insert_daily_pnl(
-            date=str(date.today()),
+            date=today_str,
             total_value=total_value,
             daily_pnl=daily_pnl,
             daily_return_pct=daily_return_pct,

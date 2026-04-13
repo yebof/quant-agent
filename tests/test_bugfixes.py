@@ -1,7 +1,7 @@
 """Tests for bugfixes identified in code review."""
 
 import json
-from datetime import datetime
+from datetime import date, datetime
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -291,6 +291,7 @@ def test_evening_return_pct_handles_zero_previous_value():
     pipeline.evening_analyst = MagicMock()
     pipeline.config = MagicMock()
     pipeline.config.llm.evening_analyst_model = "test-model"
+    pipeline.broker.is_trading_day.return_value = True
 
     pipeline.broker.get_account.return_value = {"portfolio_value": 1000.0}
     pipeline.broker.get_positions.return_value = []
@@ -306,6 +307,7 @@ def test_evening_return_pct_handles_zero_previous_value():
 
     assert result["daily_pnl"] == 1000.0
     assert result["daily_return_pct"] == 0.0
+    pipeline.db.get_daily_pnl.assert_called_once_with(limit=1, before_date=str(date.today()))
 
 
 # === Fix 9: get_trades today_only filter ===
