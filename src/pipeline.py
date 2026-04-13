@@ -132,6 +132,43 @@ class TradingPipeline:
             return max(1.0, float(int(position_qty) // 2))
         return float(position_qty) / 2
 
+    def _filter_supported_symbols(
+        self,
+        decisions: list[TradeDecision],
+        analyses: list[TechAnalysisResult],
+        positions,
+    ) -> tuple[list[TradeDecision], list[str]]:
+        universe = {symbol.strip().upper() for symbol in self.config.trading.universe}
+        analyzed_symbols = {analysis.symbol.strip().upper() for analysis in analyses}
+        held_symbols = {position.symbol.strip().upper() for position in positions}
+
+        allowed_decisions: list[TradeDecision] = []
+        blocked_reasons: list[str] = []
+
+        for decision in decisions:
+            symbol = decision.symbol.strip().upper()
+
+            if decision.action == "BUY":
+                if symbol not in universe:
+                    blocked_reasons.append(
+                        f"{symbol} is outside configured universe and cannot be bought"
+                    )
+                    continue
+                if symbol not in analyzed_symbols:
+                    blocked_reasons.append(
+                        f"{symbol} has no supporting analyst output in this run and cannot be bought"
+                    )
+                    continue
+            elif decision.action == "SELL" and symbol not in held_symbols:
+                blocked_reasons.append(
+                    f"{symbol} is not an existing holding and cannot be sold"
+                )
+                continue
+
+            allowed_decisions.append(decision)
+
+        return allowed_decisions, blocked_reasons
+
     def _filter_hard_risk_decisions(
         self,
         decisions: list[TradeDecision],
@@ -144,6 +181,7 @@ class TradingPipeline:
         blocked_reasons: list[str] = []
         pending_investment = 0.0
         pending_sector_investment: dict[str, float] = {}
+        pending_symbol_investment: dict[str, float] = {}
 
         for decision in decisions:
             if decision.action != "BUY":
@@ -157,6 +195,7 @@ class TradingPipeline:
                 daily_pnl=daily_pnl,
                 pending_investment=pending_investment,
                 pending_sector_investment=pending_sector_investment,
+                pending_symbol_investment=pending_symbol_investment,
             )
             hard_violations = [v for v in violations if v.rule in HARD_BLOCK_RULES]
             if hard_violations:
@@ -170,6 +209,9 @@ class TradingPipeline:
 
             investment = total_value * (decision.allocation_pct / 100)
             pending_investment += investment
+            pending_symbol_investment[decision.symbol] = (
+                pending_symbol_investment.get(decision.symbol, 0.0) + investment
+            )
             sector = _get_sector(decision.symbol)
             if sector and sector != "Unknown":
                 pending_sector_investment[sector] = pending_sector_investment.get(sector, 0.0) + investment
@@ -405,6 +447,21 @@ class TradingPipeline:
         if not portfolio_decision or not portfolio_decision.decisions:
             logger.info("Portfolio manager: no trades suggested")
             return {"status": "no_trades", "orders": []}
+
+        portfolio_decision.decisions, symbol_blocked_reasons = self._filter_supported_symbols(
+            portfolio_decision.decisions,
+            analyses,
+            positions,
+        )
+        if symbol_blocked_reasons:
+            reasons = "; ".join(dict.fromkeys(symbol_blocked_reasons))
+            logger.warning("SYMBOL GUARD BLOCK: %s", reasons)
+            if not portfolio_decision.decisions:
+                return {"status": "symbol_block", "orders": [], "reason": reasons}
+            logger.info(
+                "Allowing %d supported orders through after symbol guard filter",
+                len(portfolio_decision.decisions),
+            )
 
         daily_pnl = sum(p.unrealized_intraday_pnl for p in positions)
         portfolio_decision.decisions, rule_violations, blocked_reasons = self._filter_hard_risk_decisions(
