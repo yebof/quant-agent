@@ -4,6 +4,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
+from pydantic import ValidationError
+
 from src.config import AppConfig, RiskConfig
 from src.data.market import MarketDataProvider
 from src.data.macro import MacroDataProvider
@@ -19,11 +21,25 @@ from src.agents.macro_analyst import MacroAnalystAgent
 from src.agents.earnings_analyst import EarningsAnalystAgent
 from src.data.earnings import EarningsDataProvider
 from src.risk.rules import RiskRuleEngine
-from src.execution.broker import AlpacaBroker
+from src.execution.broker import AlpacaBroker, _get_sector
 from src.storage.db import Database
-from src.models import TechAnalysisResult, PortfolioDecision, RiskVerdict, NewsAnalysisResult
+from src.models import (
+    NewsAnalysisResult,
+    PortfolioDecision,
+    RiskVerdict,
+    TechAnalysisResult,
+    TradeDecision,
+)
 
 logger = logging.getLogger(__name__)
+
+HARD_BLOCK_RULES = {
+    "max_daily_loss_pct",
+    "max_total_position_pct",
+    "max_position_pct",
+    "require_stop_loss",
+    "max_sector_pct",
+}
 
 
 class TradingPipeline:
@@ -95,6 +111,105 @@ class TradingPipeline:
         )
         self.db = Database(config.storage.db_path)
         self.db.initialize()
+
+    @staticmethod
+    def _format_qty(qty: float) -> str:
+        if float(qty).is_integer():
+            return str(int(qty))
+        return f"{qty:.6f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _full_sell_qty(position_qty: float) -> float | None:
+        if position_qty <= 0:
+            return None
+        return float(position_qty)
+
+    @staticmethod
+    def _reduce_sell_qty(position_qty: float) -> float | None:
+        if position_qty <= 0:
+            return None
+        if float(position_qty).is_integer():
+            return max(1.0, float(int(position_qty) // 2))
+        return float(position_qty) / 2
+
+    def _filter_hard_risk_decisions(
+        self,
+        decisions: list[TradeDecision],
+        positions,
+        total_value: float,
+        daily_pnl: float,
+    ) -> tuple[list[TradeDecision], list, list[str]]:
+        allowed_decisions: list[TradeDecision] = []
+        remaining_violations = []
+        blocked_reasons: list[str] = []
+        pending_investment = 0.0
+        pending_sector_investment: dict[str, float] = {}
+
+        for decision in decisions:
+            if decision.action != "BUY":
+                allowed_decisions.append(decision)
+                continue
+
+            violations = self.risk_engine.check(
+                decision=decision,
+                positions=positions,
+                total_value=total_value,
+                daily_pnl=daily_pnl,
+                pending_investment=pending_investment,
+                pending_sector_investment=pending_sector_investment,
+            )
+            hard_violations = [v for v in violations if v.rule in HARD_BLOCK_RULES]
+            if hard_violations:
+                messages = [v.message for v in hard_violations]
+                blocked_reasons.extend(messages)
+                logger.warning("Hard risk block for BUY %s: %s", decision.symbol, "; ".join(messages))
+                continue
+
+            remaining_violations.extend(violations)
+            allowed_decisions.append(decision)
+
+            investment = total_value * (decision.allocation_pct / 100)
+            pending_investment += investment
+            sector = _get_sector(decision.symbol)
+            if sector and sector != "Unknown":
+                pending_sector_investment[sector] = pending_sector_investment.get(sector, 0.0) + investment
+
+        return allowed_decisions, remaining_violations, blocked_reasons
+
+    def _apply_risk_modifications(self, decisions: list[TradeDecision], modifications) -> list[TradeDecision]:
+        updated_decisions = list(decisions)
+        modifiable_fields = {"allocation_pct", "entry_price", "stop_loss", "take_profit"}
+
+        for mod in modifications:
+            if mod.field not in modifiable_fields:
+                logger.warning("Risk mod ignored: unknown field '%s'", mod.field)
+                continue
+
+            for idx, decision in enumerate(updated_decisions):
+                if decision.symbol != mod.symbol:
+                    continue
+
+                candidate = decision.model_dump()
+                candidate[mod.field] = mod.new_value
+                try:
+                    updated_decision = TradeDecision(**candidate)
+                except ValidationError as exc:
+                    logger.warning(
+                        "Risk mod rejected for %s.%s %.4f -> %.4f: %s",
+                        mod.symbol, mod.field, mod.original_value, mod.new_value, exc,
+                    )
+                    break
+
+                logger.info(
+                    "Risk mod applied: %s.%s %.4f -> %.4f (%s)",
+                    mod.symbol, mod.field, mod.original_value, mod.new_value, mod.reason,
+                )
+                updated_decisions[idx] = updated_decision
+                break
+            else:
+                logger.warning("Risk mod ignored: no matching decision for '%s'", mod.symbol)
+
+        return updated_decisions
 
     def run_morning(self) -> dict:
         run_id = f"run-{uuid.uuid4().hex[:8]}"
@@ -280,46 +395,34 @@ class TradingPipeline:
             logger.info("Portfolio manager: no trades suggested")
             return {"status": "no_trades", "orders": []}
 
-        # 5. Hard risk rule checks — these are non-negotiable circuit breakers
-        all_violations = []
         daily_pnl = sum(p.unrealized_intraday_pnl for p in positions)
-        pending_investment = 0.0
-        for decision in portfolio_decision.decisions:
-            violations = self.risk_engine.check(
-                decision=decision,
-                positions=positions,
-                total_value=total_value,
-                daily_pnl=daily_pnl,
-                pending_investment=pending_investment,
-            )
-            all_violations.extend(violations)
-            if decision.action == "BUY":
-                pending_investment += total_value * (decision.allocation_pct / 100)
-
-        # Hard block: critical violations block BUY orders, but SELL orders pass through
-        # (when over-exposed, you need to be able to sell to reduce risk)
-        critical_rules = {"max_daily_loss_pct", "max_total_position_pct", "max_position_pct"}
-        critical_violations = [v for v in all_violations if v.rule in critical_rules]
-        if critical_violations:
-            reasons = "; ".join(set(v.message for v in critical_violations))
+        portfolio_decision.decisions, rule_violations, blocked_reasons = self._filter_hard_risk_decisions(
+            portfolio_decision.decisions,
+            positions,
+            total_value,
+            daily_pnl,
+        )
+        if blocked_reasons:
+            reasons = "; ".join(dict.fromkeys(blocked_reasons))
             logger.warning("HARD RISK BLOCK (BUY blocked): %s", reasons)
-            portfolio_decision.decisions = [d for d in portfolio_decision.decisions if d.action != "BUY"]
             if not portfolio_decision.decisions:
                 return {"status": "hard_risk_block", "orders": [], "reason": reasons}
-            logger.info("Allowing %d SELL orders through to reduce exposure",
-                        sum(1 for d in portfolio_decision.decisions if d.action == "SELL"))
+            logger.info(
+                "Allowing %d non-blocked orders through after hard risk filter",
+                len(portfolio_decision.decisions),
+            )
 
-        # 6. Risk Manager LLM review (with remaining violations as advisory)
+        # 6. Risk Manager LLM review (with remaining non-blocking violations as advisory)
         verdict, rm_result = self.risk_manager.review(
             portfolio_decision=portfolio_decision,
             positions=positions,
             macro_summary=macro_summary,
-            rule_violations=all_violations,
+            rule_violations=rule_violations,
         )
 
         self.db.insert_agent_log(
             agent_name="risk_manager", run_id=run_id,
-            input_summary=f"{len(portfolio_decision.decisions)} trades, {len(all_violations)} violations",
+            input_summary=f"{len(portfolio_decision.decisions)} trades, {len(rule_violations)} violations",
             input_message=rm_result.user_message,
             output_summary=f"Approved: {verdict.approved if verdict else 'error'}",
             full_response=rm_result.raw_text,
@@ -332,18 +435,22 @@ class TradingPipeline:
                         verdict.reasoning if verdict else "parse error")
             return {"status": "rejected", "orders": [], "reason": verdict.reasoning if verdict else "error"}
 
-        # Apply risk manager modifications to decisions
-        _modifiable_fields = {"allocation_pct", "entry_price", "stop_loss", "take_profit"}
         if verdict.modifications:
-            for mod in verdict.modifications:
-                if mod.field not in _modifiable_fields:
-                    logger.warning("Risk mod ignored: unknown field '%s'", mod.field)
-                    continue
-                for d in portfolio_decision.decisions:
-                    if d.symbol == mod.symbol:
-                        logger.info("Risk mod applied: %s.%s %.4f -> %.4f (%s)",
-                                    mod.symbol, mod.field, mod.original_value, mod.new_value, mod.reason)
-                        setattr(d, mod.field, mod.new_value)
+            portfolio_decision.decisions = self._apply_risk_modifications(
+                portfolio_decision.decisions,
+                verdict.modifications,
+            )
+            portfolio_decision.decisions, _, blocked_reasons = self._filter_hard_risk_decisions(
+                portfolio_decision.decisions,
+                positions,
+                total_value,
+                daily_pnl,
+            )
+            if blocked_reasons:
+                reasons = "; ".join(dict.fromkeys(blocked_reasons))
+                logger.warning("HARD RISK BLOCK AFTER MODIFICATIONS: %s", reasons)
+                if not portfolio_decision.decisions:
+                    return {"status": "hard_risk_block", "orders": [], "reason": reasons}
 
         # Build a map of current prices from positions for price validation
         price_map = {p.symbol: p.current_price for p in positions}
@@ -392,7 +499,9 @@ class TradingPipeline:
                     existing = [p for p in positions if p.symbol == decision.symbol]
                     if not existing or existing[0].qty <= 0:
                         continue
-                    qty = max(1, int(existing[0].qty))
+                    qty = self._full_sell_qty(existing[0].qty)
+                    if qty is None:
+                        continue
                     sell_price = existing[0].current_price
                     order = self.broker.submit_order(symbol=decision.symbol, qty=qty, side="sell")
                     orders.append(order)
@@ -400,7 +509,10 @@ class TradingPipeline:
                         symbol=decision.symbol, action="SELL", qty=qty,
                         price=sell_price, reasoning=decision.reasoning, run_id=run_id,
                     )
-                    logger.info("Executed: sell %d %s @ $%.2f", qty, decision.symbol, sell_price)
+                    logger.info(
+                        "Executed: sell %s %s @ $%.2f",
+                        self._format_qty(qty), decision.symbol, sell_price,
+                    )
 
             except Exception as e:
                 logger.error("Order failed for %s %s: %s", decision.action, decision.symbol, e)
@@ -453,7 +565,9 @@ class TradingPipeline:
                 logger.warning("MIDDAY RISK ALERT: %s — force-closing all positions", loss_violation.message)
                 for p in positions:
                     try:
-                        qty = max(1, int(p.qty))
+                        qty = self._full_sell_qty(p.qty)
+                        if qty is None:
+                            continue
                         order = self.broker.submit_order(symbol=p.symbol, qty=qty, side="sell")
                         orders.append(order)
                         self.db.insert_trade(
@@ -462,7 +576,10 @@ class TradingPipeline:
                             reasoning=f"Daily loss limit breached: {loss_violation.message}",
                             run_id=run_id,
                         )
-                        logger.info("Emergency sell: %d %s @ $%.2f", qty, p.symbol, p.current_price)
+                        logger.info(
+                            "Emergency sell: %s %s @ $%.2f",
+                            self._format_qty(qty), p.symbol, p.current_price,
+                        )
                     except Exception as e:
                         logger.error("Emergency sell failed for %s: %s", p.symbol, e)
             else:
@@ -478,9 +595,12 @@ class TradingPipeline:
                                            action_item.get("action"), symbol)
                             continue
                         try:
-                            qty = max(1, int(existing[0].qty))
                             if action_item["action"] == "REDUCE":
-                                qty = max(1, qty // 2)
+                                qty = self._reduce_sell_qty(existing[0].qty)
+                            else:
+                                qty = self._full_sell_qty(existing[0].qty)
+                            if qty is None:
+                                continue
                             order = self.broker.submit_order(symbol=symbol, qty=qty, side="sell")
                             orders.append(order)
                             self.db.insert_trade(
@@ -489,8 +609,11 @@ class TradingPipeline:
                                 reasoning=action_item.get("reason", "midday review"),
                                 run_id=run_id,
                             )
-                            logger.info("Midday action: %s %d %s — %s",
-                                         action_item["action"], qty, symbol, action_item.get("reason"))
+                            logger.info(
+                                "Midday action: %s %s %s — %s",
+                                action_item["action"], self._format_qty(qty),
+                                symbol, action_item.get("reason"),
+                            )
                         except Exception as e:
                             logger.error("Midday order failed for %s: %s", symbol, e)
 

@@ -1,7 +1,7 @@
 from datetime import datetime, date
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class OHLCV(BaseModel):
@@ -39,6 +39,8 @@ class TechAnalysisResult(BaseModel):
 
 
 class TradeDecision(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     action: Literal["BUY", "SELL", "HOLD"]
     symbol: str
     allocation_pct: float = Field(ge=0, le=100)
@@ -46,6 +48,17 @@ class TradeDecision(BaseModel):
     stop_loss: float
     take_profit: float
     reasoning: str
+
+    @model_validator(mode="after")
+    def validate_buy_prices(self):
+        if self.action == "BUY":
+            if self.entry_price <= 0:
+                raise ValueError("BUY decisions require entry_price > 0")
+            if self.stop_loss < 0:
+                raise ValueError("BUY decisions require stop_loss >= 0")
+            if self.take_profit <= 0:
+                raise ValueError("BUY decisions require take_profit > 0")
+        return self
 
 
 class PortfolioDecision(BaseModel):

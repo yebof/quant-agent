@@ -17,7 +17,8 @@ class RiskRuleEngine:
 
     def check(self, decision: TradeDecision, positions: list[Position],
               total_value: float, daily_pnl: float,
-              pending_investment: float = 0.0) -> list[RiskViolation]:
+              pending_investment: float = 0.0,
+              pending_sector_investment: dict[str, float] | None = None) -> list[RiskViolation]:
         if decision.action == "SELL":
             return []
         if total_value <= 0:
@@ -70,6 +71,7 @@ class RiskRuleEngine:
         new_sector = _get_sector(decision.symbol)
         if new_sector and new_sector != "Unknown":
             sector_value = sum(p.market_value for p in positions if p.sector == new_sector)
+            sector_value += (pending_sector_investment or {}).get(new_sector, 0.0)
             sector_value += new_investment
             sector_pct = sector_value / total_value * 100
             if sector_pct > self.config.max_sector_pct:
