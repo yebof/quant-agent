@@ -127,12 +127,11 @@ class PortfolioManagerAgent(BaseAgent):
 
                 earnings_items.append(
                     f"### {sym} — {filing_label}{source_note}\n"
-                    f"- Revenue: {rev.get('total', 'N/A')} (YoY: {rev.get('yoy_growth', 'N/A')})\n"
-                    f"- Margins: Gross {prof.get('gross_margin', 'N/A')}, Operating {prof.get('operating_margin', 'N/A')}\n"
-                    f"- EPS: {prof.get('eps', 'N/A')}\n"
-                    f"- Guidance: {guidance}\n"
-                    f"- Sentiment: {impl.get('sentiment', 'N/A')} ({impl.get('conviction', 'N/A')})\n"
-                    f"- Thesis: {impl.get('key_thesis', 'N/A')}\n"
+                    f"- Filing metrics: Revenue {rev.get('total', 'N/A')} (YoY: {rev.get('yoy_growth', 'N/A')}), "
+                    f"Gross margin {prof.get('gross_margin', 'N/A')}, Operating margin {prof.get('operating_margin', 'N/A')}, "
+                    f"EPS {prof.get('eps', 'N/A')}\n"
+                    f"- Filing guidance: {guidance}\n"
+                    f"- Analyst synthesis: {impl.get('sentiment', 'N/A')} ({impl.get('conviction', 'N/A')}) — {impl.get('key_thesis', 'N/A')}\n"
                     f"- Data quality: {analysis.get('data_quality', 'N/A')}"
                 )
             earnings_section = "## Earnings Analysis (from SEC Filings)\n\n" + "\n\n".join(earnings_items)

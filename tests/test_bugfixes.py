@@ -11,7 +11,7 @@ from src.agents.base import AgentResult
 from src.pipeline import TradingPipeline
 from src.risk.rules import RiskRuleEngine, RiskViolation
 from src.config import RiskConfig
-from src.models import RiskModification, TradeDecision, Position
+from src.models import RiskModification, TechAnalysisResult, TradeDecision, Position
 
 
 # === Fix 1: Hard risk rules actually block trades ===
@@ -153,6 +153,28 @@ def test_parse_json_garbage_returns_none():
     assert result.parse_json() is None
 
 
+def test_parse_json_prefers_last_valid_json_block():
+    text = (
+        'Example only:\n'
+        '```json\n{"decision": "draft"}\n```\n'
+        'Correction, use this instead:\n'
+        '```json\n{"decision": "final"}\n```'
+    )
+    result = AgentResult(raw_text=text, tokens_used=10, model="test")
+    assert result.parse_json() == {"decision": "final"}
+
+
+def test_parse_json_prefers_later_raw_json_over_earlier_code_block():
+    text = (
+        'Example only:\n'
+        '```json\n{"decision": "draft"}\n```\n'
+        'Final answer:\n'
+        '{"decision": "final"}'
+    )
+    result = AgentResult(raw_text=text, tokens_used=10, model="test")
+    assert result.parse_json() == {"decision": "final"}
+
+
 # === Fix 6: Division by zero safety ===
 
 def test_midday_pnl_pct_zero_qty():
@@ -252,6 +274,75 @@ def test_pipeline_hard_risk_filter_blocks_second_same_sector_buy():
     assert [d.symbol for d in allowed] == ["AAPL"]
     assert violations == []
     assert any("Technology" in reason for reason in blocked)
+
+
+def test_pipeline_hard_risk_filter_blocks_second_same_symbol_buy():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.risk_engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=20,
+        max_total_position_pct=90,
+        max_daily_loss_pct=3,
+        max_sector_pct=40,
+        require_stop_loss=True,
+    ))
+    decisions = [
+        TradeDecision(
+            action="BUY", symbol="SPY", allocation_pct=15,
+            entry_price=500, stop_loss=480, take_profit=530, reasoning="first leg",
+        ),
+        TradeDecision(
+            action="BUY", symbol="SPY", allocation_pct=15,
+            entry_price=500, stop_loss=480, take_profit=530, reasoning="duplicate leg",
+        ),
+    ]
+
+    with patch("src.pipeline._get_sector", return_value="ETF"), patch(
+        "src.execution.broker._get_sector", return_value="ETF"
+    ):
+        allowed, violations, blocked = pipeline._filter_hard_risk_decisions(
+            decisions, positions=[], total_value=100000, daily_pnl=0,
+        )
+
+    assert [d.reasoning for d in allowed] == ["first leg"]
+    assert violations == []
+    assert any("SPY position would be" in reason for reason in blocked)
+
+
+def test_pipeline_symbol_guard_blocks_off_universe_and_unanalyzed_buys():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.config = MagicMock()
+    pipeline.config.trading.universe = ["SPY", "QQQ"]
+
+    decisions = [
+        TradeDecision(
+            action="BUY", symbol="TSLA", allocation_pct=10,
+            entry_price=250, stop_loss=230, take_profit=280, reasoning="hallucinated",
+        ),
+        TradeDecision(
+            action="BUY", symbol="QQQ", allocation_pct=10,
+            entry_price=500, stop_loss=480, take_profit=530, reasoning="not analyzed",
+        ),
+        TradeDecision(
+            action="BUY", symbol="SPY", allocation_pct=10,
+            entry_price=500, stop_loss=480, take_profit=530, reasoning="supported",
+        ),
+    ]
+    analyses = [
+        TechAnalysisResult(
+            symbol="SPY",
+            rating="buy",
+            entry_price=500,
+            exit_price=530,
+            stop_loss=480,
+            reasoning="supported",
+        )
+    ]
+
+    allowed, blocked = pipeline._filter_supported_symbols(decisions, analyses, positions=[])
+
+    assert [d.symbol for d in allowed] == ["SPY"]
+    assert any("TSLA is outside configured universe" in reason for reason in blocked)
+    assert any("QQQ has no supporting analyst output" in reason for reason in blocked)
 
 
 def test_pipeline_ignores_invalid_risk_modification():

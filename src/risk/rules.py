@@ -18,26 +18,30 @@ class RiskRuleEngine:
     def check(self, decision: TradeDecision, positions: list[Position],
               total_value: float, daily_pnl: float,
               pending_investment: float = 0.0,
-              pending_sector_investment: dict[str, float] | None = None) -> list[RiskViolation]:
+              pending_sector_investment: dict[str, float] | None = None,
+              pending_symbol_investment: dict[str, float] | None = None) -> list[RiskViolation]:
         if decision.action == "SELL":
             return []
         if total_value <= 0:
             return []
 
         violations = []
+        new_investment = total_value * (decision.allocation_pct / 100)
 
         # 1. Single position size limit (hard block)
-        if decision.allocation_pct > self.config.max_position_pct:
+        current_symbol_value = sum(p.market_value for p in positions if p.symbol == decision.symbol)
+        current_symbol_value += (pending_symbol_investment or {}).get(decision.symbol, 0.0)
+        position_pct = (current_symbol_value + new_investment) / total_value * 100
+        if position_pct > self.config.max_position_pct:
             violations.append(RiskViolation(
                 rule="max_position_pct",
-                message=f"{decision.symbol} allocation {decision.allocation_pct}% exceeds max {self.config.max_position_pct}%",
-                value=decision.allocation_pct,
+                message=f"{decision.symbol} position would be {position_pct:.1f}% and exceed max {self.config.max_position_pct}%",
+                value=position_pct,
                 limit=self.config.max_position_pct,
             ))
 
         # 2. Total exposure limit (includes pending buys from this batch)
         current_invested = sum(p.market_value for p in positions)
-        new_investment = total_value * (decision.allocation_pct / 100)
         total_pct = (current_invested + pending_investment + new_investment) / total_value * 100
         if total_pct > self.config.max_total_position_pct:
             violations.append(RiskViolation(

@@ -1,7 +1,14 @@
 from datetime import datetime, date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def _normalize_symbol(value: str) -> str:
+    symbol = value.strip().upper()
+    if not symbol:
+        raise ValueError("symbol cannot be empty")
+    return symbol
 
 
 class OHLCV(BaseModel):
@@ -28,6 +35,11 @@ class TechnicalIndicators(BaseModel):
     atr_14: float | None = None
     volume_change_pct: float | None = None
 
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        return _normalize_symbol(value)
+
 
 class TechAnalysisResult(BaseModel):
     symbol: str
@@ -36,6 +48,11 @@ class TechAnalysisResult(BaseModel):
     exit_price: float | None = None
     stop_loss: float | None = None
     reasoning: str
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        return _normalize_symbol(value)
 
 
 class TradeDecision(BaseModel):
@@ -48,6 +65,11 @@ class TradeDecision(BaseModel):
     stop_loss: float
     take_profit: float
     reasoning: str
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        return _normalize_symbol(value)
 
     @model_validator(mode="after")
     def validate_buy_prices(self):
@@ -100,6 +122,11 @@ class SymbolAlert(BaseModel):
     sentiment: str  # "bullish" | "bearish" | "neutral"
     reason: str
 
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        return _normalize_symbol(value)
+
 
 class NewsAnalysisResult(BaseModel):
     market_sentiment: str  # "bullish" | "bearish" | "neutral"
@@ -119,6 +146,84 @@ class Position(BaseModel):
     unrealized_pnl: float
     unrealized_intraday_pnl: float = 0.0
     sector: str
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        return _normalize_symbol(value)
+
+
+class EarningsSegment(BaseModel):
+    name: str
+    revenue: str
+    growth: str = "not disclosed"
+
+
+class EarningsRevenue(BaseModel):
+    total: str
+    yoy_growth: str = "not disclosed"
+    segments: list[EarningsSegment] = []
+
+
+class EarningsProfitability(BaseModel):
+    gross_margin: str = "not disclosed"
+    operating_margin: str = "not disclosed"
+    net_income: str = "not disclosed"
+    eps: str = "not disclosed"
+
+
+class EarningsCashFlow(BaseModel):
+    operating_cf: str = "not disclosed"
+    free_cf: str = "not disclosed"
+    capex: str = "not disclosed"
+
+
+class EarningsBalanceSheet(BaseModel):
+    cash_and_equivalents: str = "not disclosed"
+    total_debt: str = "not disclosed"
+    assessment: str = "not disclosed"
+
+
+class EarningsInvestmentImplications(BaseModel):
+    sentiment: Literal["bullish", "bearish", "neutral"]
+    conviction: Literal["high", "medium", "low"]
+    key_thesis: str
+    bull_case: str = "not disclosed"
+    bear_case: str = "not disclosed"
+
+
+class EarningsAnalysis(BaseModel):
+    symbol: str
+    form_type: Literal["10-Q", "10-K"]
+    filing_date: str
+    revenue: EarningsRevenue
+    profitability: EarningsProfitability
+    cash_flow: EarningsCashFlow
+    balance_sheet: EarningsBalanceSheet
+    management_highlights: list[str] = []
+    guidance: str
+    risk_flags: list[str] = []
+    investment_implications: EarningsInvestmentImplications
+    data_quality: str
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        return _normalize_symbol(value)
+
+    @field_validator("filing_date")
+    @classmethod
+    def validate_filing_date(cls, value: str) -> str:
+        date.fromisoformat(value)
+        return value
+
+    @field_validator("guidance", "data_quality")
+    @classmethod
+    def require_non_empty_text(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("field cannot be empty")
+        return text
 
 
 class AgentLog(BaseModel):

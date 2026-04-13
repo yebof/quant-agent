@@ -9,8 +9,11 @@ import logging
 import re
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from src.agents.base import BaseAgent, AgentResult
 from src.data.earnings import EarningsReport
+from src.models import EarningsAnalysis
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +54,7 @@ class EarningsAnalystAgent(BaseAgent):
 Analyze this filing and respond with JSON. Cite specific numbers from the text above."""
 
     def analyze_reports(self, reports: list[EarningsReport]) -> list[dict]:
-        """Analyze all reports. New filings get LLM analysis; existing ones are read from disk.
+        """Analyze all reports. Only schema-validated analyses are returned.
 
         Returns list of {symbol, analysis_dict, agent_result_or_none}.
         """
@@ -64,25 +67,26 @@ Analyze this filing and respond with JSON. Cite specific numbers from the text a
                 if analysis:
                     # Save analysis to disk
                     self._save_analysis(report.analysis_path, report, analysis)
-                results.append({
-                    "symbol": report.symbol,
-                    "analysis": analysis,
-                    "agent_result": agent_result,
-                    "is_new": True,
-                    "form_type": report.form_type,
-                    "filing_date": report.filing_date,
-                })
+                    results.append({
+                        "symbol": report.symbol,
+                        "analysis": analysis,
+                        "agent_result": agent_result,
+                        "is_new": True,
+                        "form_type": report.form_type,
+                        "filing_date": report.filing_date,
+                    })
             elif report.analysis_path and Path(report.analysis_path).exists():
                 # Existing analysis — read from disk
-                analysis = self._load_analysis(report.analysis_path)
-                results.append({
-                    "symbol": report.symbol,
-                    "analysis": analysis,
-                    "agent_result": None,
-                    "is_new": False,
-                    "form_type": report.form_type,
-                    "filing_date": report.filing_date,
-                })
+                analysis = self._load_analysis(report)
+                if analysis:
+                    results.append({
+                        "symbol": report.symbol,
+                        "analysis": analysis,
+                        "agent_result": None,
+                        "is_new": False,
+                        "form_type": report.form_type,
+                        "filing_date": report.filing_date,
+                    })
 
         return results
 
@@ -110,7 +114,10 @@ Analyze this filing and respond with JSON. Cite specific numbers from the text a
         if parsed is None:
             logger.error("Earnings analyst returned non-JSON for %s", report.symbol)
             return None, result
-        return parsed, result
+        validated = self._validate_analysis(report, parsed, source="llm")
+        if validated is None:
+            return None, result
+        return validated.model_dump(), result
 
     def _save_analysis(self, path: str, report: EarningsReport, analysis: dict):
         """Save analysis as markdown + JSON for future reference."""
@@ -130,14 +137,56 @@ Analyze this filing and respond with JSON. Cite specific numbers from the text a
         p.write_text(header)
         logger.info("Saved analysis for %s %s → %s", report.symbol, report.form_type, path)
 
-    def _load_analysis(self, path: str) -> dict | None:
+    def _load_analysis(self, report: EarningsReport) -> dict | None:
         """Load previously saved analysis from markdown file."""
-        text = Path(path).read_text()
+        text = Path(report.analysis_path).read_text()
         # Extract JSON from ```json ... ``` block
         match = re.search(r"```json\s*\n(.*?)\n```", text, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(1))
+                parsed = json.loads(match.group(1))
+                validated = self._validate_analysis(report, parsed, source="cache")
+                return validated.model_dump() if validated else None
             except json.JSONDecodeError:
-                logger.warning("Failed to parse saved analysis: %s", path)
+                logger.warning("Failed to parse saved analysis: %s", report.analysis_path)
         return None
+
+    def _validate_analysis(
+        self, report: EarningsReport, parsed: dict | list, source: str
+    ) -> EarningsAnalysis | None:
+        if not isinstance(parsed, dict):
+            logger.warning("Invalid %s earnings analysis for %s: expected JSON object", source, report.symbol)
+            return None
+
+        try:
+            analysis = EarningsAnalysis(**parsed)
+        except ValidationError as exc:
+            logger.warning("Invalid %s earnings analysis for %s: %s", source, report.symbol, exc)
+            return None
+
+        if analysis.symbol != report.symbol.upper():
+            logger.warning(
+                "Invalid %s earnings analysis for %s: symbol mismatch (%s)",
+                source,
+                report.symbol,
+                analysis.symbol,
+            )
+            return None
+        if analysis.form_type != report.form_type:
+            logger.warning(
+                "Invalid %s earnings analysis for %s: form mismatch (%s)",
+                source,
+                report.symbol,
+                analysis.form_type,
+            )
+            return None
+        if analysis.filing_date != report.filing_date:
+            logger.warning(
+                "Invalid %s earnings analysis for %s: filing_date mismatch (%s)",
+                source,
+                report.symbol,
+                analysis.filing_date,
+            )
+            return None
+
+        return analysis

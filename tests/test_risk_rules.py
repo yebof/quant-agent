@@ -40,6 +40,45 @@ def test_position_size_exceeds_limit(engine):
     assert any(v.rule == "max_position_pct" for v in violations)
 
 
+def test_existing_position_plus_new_buy_exceeds_limit(engine):
+    positions = [
+        Position(
+            symbol="SPY",
+            qty=3,
+            avg_entry=500.0,
+            current_price=500.0,
+            market_value=1500.0,
+            unrealized_pnl=0.0,
+            sector="ETF",
+        )
+    ]
+    decision = TradeDecision(
+        action="BUY", symbol="SPY", allocation_pct=10.0,
+        entry_price=500.0, stop_loss=485.0, take_profit=530.0,
+        reasoning="Add to winner",
+    )
+
+    violations = engine.check(decision, positions=positions, total_value=10000.0, daily_pnl=0.0)
+    assert any(v.rule == "max_position_pct" for v in violations)
+
+
+def test_pending_same_symbol_buy_exceeds_limit(engine):
+    decision = TradeDecision(
+        action="BUY", symbol="SPY", allocation_pct=15.0,
+        entry_price=500.0, stop_loss=485.0, take_profit=530.0,
+        reasoning="Second leg",
+    )
+
+    violations = engine.check(
+        decision,
+        positions=[],
+        total_value=10000.0,
+        daily_pnl=0.0,
+        pending_symbol_investment={"SPY": 1500.0},
+    )
+    assert any(v.rule == "max_position_pct" for v in violations)
+
+
 def test_total_exposure_exceeds_limit(engine):
     positions = [
         Position(symbol="AAPL", qty=10, avg_entry=180.0, current_price=190.0,
