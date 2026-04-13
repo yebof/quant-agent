@@ -3,6 +3,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from numbers import Real
 
 from pydantic import ValidationError
 
@@ -244,16 +245,21 @@ class TradingPipeline:
 
         def _run_tech():
             symbols_data = []
+            latest_prices = {}
             for symbol in self.config.trading.universe:
                 bars = self.market.get_ohlcv(symbol, self.config.trading.lookback_days)
                 if not bars:
                     logger.warning("No data for %s, skipping", symbol)
                     continue
+                latest_close = getattr(bars[-1], "close", None)
+                if isinstance(latest_close, Real) and latest_close > 0:
+                    latest_prices[symbol] = latest_close
                 indicators = compute_indicators(symbol, bars)
                 symbols_data.append({"symbol": symbol, "bars": bars, "indicators": indicators})
             if symbols_data:
-                return self.tech_analyst.analyze_batch(symbols_data)
-            return {}, None
+                analyses_map, ta_result = self.tech_analyst.analyze_batch(symbols_data)
+                return analyses_map, latest_prices, ta_result
+            return {}, {}, None
 
         def _run_earnings():
             """Check for filings, return cached analyses immediately.
@@ -340,8 +346,9 @@ class TradingPipeline:
             logger.error("News analyst failed: %s. Continuing without news.", e)
 
         analyses: list[TechAnalysisResult] = []
+        latest_prices = {}
         try:
-            analyses_map, ta_result = tech_future.result()
+            analyses_map, latest_prices, ta_result = tech_future.result()
             analyses = list(analyses_map.values())
             if ta_result:
                 self.db.insert_agent_log(
@@ -453,7 +460,8 @@ class TradingPipeline:
                     return {"status": "hard_risk_block", "orders": [], "reason": reasons}
 
         # Build a map of current prices from positions for price validation
-        price_map = {p.symbol: p.current_price for p in positions}
+        price_map = dict(latest_prices)
+        price_map.update({p.symbol: p.current_price for p in positions})
 
         # 7. Execute approved trades
         orders = []
@@ -637,7 +645,7 @@ class TradingPipeline:
         if recent_pnl:
             prev_value = recent_pnl[0]["total_value"]
             daily_pnl = total_value - prev_value
-            daily_return_pct = (daily_pnl / prev_value) * 100
+            daily_return_pct = (daily_pnl / prev_value) * 100 if prev_value > 0 else 0.0
         else:
             daily_pnl = 0.0
             daily_return_pct = 0.0

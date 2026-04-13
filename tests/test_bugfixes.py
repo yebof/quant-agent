@@ -283,6 +283,31 @@ def test_fractional_sell_helpers_preserve_position_size():
     assert pipeline._reduce_sell_qty(5.0) == pytest.approx(2.0)
 
 
+def test_evening_return_pct_handles_zero_previous_value():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+    pipeline.macro = MagicMock()
+    pipeline.evening_analyst = MagicMock()
+    pipeline.config = MagicMock()
+    pipeline.config.llm.evening_analyst_model = "test-model"
+
+    pipeline.broker.get_account.return_value = {"portfolio_value": 1000.0}
+    pipeline.broker.get_positions.return_value = []
+    pipeline.db.get_daily_pnl.return_value = [{"total_value": 0.0}]
+    pipeline.db.get_trades.return_value = []
+    pipeline.macro.get_macro_summary.return_value = {}
+    pipeline.evening_analyst.analyze.return_value = (
+        {"daily_summary": "Flat", "tomorrow_outlook": "Watch", "risk_rating": "low"},
+        AgentResult(raw_text="{}", tokens_used=10, model="test", user_message="test"),
+    )
+
+    result = pipeline.run_evening()
+
+    assert result["daily_pnl"] == 1000.0
+    assert result["daily_return_pct"] == 0.0
+
+
 # === Fix 9: get_trades today_only filter ===
 
 def test_get_trades_today_only(tmp_path):

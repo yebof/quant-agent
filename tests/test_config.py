@@ -119,3 +119,88 @@ storage:
     # Missing required API keys now raise ValidationError
     with pytest.raises(Exception, match="API key"):
         load_config(config_file)
+
+
+def test_load_config_requires_openai_key_for_selected_openai_model(tmp_path):
+    yaml_content = """
+api_keys:
+  anthropic: "anthropic-key"
+  fred: "fred-key"
+  alpaca_key: "alpaca-key"
+  alpaca_secret: "alpaca-secret"
+alpaca:
+  base_url: "https://paper-api.alpaca.markets"
+  paper: true
+llm:
+  tech_analyst_model: "gpt-5.4"
+  max_tokens: 4096
+risk:
+  max_position_pct: 20
+  max_total_position_pct: 90
+  max_daily_loss_pct: 3
+  max_sector_pct: 40
+  require_stop_loss: true
+trading:
+  universe: ["SPY"]
+  lookback_days: 60
+  schedule:
+    morning: "06:00"
+    midday: "12:00"
+    evening: "16:30"
+storage:
+  db_path: "data/test.db"
+"""
+    config_file = tmp_path / "settings.yaml"
+    config_file.write_text(yaml_content)
+
+    from src.config import load_config
+
+    with pytest.raises(Exception, match="OPENAI_API_KEY"):
+        load_config(config_file)
+
+
+def test_load_config_allows_openai_only_when_all_models_are_openai(tmp_path):
+    yaml_content = """
+api_keys:
+  anthropic: ""
+  openai: "openai-key"
+  fred: "fred-key"
+  alpaca_key: "alpaca-key"
+  alpaca_secret: "alpaca-secret"
+alpaca:
+  base_url: "https://paper-api.alpaca.markets"
+  paper: true
+llm:
+  tech_analyst_model: "gpt-5.4"
+  news_analyst_model: "gpt-5.4"
+  macro_analyst_model: "gpt-5.4"
+  earnings_analyst_model: "gpt-5.4"
+  portfolio_manager_model: "gpt-5.4"
+  risk_manager_model: "gpt-5.4"
+  midday_reviewer_model: "gpt-5.4"
+  evening_analyst_model: "gpt-5.4"
+  max_tokens: 4096
+risk:
+  max_position_pct: 20
+  max_total_position_pct: 90
+  max_daily_loss_pct: 3
+  max_sector_pct: 40
+  require_stop_loss: true
+trading:
+  universe: ["SPY"]
+  lookback_days: 60
+  schedule:
+    morning: "06:00"
+    midday: "12:00"
+    evening: "16:30"
+storage:
+  db_path: "data/test.db"
+"""
+    config_file = tmp_path / "settings.yaml"
+    config_file.write_text(yaml_content)
+
+    from src.config import load_config
+
+    cfg = load_config(config_file)
+    assert cfg.api_keys.openai == "openai-key"
+    assert cfg.api_keys.anthropic == ""
