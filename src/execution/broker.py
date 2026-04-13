@@ -117,6 +117,18 @@ class AlpacaBroker:
         except Exception:
             return getattr(payload, symbol, None)
 
+    def cancel_open_orders(self) -> int:
+        """Cancel all open orders. Returns count of cancelled orders."""
+        try:
+            cancelled = self.client.cancel_orders()
+            count = len(cancelled) if cancelled else 0
+            if count:
+                logger.info("Cancelled %d open order(s)", count)
+            return count
+        except Exception as exc:
+            logger.warning("Failed to cancel open orders: %s", exc)
+            return 0
+
     def submit_order(self, symbol: str, qty: float, side: str, limit_price: float | None = None) -> dict:
         order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 

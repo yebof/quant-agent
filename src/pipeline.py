@@ -218,11 +218,24 @@ class TradingPipeline:
 
         return allowed_decisions, remaining_violations, blocked_reasons
 
+    _FIELD_ALIASES = {
+        "target": "take_profit",
+        "tp": "take_profit",
+        "stop": "stop_loss",
+        "sl": "stop_loss",
+        "price": "entry_price",
+        "alloc": "allocation_pct",
+    }
+
     def _apply_risk_modifications(self, decisions: list[TradeDecision], modifications) -> list[TradeDecision]:
         updated_decisions = list(decisions)
         modifiable_fields = {"allocation_pct", "entry_price", "stop_loss", "take_profit"}
 
         for mod in modifications:
+            field = self._FIELD_ALIASES.get(mod.field, mod.field)
+            if field != mod.field:
+                logger.info("Risk mod field alias: '%s' -> '%s'", mod.field, field)
+                mod = type(mod)(**{**mod.model_dump(), "field": field})
             if mod.field not in modifiable_fields:
                 logger.warning("Risk mod ignored: unknown field '%s'", mod.field)
                 continue
@@ -256,6 +269,9 @@ class TradingPipeline:
     def run_morning(self) -> dict:
         run_id = f"run-{uuid.uuid4().hex[:8]}"
         logger.info("=== Morning run started: %s ===", run_id)
+
+        # 0. Cancel stale orders from previous sessions to free held quantities
+        self.broker.cancel_open_orders()
 
         # 1. Get account state
         account = self.broker.get_account()
@@ -602,6 +618,9 @@ class TradingPipeline:
     def run_midday(self) -> dict:
         run_id = f"midday-{uuid.uuid4().hex[:8]}"
         logger.info("=== Midday check: %s ===", run_id)
+
+        # 0. Cancel stale orders to free held quantities
+        self.broker.cancel_open_orders()
 
         # 1. Sync positions
         account = self.broker.get_account()
