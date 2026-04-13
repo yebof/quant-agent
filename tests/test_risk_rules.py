@@ -90,10 +90,12 @@ def test_sector_concentration(engine):
         entry_price=850.0, stop_loss=810.0, take_profit=920.0,
         reasoning="Test",
     )
-    violations = engine.check(
-        decision, positions=positions, total_value=10000.0, daily_pnl=0.0,
-        new_sector="Technology",
-    )
+    # Sector is now auto-detected from _get_sector(symbol)
+    from unittest.mock import patch
+    with patch("src.execution.broker._get_sector", return_value="Technology"):
+        violations = engine.check(
+            decision, positions=positions, total_value=10000.0, daily_pnl=0.0,
+        )
     assert any(v.rule == "max_sector_pct" for v in violations)
 
 

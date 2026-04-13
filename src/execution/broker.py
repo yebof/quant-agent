@@ -1,5 +1,6 @@
 import logging
 
+import yfinance as yf
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -7,6 +8,20 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from src.models import Position
 
 logger = logging.getLogger(__name__)
+
+# Cache sector lookups to avoid repeated API calls
+_sector_cache: dict[str, str] = {}
+
+
+def _get_sector(symbol: str) -> str:
+    """Look up sector for a symbol using yfinance. Cached per process."""
+    if symbol not in _sector_cache:
+        try:
+            info = yf.Ticker(symbol).info
+            _sector_cache[symbol] = info.get("sector", "Unknown")
+        except Exception:
+            _sector_cache[symbol] = "Unknown"
+    return _sector_cache[symbol]
 
 
 class AlpacaBroker:
@@ -31,7 +46,7 @@ class AlpacaBroker:
                 current_price=float(p.current_price),
                 market_value=float(p.market_value),
                 unrealized_pnl=float(p.unrealized_pl),
-                sector="Unknown",
+                sector=_get_sector(p.symbol),
             ))
         return positions
 

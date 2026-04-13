@@ -406,27 +406,53 @@ class TradingPipeline:
                 tokens_used=md_result.tokens_used,
             )
 
-            # 3. Execute urgent actions (SELL/REDUCE only)
-            if review and review.get("actions"):
-                for action in review["actions"]:
-                    if action.get("action") in ("SELL", "REDUCE"):
-                        symbol = action["symbol"]
-                        existing = [p for p in positions if p.symbol == symbol]
-                        if not existing:
-                            continue
-                        qty = int(existing[0].qty)
-                        if action["action"] == "REDUCE":
-                            qty = max(1, qty // 2)
-                        order = self.broker.submit_order(symbol=symbol, qty=qty, side="sell")
+            # 3. Risk check: if daily loss limit breached, force-sell all positions
+            daily_pnl = sum(p.unrealized_pnl for p in positions)
+            loss_violation = self.risk_engine.check_daily_loss(total_value, daily_pnl)
+            if loss_violation:
+                logger.warning("MIDDAY RISK ALERT: %s — force-closing all positions", loss_violation.message)
+                for p in positions:
+                    try:
+                        qty = max(1, int(p.qty))
+                        order = self.broker.submit_order(symbol=p.symbol, qty=qty, side="sell")
                         orders.append(order)
                         self.db.insert_trade(
-                            symbol=symbol, action=action["action"], qty=qty,
-                            price=existing[0].current_price,
-                            reasoning=action.get("reason", "midday review"),
+                            symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,
+                            price=p.current_price,
+                            reasoning=f"Daily loss limit breached: {loss_violation.message}",
                             run_id=run_id,
                         )
-                        logger.info("Midday action: %s %d %s — %s",
-                                     action["action"], qty, symbol, action.get("reason"))
+                        logger.info("Emergency sell: %d %s @ $%.2f", qty, p.symbol, p.current_price)
+                    except Exception as e:
+                        logger.error("Emergency sell failed for %s: %s", p.symbol, e)
+            else:
+                # 4. Execute LLM-recommended actions (SELL/REDUCE only)
+                if review and review.get("actions"):
+                    for action_item in review["actions"]:
+                        if action_item.get("action") not in ("SELL", "REDUCE"):
+                            continue
+                        symbol = action_item.get("symbol", "")
+                        existing = [p for p in positions if p.symbol == symbol]
+                        if not existing or existing[0].qty <= 0:
+                            logger.warning("Midday: skipping %s %s — no matching position",
+                                           action_item.get("action"), symbol)
+                            continue
+                        try:
+                            qty = max(1, int(existing[0].qty))
+                            if action_item["action"] == "REDUCE":
+                                qty = max(1, qty // 2)
+                            order = self.broker.submit_order(symbol=symbol, qty=qty, side="sell")
+                            orders.append(order)
+                            self.db.insert_trade(
+                                symbol=symbol, action=action_item["action"], qty=qty,
+                                price=existing[0].current_price,
+                                reasoning=action_item.get("reason", "midday review"),
+                                run_id=run_id,
+                            )
+                            logger.info("Midday action: %s %d %s — %s",
+                                         action_item["action"], qty, symbol, action_item.get("reason"))
+                        except Exception as e:
+                            logger.error("Midday order failed for %s: %s", symbol, e)
 
         logger.info("Midday: %d positions, risk=%s, %d orders",
                      len(positions),

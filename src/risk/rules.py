@@ -16,9 +16,10 @@ class RiskRuleEngine:
         self.config = config
 
     def check(self, decision: TradeDecision, positions: list[Position],
-              total_value: float, daily_pnl: float,
-              new_sector: str | None = None) -> list[RiskViolation]:
+              total_value: float, daily_pnl: float) -> list[RiskViolation]:
         if decision.action == "SELL":
+            return []
+        if total_value <= 0:
             return []
 
         violations = []
@@ -63,8 +64,10 @@ class RiskRuleEngine:
                 limit=0,
             ))
 
-        # 5. Sector concentration
-        if new_sector:
+        # 5. Sector concentration (uses sector from positions)
+        from src.execution.broker import _get_sector
+        new_sector = _get_sector(decision.symbol)
+        if new_sector and new_sector != "Unknown":
             sector_value = sum(p.market_value for p in positions if p.sector == new_sector)
             sector_value += new_investment
             sector_pct = sector_value / total_value * 100
@@ -77,3 +80,17 @@ class RiskRuleEngine:
                 ))
 
         return violations
+
+    def check_daily_loss(self, total_value: float, daily_pnl: float) -> RiskViolation | None:
+        """Standalone daily loss check for midday session."""
+        if total_value <= 0:
+            return None
+        daily_loss_pct = abs(daily_pnl / total_value * 100) if daily_pnl < 0 else 0
+        if daily_loss_pct > self.config.max_daily_loss_pct:
+            return RiskViolation(
+                rule="max_daily_loss_pct",
+                message=f"Daily loss {daily_loss_pct:.1f}% exceeds max {self.config.max_daily_loss_pct}%",
+                value=daily_loss_pct,
+                limit=self.config.max_daily_loss_pct,
+            )
+        return None
