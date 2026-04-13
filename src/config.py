@@ -5,6 +5,8 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, model_validator
 
+from src.agents.base import _is_openai_model
+
 
 class ApiKeysConfig(BaseModel):
     anthropic: str
@@ -71,6 +73,33 @@ class AppConfig(BaseModel):
     risk: RiskConfig
     trading: TradingConfig
     storage: StorageConfig
+
+    @model_validator(mode="after")
+    def _check_llm_provider_keys(self):
+        openai_models = []
+        anthropic_models = []
+
+        for field_name, model_name in self.llm.model_dump().items():
+            if not field_name.endswith("_model"):
+                continue
+            if _is_openai_model(model_name):
+                openai_models.append(f"{field_name}={model_name}")
+            else:
+                anthropic_models.append(f"{field_name}={model_name}")
+
+        if openai_models and not self.api_keys.openai:
+            selected = ", ".join(openai_models)
+            raise ValueError(
+                f"OPENAI_API_KEY is required for selected OpenAI models: {selected}"
+            )
+
+        if anthropic_models and not self.api_keys.anthropic:
+            selected = ", ".join(anthropic_models)
+            raise ValueError(
+                f"ANTHROPIC_API_KEY is required for selected Anthropic models: {selected}"
+            )
+
+        return self
 
 
 def _substitute_env_vars(value: str) -> str:
