@@ -4,8 +4,11 @@ from datetime import date
 
 import yfinance as yf
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import (
+    MarketOrderRequest, LimitOrderRequest,
+    TakeProfitRequest, StopLossRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 from src.models import Position
 
@@ -129,28 +132,42 @@ class AlpacaBroker:
             logger.warning("Failed to cancel open orders: %s", exc)
             return 0
 
-    def submit_order(self, symbol: str, qty: float, side: str, limit_price: float | None = None) -> dict:
+    def submit_order(self, symbol: str, qty: float, side: str,
+                     limit_price: float | None = None,
+                     stop_loss_price: float | None = None,
+                     take_profit_price: float | None = None) -> dict:
         order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
+        # Use bracket order when stop/target are provided (attaches OCO legs)
+        use_bracket = (stop_loss_price is not None and stop_loss_price > 0
+                       and take_profit_price is not None and take_profit_price > 0
+                       and order_side == OrderSide.BUY)
+
         if limit_price is not None:
-            request = LimitOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=order_side,
-                time_in_force=TimeInForce.DAY,
-                limit_price=limit_price,
+            kwargs = dict(
+                symbol=symbol, qty=qty, side=order_side,
+                time_in_force=TimeInForce.DAY, limit_price=limit_price,
             )
+            if use_bracket:
+                kwargs["order_class"] = OrderClass.BRACKET
+                kwargs["stop_loss"] = StopLossRequest(stop_price=stop_loss_price)
+                kwargs["take_profit"] = TakeProfitRequest(limit_price=take_profit_price)
+            request = LimitOrderRequest(**kwargs)
         else:
-            request = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=order_side,
+            kwargs = dict(
+                symbol=symbol, qty=qty, side=order_side,
                 time_in_force=TimeInForce.DAY,
             )
+            if use_bracket:
+                kwargs["order_class"] = OrderClass.BRACKET
+                kwargs["stop_loss"] = StopLossRequest(stop_price=stop_loss_price)
+                kwargs["take_profit"] = TakeProfitRequest(limit_price=take_profit_price)
+            request = MarketOrderRequest(**kwargs)
 
         order = self.client.submit_order(request)
-        logger.info("Order submitted: %s %s %s @ %s — status: %s",
-                     side, qty, symbol, limit_price or "market", order.status)
+        bracket_info = f" [bracket: SL=${stop_loss_price}, TP=${take_profit_price}]" if use_bracket else ""
+        logger.info("Order submitted: %s %s %s @ %s%s — status: %s",
+                     side, qty, symbol, limit_price or "market", bracket_info, order.status)
         return {
             "id": str(order.id),
             "status": str(order.status),

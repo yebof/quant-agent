@@ -164,6 +164,26 @@ class PortfolioManagerAgent(BaseAgent):
         invested = total_value - cash_balance
         invested_pct = (invested / total_value * 100) if total_value else 0
 
+        # Yesterday's insights section
+        yesterday_insights: dict | None = kwargs.get("yesterday_insights")
+        if yesterday_insights and yesterday_insights.get("tomorrow_outlook"):
+            import json
+            actions = yesterday_insights.get("suggested_actions", "")
+            if isinstance(actions, str):
+                try:
+                    actions = json.loads(actions)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            actions_text = "\n".join(f"  - {a}" for a in actions) if isinstance(actions, list) else f"  - {actions}"
+            insights_section = f"""## Yesterday's Evening Insights
+- Outlook: {yesterday_insights.get('tomorrow_outlook', 'N/A')}
+- Lessons: {yesterday_insights.get('lessons', 'N/A')}
+- Risk Rating: {yesterday_insights.get('risk_rating', 'N/A')}
+- Suggested Actions:
+{actions_text}"""
+        else:
+            insights_section = "## Yesterday's Evening Insights\nNo prior session insights available."
+
         return f"""## Account Status
 - Total Value: ${total_value:,.2f}
 - Cash Balance: ${cash_balance:,.2f}
@@ -171,6 +191,8 @@ class PortfolioManagerAgent(BaseAgent):
 
 ## Current Positions
 {positions_text}
+
+{insights_section}
 
 {macro_section}
 
@@ -181,13 +203,14 @@ class PortfolioManagerAgent(BaseAgent):
 ## Technical Analysis Reports
 {analyses_text}
 
-Based on all the above (macro analysis, news, and technical signals), what trades should we execute? Respond as JSON."""
+Based on all the above (yesterday's insights, macro analysis, news, earnings, and technical signals), what trades should we execute? Respond as JSON."""
 
     def decide(self, analyses: list[TechAnalysisResult], positions: list[Position],
                macro_analysis: dict | None = None, cash_balance: float = 0,
                total_value: float = 0,
                news_analysis: NewsAnalysisResult | None = None,
-               earnings_analyses: list[dict] | None = None) -> tuple[PortfolioDecision | None, "AgentResult"]:
+               earnings_analyses: list[dict] | None = None,
+               yesterday_insights: dict | None = None) -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
             analyses=analyses,
             positions=positions,
@@ -196,6 +219,7 @@ Based on all the above (macro analysis, news, and technical signals), what trade
             total_value=total_value,
             news_analysis=news_analysis,
             earnings_analyses=earnings_analyses or [],
+            yesterday_insights=yesterday_insights,
         )
         parsed = result.parse_json()
         if parsed is None:

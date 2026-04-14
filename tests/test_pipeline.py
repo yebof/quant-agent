@@ -250,6 +250,7 @@ def test_pipeline_market_order_sizes_from_live_market_price(
     assert result["status"] == "executed"
     mock_broker.submit_order.assert_called_once_with(
         symbol="SPY", qty=10, side="buy", limit_price=None,
+        stop_loss_price=90.0, take_profit_price=130.0,
     )
     mock_broker.get_latest_price.assert_called_once_with("SPY")
 

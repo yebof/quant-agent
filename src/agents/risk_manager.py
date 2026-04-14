@@ -43,6 +43,8 @@ class RiskManagerAgent(BaseAgent):
         ) if rule_violations else "No hard rule violations detected."
 
         vix = macro_summary.get("vix", {})
+        treasury = macro_summary.get("treasury", {})
+        fed_funds = macro_summary.get("fed_funds_rate")
 
         return f"""## Proposed Trades
 {decisions_text}
@@ -53,7 +55,11 @@ Portfolio View: {portfolio_decision.portfolio_view}
 {positions_text}
 
 ## Macro Context
-- VIX: {vix.get('current', 'N/A')}
+- VIX: {vix.get('current', 'N/A')} (5d avg: {vix.get('mean_5d', 'N/A')}, trend: {vix.get('trend', 'N/A')})
+- 2Y Treasury: {treasury.get('us2y', 'N/A')}%
+- 10Y Treasury: {treasury.get('us10y', 'N/A')}%
+- 2Y-10Y Spread: {treasury.get('spread_2_10', 'N/A')}% (inverted: {treasury.get('inverted', 'N/A')})
+- Fed Funds Rate: {fed_funds if fed_funds is not None else 'N/A'}%
 
 ## Hard Risk Rule Check Results
 {violations_text}

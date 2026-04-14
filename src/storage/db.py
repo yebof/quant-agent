@@ -58,6 +58,15 @@ class Database:
                 daily_return_pct REAL NOT NULL,
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS insights (
+                date TEXT PRIMARY KEY,
+                tomorrow_outlook TEXT,
+                lessons TEXT,
+                suggested_actions TEXT,
+                risk_rating TEXT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now'))
+            );
         """)
         self.conn.commit()
         self._migrate()
@@ -70,16 +79,24 @@ class Database:
             self.conn.execute("ALTER TABLE agent_logs ADD COLUMN input_message TEXT DEFAULT ''")
             self.conn.commit()
 
+        cursor = self.conn.execute("PRAGMA table_info(trades)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "stop_loss" not in columns:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN stop_loss REAL DEFAULT 0")
+            self.conn.execute("ALTER TABLE trades ADD COLUMN take_profit REAL DEFAULT 0")
+            self.conn.commit()
+
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
             return self.conn.execute(sql, params)
 
     def insert_trade(self, symbol: str, action: str, qty: float, price: float,
-                     reasoning: str, run_id: str):
+                     reasoning: str, run_id: str,
+                     stop_loss: float = 0, take_profit: float = 0):
         with self._lock:
             self.conn.execute(
-                "INSERT INTO trades (symbol, action, qty, price, reasoning, run_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (symbol, action, qty, price, reasoning, run_id),
+                "INSERT INTO trades (symbol, action, qty, price, reasoning, run_id, stop_loss, take_profit) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (symbol, action, qty, price, reasoning, run_id, stop_loss, take_profit),
             )
             self.conn.commit()
 
@@ -167,6 +184,25 @@ class Database:
                 (*params, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def save_insights(self, date: str, tomorrow_outlook: str, lessons: str,
+                      suggested_actions: str, risk_rating: str):
+        import json
+        actions_json = json.dumps(suggested_actions) if isinstance(suggested_actions, list) else suggested_actions
+        with self._lock:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO insights (date, tomorrow_outlook, lessons, suggested_actions, risk_rating)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (date, tomorrow_outlook, lessons, actions_json, risk_rating),
+            )
+            self.conn.commit()
+
+    def get_latest_insights(self) -> dict | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM insights ORDER BY date DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
 
     def close(self):
         if self.conn:

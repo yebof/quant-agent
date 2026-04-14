@@ -25,15 +25,33 @@ class MiddayReviewerAgent(BaseAgent):
         macro_summary: dict = kwargs["macro_summary"]
         cash_balance: float = kwargs["cash_balance"]
         total_value: float = kwargs["total_value"]
+        morning_trades: list[dict] = kwargs.get("morning_trades", [])
 
         def _pnl_pct(p):
             cost = p.avg_entry * p.qty
             return f"{p.unrealized_pnl / cost * 100:.1f}%" if cost else "N/A"
 
-        positions_text = "\n".join(
-            f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Now: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} ({_pnl_pct(p)}) | Sector: {p.sector}"
-            for p in positions
-        ) if positions else "No open positions."
+        # Build trade context map: symbol → {stop_loss, take_profit, reasoning}
+        trade_context = {}
+        for t in morning_trades:
+            sym = t.get("symbol", "")
+            if t.get("action") == "BUY" and sym:
+                trade_context[sym] = t
+
+        positions_lines = []
+        for p in positions:
+            line = f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Now: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} ({_pnl_pct(p)}) | Sector: {p.sector}"
+            ctx = trade_context.get(p.symbol)
+            if ctx:
+                sl = ctx.get("stop_loss", 0)
+                tp = ctx.get("take_profit", 0)
+                if sl or tp:
+                    line += f"\n  Stop: ${sl:.2f} | Target: ${tp:.2f}"
+                reasoning = ctx.get("reasoning", "")
+                if reasoning:
+                    line += f"\n  Entry thesis: {reasoning[:150]}"
+            positions_lines.append(line)
+        positions_text = "\n".join(positions_lines) if positions_lines else "No open positions."
 
         vix = macro_summary.get("vix", {})
         cash_pct = f"{cash_balance / total_value * 100:.1f}%" if total_value else "N/A"
@@ -44,21 +62,23 @@ class MiddayReviewerAgent(BaseAgent):
 - Total Value: ${total_value:,.2f}
 - Cash: ${cash_balance:,.2f} ({cash_pct})
 
-### Open Positions
+### Open Positions (with stop/target from morning decisions)
 {positions_text}
 
 ### Macro
 - VIX: {vix.get('current', 'N/A')} (trend: {vix.get('trend', 'N/A')})
 
-Review each position and recommend actions. Respond as JSON."""
+Review each position against its stop loss and target. Recommend actions. Respond as JSON."""
 
     def review(self, positions: list[Position], macro_summary: dict,
-               cash_balance: float, total_value: float) -> tuple[dict | None, "AgentResult"]:
+               cash_balance: float, total_value: float,
+               morning_trades: list[dict] | None = None) -> tuple[dict | None, "AgentResult"]:
         result = self.run(
             positions=positions,
             macro_summary=macro_summary,
             cash_balance=cash_balance,
             total_value=total_value,
+            morning_trades=morning_trades or [],
         )
         parsed = result.parse_json()
         if parsed is None:

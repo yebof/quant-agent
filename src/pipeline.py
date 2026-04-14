@@ -28,6 +28,7 @@ from src.models import (
     PortfolioDecision,
     RiskVerdict,
     TechAnalysisResult,
+    TechnicalIndicators,
     TradeDecision,
 )
 
@@ -300,15 +301,52 @@ class TradingPipeline:
             )
             return news_items, analysis, result
 
+        def _has_actionable_signal(indicators, symbol: str) -> bool:
+            """Pre-filter: only send symbols with interesting signals to the LLM."""
+            # Always analyze held positions
+            held_symbols = {p.symbol for p in positions}
+            if symbol in held_symbols:
+                return True
+            if not isinstance(indicators, TechnicalIndicators):
+                return True  # can't filter unknown types, pass through
+            # RSI extremes (oversold < 35 or overbought > 65)
+            if indicators.rsi_14 is not None and (indicators.rsi_14 < 35 or indicators.rsi_14 > 65):
+                return True
+            # Price near Bollinger Bands (within 1% of upper or lower)
+            if indicators.bb_upper and indicators.bb_lower and indicators.ma_20:
+                last_close = indicators.ma_20  # approximate current price
+                band_width = indicators.bb_upper - indicators.bb_lower
+                if band_width > 0:
+                    if abs(last_close - indicators.bb_upper) / band_width < 0.1:
+                        return True
+                    if abs(last_close - indicators.bb_lower) / band_width < 0.1:
+                        return True
+            # MACD crossover (histogram near zero and changing sign)
+            if indicators.macd_hist is not None and abs(indicators.macd_hist) < 0.5:
+                return True
+            # Significant volume change (> 50%)
+            if indicators.volume_change_pct is not None and abs(indicators.volume_change_pct) > 50:
+                return True
+            # Golden/Death cross signals (MA20 near MA50)
+            if indicators.ma_20 and indicators.ma_50:
+                spread = abs(indicators.ma_20 - indicators.ma_50) / indicators.ma_50
+                if spread < 0.02:
+                    return True
+            return False
+
         def _run_tech():
-            symbols_data = []
+            all_symbols_data = []
             for symbol in self.config.trading.universe:
                 bars = self.market.get_ohlcv(symbol, self.config.trading.lookback_days)
                 if not bars:
                     logger.warning("No data for %s, skipping", symbol)
                     continue
                 indicators = compute_indicators(symbol, bars)
-                symbols_data.append({"symbol": symbol, "bars": bars, "indicators": indicators})
+                all_symbols_data.append({"symbol": symbol, "bars": bars, "indicators": indicators})
+            # Pre-filter: only send actionable symbols to the LLM
+            symbols_data = [s for s in all_symbols_data if _has_actionable_signal(s["indicators"], s["symbol"])]
+            logger.info("Tech pre-filter: %d/%d symbols have actionable signals",
+                        len(symbols_data), len(all_symbols_data))
             if symbols_data:
                 return self.tech_analyst.analyze_batch(symbols_data)
             return {}, None
@@ -433,6 +471,12 @@ class TradingPipeline:
             return {"status": "no_data", "orders": []}
 
         # 5. Portfolio Manager decision
+        yesterday_insights = self.db.get_latest_insights()
+        if yesterday_insights:
+            logger.info("Loaded yesterday's insights (risk=%s): %s",
+                        yesterday_insights.get("risk_rating", "?"),
+                        yesterday_insights.get("tomorrow_outlook", "")[:100])
+
         portfolio_decision, pm_result = self.portfolio_manager.decide(
             analyses=analyses,
             positions=positions,
@@ -441,6 +485,7 @@ class TradingPipeline:
             total_value=total_value,
             news_analysis=news_analysis,
             earnings_analyses=earnings_results,
+            yesterday_insights=yesterday_insights,
         )
 
         self.db.insert_agent_log(
@@ -532,9 +577,13 @@ class TradingPipeline:
         # Build a map of current prices from broker state for price validation
         price_map = {p.symbol: p.current_price for p in positions}
 
-        # 7. Execute approved trades
+        # 7. Execute approved trades (SELLs first to free cash for BUYs)
         orders = []
-        for decision in portfolio_decision.decisions:
+        sorted_decisions = sorted(
+            portfolio_decision.decisions,
+            key=lambda d: 0 if d.action == "SELL" else 1,
+        )
+        for decision in sorted_decisions:
             if decision.action not in ("BUY", "SELL"):
                 continue
             try:
@@ -582,11 +631,14 @@ class TradingPipeline:
                     order = self.broker.submit_order(
                         symbol=decision.symbol, qty=qty, side="buy",
                         limit_price=limit_price,
+                        stop_loss_price=decision.stop_loss if decision.stop_loss > 0 else None,
+                        take_profit_price=decision.take_profit if decision.take_profit > 0 else None,
                     )
                     orders.append(order)
                     self.db.insert_trade(
                         symbol=decision.symbol, action="BUY", qty=qty,
                         price=decision.entry_price, reasoning=decision.reasoning, run_id=run_id,
+                        stop_loss=decision.stop_loss, take_profit=decision.take_profit,
                     )
                     logger.info("Executed: buy %d %s @ limit $%.2f", qty, decision.symbol, decision.entry_price)
 
@@ -594,19 +646,35 @@ class TradingPipeline:
                     existing = [p for p in positions if p.symbol == decision.symbol]
                     if not existing or existing[0].qty <= 0:
                         continue
-                    qty = self._full_sell_qty(existing[0].qty)
-                    if qty is None:
-                        continue
+                    # Partial sell: if allocation_pct > 0, sell that fraction; otherwise full sell
+                    if decision.allocation_pct > 0:
+                        sell_fraction = min(decision.allocation_pct / 100, 1.0)
+                        qty = existing[0].qty * sell_fraction
+                        if float(existing[0].qty).is_integer():
+                            qty = max(1.0, float(int(qty)))
+                        if qty <= 0:
+                            continue
+                        action_label = f"PARTIAL_SELL({decision.allocation_pct:.0f}%)"
+                    else:
+                        qty = self._full_sell_qty(existing[0].qty)
+                        if qty is None:
+                            continue
+                        action_label = "SELL"
                     sell_price = existing[0].current_price
-                    order = self.broker.submit_order(symbol=decision.symbol, qty=qty, side="sell")
+                    # Use limit price slightly below market to protect against slippage
+                    sell_limit = round(sell_price * 0.995, 2)
+                    order = self.broker.submit_order(
+                        symbol=decision.symbol, qty=qty, side="sell",
+                        limit_price=sell_limit,
+                    )
                     orders.append(order)
                     self.db.insert_trade(
-                        symbol=decision.symbol, action="SELL", qty=qty,
+                        symbol=decision.symbol, action=action_label, qty=qty,
                         price=sell_price, reasoning=decision.reasoning, run_id=run_id,
                     )
                     logger.info(
-                        "Executed: sell %s %s @ $%.2f",
-                        self._format_qty(qty), decision.symbol, sell_price,
+                        "Executed: %s %s %s @ limit $%.2f",
+                        action_label.lower(), self._format_qty(qty), decision.symbol, sell_limit,
                     )
 
             except Exception as e:
@@ -640,11 +708,13 @@ class TradingPipeline:
         review = None
         orders = []
         if positions:
+            morning_trades = self.db.get_trades(limit=50, today_only=True)
             review, md_result = self.midday_reviewer.review(
                 positions=positions,
                 macro_summary=macro_summary,
                 cash_balance=cash,
                 total_value=total_value,
+                morning_trades=morning_trades,
             )
             self.db.insert_agent_log(
                 agent_name="midday_reviewer", run_id=run_id,
@@ -769,6 +839,16 @@ class TradingPipeline:
             model=self.config.llm.evening_analyst_model,
             tokens_used=ev_result.tokens_used,
         )
+
+        # Save insights for next morning's PM
+        if analysis:
+            self.db.save_insights(
+                date=today_str,
+                tomorrow_outlook=analysis.get("tomorrow_outlook", ""),
+                lessons=analysis.get("lessons", ""),
+                suggested_actions=analysis.get("suggested_actions", []),
+                risk_rating=analysis.get("risk_rating", ""),
+            )
 
         logger.info("Evening: value=$%.2f, PnL=$%.2f (%.2f%%), risk=%s",
                      total_value, daily_pnl, daily_return_pct,
