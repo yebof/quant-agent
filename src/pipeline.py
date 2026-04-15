@@ -25,7 +25,6 @@ from src.risk.rules import RiskRuleEngine
 from src.execution.broker import AlpacaBroker, _get_sector
 from src.storage.db import Database
 from src.models import (
-    NewsAnalysisResult,
     NewsIntelligenceReport,
     PortfolioDecision,
     RiskVerdict,

@@ -6,7 +6,6 @@ import pytest
 
 from src.data.news import NewsDataProvider, NewsItem
 from src.agents.news_analyst import NewsAnalystAgent
-from src.models import NewsAnalysisResult
 
 
 # === NewsDataProvider tests ===

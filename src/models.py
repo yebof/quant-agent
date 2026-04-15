@@ -150,9 +150,15 @@ class NewsAnalysisResult(BaseModel):
 
 class MacroNarrative(BaseModel):
     last_updated: str
-    era_themes: list[str] = []
-    current_regime: str
+    era_themes: list[str] = Field(min_length=1)
+    current_regime: str = Field(min_length=5)
     key_state_tracker: dict[str, str] = {}
+
+    @field_validator("last_updated")
+    @classmethod
+    def validate_date_format(cls, v: str) -> str:
+        date.fromisoformat(v)
+        return v
 
 
 class StateChange(BaseModel):

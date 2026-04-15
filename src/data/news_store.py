@@ -2,10 +2,18 @@
 
 import json
 import logging
+import os
 from datetime import date
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write(path: Path, data: str):
+    """Write-to-temp-then-rename for crash safety."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(data)
+    os.replace(str(tmp), str(path))
 
 
 class NewsStore:
@@ -31,14 +39,21 @@ class NewsStore:
 
     def save_macro_narrative(self, narrative: dict):
         path = self.data_dir / "macro_narrative.json"
-        path.write_text(json.dumps(narrative, indent=2, ensure_ascii=False))
+        # Keep a dated backup before overwriting
+        backup = self.data_dir / f"macro_narrative_{date.today()}.json"
+        if path.exists() and not backup.exists():
+            try:
+                backup.write_text(path.read_text())
+            except OSError:
+                pass
+        _atomic_write(path, json.dumps(narrative, indent=2, ensure_ascii=False))
         logger.info("Macro narrative updated → %s", path)
 
     # ── Daily Reports ──
 
     def save_daily_report(self, report: dict):
         path = self._today_dir() / "full_report.json"
-        path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+        _atomic_write(path, json.dumps(report, indent=2, ensure_ascii=False))
         logger.info("Daily news report saved → %s", path)
 
     def save_stock_alerts(self, stock_news: dict):
@@ -46,12 +61,12 @@ class NewsStore:
         alerts_dir.mkdir(exist_ok=True)
         for symbol, alerts in stock_news.items():
             path = alerts_dir / f"{symbol}.json"
-            path.write_text(json.dumps(alerts, indent=2, ensure_ascii=False))
+            _atomic_write(path, json.dumps(alerts, indent=2, ensure_ascii=False))
         logger.info("Stock alerts saved for %d symbols", len(stock_news))
 
     def save_raw_headlines(self, headlines: list[dict]):
         path = self._today_dir() / "raw_headlines.json"
-        path.write_text(json.dumps(headlines, indent=2, ensure_ascii=False))
+        _atomic_write(path, json.dumps(headlines, indent=2, ensure_ascii=False))
 
     def get_report_path(self) -> str:
         return str(self._today_dir())

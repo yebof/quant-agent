@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 
 from src.agents.base import BaseAgent, AgentResult
-from src.models import NewsAnalysisResult, NewsIntelligenceReport
+from src.models import NewsIntelligenceReport
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,12 @@ class NewsAnalystAgent(BaseAgent):
         else:
             stock_section = "## Stock-Specific News\nNo universe symbols detected in today's headlines."
 
-        return f"""{narrative_section}
+        from datetime import date as _date
+        today = str(_date.today())
+
+        return f"""## Today's Date: {today}
+
+{narrative_section}
 
 ## General News (last 24 hours)
 
@@ -85,11 +90,4 @@ Analyze all the above and produce your 3-layer intelligence report as JSON."""
             return NewsIntelligenceReport(**parsed), result
         except Exception as e:
             logger.error("Failed to parse news intelligence report: %s", e)
-            # Fallback: try legacy format for backward compatibility
-            try:
-                legacy = NewsAnalysisResult(**parsed)
-                logger.info("Parsed as legacy NewsAnalysisResult format")
-                return None, result
-            except Exception:
-                pass
             return None, result

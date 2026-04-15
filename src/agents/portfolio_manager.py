@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 
 from src.agents.base import BaseAgent
-from src.models import TechAnalysisResult, Position, PortfolioDecision, NewsAnalysisResult, NewsIntelligenceReport
+from src.models import TechAnalysisResult, Position, PortfolioDecision, NewsIntelligenceReport
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,6 @@ class PortfolioManagerAgent(BaseAgent):
         cash_balance: float = kwargs["cash_balance"]
         total_value: float = kwargs["total_value"]
         news_intel: NewsIntelligenceReport | None = kwargs.get("news_intel")
-        news_analysis: NewsAnalysisResult | None = kwargs.get("news_analysis")  # legacy fallback
         earnings_analyses: list[dict] = kwargs.get("earnings_analyses", [])
 
         analyses_text = "\n".join(
@@ -95,10 +94,12 @@ class PortfolioManagerAgent(BaseAgent):
             else:
                 changes_text = "No significant state changes today."
 
-            # Layer 3: Stock-specific (top items only)
+            # Layer 3: Stock-specific (sorted by conviction, top 2 per symbol)
+            _conv_order = {"high": 0, "medium": 1, "low": 2}
             stock_items = []
             for sym, alerts in news_intel.stock_news.items():
-                for a in alerts[:2]:
+                sorted_alerts = sorted(alerts, key=lambda a: _conv_order.get(a.conviction, 9))
+                for a in sorted_alerts[:2]:
                     stock_items.append(f"- {sym}: [{a.conviction.upper()}] {a.sentiment} — {a.impact_summary}")
             stock_text = "\n".join(stock_items) if stock_items else "No stock-specific news."
 
@@ -119,17 +120,6 @@ class PortfolioManagerAgent(BaseAgent):
 {stock_text}
 
 Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confidence})"""
-        elif news_analysis:
-            # Legacy fallback
-            events_text = "\n".join(
-                f"- [{e.impact.upper()}] {e.headline} → {e.sentiment}"
-                for e in news_analysis.key_events
-            ) if news_analysis.key_events else "No major events."
-            news_section = f"""## News Analysis (legacy)
-- Sentiment: {news_analysis.market_sentiment} ({news_analysis.confidence})
-- Summary: {news_analysis.summary}
-
-{events_text}"""
         else:
             news_section = "## News Intelligence\nNo news data available."
 
@@ -232,7 +222,6 @@ Based on all the above (yesterday's insights, macro analysis, news, earnings, an
                macro_analysis: dict | None = None, cash_balance: float = 0,
                total_value: float = 0,
                news_intel: NewsIntelligenceReport | None = None,
-               news_analysis: NewsAnalysisResult | None = None,
                earnings_analyses: list[dict] | None = None,
                yesterday_insights: dict | None = None) -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
@@ -242,7 +231,6 @@ Based on all the above (yesterday's insights, macro analysis, news, earnings, an
             cash_balance=cash_balance,
             total_value=total_value,
             news_intel=news_intel,
-            news_analysis=news_analysis,
             earnings_analyses=earnings_analyses or [],
             yesterday_insights=yesterday_insights,
         )

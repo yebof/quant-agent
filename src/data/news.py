@@ -129,14 +129,18 @@ class NewsDataProvider:
         return unique
 
     def tag_symbol_mentions(self, items: list[NewsItem], universe: list[str]) -> dict[str, list[NewsItem]]:
-        """Tag which news items mention symbols from the universe. Returns {symbol: [items]}."""
-        # Build lookup: company names / common aliases
-        symbol_set = {s.upper() for s in universe}
+        """Tag which news items mention symbols from the universe. Uses word-boundary matching."""
+        import re
+        # Short symbols (1-3 chars) are prone to false positives; require word boundaries
+        patterns: dict[str, re.Pattern] = {}
+        for s in universe:
+            sym = s.upper()
+            patterns[sym] = re.compile(r'\b' + re.escape(sym) + r'\b')
         result: dict[str, list[NewsItem]] = {}
         for item in items:
             text = f"{item.title} {item.summary}".upper()
-            for sym in symbol_set:
-                if sym in text:
+            for sym, pat in patterns.items():
+                if pat.search(text):
                     result.setdefault(sym, []).append(item)
         return result
 
