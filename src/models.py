@@ -148,6 +148,45 @@ class NewsAnalysisResult(BaseModel):
     summary: str
 
 
+class MacroNarrative(BaseModel):
+    last_updated: str
+    era_themes: list[str] = []
+    current_regime: str
+    key_state_tracker: dict[str, str] = {}
+
+
+class StateChange(BaseModel):
+    event: str
+    previous_state: str
+    new_state: str
+    market_impact: str
+    affected_symbols: list[str] = []
+    conviction: Literal["high", "medium", "low"]
+
+
+class StockNewsItem(BaseModel):
+    headline: str
+    sentiment: Literal["bullish", "bearish", "neutral"]
+    conviction: Literal["high", "medium", "low"]
+    impact_summary: str
+
+    @field_validator("headline")
+    @classmethod
+    def require_headline(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("headline cannot be empty")
+        return v
+
+
+class NewsIntelligenceReport(BaseModel):
+    macro_narrative: MacroNarrative
+    state_changes: list[StateChange] = []
+    stock_news: dict[str, list[StockNewsItem]] = {}
+    pm_briefing: str
+    market_sentiment: Literal["bullish", "bearish", "neutral"]
+    confidence: Literal["high", "medium", "low"]
+
+
 class Position(BaseModel):
     symbol: str
     qty: float

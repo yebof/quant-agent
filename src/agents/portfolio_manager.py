@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 
 from src.agents.base import BaseAgent
-from src.models import TechAnalysisResult, Position, PortfolioDecision, NewsAnalysisResult
+from src.models import TechAnalysisResult, Position, PortfolioDecision, NewsAnalysisResult, NewsIntelligenceReport
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,8 @@ class PortfolioManagerAgent(BaseAgent):
         macro_analysis: dict | None = kwargs.get("macro_analysis")
         cash_balance: float = kwargs["cash_balance"]
         total_value: float = kwargs["total_value"]
-        news_analysis: NewsAnalysisResult | None = kwargs.get("news_analysis")
+        news_intel: NewsIntelligenceReport | None = kwargs.get("news_intel")
+        news_analysis: NewsAnalysisResult | None = kwargs.get("news_analysis")  # legacy fallback
         earnings_analyses: list[dict] = kwargs.get("earnings_analyses", [])
 
         analyses_text = "\n".join(
@@ -78,37 +79,59 @@ class PortfolioManagerAgent(BaseAgent):
         else:
             macro_section = "## Macro Analysis\nNo macro data available."
 
-        # Format news analysis section
-        if news_analysis:
+        # Format news intelligence section (3-layer)
+        if news_intel:
+            # Layer 1: Macro narrative
+            mn = news_intel.macro_narrative
+            era_text = "; ".join(mn.era_themes) if mn.era_themes else "N/A"
+            state_items = "\n".join(f"  - {k}: {v}" for k, v in mn.key_state_tracker.items()) if mn.key_state_tracker else "  No tracked states."
+
+            # Layer 2: State changes
+            if news_intel.state_changes:
+                changes_text = "\n".join(
+                    f"- [{c.conviction.upper()}] {c.event}\n  Was: {c.previous_state} → Now: {c.new_state}\n  Impact: {c.market_impact}"
+                    for c in news_intel.state_changes
+                )
+            else:
+                changes_text = "No significant state changes today."
+
+            # Layer 3: Stock-specific (top items only)
+            stock_items = []
+            for sym, alerts in news_intel.stock_news.items():
+                for a in alerts[:2]:
+                    stock_items.append(f"- {sym}: [{a.conviction.upper()}] {a.sentiment} — {a.impact_summary}")
+            stock_text = "\n".join(stock_items) if stock_items else "No stock-specific news."
+
+            news_section = f"""## News Intelligence
+### PM Briefing
+{news_intel.pm_briefing}
+
+### Macro Narrative (Grand Backdrop)
+- Regime: {mn.current_regime}
+- Era themes: {era_text}
+- State tracker:
+{state_items}
+
+### State Changes (What Changed Today)
+{changes_text}
+
+### Stock-Specific News
+{stock_text}
+
+Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confidence})"""
+        elif news_analysis:
+            # Legacy fallback
             events_text = "\n".join(
-                f"- [{e.impact.upper()}] {e.headline} → {e.sentiment} for {', '.join(e.affected_sectors) or 'broad market'}\n  {e.explanation}"
+                f"- [{e.impact.upper()}] {e.headline} → {e.sentiment}"
                 for e in news_analysis.key_events
             ) if news_analysis.key_events else "No major events."
-
-            news_sector_text = "\n".join(
-                f"- {s.sector}: {s.sentiment} — {s.reason}"
-                for s in news_analysis.sector_impacts
-            ) if news_analysis.sector_impacts else "No sector-specific impacts."
-
-            alerts_text = "\n".join(
-                f"- {a.symbol}: {a.sentiment} — {a.reason}"
-                for a in news_analysis.symbol_alerts
-            ) if news_analysis.symbol_alerts else "No symbol-specific alerts."
-
-            news_section = f"""## News Analysis
-- Overall Sentiment: {news_analysis.market_sentiment} (confidence: {news_analysis.confidence})
+            news_section = f"""## News Analysis (legacy)
+- Sentiment: {news_analysis.market_sentiment} ({news_analysis.confidence})
 - Summary: {news_analysis.summary}
 
-### Key Events
-{events_text}
-
-### Sector Impacts
-{news_sector_text}
-
-### Symbol Alerts
-{alerts_text}"""
+{events_text}"""
         else:
-            news_section = "## News Analysis\nNo news data available."
+            news_section = "## News Intelligence\nNo news data available."
 
         # Format earnings analysis section
         if earnings_analyses:
@@ -208,6 +231,7 @@ Based on all the above (yesterday's insights, macro analysis, news, earnings, an
     def decide(self, analyses: list[TechAnalysisResult], positions: list[Position],
                macro_analysis: dict | None = None, cash_balance: float = 0,
                total_value: float = 0,
+               news_intel: NewsIntelligenceReport | None = None,
                news_analysis: NewsAnalysisResult | None = None,
                earnings_analyses: list[dict] | None = None,
                yesterday_insights: dict | None = None) -> tuple[PortfolioDecision | None, "AgentResult"]:
@@ -217,6 +241,7 @@ Based on all the above (yesterday's insights, macro analysis, news, earnings, an
             macro_analysis=macro_analysis,
             cash_balance=cash_balance,
             total_value=total_value,
+            news_intel=news_intel,
             news_analysis=news_analysis,
             earnings_analyses=earnings_analyses or [],
             yesterday_insights=yesterday_insights,

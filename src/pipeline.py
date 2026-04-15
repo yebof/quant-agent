@@ -10,6 +10,7 @@ from src.config import AppConfig, RiskConfig
 from src.data.market import MarketDataProvider
 from src.data.macro import MacroDataProvider
 from src.data.news import NewsDataProvider
+from src.data.news_store import NewsStore
 from src.data.technical import compute_indicators
 from src.agents.tech_analyst import TechAnalystAgent
 from src.agents.portfolio_manager import PortfolioManagerAgent
@@ -25,6 +26,7 @@ from src.execution.broker import AlpacaBroker, _get_sector
 from src.storage.db import Database
 from src.models import (
     NewsAnalysisResult,
+    NewsIntelligenceReport,
     PortfolioDecision,
     RiskVerdict,
     TechAnalysisResult,
@@ -99,6 +101,7 @@ class TradingPipeline:
             max_tokens=config.llm.max_tokens,
         )
         self.news_provider = NewsDataProvider()
+        self.news_store = NewsStore()
         self.earnings_analyst = EarningsAnalystAgent(
             api_key=_key_for(config.llm.earnings_analyst_model),
             model=config.llm.earnings_analyst_model,
@@ -295,11 +298,25 @@ class TradingPipeline:
         def _run_news():
             news_items = self.news_provider.fetch_news()
             news_text = self.news_provider.format_for_prompt(news_items)
-            analysis, result = self.news_analyst.analyze(
+            stock_mentions = self.news_provider.tag_symbol_mentions(
+                news_items, self.config.trading.universe)
+            previous_narrative = self.news_store.load_macro_narrative()
+            intel_report, result = self.news_analyst.analyze(
                 news_text=news_text,
                 universe=self.config.trading.universe,
+                stock_mentions=stock_mentions,
+                previous_narrative=previous_narrative,
             )
-            return news_items, analysis, result
+            # Save detailed report and update narrative
+            if intel_report:
+                report_dict = intel_report.model_dump()
+                self.news_store.save_daily_report(report_dict)
+                self.news_store.save_macro_narrative(report_dict["macro_narrative"])
+                if report_dict.get("stock_news"):
+                    self.news_store.save_stock_alerts(report_dict["stock_news"])
+                self.news_store.save_raw_headlines(
+                    [{"title": i.title, "source": i.source, "summary": i.summary} for i in news_items])
+            return news_items, intel_report, result
 
         def _has_actionable_signal(indicators, symbol: str) -> bool:
             """Pre-filter: only send symbols with interesting signals to the LLM."""
@@ -420,22 +437,25 @@ class TradingPipeline:
         except Exception as e:
             logger.error("Macro analyst failed: %s. Continuing without macro.", e)
 
-        news_analysis = None
+        news_intel: NewsIntelligenceReport | None = None
         try:
-            news_items, news_analysis, na_result = news_future.result()
+            news_items, news_intel, na_result = news_future.result()
+            summary = "parse_error"
+            if news_intel:
+                n_changes = len(news_intel.state_changes)
+                n_stocks = len(news_intel.stock_news)
+                summary = f"sentiment={news_intel.market_sentiment}, changes={n_changes}, stocks={n_stocks}"
+                logger.info("News intelligence: %s, briefing: %s",
+                            summary, news_intel.pm_briefing[:150])
             self.db.insert_agent_log(
                 agent_name="news_analyst", run_id=run_id,
                 input_summary=f"{len(news_items)} news items",
                 input_message=na_result.user_message,
-                output_summary=f"sentiment={news_analysis.market_sentiment}, events={len(news_analysis.key_events)}" if news_analysis else "parse_error",
+                output_summary=summary,
                 full_response=na_result.raw_text,
                 model=self.config.llm.news_analyst_model,
                 tokens_used=na_result.tokens_used,
             )
-            if news_analysis:
-                logger.info("News analysis: sentiment=%s, confidence=%s, %d key events, %d symbol alerts",
-                             news_analysis.market_sentiment, news_analysis.confidence,
-                             len(news_analysis.key_events), len(news_analysis.symbol_alerts))
         except Exception as e:
             logger.error("News analyst failed: %s. Continuing without news.", e)
 
@@ -483,7 +503,7 @@ class TradingPipeline:
             macro_analysis=macro_analysis,
             cash_balance=cash,
             total_value=total_value,
-            news_analysis=news_analysis,
+            news_intel=news_intel,
             earnings_analyses=earnings_results,
             yesterday_insights=yesterday_insights,
         )

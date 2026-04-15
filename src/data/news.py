@@ -128,6 +128,18 @@ class NewsDataProvider:
 
         return unique
 
+    def tag_symbol_mentions(self, items: list[NewsItem], universe: list[str]) -> dict[str, list[NewsItem]]:
+        """Tag which news items mention symbols from the universe. Returns {symbol: [items]}."""
+        # Build lookup: company names / common aliases
+        symbol_set = {s.upper() for s in universe}
+        result: dict[str, list[NewsItem]] = {}
+        for item in items:
+            text = f"{item.title} {item.summary}".upper()
+            for sym in symbol_set:
+                if sym in text:
+                    result.setdefault(sym, []).append(item)
+        return result
+
     def format_for_prompt(self, items: list[NewsItem], max_items: int = 50) -> str:
         """Format news items into a text block for the LLM prompt."""
         if not items:

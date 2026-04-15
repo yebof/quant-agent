@@ -73,25 +73,35 @@ def test_news_provider_format_max_items():
 @patch("anthropic.Anthropic")
 def test_news_analyst_analyze(mock_cls):
     response_json = json.dumps({
-        "market_sentiment": "bullish",
-        "confidence": "medium",
-        "key_events": [
+        "macro_narrative": {
+            "last_updated": "2026-04-15",
+            "era_themes": ["AI supercycle", "Fed easing"],
+            "current_regime": "Risk-on with caution",
+            "key_state_tracker": {"fed_policy": "Easing — paused at 3.6%"},
+        },
+        "state_changes": [
             {
-                "headline": "Fed signals pause",
-                "impact": "high",
-                "affected_sectors": ["Financial"],
+                "event": "Fed signals pause in rate hikes",
+                "previous_state": "Cutting rates",
+                "new_state": "Pausing to assess",
+                "market_impact": "Slightly bearish for rate-sensitive sectors",
                 "affected_symbols": ["JPM"],
-                "sentiment": "bullish",
-                "explanation": "Lower rates support equities",
+                "conviction": "high",
             }
         ],
-        "sector_impacts": [
-            {"sector": "Technology", "sentiment": "bullish", "reason": "AI spending continues"}
-        ],
-        "symbol_alerts": [
-            {"symbol": "NVDA", "sentiment": "bullish", "reason": "New chip announcement"}
-        ],
-        "summary": "Market tone is bullish driven by Fed dovishness.",
+        "stock_news": {
+            "NVDA": [
+                {
+                    "headline": "New chip announcement",
+                    "sentiment": "bullish",
+                    "conviction": "medium",
+                    "impact_summary": "Next-gen GPU may accelerate AI adoption",
+                }
+            ]
+        },
+        "pm_briefing": "Fed pausing. NVDA new chip bullish. Risk-on with caution.",
+        "market_sentiment": "bullish",
+        "confidence": "medium",
     })
 
     mock_client = MagicMock()
@@ -103,18 +113,18 @@ def test_news_analyst_analyze(mock_cls):
     mock_cls.return_value = mock_client
 
     agent = NewsAnalystAgent(api_key="test", model="claude-sonnet-4-6-20250514")
-    analysis, agent_result = agent.analyze(
+    report, agent_result = agent.analyze(
         news_text="Fed signals pause in rate hikes...",
         universe=["SPY", "NVDA", "JPM"],
     )
 
-    assert analysis is not None
-    assert analysis.market_sentiment == "bullish"
-    assert analysis.confidence == "medium"
-    assert len(analysis.key_events) == 1
-    assert analysis.key_events[0].impact == "high"
-    assert len(analysis.symbol_alerts) == 1
-    assert analysis.symbol_alerts[0].symbol == "NVDA"
+    assert report is not None
+    assert report.market_sentiment == "bullish"
+    assert report.confidence == "medium"
+    assert len(report.state_changes) == 1
+    assert report.state_changes[0].conviction == "high"
+    assert "NVDA" in report.stock_news
+    assert report.macro_narrative.current_regime == "Risk-on with caution"
     assert agent_result.tokens_used == 2500
 
 
