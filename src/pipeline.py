@@ -709,6 +709,11 @@ class TradingPipeline:
                                            decision.entry_price, decision.symbol, deviation * 100, market_price)
                             limit_price = None
                             sizing_price = market_price
+                        elif limit_price < market_price:
+                            logger.info("Adjusting limit price for %s: $%.2f → $%.2f (raised to market)",
+                                        decision.symbol, limit_price, market_price)
+                            limit_price = market_price
+                            sizing_price = market_price
                         else:
                             sizing_price = max(market_price, limit_price)
                     else:
