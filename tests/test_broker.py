@@ -90,3 +90,42 @@ def test_is_trading_day_uses_calendar(mock_tc_cls):
 
     assert broker.is_trading_day() is True
     mock_client.get_calendar.assert_called_once()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_cancel_open_entry_orders_preserves_sell_protection(mock_tc_cls):
+    buy_order = MagicMock()
+    buy_order.id = "buy-1"
+    buy_order.side = "buy"
+
+    stop_order = MagicMock()
+    stop_order.id = "sell-stop-1"
+    stop_order.side = "sell"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [buy_order, stop_order]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    cancelled = broker.cancel_open_entry_orders()
+
+    assert cancelled == 1
+    mock_client.cancel_order_by_id.assert_called_once_with("buy-1")
+
+
+@patch("src.execution.broker.TradingClient")
+def test_wait_for_order_terminal_polls_until_filled(mock_tc_cls):
+    open_order = MagicMock()
+    open_order.status = "new"
+    filled_order = MagicMock()
+    filled_order.status = "filled"
+
+    mock_client = MagicMock()
+    mock_client.get_order_by_id.side_effect = [open_order, filled_order]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    status = broker.wait_for_order_terminal("order-1", timeout_seconds=2.0, poll_interval=0.0)
+
+    assert status == "filled"
+    assert mock_client.get_order_by_id.call_count == 2

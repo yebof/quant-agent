@@ -271,12 +271,29 @@ class TradingPipeline:
 
         return updated_decisions
 
+    def _is_trading_day(self) -> bool:
+        try:
+            return self.broker.is_trading_day()
+        except Exception as exc:
+            logger.warning("Trading-day check failed; assuming market closed: %s", exc)
+            return False
+
+    def _refresh_account_state(self):
+        account = self.broker.get_account()
+        positions = self.broker.get_positions()
+        price_map = {p.symbol: p.current_price for p in positions}
+        return account, positions, price_map
+
     def run_morning(self) -> dict:
         run_id = f"run-{uuid.uuid4().hex[:8]}"
         logger.info("=== Morning run started: %s ===", run_id)
 
-        # 0. Cancel stale orders from previous sessions to free held quantities
-        self.broker.cancel_open_orders()
+        if not self._is_trading_day():
+            logger.info("Morning run skipped: market closed for non-trading day")
+            return {"status": "market_holiday", "orders": [], "run_id": run_id}
+
+        # 0. Cancel stale entry orders from previous sessions, but preserve live protective exits.
+        self.broker.cancel_open_entry_orders()
 
         # 1. Get account state
         account = self.broker.get_account()
@@ -604,109 +621,138 @@ class TradingPipeline:
                 if not portfolio_decision.decisions:
                     return {"status": "hard_risk_block", "orders": [], "reason": reasons}
 
-        # Build a map of current prices from broker state for price validation
-        price_map = {p.symbol: p.current_price for p in positions}
-
-        # 7. Execute approved trades (SELLs first to free cash for BUYs)
         orders = []
-        sorted_decisions = sorted(
-            portfolio_decision.decisions,
-            key=lambda d: 0 if d.action == "SELL" else 1,
-        )
-        for decision in sorted_decisions:
-            if decision.action not in ("BUY", "SELL"):
+        sell_decisions = [d for d in portfolio_decision.decisions if d.action == "SELL"]
+        buy_decisions = [d for d in portfolio_decision.decisions if d.action == "BUY"]
+
+        # 7. Execute SELLs first, then refresh broker state before placing BUYs.
+        sell_order_ids: list[str] = []
+        for decision in sell_decisions:
+            try:
+                existing = [p for p in positions if p.symbol == decision.symbol]
+                if not existing or existing[0].qty <= 0:
+                    continue
+                # Partial sell: 0 < allocation_pct < 100 = sell that fraction; 0 or 100 = full sell
+                if 0 < decision.allocation_pct < 100:
+                    sell_fraction = decision.allocation_pct / 100
+                    qty = existing[0].qty * sell_fraction
+                    if float(existing[0].qty).is_integer():
+                        qty = max(1.0, float(int(qty)))
+                    if qty <= 0:
+                        continue
+                    action_label = f"PARTIAL_SELL({decision.allocation_pct:.0f}%)"
+                else:
+                    qty = self._full_sell_qty(existing[0].qty)
+                    if qty is None:
+                        continue
+                    action_label = "SELL"
+                sell_price = existing[0].current_price
+                # Use limit price slightly below market to protect against slippage
+                sell_limit = round(sell_price * 0.995, 2)
+                order = self.broker.submit_order(
+                    symbol=decision.symbol, qty=qty, side="sell",
+                    limit_price=sell_limit,
+                )
+                orders.append(order)
+                if order.get("id"):
+                    sell_order_ids.append(order["id"])
+                self.db.insert_trade(
+                    symbol=decision.symbol, action=action_label, qty=qty,
+                    price=sell_price, reasoning=decision.reasoning, run_id=run_id,
+                )
+                logger.info(
+                    "Executed: %s %s %s @ limit $%.2f",
+                    action_label.lower(), self._format_qty(qty), decision.symbol, sell_limit,
+                )
+            except Exception as e:
+                logger.error("Order failed for %s %s: %s", decision.action, decision.symbol, e)
+
+        for order_id in sell_order_ids:
+            status = self.broker.wait_for_order_terminal(order_id)
+            if status != "filled":
+                logger.warning(
+                    "Sell order %s did not fill before buy phase (status=%s); buys will use current cash only",
+                    order_id,
+                    status or "unknown",
+                )
+
+        if sell_decisions:
+            account, positions, price_map = self._refresh_account_state()
+            cash = account["cash"]
+            logger.info("Post-sell refresh: $%.2f cash, %d positions", cash, len(positions))
+        else:
+            price_map = {p.symbol: p.current_price for p in positions}
+
+        available_cash = cash
+        for decision in buy_decisions:
+            if decision.action != "BUY":
                 continue
             try:
-                if decision.action == "BUY":
-                    # Use executable pricing from the broker when available.
-                    market_price = price_map.get(decision.symbol)
-                    if not market_price or market_price <= 0:
-                        live_price = self.broker.get_latest_price(decision.symbol)
-                        if live_price and live_price > 0:
-                            market_price = live_price
-                            price_map[decision.symbol] = live_price
+                # Use executable pricing from the broker when available.
+                market_price = price_map.get(decision.symbol)
+                if not market_price or market_price <= 0:
+                    live_price = self.broker.get_latest_price(decision.symbol)
+                    if live_price and live_price > 0:
+                        market_price = live_price
+                        price_map[decision.symbol] = live_price
 
-                    limit_price = None
-                    sizing_price = None
-                    if decision.entry_price > 0:
-                        limit_price = decision.entry_price
+                limit_price = None
+                sizing_price = None
+                if decision.entry_price > 0:
+                    limit_price = decision.entry_price
 
-                    if market_price and market_price > 0:
-                        if limit_price is not None:
-                            deviation = abs(limit_price - market_price) / market_price
-                            if deviation > 0.10:
-                                logger.warning("LLM entry_price $%.2f for %s is %.1f%% away from market $%.2f, using market order",
-                                               decision.entry_price, decision.symbol, deviation * 100, market_price)
-                                limit_price = None
-                                sizing_price = market_price
-                            else:
-                                sizing_price = max(market_price, limit_price)
-                        else:
+                if market_price and market_price > 0:
+                    if limit_price is not None:
+                        deviation = abs(limit_price - market_price) / market_price
+                        if deviation > 0.10:
+                            logger.warning("LLM entry_price $%.2f for %s is %.1f%% away from market $%.2f, using market order",
+                                           decision.entry_price, decision.symbol, deviation * 100, market_price)
+                            limit_price = None
                             sizing_price = market_price
-                    elif limit_price is not None:
-                        logger.warning(
-                            "No live market price for %s; sizing and submitting as a limit order at $%.2f",
-                            decision.symbol,
-                            limit_price,
-                        )
-                        sizing_price = limit_price
+                        else:
+                            sizing_price = max(market_price, limit_price)
                     else:
-                        logger.warning("Invalid price for %s, skipping", decision.symbol)
-                        continue
+                        sizing_price = market_price
+                elif limit_price is not None:
+                    logger.warning(
+                        "No live market price for %s; sizing and submitting as a limit order at $%.2f",
+                        decision.symbol,
+                        limit_price,
+                    )
+                    sizing_price = limit_price
+                else:
+                    logger.warning("Invalid price for %s, skipping", decision.symbol)
+                    continue
 
-                    qty = int((total_value * decision.allocation_pct / 100) / sizing_price)
-                    if qty <= 0:
-                        logger.warning("Calculated qty=0 for %s, skipping", decision.symbol)
-                        continue
-                    order = self.broker.submit_order(
-                        symbol=decision.symbol, qty=qty, side="buy",
-                        limit_price=limit_price,
-                        stop_loss_price=decision.stop_loss if decision.stop_loss > 0 else None,
-                        take_profit_price=decision.take_profit if decision.take_profit > 0 else None,
-                    )
-                    orders.append(order)
-                    self.db.insert_trade(
-                        symbol=decision.symbol, action="BUY", qty=qty,
-                        price=decision.entry_price, reasoning=decision.reasoning, run_id=run_id,
-                        stop_loss=decision.stop_loss, take_profit=decision.take_profit,
-                    )
-                    logger.info("Executed: buy %d %s @ limit $%.2f", qty, decision.symbol, decision.entry_price)
+                qty = int((total_value * decision.allocation_pct / 100) / sizing_price)
+                if qty <= 0:
+                    logger.warning("Calculated qty=0 for %s, skipping", decision.symbol)
+                    continue
 
-                elif decision.action == "SELL":
-                    existing = [p for p in positions if p.symbol == decision.symbol]
-                    if not existing or existing[0].qty <= 0:
-                        continue
-                    # Partial sell: 0 < allocation_pct < 100 = sell that fraction; 0 or 100 = full sell
-                    if 0 < decision.allocation_pct < 100:
-                        sell_fraction = decision.allocation_pct / 100
-                        qty = existing[0].qty * sell_fraction
-                        if float(existing[0].qty).is_integer():
-                            qty = max(1.0, float(int(qty)))
-                        if qty <= 0:
-                            continue
-                        action_label = f"PARTIAL_SELL({decision.allocation_pct:.0f}%)"
-                    else:
-                        qty = self._full_sell_qty(existing[0].qty)
-                        if qty is None:
-                            continue
-                        action_label = "SELL"
-                    sell_price = existing[0].current_price
-                    # Use limit price slightly below market to protect against slippage
-                    sell_limit = round(sell_price * 0.995, 2)
-                    order = self.broker.submit_order(
-                        symbol=decision.symbol, qty=qty, side="sell",
-                        limit_price=sell_limit,
+                estimated_cost = qty * sizing_price
+                if estimated_cost > available_cash:
+                    logger.warning(
+                        "Skipping BUY %s: estimated cost $%.2f exceeds available cash $%.2f after sell phase",
+                        decision.symbol,
+                        estimated_cost,
+                        available_cash,
                     )
-                    orders.append(order)
-                    self.db.insert_trade(
-                        symbol=decision.symbol, action=action_label, qty=qty,
-                        price=sell_price, reasoning=decision.reasoning, run_id=run_id,
-                    )
-                    logger.info(
-                        "Executed: %s %s %s @ limit $%.2f",
-                        action_label.lower(), self._format_qty(qty), decision.symbol, sell_limit,
-                    )
+                    continue
 
+                order = self.broker.submit_order(
+                    symbol=decision.symbol, qty=qty, side="buy",
+                    limit_price=limit_price,
+                    stop_loss_price=decision.stop_loss if decision.stop_loss > 0 else None,
+                    take_profit_price=decision.take_profit if decision.take_profit > 0 else None,
+                )
+                orders.append(order)
+                available_cash -= estimated_cost
+                self.db.insert_trade(
+                    symbol=decision.symbol, action="BUY", qty=qty,
+                    price=decision.entry_price, reasoning=decision.reasoning, run_id=run_id,
+                    stop_loss=decision.stop_loss, take_profit=decision.take_profit,
+                )
+                logger.info("Executed: buy %d %s @ limit $%.2f", qty, decision.symbol, decision.entry_price)
             except Exception as e:
                 logger.error("Order failed for %s %s: %s", decision.action, decision.symbol, e)
 
@@ -717,8 +763,9 @@ class TradingPipeline:
         run_id = f"midday-{uuid.uuid4().hex[:8]}"
         logger.info("=== Midday check: %s ===", run_id)
 
-        # 0. Cancel stale orders to free held quantities
-        self.broker.cancel_open_orders()
+        if not self._is_trading_day():
+            logger.info("Midday run skipped: market closed for non-trading day")
+            return {"status": "market_holiday", "positions": 0, "orders": [], "run_id": run_id}
 
         # 1. Sync positions
         account = self.broker.get_account()
@@ -827,6 +874,10 @@ class TradingPipeline:
     def run_evening(self) -> dict:
         run_id = f"evening-{uuid.uuid4().hex[:8]}"
         logger.info("=== Evening report: %s ===", run_id)
+
+        if not self._is_trading_day():
+            logger.info("Evening run skipped: market closed for non-trading day")
+            return {"status": "market_holiday", "analysis": None, "run_id": run_id}
 
         # 1. Record daily PnL
         account = self.broker.get_account()

@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from datetime import date
 
 import yfinance as yf
@@ -8,7 +9,7 @@ from alpaca.trading.requests import (
     MarketOrderRequest, LimitOrderRequest,
     TakeProfitRequest, StopLossRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
 
 from src.models import Position
 
@@ -131,6 +132,67 @@ class AlpacaBroker:
         except Exception as exc:
             logger.warning("Failed to cancel open orders: %s", exc)
             return 0
+
+    def cancel_open_entry_orders(self) -> int:
+        """Cancel open BUY/entry orders while preserving protective SELL legs."""
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+
+            orders = self.client.get_orders(
+                filter=GetOrdersRequest(
+                    status=QueryOrderStatus.OPEN,
+                    side=OrderSide.BUY,
+                    nested=True,
+                )
+            )
+            count = 0
+            for order in orders or []:
+                order_id = getattr(order, "id", None)
+                order_side = getattr(getattr(order, "side", None), "value", getattr(order, "side", ""))
+                if str(order_side).lower() != "buy" or not order_id:
+                    continue
+                self.client.cancel_order_by_id(order_id)
+                count += 1
+            if count:
+                logger.info("Cancelled %d open entry order(s)", count)
+            return count
+        except Exception as exc:
+            logger.warning("Failed to cancel open entry orders: %s", exc)
+            return 0
+
+    def wait_for_order_terminal(
+        self,
+        order_id: str,
+        timeout_seconds: float = 15.0,
+        poll_interval: float = 1.0,
+    ) -> str | None:
+        """Wait for an order to reach a terminal state and return its last known status."""
+        deadline = time.monotonic() + timeout_seconds
+        terminal_states = {
+            "filled",
+            "canceled",
+            "cancelled",
+            "expired",
+            "rejected",
+            "done_for_day",
+            "replaced",
+        }
+        last_status = None
+
+        while time.monotonic() < deadline:
+            try:
+                order = self.client.get_order_by_id(order_id)
+                status = str(getattr(getattr(order, "status", None), "value", getattr(order, "status", ""))).lower()
+            except Exception as exc:
+                logger.warning("Failed to poll order %s: %s", order_id, exc)
+                return last_status
+
+            last_status = status or last_status
+            if status in terminal_states:
+                return status
+            time.sleep(poll_interval)
+
+        return last_status
 
     def submit_order(self, symbol: str, qty: float, side: str,
                      limit_price: float | None = None,
