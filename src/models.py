@@ -83,7 +83,18 @@ class TradeDecision(BaseModel):
         return self
 
 
+class ReasoningChain(BaseModel):
+    macro_filter: str
+    news_check: str
+    earnings_check: str
+    signal_conflicts: str
+    sizing_logic: str
+    portfolio_balance: str
+    cash_target: str
+
+
 class PortfolioDecision(BaseModel):
+    reasoning_chain: ReasoningChain | None = None
     decisions: list[TradeDecision]
     portfolio_view: str
 

@@ -46,7 +46,22 @@ class RiskManagerAgent(BaseAgent):
         treasury = macro_summary.get("treasury", {})
         fed_funds = macro_summary.get("fed_funds_rate")
 
-        return f"""## Proposed Trades
+        # PM reasoning chain (if available)
+        rc = portfolio_decision.reasoning_chain
+        if rc:
+            reasoning_section = f"""## PM Reasoning Chain (audit this for logic errors)
+- Macro filter: {rc.macro_filter}
+- News check: {rc.news_check}
+- Earnings check: {rc.earnings_check}
+- Signal conflicts: {rc.signal_conflicts}
+- Sizing logic: {rc.sizing_logic}
+- Portfolio balance: {rc.portfolio_balance}
+- Cash target: {rc.cash_target}
+"""
+        else:
+            reasoning_section = ""
+
+        return f"""{reasoning_section}## Proposed Trades
 {decisions_text}
 
 Portfolio View: {portfolio_decision.portfolio_view}

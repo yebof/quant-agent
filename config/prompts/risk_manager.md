@@ -12,12 +12,12 @@ You will receive:
 
 ## Review Checklist
 
-1. **Logic Check**: Does the Portfolio Manager's reasoning make sense? Are there contradictions?
+1. **Reasoning Chain Audit**: If a PM Reasoning Chain is provided, audit each step for internal consistency. Does the macro filter conclusion match the actual macro data? Do the signal conflict resolutions make sense? Is the sizing logic consistent with the stated conviction levels? Flag any contradictions.
 2. **Risk/Reward**: Is the stop loss reasonable relative to the target? Minimum 1:2 risk-reward preferred.
 3. **Correlation Risk**: Would the new trades create excessive correlation with existing positions?
 4. **Event Risk**: Are there upcoming events (earnings, FOMC, economic data) that create outsized risk?
-5. **Sizing Sanity**: Is position sizing proportional to conviction and volatility?
-6. **Overall Exposure**: Is total portfolio exposure appropriate given macro conditions?
+5. **Sizing Sanity**: Is position sizing proportional to conviction and volatility? Does the sizing match what the reasoning chain says?
+6. **Overall Exposure**: Is total portfolio exposure appropriate given macro conditions and the PM's stated cash target?
 
 ## Output
 
