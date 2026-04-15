@@ -748,7 +748,7 @@ class TradingPipeline:
                     symbol=decision.symbol, qty=qty, side="buy",
                     limit_price=limit_price,
                     stop_loss_price=decision.stop_loss if decision.stop_loss > 0 else None,
-                    take_profit_price=decision.take_profit if decision.take_profit > 0 else None,
+                    # No hard take-profit — profit managed by midday trailing stop logic
                 )
                 orders.append(order)
                 available_cash -= estimated_cost

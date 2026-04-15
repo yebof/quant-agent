@@ -45,8 +45,10 @@ class MiddayReviewerAgent(BaseAgent):
             if ctx:
                 sl = ctx.get("stop_loss", 0)
                 tp = ctx.get("take_profit", 0)
-                if sl or tp:
-                    line += f"\n  Stop: ${sl:.2f} | Target: ${tp:.2f}"
+                if sl:
+                    line += f"\n  Hard stop (broker-enforced): ${sl:.2f}"
+                if tp:
+                    line += f" | Reference target: ${tp:.2f} (not a hard TP — you manage exit)"
                 reasoning = ctx.get("reasoning", "")
                 if reasoning:
                     line += f"\n  Entry thesis: {reasoning[:150]}"

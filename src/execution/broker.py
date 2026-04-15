@@ -200,34 +200,32 @@ class AlpacaBroker:
                      take_profit_price: float | None = None) -> dict:
         order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
-        # Use bracket order when stop/target are provided (attaches OCO legs)
-        use_bracket = (stop_loss_price is not None and stop_loss_price > 0
-                       and take_profit_price is not None and take_profit_price > 0
-                       and order_side == OrderSide.BUY)
+        # Attach stop-loss as OTO (one-triggers-other) leg — no hard take-profit,
+        # profit management is handled by midday reviewer's trailing stop logic
+        use_stop = (stop_loss_price is not None and stop_loss_price > 0
+                    and order_side == OrderSide.BUY)
 
         if limit_price is not None:
             kwargs = dict(
                 symbol=symbol, qty=qty, side=order_side,
                 time_in_force=TimeInForce.DAY, limit_price=limit_price,
             )
-            if use_bracket:
-                kwargs["order_class"] = OrderClass.BRACKET
+            if use_stop:
+                kwargs["order_class"] = OrderClass.OTO
                 kwargs["stop_loss"] = StopLossRequest(stop_price=stop_loss_price)
-                kwargs["take_profit"] = TakeProfitRequest(limit_price=take_profit_price)
             request = LimitOrderRequest(**kwargs)
         else:
             kwargs = dict(
                 symbol=symbol, qty=qty, side=order_side,
                 time_in_force=TimeInForce.DAY,
             )
-            if use_bracket:
-                kwargs["order_class"] = OrderClass.BRACKET
+            if use_stop:
+                kwargs["order_class"] = OrderClass.OTO
                 kwargs["stop_loss"] = StopLossRequest(stop_price=stop_loss_price)
-                kwargs["take_profit"] = TakeProfitRequest(limit_price=take_profit_price)
             request = MarketOrderRequest(**kwargs)
 
         order = self.client.submit_order(request)
-        bracket_info = f" [bracket: SL=${stop_loss_price}, TP=${take_profit_price}]" if use_bracket else ""
+        bracket_info = f" [SL=${stop_loss_price}]" if use_stop else ""
         logger.info("Order submitted: %s %s %s @ %s%s — status: %s",
                      side, qty, symbol, limit_price or "market", bracket_info, order.status)
         return {
