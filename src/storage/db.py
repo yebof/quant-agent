@@ -197,11 +197,15 @@ class Database:
             )
             self.conn.commit()
 
-    def get_latest_insights(self) -> dict | None:
+    def get_latest_insights(self, before_date: str | None = None) -> dict | None:
+        if before_date:
+            sql = "SELECT * FROM insights WHERE date < ? ORDER BY date DESC LIMIT 1"
+            params: tuple = (before_date,)
+        else:
+            sql = "SELECT * FROM insights ORDER BY date DESC LIMIT 1"
+            params = ()
         with self._lock:
-            row = self.conn.execute(
-                "SELECT * FROM insights ORDER BY date DESC LIMIT 1"
-            ).fetchone()
+            row = self.conn.execute(sql, params).fetchone()
         return dict(row) if row else None
 
     def close(self):

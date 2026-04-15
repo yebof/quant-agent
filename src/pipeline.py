@@ -210,14 +210,16 @@ class TradingPipeline:
             remaining_violations.extend(violations)
             allowed_decisions.append(decision)
 
-            investment = total_value * (decision.allocation_pct / 100)
-            pending_investment += investment
+            from src.risk.rules import _effective_multiplier
+            raw_investment = total_value * (decision.allocation_pct / 100)
+            effective_investment = raw_investment * _effective_multiplier(decision.symbol)
+            pending_investment += effective_investment
             pending_symbol_investment[decision.symbol] = (
-                pending_symbol_investment.get(decision.symbol, 0.0) + investment
+                pending_symbol_investment.get(decision.symbol, 0.0) + raw_investment
             )
             sector = _get_sector(decision.symbol)
             if sector and sector != "Unknown":
-                pending_sector_investment[sector] = pending_sector_investment.get(sector, 0.0) + investment
+                pending_sector_investment[sector] = pending_sector_investment.get(sector, 0.0) + effective_investment
 
         return allowed_decisions, remaining_violations, blocked_reasons
 
@@ -337,9 +339,11 @@ class TradingPipeline:
                         return True
                     if abs(last_close - indicators.bb_lower) / band_width < 0.1:
                         return True
-            # MACD crossover (histogram near zero and changing sign)
-            if indicators.macd_hist is not None and abs(indicators.macd_hist) < 0.5:
-                return True
+            # MACD crossover (histogram near zero relative to price — within 0.3% of price)
+            if indicators.macd_hist is not None and indicators.ma_20 and indicators.ma_20 > 0:
+                macd_pct = abs(indicators.macd_hist) / indicators.ma_20
+                if macd_pct < 0.003:
+                    return True
             # Significant volume change (> 50%)
             if indicators.volume_change_pct is not None and abs(indicators.volume_change_pct) > 50:
                 return True
@@ -490,7 +494,7 @@ class TradingPipeline:
             return {"status": "no_data", "orders": []}
 
         # 5. Portfolio Manager decision
-        yesterday_insights = self.db.get_latest_insights()
+        yesterday_insights = self.db.get_latest_insights(before_date=str(date.today()))
         if yesterday_insights:
             logger.info("Loaded yesterday's insights (risk=%s): %s",
                         yesterday_insights.get("risk_rating", "?"),
@@ -672,9 +676,9 @@ class TradingPipeline:
                     existing = [p for p in positions if p.symbol == decision.symbol]
                     if not existing or existing[0].qty <= 0:
                         continue
-                    # Partial sell: if allocation_pct > 0, sell that fraction; otherwise full sell
-                    if decision.allocation_pct > 0:
-                        sell_fraction = min(decision.allocation_pct / 100, 1.0)
+                    # Partial sell: 0 < allocation_pct < 100 = sell that fraction; 0 or 100 = full sell
+                    if 0 < decision.allocation_pct < 100:
+                        sell_fraction = decision.allocation_pct / 100
                         qty = existing[0].qty * sell_fraction
                         if float(existing[0].qty).is_integer():
                             qty = max(1.0, float(int(qty)))
@@ -795,7 +799,9 @@ class TradingPipeline:
                                 qty = self._full_sell_qty(existing[0].qty)
                             if qty is None:
                                 continue
-                            order = self.broker.submit_order(symbol=symbol, qty=qty, side="sell")
+                            sell_limit = round(existing[0].current_price * 0.995, 2)
+                            order = self.broker.submit_order(
+                                symbol=symbol, qty=qty, side="sell", limit_price=sell_limit)
                             orders.append(order)
                             self.db.insert_trade(
                                 symbol=symbol, action=action_item["action"], qty=qty,

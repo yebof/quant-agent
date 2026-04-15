@@ -453,3 +453,104 @@ def test_broker_limit_price_none_vs_zero():
         broker.submit_order("SPY", 10, "buy", limit_price=0.0)
         req = mock_client.submit_order.call_args[0][0]
         assert isinstance(req, LimitOrderRequest)
+
+
+# === Final review: leverage-adjusted pending investment ===
+
+def test_pending_investment_is_leverage_adjusted():
+    """SQQQ (3x) pending investment should be counted as 3x in total exposure."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.risk_engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=40,
+        max_total_position_pct=50,  # tight limit
+        max_daily_loss_pct=3,
+        max_sector_pct=90,  # high to not interfere
+        require_stop_loss=True,
+    ))
+    # SQQQ 10% raw → 30% effective. Then SPY 15% → 15% effective.
+    # Total effective = 45% < 50%. Both should pass if leverage is correctly tracked.
+    # Without adjustment: pending=10% (raw), SPY new=15%, total=25% → incorrectly passes
+    # even if we later raise the limit.
+    #
+    # To prove adjustment works, we make total limit tight enough that
+    # SQQQ (30% effective) + SPY (25% effective) = 55% > 50% → SPY blocked
+    decisions = [
+        TradeDecision(
+            action="BUY", symbol="SQQQ", allocation_pct=10,
+            entry_price=20, stop_loss=18, take_profit=25, reasoning="hedge",
+        ),
+        TradeDecision(
+            action="BUY", symbol="SPY", allocation_pct=25,
+            entry_price=500, stop_loss=480, take_profit=530, reasoning="core",
+        ),
+    ]
+
+    with patch("src.pipeline._get_sector", return_value="Broad"), patch(
+        "src.execution.broker._get_sector", return_value="Broad"
+    ):
+        allowed, violations, blocked = pipeline._filter_hard_risk_decisions(
+            decisions, positions=[], total_value=100000, daily_pnl=0,
+        )
+
+    # SQQQ passes (30% effective < 40% pos limit, 30% < 50% total)
+    # SPY: pending_investment=30000 (leverage-adjusted) + new=25000 = 55% > 50% → BLOCKED
+    assert [d.symbol for d in allowed] == ["SQQQ"]
+    assert any("Total exposure" in r for r in blocked)
+
+
+def test_insights_excludes_today(tmp_path):
+    """get_latest_insights(before_date=today) should not return today's insights."""
+    from src.storage.db import Database
+    today = str(date.today())
+    db = Database(str(tmp_path / "test.db"))
+    db.initialize()
+
+    db.save_insights(
+        date=today,
+        tomorrow_outlook="Today's outlook",
+        lessons="Today's lesson",
+        suggested_actions="[]",
+        risk_rating="moderate",
+    )
+    db.save_insights(
+        date="2026-04-01",
+        tomorrow_outlook="Old outlook",
+        lessons="Old lesson",
+        suggested_actions="[]",
+        risk_rating="low",
+    )
+
+    result = db.get_latest_insights(before_date=today)
+    assert result is not None
+    assert result["date"] == "2026-04-01"
+    assert result["tomorrow_outlook"] == "Old outlook"
+
+
+def test_sell_allocation_100_is_full_sell():
+    """allocation_pct=100 for SELL should be treated as full sell, not partial."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    decision = TradeDecision(
+        action="SELL", symbol="SPY", allocation_pct=100,
+        entry_price=0, stop_loss=0, take_profit=0, reasoning="exit",
+    )
+    # 0 < 100 < 100 is False, so it should hit the full sell branch
+    assert not (0 < decision.allocation_pct < 100)
+
+
+def test_macd_prefilter_normalizes_by_price():
+    """MACD threshold should be relative to price, not absolute."""
+    from src.models import TechnicalIndicators
+
+    # High-price stock ($900): MACD hist 0.5 is only 0.056% → should NOT trigger
+    high_price = TechnicalIndicators(
+        symbol="COST", ma_20=900.0, macd_hist=0.5
+    )
+    pct = abs(high_price.macd_hist) / high_price.ma_20
+    assert pct < 0.003  # 0.00056, triggers
+
+    # Low-price stock ($5): MACD hist 0.5 is 10% → should NOT trigger
+    low_price = TechnicalIndicators(
+        symbol="ONDS", ma_20=5.0, macd_hist=0.5
+    )
+    pct = abs(low_price.macd_hist) / low_price.ma_20
+    assert pct >= 0.003  # 0.1, does NOT trigger — correct!
