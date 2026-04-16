@@ -324,6 +324,47 @@ class TradingPipeline:
             logger.error("[%s] News analyst failed: %s", session, e)
             return None
 
+    def _run_earnings_check(self, run_id: str, session: str = "morning") -> tuple[list, list]:
+        """Check for new SEC filings, analyze in background, return cached results."""
+        try:
+            reports = self.earnings_provider.check_and_fetch(self.config.trading.universe)
+            if not reports:
+                return [], []
+
+            new_reports = [r for r in reports if r.is_new]
+            cached_reports = [r for r in reports if not r.is_new]
+
+            cached_results = self.earnings_analyst.analyze_reports(cached_reports)
+
+            if new_reports:
+                symbols = ", ".join(r.symbol for r in new_reports)
+                logger.info("[%s] Background: queued %d new filings for analysis (%s)",
+                            session, len(new_reports), symbols)
+
+                def _bg_analyze(bg_reports):
+                    try:
+                        results = self.earnings_analyst.analyze_reports(bg_reports)
+                        for r in bg_reports:
+                            if any(res["symbol"] == r.symbol and res["is_new"] for res in results):
+                                self.earnings_provider.confirm_filing(r)
+                    except Exception as e:
+                        logger.error("[%s] Background earnings analysis failed: %s", session, e, exc_info=True)
+
+                bg = threading.Thread(
+                    target=_bg_analyze,
+                    args=(new_reports,),
+                    name=f"earnings-bg-{session}",
+                    daemon=True,
+                )
+                bg.start()
+
+            logger.info("[%s] Earnings: %d cached analyses, %d new filings queued",
+                        session, len(cached_results), len(new_reports))
+            return reports, cached_results
+        except Exception as e:
+            logger.error("[%s] Earnings check failed: %s", session, e)
+            return [], []
+
     def run_morning(self) -> dict:
         run_id = f"run-{uuid.uuid4().hex[:8]}"
         logger.info("=== Morning run started: %s ===", run_id)
@@ -410,45 +451,7 @@ class TradingPipeline:
             return {}, None
 
         def _run_earnings():
-            """Check for filings, return cached analyses immediately.
-            New filings are downloaded but analyzed in a background thread
-            so they don't block the trading decision. Results are cached
-            for the next run."""
-            reports = self.earnings_provider.check_and_fetch(self.config.trading.universe)
-            if not reports:
-                return [], []
-
-            new_reports = [r for r in reports if r.is_new]
-            cached_reports = [r for r in reports if not r.is_new]
-
-            # Read cached analyses immediately (fast — disk reads only)
-            cached_results = self.earnings_analyst.analyze_reports(cached_reports)
-
-            # Kick off new filing analysis in background (non-blocking)
-            if new_reports:
-                symbols = ", ".join(r.symbol for r in new_reports)
-                logger.info("Background: queued %d new filings for analysis (%s). "
-                            "Results will be cached for next run.", len(new_reports), symbols)
-
-                def _bg_analyze(reports):
-                    try:
-                        results = self.earnings_analyst.analyze_reports(reports)
-                        # Update manifest only after analysis files are written to disk
-                        for r in reports:
-                            if any(res["symbol"] == r.symbol and res["is_new"] for res in results):
-                                self.earnings_provider.confirm_filing(r)
-                    except Exception as e:
-                        logger.error("Background earnings analysis failed: %s", e, exc_info=True)
-
-                bg = threading.Thread(
-                    target=_bg_analyze,
-                    args=(new_reports,),
-                    name="earnings-bg-analysis",
-                    daemon=True,
-                )
-                bg.start()
-
-            return reports, cached_results
+            return self._run_earnings_check(run_id, session="morning")
 
         logger.info("Starting parallel: macro_analyst + news_analyst + tech_analyst + earnings_check")
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -506,10 +509,7 @@ class TradingPipeline:
 
         earnings_results = []
         try:
-            earnings_reports, earnings_results = earnings_future.result()
-            new_filings = sum(1 for r in earnings_reports if r.is_new)
-            logger.info("Earnings: %d cached analyses for PM, %d new filings analyzing in background",
-                         len(earnings_results), new_filings)
+            _, earnings_results = earnings_future.result()
         except Exception as e:
             logger.error("Earnings check failed: %s. Continuing without earnings.", e)
 
@@ -792,10 +792,11 @@ class TradingPipeline:
                 unrealized_pnl=p.unrealized_pnl, sector=p.sector,
             )
 
-        # 2. News update — capture midday developments
+        # 2. News + Earnings update — capture midday developments
         midday_news = self._run_news_update(run_id, session="midday")
         if midday_news:
             logger.info("Midday news: %s", midday_news.pm_briefing[:200])
+        self._run_earnings_check(run_id, session="midday")
 
         # 3. LLM midday review — assess positions and recommend actions
         macro_summary = self.macro.get_macro_summary()
@@ -918,10 +919,11 @@ class TradingPipeline:
             daily_return_pct=daily_return_pct,
         )
 
-        # 2. News update — capture end-of-day developments
+        # 2. News + Earnings update — capture end-of-day developments
         evening_news = self._run_news_update(run_id, session="evening")
         if evening_news:
             logger.info("Evening news: %s", evening_news.pm_briefing[:200])
+        self._run_earnings_check(run_id, session="evening")
 
         # 3. LLM evening analysis — daily review and tomorrow outlook
         macro_summary = self.macro.get_macro_summary()
