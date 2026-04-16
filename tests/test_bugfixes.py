@@ -11,7 +11,10 @@ from src.agents.base import AgentResult
 from src.pipeline import TradingPipeline
 from src.risk.rules import RiskRuleEngine, RiskViolation
 from src.config import RiskConfig
-from src.models import RiskModification, TechAnalysisResult, TradeDecision, Position
+from src.models import (
+    RiskModification, TechAnalysisResult, TradeDecision, Position,
+    MacroAnalysis, MacroReasoningChain, MacroPositionGuidance, MacroSectorGuidance,
+)
 
 
 # === Fix 1: Hard risk rules actually block trades ===
@@ -551,6 +554,79 @@ def test_same_direction_longs_sum_for_total_exposure():
 
     assert [d.symbol for d in allowed] == ["SPY"]
     assert any("Net exposure" in r for r in blocked)
+
+
+# === MacroAnalysis Pydantic validation (2026-04-17 refactor) ===
+
+def _valid_macro_payload(**overrides) -> dict:
+    base = {
+        "reasoning_chain": {
+            "volatility_analysis": "VIX 19 falling.",
+            "yield_curve_analysis": "Spread -0.2, narrowing.",
+            "monetary_policy_analysis": "DFF 3.60 flat 30d.",
+            "inflation_labor_credit": "Core CPI 2.8, UNRATE 4.1, HY OAS 380bps.",
+            "cross_signal_synthesis": "Four of five align risk-on.",
+            "sector_implications": "OW tech, financials.",
+        },
+        "regime": "risk-on",
+        "confidence": "medium",
+        "equity_outlook": "bullish",
+        "regime_shift": False,
+        "sector_guidance": [
+            {"sector": "Technology", "stance": "overweight", "reason": "AI capex"},
+        ],
+        "position_guidance": {
+            "target_invested_pct": 75.0,
+            "cash_recommendation_pct": 25.0,
+            "reasoning": "Hold buffer.",
+        },
+        "summary": "Moderately supportive.",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_macro_analysis_accepts_full_schema():
+    MacroAnalysis(**_valid_macro_payload())  # should not raise
+
+
+def test_macro_analysis_requires_reasoning_chain():
+    payload = _valid_macro_payload()
+    del payload["reasoning_chain"]
+    with pytest.raises(ValidationError):
+        MacroAnalysis(**payload)
+
+
+def test_macro_analysis_rejects_invalid_regime():
+    with pytest.raises(ValidationError):
+        MacroAnalysis(**_valid_macro_payload(regime="bullish"))  # not in Literal enum
+
+
+def test_macro_analysis_rejects_invalid_sector():
+    payload = _valid_macro_payload()
+    payload["sector_guidance"] = [
+        {"sector": "Financials", "stance": "overweight", "reason": "x"}  # wrong: should be "Financial Services"
+    ]
+    with pytest.raises(ValidationError):
+        MacroAnalysis(**payload)
+
+
+def test_macro_analysis_position_guidance_pct_bounds():
+    payload = _valid_macro_payload()
+    payload["position_guidance"]["target_invested_pct"] = 150  # > 100
+    with pytest.raises(ValidationError):
+        MacroAnalysis(**payload)
+
+
+def test_macro_analysis_allows_all_yfinance_sectors():
+    """All 12 canonical sectors should validate, so sector_guidance covers the universe."""
+    canonical = [
+        "Technology", "Financial Services", "Healthcare", "Consumer Cyclical",
+        "Consumer Defensive", "Energy", "Industrials", "Communication Services",
+        "Utilities", "Basic Materials", "Real Estate", "Broad",
+    ]
+    for sec in canonical:
+        MacroSectorGuidance(sector=sec, stance="neutral", reason="test")
 
 
 def test_single_position_cap_uses_gross_leverage():

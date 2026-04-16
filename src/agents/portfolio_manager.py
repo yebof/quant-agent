@@ -56,11 +56,48 @@ class PortfolioManagerAgent(BaseAgent):
                 f"- {r}" for r in macro_analysis.get("risk_factors", [])
             ) if macro_analysis.get("risk_factors") else "None identified."
 
-            pos_guidance = macro_analysis.get("position_guidance", {})
+            pos_guidance = macro_analysis.get("position_guidance", {}) or {}
+            rc = macro_analysis.get("reasoning_chain", {}) or {}
+
+            shift_line = ""
+            if macro_analysis.get("regime_shift"):
+                shift_line = f"\n- **REGIME SHIFT TODAY**: {macro_analysis.get('shift_reason', 'reason unspecified')}"
+
+            alignment = macro_analysis.get("alignment_with_news", "")
+            alignment_line = f"\n- News alignment: {alignment}" if alignment else ""
+
+            reasoning_section = ""
+            if rc:
+                reasoning_section = f"""
+
+### Macro Reasoning Chain (audit these for logic errors)
+- Volatility: {rc.get('volatility_analysis', 'N/A')}
+- Yield curve: {rc.get('yield_curve_analysis', 'N/A')}
+- Monetary policy: {rc.get('monetary_policy_analysis', 'N/A')}
+- Inflation/labor/credit: {rc.get('inflation_labor_credit', 'N/A')}
+- Cross-signal synthesis: {rc.get('cross_signal_synthesis', 'N/A')}
+- Sector implications: {rc.get('sector_implications', 'N/A')}"""
+
+            bull_triggers = macro_analysis.get("bull_triggers", []) or []
+            bear_triggers = macro_analysis.get("bear_triggers", []) or []
+            triggers_section = ""
+            if bull_triggers or bear_triggers:
+                bull_text = "\n".join(f"  + {t}" for t in bull_triggers) or "  (none)"
+                bear_text = "\n".join(f"  - {t}" for t in bear_triggers) or "  (none)"
+                triggers_section = f"""
+
+### View-Change Triggers
+Bull triggers (would turn more constructive):
+{bull_text}
+Bear triggers (would turn defensive):
+{bear_text}"""
+
+            target_inv = pos_guidance.get('target_invested_pct', 'N/A')
+            cash_rec = pos_guidance.get('cash_recommendation_pct', 'N/A')
 
             macro_section = f"""## Macro Analysis
-- Regime: {macro_analysis.get('regime', 'N/A')} | Outlook: {macro_analysis.get('equity_outlook', 'N/A')} | Confidence: {macro_analysis.get('confidence', 'N/A')}
-- Summary: {macro_analysis.get('summary', 'N/A')}
+- Regime: {macro_analysis.get('regime', 'N/A')} | Outlook: {macro_analysis.get('equity_outlook', 'N/A')} | Confidence: {macro_analysis.get('confidence', 'N/A')}{shift_line}{alignment_line}
+- Summary: {macro_analysis.get('summary', 'N/A')}{reasoning_section}
 
 ### Key Observations
 {observations_text}
@@ -69,11 +106,11 @@ class PortfolioManagerAgent(BaseAgent):
 {sector_guidance_text}
 
 ### Risk Factors
-{risk_factors_text}
+{risk_factors_text}{triggers_section}
 
 ### Position Guidance
-- Overall Exposure: {pos_guidance.get('overall_exposure', 'N/A')}
-- Cash Recommendation: {pos_guidance.get('cash_recommendation', 'N/A')}
+- Target invested: {target_inv}%
+- Cash recommendation: {cash_rec}%
 - Reasoning: {pos_guidance.get('reasoning', 'N/A')}"""
         else:
             macro_section = "## Macro Analysis\nNo macro data available."

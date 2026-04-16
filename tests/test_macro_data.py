@@ -49,3 +49,110 @@ def test_get_macro_summary(mock_fred_cls, mock_fred):
     assert "vix" in summary
     assert "treasury" in summary
     assert "fed_funds_rate" in summary
+    # New in 2026-04-17 refactor
+    assert "inflation" in summary
+    assert "unemployment" in summary
+    assert "credit_spread" in summary
+
+
+@patch("src.data.macro.Fred")
+def test_get_fed_funds_rate_uses_dff_and_returns_dict(mock_fred_cls):
+    """Switched from monthly FEDFUNDS to daily DFF; returns dict with current + 30d change."""
+    mock = MagicMock()
+    # 30 business days of DFF at 3.60% then stepping down to 3.35%
+    mock.get_series.return_value = pd.Series(
+        [3.60] * 15 + [3.35] * 15,
+        index=pd.date_range("2026-03-15", periods=30, freq="B"),
+    )
+    mock_fred_cls.return_value = mock
+
+    provider = MacroDataProvider(api_key="test-key")
+    fed = provider.get_fed_funds_rate()
+
+    assert fed["current"] == pytest.approx(3.35)
+    assert fed["change_30d"] == pytest.approx(-0.25, abs=0.01)
+    assert "staleness_days" in fed
+    # Should have queried DFF, not FEDFUNDS
+    assert mock.get_series.call_args_list[0][0][0] == "DFF"
+
+
+@patch("src.data.macro.Fred")
+def test_get_inflation(mock_fred_cls):
+    """Headline + core CPI YoY and MoM; PCE YoY."""
+    mock = MagicMock()
+    # 14 monthly points so YoY (index[-1]/index[-13]) is defined.
+    # Build a CPI series rising ~3% per year on headline, ~2.8% on core.
+    # YoY is index[-1]/index[-13] − 1 (13 months back, not 14). Step sizes picked
+    # so the ratio hits ~target: step such that (base + 13·step)/(base + step) ≈ 1 + target.
+    def _fake_series(series_id, **kw):
+        if series_id == "CPIAUCSL":
+            vals = [300 + i * 0.75 for i in range(14)]   # ~3.0% YoY
+        elif series_id == "CPILFESL":
+            vals = [310 + i * 0.72 for i in range(14)]   # ~2.8% YoY
+        elif series_id == "PCEPI":
+            vals = [120 + i * 0.25 for i in range(14)]   # ~2.5% YoY
+        else:
+            vals = [0.0]
+        return pd.Series(vals, index=pd.date_range("2025-03-01", periods=len(vals), freq="MS"))
+
+    mock.get_series.side_effect = _fake_series
+    mock_fred_cls.return_value = mock
+
+    provider = MacroDataProvider(api_key="test-key")
+    infl = provider.get_inflation()
+
+    assert infl["headline_cpi_yoy"] == pytest.approx(3.0, abs=0.1)
+    assert infl["core_cpi_yoy"] == pytest.approx(2.8, abs=0.1)
+    assert infl["pce_yoy"] == pytest.approx(2.5, abs=0.1)
+    assert infl["headline_cpi_mom"] is not None
+
+
+@patch("src.data.macro.Fred")
+def test_get_unemployment(mock_fred_cls):
+    """UNRATE level + 3m and 12m changes."""
+    mock = MagicMock()
+    # Starting at 3.8%, ending at 4.1% over 13 months → +0.3pp 12m, last 3m +0.1pp
+    vals = [3.8, 3.8, 3.9, 3.9, 3.9, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.1, 4.1]
+    mock.get_series.return_value = pd.Series(
+        vals, index=pd.date_range("2025-04-01", periods=13, freq="MS"),
+    )
+    mock_fred_cls.return_value = mock
+
+    provider = MacroDataProvider(api_key="test-key")
+    une = provider.get_unemployment()
+
+    assert une["current"] == 4.1
+    assert une["change_3m"] == pytest.approx(0.1, abs=0.01)
+    assert une["change_12m"] == pytest.approx(0.3, abs=0.01)
+
+
+@patch("src.data.macro.Fred")
+def test_get_credit_spread(mock_fred_cls):
+    """HY OAS returned in bps, 30-day change computed."""
+    mock = MagicMock()
+    # FRED returns HY OAS in percent (e.g. 3.80 = 380bps). Convert to bps.
+    mock.get_series.return_value = pd.Series(
+        [3.50, 3.60, 3.80],
+        index=pd.date_range("2026-03-17", periods=3, freq="10B"),
+    )
+    mock_fred_cls.return_value = mock
+
+    provider = MacroDataProvider(api_key="test-key")
+    hy = provider.get_credit_spread()
+
+    assert hy["current_bps"] == pytest.approx(380.0, abs=0.1)
+    assert hy["change_30d_bps"] == pytest.approx(30.0, abs=0.1)
+
+
+@patch("src.data.macro.Fred")
+def test_empty_series_returns_safe_nulls(mock_fred_cls):
+    """When FRED returns empty (network issue, stale holiday), fetchers don't crash."""
+    mock = MagicMock()
+    mock.get_series.return_value = pd.Series(dtype=float)
+    mock_fred_cls.return_value = mock
+
+    provider = MacroDataProvider(api_key="test-key")
+    assert provider.get_fed_funds_rate()["current"] is None
+    assert provider.get_inflation()["core_cpi_yoy"] is None
+    assert provider.get_unemployment()["current"] is None
+    assert provider.get_credit_spread()["current_bps"] is None

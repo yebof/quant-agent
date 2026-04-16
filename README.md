@@ -58,7 +58,7 @@ Evening (post-market)
 |-------|------|-------------|
 | **Tech Analyst** | Batch technical analysis | Pre-filtered: only actionable signals sent to LLM (RSI extremes, BB proximity, MACD crossover, volume spike) |
 | **News Intelligence** | 3-layer news analysis | Layer 1: Persistent macro narrative. Layer 2: State change detection. Layer 3: Per-symbol alerts with conviction. Daily storage in `data/news/` |
-| **Macro Analyst** | Regime assessment & sector guidance | VIX, Treasury yields, Fed funds rate via FRED API |
+| **Macro Analyst** | Regime assessment & sector guidance | 6-step CoT (vol / curve / monetary / inflation+labor+credit / cross-signal / sector). Inputs: VIX, 2Y/10Y yields, **DFF** (daily fed funds), **core & headline CPI**, **UNRATE**, **HY OAS**. Persists yesterday's regime → detects `regime_shift`. Cross-references News narrative via `alignment_with_news`. Emits bull/bear view-change triggers. |
 | **Earnings Analyst** | SEC 10-Q/10-K analysis | Revenue, margins, strategic direction, competitive positioning, strategic vs operational risks, strategy consistency across filings |
 | **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain (macro → news → earnings → signal conflicts → sizing → balance → cash). Each decision traces which signals aligned/conflicted |
 | **Risk Manager** | Trade review with veto power | Audits PM's reasoning chain for logic errors. Sees full macro context (VIX + yields + spread + fed funds). Can modify allocation, stop, target |
@@ -159,7 +159,8 @@ quant-agent/
 │   ├── agents/                    # 8 LLM agents
 │   ├── data/
 │   │   ├── market.py              # yfinance OHLCV
-│   │   ├── macro.py               # FRED API
+│   │   ├── macro.py               # FRED API (VIX, yields, DFF, CPI, UNRATE, HY OAS)
+│   │   ├── macro_store.py         # Persists yesterday's regime for shift detection
 │   │   ├── news.py                # RSS feeds + symbol mention tagging
 │   │   ├── news_store.py          # Dated news storage + narrative persistence
 │   │   ├── earnings.py            # SEC EDGAR provider
@@ -170,7 +171,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 115 tests
+├── tests/                         # 133 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -181,7 +182,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 115 tests
+pytest tests/ -v    # 133 tests
 ```
 
 ## Data Sources
@@ -189,7 +190,7 @@ pytest tests/ -v    # 115 tests
 | Source | Data | Provider |
 |--------|------|----------|
 | Market data | OHLCV, sector performance | yfinance |
-| Macro | VIX, Treasury yields, Fed funds rate | FRED API |
+| Macro | VIX, 2Y/10Y yields, DFF (daily fed funds), headline & core CPI, PCE, UNRATE, HY OAS spread | FRED API |
 | News | Real-time headlines (9 RSS feeds) | Reuters, CNBC, MarketWatch, AP, BBC, NPR, Fed |
 | Earnings | 10-Q/10-K filings + strategic analysis | SEC EDGAR |
 | Trading | Orders, positions, account, calendar, live quotes | Alpaca API |
@@ -208,6 +209,9 @@ pytest tests/ -v    # 115 tests
 - `YYYY-MM-DD/full_report.json` — daily news intelligence report
 - `YYYY-MM-DD/stock_alerts/` — per-symbol news alerts
 - `YYYY-MM-DD/raw_headlines.json` — raw headlines for audit
+
+**File-based** (`data/macro/`):
+- `last_state.json` — yesterday's regime/confidence/outlook snapshot for shift detection
 
 **File-based** (`data/earnings/`):
 - `{SYMBOL}/analysis_{10-Q}_{date}.md` — cached SEC filing analyses

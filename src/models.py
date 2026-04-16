@@ -113,6 +113,64 @@ class RiskVerdict(BaseModel):
     reasoning: str
 
 
+class MacroObservation(BaseModel):
+    indicator: str
+    reading: str
+    interpretation: str
+
+
+# yfinance sector taxonomy (matches what broker._get_sector returns).
+# "Broad" covers index ETFs (SPY/QQQ/IWM/DIA) that have no single sector tag.
+_ALLOWED_SECTORS = (
+    "Technology", "Financial Services", "Healthcare", "Consumer Cyclical",
+    "Consumer Defensive", "Energy", "Industrials", "Communication Services",
+    "Utilities", "Basic Materials", "Real Estate", "Broad",
+)
+
+
+class MacroSectorGuidance(BaseModel):
+    sector: Literal[
+        "Technology", "Financial Services", "Healthcare", "Consumer Cyclical",
+        "Consumer Defensive", "Energy", "Industrials", "Communication Services",
+        "Utilities", "Basic Materials", "Real Estate", "Broad",
+    ]
+    stance: Literal["overweight", "neutral", "underweight"]
+    reason: str
+
+
+class MacroPositionGuidance(BaseModel):
+    target_invested_pct: float = Field(ge=0, le=100)
+    cash_recommendation_pct: float = Field(ge=0, le=100)
+    reasoning: str
+
+
+class MacroReasoningChain(BaseModel):
+    """Six-step CoT, one field per step — forces the LLM to walk each stage."""
+    volatility_analysis: str        # VIX regime, trend, term structure if inferable
+    yield_curve_analysis: str       # 2Y/10Y level, spread, inversion trajectory
+    monetary_policy_analysis: str   # Fed funds (DFF) level + direction
+    inflation_labor_credit: str     # CPI + UNRATE + HY OAS combined read
+    cross_signal_synthesis: str     # How the above reinforce or contradict each other
+    sector_implications: str        # What this means for sector tilts
+
+
+class MacroAnalysis(BaseModel):
+    reasoning_chain: MacroReasoningChain
+    regime: Literal["risk-on", "risk-off", "neutral", "transitional"]
+    confidence: Literal["high", "medium", "low"]
+    equity_outlook: Literal["bullish", "bearish", "neutral"]
+    regime_shift: bool = False
+    shift_reason: str = ""
+    key_observations: list[MacroObservation] = []
+    sector_guidance: list[MacroSectorGuidance] = []
+    risk_factors: list[str] = []
+    position_guidance: MacroPositionGuidance
+    bull_triggers: list[str] = []
+    bear_triggers: list[str] = []
+    alignment_with_news: str = ""
+    summary: str
+
+
 class NewsEvent(BaseModel):
     headline: str
     impact: str  # "high" | "medium" | "low"

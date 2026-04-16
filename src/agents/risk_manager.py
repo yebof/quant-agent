@@ -42,9 +42,14 @@ class RiskManagerAgent(BaseAgent):
             for v in rule_violations
         ) if rule_violations else "No hard rule violations detected."
 
-        vix = macro_summary.get("vix", {})
-        treasury = macro_summary.get("treasury", {})
-        fed_funds = macro_summary.get("fed_funds_rate")
+        vix = macro_summary.get("vix", {}) or {}
+        treasury = macro_summary.get("treasury", {}) or {}
+        fed_funds_obj = macro_summary.get("fed_funds_rate", {}) or {}
+        # Backward-compat: fed_funds_rate was previously a float; now a dict.
+        if isinstance(fed_funds_obj, (int, float)):
+            fed_funds = fed_funds_obj
+        else:
+            fed_funds = fed_funds_obj.get("current")
 
         # PM reasoning chain (if available)
         rc = portfolio_decision.reasoning_chain

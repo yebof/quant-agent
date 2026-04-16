@@ -11,6 +11,7 @@ from src.data.market import MarketDataProvider
 from src.data.macro import MacroDataProvider
 from src.data.news import NewsDataProvider
 from src.data.news_store import NewsStore
+from src.data.macro_store import MacroStore
 from src.data.technical import compute_indicators
 from src.agents.tech_analyst import TechAnalystAgent
 from src.agents.portfolio_manager import PortfolioManagerAgent
@@ -101,6 +102,7 @@ class TradingPipeline:
         )
         self.news_provider = NewsDataProvider()
         self.news_store = NewsStore()
+        self.macro_store = MacroStore()
         self.earnings_analyst = EarningsAnalystAgent(
             api_key=_key_for(config.llm.earnings_analyst_model),
             model=config.llm.earnings_analyst_model,
@@ -393,11 +395,27 @@ class TradingPipeline:
         # 2. Parallel: Macro Analyst + News Analyst + Tech Analyst
         def _run_macro():
             macro_summary = self.macro.get_macro_summary()
-            logger.info("Macro data: VIX=%s", macro_summary.get("vix", {}).get("current"))
+            logger.info(
+                "Macro data: VIX=%s, HY OAS=%sbps, CPI core YoY=%s, UNRATE=%s",
+                macro_summary.get("vix", {}).get("current"),
+                macro_summary.get("credit_spread", {}).get("current_bps"),
+                macro_summary.get("inflation", {}).get("core_cpi_yoy"),
+                macro_summary.get("unemployment", {}).get("current"),
+            )
+            # Load yesterday's regime (for shift detection) and News narrative (cross-ref).
+            last_state = self.macro_store.load_last_state()
+            news_narrative = self.news_store.load_macro_narrative()
             analysis, result = self.macro_analyst.analyze(
                 macro_summary=macro_summary,
                 universe=self.config.trading.universe,
+                last_state=last_state,
+                news_narrative=news_narrative,
             )
+            if analysis:
+                try:
+                    self.macro_store.save_last_state(analysis)
+                except Exception as e:
+                    logger.warning("Failed to persist macro last state: %s", e)
             return macro_summary, analysis, result
 
         def _run_news():
