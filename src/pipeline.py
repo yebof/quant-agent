@@ -515,7 +515,7 @@ class TradingPipeline:
 
         if not analyses:
             logger.warning("No analyses produced, skipping trading")
-            return {"status": "no_data", "orders": []}
+            return {"status": "no_data", "orders": [], "run_id": run_id}
 
         # 5. Portfolio Manager decision
         yesterday_insights = self.db.get_latest_insights(before_date=str(date.today()))
@@ -686,7 +686,9 @@ class TradingPipeline:
         if sell_decisions:
             account, positions, price_map = self._refresh_account_state()
             cash = account["cash"]
-            logger.info("Post-sell refresh: $%.2f cash, %d positions", cash, len(positions))
+            total_value = account["portfolio_value"]
+            logger.info("Post-sell refresh: $%.2f total, $%.2f cash, %d positions",
+                        total_value, cash, len(positions))
         else:
             price_map = {p.symbol: p.current_price for p in positions}
 

@@ -28,13 +28,15 @@ class AgentResult:
         except json.JSONDecodeError:
             pass
 
-        candidates: list[tuple[int, dict | list]] = []
+        candidates: list[tuple[int, int, dict | list]] = []
+        idx = 0
         for match in re.finditer(r"```(?:json)?\s*\n(.*?)\n```", self.raw_text, re.DOTALL):
             try:
                 parsed = json.loads(match.group(1).strip())
             except json.JSONDecodeError:
                 continue
-            candidates.append((match.end(), parsed))
+            candidates.append((len(json.dumps(parsed)), idx, parsed))
+            idx += 1
 
         decoder = json.JSONDecoder()
         for i, ch in enumerate(self.raw_text):
@@ -44,9 +46,11 @@ class AgentResult:
                 parsed, end = decoder.raw_decode(self.raw_text[i:])
             except json.JSONDecodeError:
                 continue
-            candidates.append((i + end, parsed))
+            candidates.append((len(json.dumps(parsed)), idx, parsed))
+            idx += 1
         if candidates:
-            return max(candidates, key=lambda item: item[0])[1]
+            # Pick the largest JSON object; on tie, pick the later one (higher idx)
+            return max(candidates, key=lambda item: (item[0], item[1]))[2]
 
         logger.warning("Failed to parse agent response as JSON: %s", self.raw_text[:200])
         return None

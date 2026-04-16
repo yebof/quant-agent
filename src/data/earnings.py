@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -55,27 +56,35 @@ class EarningsDataProvider:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.data_dir / "manifest.json"
+        self._manifest_lock = threading.Lock()
         self.manifest = self._load_manifest()
         self.lookback_days = lookback_days
         self._ticker_to_cik: dict[str, str] | None = None
 
     def _load_manifest(self) -> dict:
         if self.manifest_path.exists():
-            return json.loads(self.manifest_path.read_text())
+            try:
+                return json.loads(self.manifest_path.read_text())
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning("Corrupt manifest, starting fresh: %s", e)
         return {}
 
     def save_manifest(self):
-        self.manifest_path.write_text(json.dumps(self.manifest, indent=2))
+        with self._manifest_lock:
+            tmp = self.manifest_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.manifest, indent=2))
+            os.replace(str(tmp), str(self.manifest_path))
 
     def confirm_filing(self, report: "EarningsReport"):
         """Mark a filing as processed in the manifest. Call after analysis file is written."""
-        manifest_key = f"{report.symbol}_{report.form_type}"
-        self.manifest[manifest_key] = {
-            "filing_date": report.filing_date,
-            "form_type": report.form_type,
-            "local_path": report.filing_path,
-            "analysis_path": report.analysis_path,
-        }
+        with self._manifest_lock:
+            manifest_key = f"{report.symbol}_{report.form_type}"
+            self.manifest[manifest_key] = {
+                "filing_date": report.filing_date,
+                "form_type": report.form_type,
+                "local_path": report.filing_path,
+                "analysis_path": report.analysis_path,
+            }
         self.save_manifest()
 
     def _sec_get(self, url: str) -> bytes:
