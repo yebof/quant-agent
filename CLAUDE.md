@@ -17,12 +17,16 @@ LLM multi-agent 美股量化交易系统，通过 Alpaca 执行交易（默认 p
 - **SELL `allocation_pct`**：100=全卖、1-99=部分、0=跳过（不要再用 0 表示全卖）
 - **DB**：SQLite WAL；midday `sync_positions` 整体替换仓位快照；evening `prune_agent_logs(30天)`
 - **MacroAnalyst**：6 步 reasoning_chain (vol / curve / monetary / inflation+labor+credit / cross-signal / sector)；持久化到 `data/macro/last_state.json` 做 regime-shift 检测；读昨日 News narrative 做 `alignment_with_news` 交叉验证；输出含 `bull_triggers` / `bear_triggers`；`sector_guidance.sector` 限定为 yfinance 枚举
+- **Midday trailing stop 是真实订单**：`TRAIL_STOP` 动作走 `broker.replace_stop_loss()`——取消旧 stop + 下新 stop。HOLD 是不动、REDUCE 是真卖半仓、SELL 是真全平
+- **RiskManager 可以 `scale_all_buys: 0.0-1.0`** 对所有 BUY 做组合级缩放；看到 `tech_analyses` 可以审计 PM 对底层信号的忠实度
+- **硬风控 + macro_exposure_deviation 软违规**：实际净敞口偏离 Macro 的 `target_invested_pct` > 15pp 时给 RM 一个 advisory（不拦单）
+- **责任边界**：Macro 拥有 regime 枚举的权威；News 的 `current_regime` 只描述新闻/地缘背景，不复述枚举
 - **生产调度**：macOS launchd，Mon-Fri SGT 22:00/04:00/08:30 → morning/midday/evening（对应美东 10:00/16:00/20:30）
 
 ## 开发规范
 
 - Python 3.11+，依赖管理用 pyproject.toml
-- 测试：`pytest tests/ -v`（133 tests）
+- 测试：`pytest tests/ -v`（139 tests）
 - 配置：`config/settings.yaml`，API key 通过 `${ENV_VAR}` 引用 `.env`
 - Agent prompts 在 `config/prompts/*.md`
 - 入口：`python main.py --mode morning|midday|evening|live`

@@ -25,15 +25,15 @@ Respond ONLY with valid JSON:
 
 ```json
 {
-  "daily_summary": "Portfolio returned +0.8% vs SPY +0.3%. GOOGL and IWM buys from this morning are both in profit.",
-  "winners": ["GOOGL +1.2%"],
-  "losers": ["IWM -0.3%"],
-  "lessons": "Entry timing on IWM was slightly early — RSI was still declining when we bought.",
+  "daily_summary": "Portfolio returned +0.8% vs SPY +0.3%. GOOGL and IWM buys from this morning are both in profit. IWM entry was slightly early — RSI was still declining when we bought.",
+  "lessons": "Entry timing on IWM was slightly early — RSI was still declining when we bought. Next time, wait for RSI to bottom and turn before adding small caps on a recovery thesis.",
   "tomorrow_outlook": "Watch for FOMC minutes release at 2pm ET. VIX elevated at 24 suggests caution. Consider tightening stops if market weakness persists.",
   "risk_rating": "moderate",
   "suggested_actions": ["Tighten IWM stop to $248 from $245", "Watch NVDA for potential entry below $280"]
 }
 ```
+
+Fold winners/losers commentary into `daily_summary` (prose) rather than as separate arrays — the pipeline only consumes the summary plus tomorrow_outlook/lessons/risk_rating/suggested_actions.
 
 risk_rating: "low", "moderate", "elevated", "high"
 

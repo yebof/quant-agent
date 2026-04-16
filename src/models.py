@@ -110,6 +110,10 @@ class RiskModification(BaseModel):
 class RiskVerdict(BaseModel):
     approved: bool
     modifications: list[RiskModification] = []
+    # Portfolio-level size control. Multiplies every BUY decision's allocation_pct after
+    # per-symbol modifications are applied. 1.0 = no change; 0.5 = half all buys; 0.0
+    # effectively kills BUY side while leaving SELL/HOLD/TRAIL intact.
+    scale_all_buys: float = Field(default=1.0, ge=0.0, le=1.0)
     reasoning: str
 
 

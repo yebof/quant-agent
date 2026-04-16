@@ -70,10 +70,22 @@ Current: {recent_bars[-1].close if recent_bars else 'N/A'}""")
         # Handle both array response and single object
         items = parsed if isinstance(parsed, list) else [parsed]
         analyses = {}
+        failed_symbols: list[str] = []
         for item in items:
             try:
                 analysis = TechAnalysisResult(**item)
                 analyses[analysis.symbol] = analysis
             except Exception as e:
-                logger.error("Failed to parse tech analysis item: %s", e)
+                # Preserve which symbol we lost — PM's input_summary shouldn't pretend
+                # the batch was complete if schema validation dropped items.
+                bad_symbol = str((item or {}).get("symbol", "?")) if isinstance(item, dict) else "?"
+                failed_symbols.append(bad_symbol)
+                logger.error("Failed to parse tech analysis item for %s: %s", bad_symbol, e)
+        submitted = {s.get("symbol") for s in symbols_data if isinstance(s, dict)}
+        missing = submitted - set(analyses.keys())
+        if missing or failed_symbols:
+            logger.warning(
+                "Tech batch incomplete: submitted=%d, parsed=%d, validation-failed=%s, missing-from-response=%s",
+                len(submitted), len(analyses), failed_symbols, sorted(missing),
+            )
         return analyses, result

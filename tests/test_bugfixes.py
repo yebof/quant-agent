@@ -618,6 +618,63 @@ def test_macro_analysis_position_guidance_pct_bounds():
         MacroAnalysis(**payload)
 
 
+# === Agent-coordination refactor (2026-04-17 follow-up) ===
+
+def test_macro_exposure_deviation_emits_advisory_violation():
+    """When projected net exposure deviates > 15pp from macro target, a non-blocking violation is emitted."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.risk_engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=40, max_total_position_pct=90,
+        max_daily_loss_pct=3, max_sector_pct=90, require_stop_loss=True,
+    ))
+    decisions = [
+        TradeDecision(action="BUY", symbol="SPY", allocation_pct=40,
+                      entry_price=500, stop_loss=480, take_profit=530, reasoning="aggressive"),
+    ]
+    with patch("src.pipeline._get_sector", return_value="Broad"), patch(
+        "src.execution.broker._get_sector", return_value="Broad"
+    ):
+        allowed, violations, blocked = pipeline._filter_hard_risk_decisions(
+            decisions, positions=[], total_value=100000, daily_pnl=0,
+            macro_target_invested_pct=20,  # Macro says "stay light at 20%", PM is at 40%
+        )
+
+    assert [d.symbol for d in allowed] == ["SPY"]  # advisory — not blocked
+    deviation_rules = [v.rule for v in violations]
+    assert "macro_exposure_deviation" in deviation_rules
+
+
+def test_macro_exposure_deviation_skipped_when_within_tolerance():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.risk_engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=40, max_total_position_pct=90,
+        max_daily_loss_pct=3, max_sector_pct=90, require_stop_loss=True,
+    ))
+    decisions = [
+        TradeDecision(action="BUY", symbol="SPY", allocation_pct=25,
+                      entry_price=500, stop_loss=480, take_profit=530, reasoning="on target"),
+    ]
+    with patch("src.pipeline._get_sector", return_value="Broad"), patch(
+        "src.execution.broker._get_sector", return_value="Broad"
+    ):
+        _, violations, _ = pipeline._filter_hard_risk_decisions(
+            decisions, positions=[], total_value=100000, daily_pnl=0,
+            macro_target_invested_pct=20,  # 25% vs 20% = 5pp deviation, under 15pp tolerance
+        )
+    assert not any(v.rule == "macro_exposure_deviation" for v in violations)
+
+
+def test_risk_verdict_accepts_scale_all_buys():
+    from src.models import RiskVerdict
+    v = RiskVerdict(approved=True, scale_all_buys=0.5, reasoning="Cut exposure")
+    assert v.scale_all_buys == 0.5
+    # bounds
+    with pytest.raises(ValidationError):
+        RiskVerdict(approved=True, scale_all_buys=1.5, reasoning="x")
+    with pytest.raises(ValidationError):
+        RiskVerdict(approved=True, scale_all_buys=-0.1, reasoning="x")
+
+
 def test_macro_analysis_allows_all_yfinance_sectors():
     """All 12 canonical sectors should validate, so sector_guidance covers the universe."""
     canonical = [

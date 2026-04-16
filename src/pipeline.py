@@ -181,6 +181,7 @@ class TradingPipeline:
         total_value: float,
         daily_pnl: float,
         baseline: float | None = None,
+        macro_target_invested_pct: float | None = None,
     ) -> tuple[list[TradeDecision], list, list[str]]:
         allowed_decisions: list[TradeDecision] = []
         remaining_violations = []
@@ -227,6 +228,26 @@ class TradingPipeline:
             sector = _get_sector(decision.symbol)
             if sector and sector != "Unknown":
                 pending_sector_investment[sector] = pending_sector_investment.get(sector, 0.0) + gross_investment
+
+        # Advisory check: projected net exposure vs macro's target_invested_pct.
+        # Does NOT block trades; emits a non-hard violation so RiskManager sees it
+        # and can either scale_all_buys or override with a reasoning.
+        if macro_target_invested_pct is not None and total_value > 0:
+            from src.risk.rules import _effective_multiplier, RiskViolation
+            existing_net = sum(p.market_value * _effective_multiplier(p.symbol) for p in positions)
+            projected_invested_pct = abs(existing_net + pending_investment) / total_value * 100
+            deviation = projected_invested_pct - macro_target_invested_pct
+            if abs(deviation) > 15:
+                remaining_violations.append(RiskViolation(
+                    rule="macro_exposure_deviation",
+                    message=(
+                        f"Projected net exposure {projected_invested_pct:.0f}% deviates "
+                        f"from Macro target {macro_target_invested_pct:.0f}% by {deviation:+.0f}pp "
+                        f"(advisory — RM should consider scale_all_buys)"
+                    ),
+                    value=projected_invested_pct,
+                    limit=macro_target_invested_pct,
+                ))
 
         return allowed_decisions, remaining_violations, blocked_reasons
 
@@ -342,6 +363,19 @@ class TradingPipeline:
             cached_reports = [r for r in reports if not r.is_new]
 
             cached_results = self.earnings_analyst.analyze_reports(cached_reports)
+
+            # Insert lightweight placeholder entries for filings whose LLM analysis is
+            # running in the background. PM needs to know "a fresh 10-Q dropped today,
+            # treat the cached prior analysis with a bigger grain of salt".
+            for r in new_reports:
+                cached_results.append({
+                    "symbol": r.symbol,
+                    "analysis": None,
+                    "is_new": True,
+                    "queued": True,
+                    "form_type": r.form_type,
+                    "filing_date": r.filing_date,
+                })
 
             if new_reports:
                 symbols = ", ".join(r.symbol for r in new_reports)
@@ -604,12 +638,17 @@ class TradingPipeline:
         # marks and any fills (including broker-triggered OTO stop-losses we never
         # submitted ourselves). Avoids the old unrealized-only blind spot.
         daily_pnl = total_value - last_equity
+        macro_target_pct = None
+        if macro_analysis:
+            pg = macro_analysis.get("position_guidance", {}) or {}
+            macro_target_pct = pg.get("target_invested_pct")
         portfolio_decision.decisions, rule_violations, blocked_reasons = self._filter_hard_risk_decisions(
             portfolio_decision.decisions,
             positions,
             total_value,
             daily_pnl,
             baseline=last_equity,
+            macro_target_invested_pct=macro_target_pct,
         )
         if blocked_reasons:
             reasons = "; ".join(dict.fromkeys(blocked_reasons))
@@ -621,12 +660,14 @@ class TradingPipeline:
                 len(portfolio_decision.decisions),
             )
 
-        # 6. Risk Manager LLM review (with remaining non-blocking violations as advisory)
+        # 6. Risk Manager LLM review (with remaining non-blocking violations as advisory).
+        # Pass tech_analyses so RM can audit PM's fidelity to the underlying ratings.
         verdict, rm_result = self.risk_manager.review(
             portfolio_decision=portfolio_decision,
             positions=positions,
             macro_summary=macro_summary,
             rule_violations=rule_violations,
+            tech_analyses=analyses,
         )
 
         self.db.insert_agent_log(
@@ -649,12 +690,39 @@ class TradingPipeline:
                 portfolio_decision.decisions,
                 verdict.modifications,
             )
+
+        # Portfolio-level scaling: RM may pull all BUY sizes down uniformly (e.g. 0.5
+        # for a "half everything, macro uncertain" call) without having to emit
+        # per-symbol modifications.
+        scale = getattr(verdict, "scale_all_buys", 1.0) or 1.0
+        if scale < 1.0 and scale >= 0.0:
+            scaled: list[TradeDecision] = []
+            for d in portfolio_decision.decisions:
+                if d.action == "BUY":
+                    new_alloc = max(0.0, min(100.0, d.allocation_pct * scale))
+                    if new_alloc <= 0:
+                        logger.info("scale_all_buys=%.2f drops %s (alloc 0 after scaling)",
+                                    scale, d.symbol)
+                        continue
+                    try:
+                        scaled.append(d.model_copy(update={"allocation_pct": new_alloc}))
+                        logger.info("scale_all_buys=%.2f: %s %.2f%% → %.2f%%",
+                                    scale, d.symbol, d.allocation_pct, new_alloc)
+                    except Exception as e:
+                        logger.warning("scale_all_buys copy failed for %s: %s — keeping original", d.symbol, e)
+                        scaled.append(d)
+                else:
+                    scaled.append(d)
+            portfolio_decision.decisions = scaled
+
+        if verdict.modifications or scale < 1.0:
             portfolio_decision.decisions, _, blocked_reasons = self._filter_hard_risk_decisions(
                 portfolio_decision.decisions,
                 positions,
                 total_value,
                 daily_pnl,
                 baseline=last_equity,
+                macro_target_invested_pct=macro_target_pct,
             )
             if blocked_reasons:
                 reasons = "; ".join(dict.fromkeys(blocked_reasons))
@@ -665,6 +733,18 @@ class TradingPipeline:
         orders = []
         sell_decisions = [d for d in portfolio_decision.decisions if d.action == "SELL"]
         buy_decisions = [d for d in portfolio_decision.decisions if d.action == "BUY"]
+        hold_decisions = [d for d in portfolio_decision.decisions if d.action == "HOLD"]
+
+        # Log HOLDs to the audit trail — no order placed, but PM's reasoning for
+        # deliberately NOT trading is preserved for evening/next-morning review.
+        for d in hold_decisions:
+            try:
+                self.db.insert_trade(
+                    symbol=d.symbol, action="HOLD", qty=0.0, price=0.0,
+                    reasoning=d.reasoning, run_id=run_id,
+                )
+            except Exception as e:
+                logger.warning("Failed to record HOLD decision for %s: %s", d.symbol, e)
 
         # 7. Execute SELLs first, then refresh broker state before placing BUYs.
         sell_order_ids: list[str] = []
@@ -908,19 +988,55 @@ class TradingPipeline:
                     except Exception as e:
                         logger.error("Emergency sell failed for %s: %s", p.symbol, e)
             else:
-                # 4. Execute LLM-recommended actions (SELL/REDUCE only)
+                # 4. Execute LLM-recommended actions (SELL / REDUCE / TRAIL_STOP).
+                # HOLD is intentionally a no-op (position stays, broker stop unchanged).
                 if review and review.get("actions"):
                     for action_item in review["actions"]:
-                        if action_item.get("action") not in ("SELL", "REDUCE"):
+                        act = action_item.get("action")
+                        if act not in ("SELL", "REDUCE", "TRAIL_STOP"):
                             continue
                         symbol = action_item.get("symbol", "")
                         existing = [p for p in positions if p.symbol == symbol]
                         if not existing or existing[0].qty <= 0:
                             logger.warning("Midday: skipping %s %s — no matching position",
-                                           action_item.get("action"), symbol)
+                                           act, symbol)
                             continue
                         try:
-                            if action_item["action"] == "REDUCE":
+                            if act == "TRAIL_STOP":
+                                # Actual broker stop replacement — cancel old, submit new.
+                                try:
+                                    new_stop = float(action_item.get("new_stop_price") or 0)
+                                except (TypeError, ValueError):
+                                    new_stop = 0.0
+                                if new_stop <= 0:
+                                    logger.warning(
+                                        "Midday: TRAIL_STOP %s skipped — missing/invalid new_stop_price",
+                                        symbol,
+                                    )
+                                    continue
+                                if new_stop >= existing[0].current_price:
+                                    logger.warning(
+                                        "Midday: TRAIL_STOP %s skipped — new_stop $%.2f >= current $%.2f",
+                                        symbol, new_stop, existing[0].current_price,
+                                    )
+                                    continue
+                                order = self.broker.replace_stop_loss(symbol, new_stop)
+                                if order:
+                                    orders.append(order)
+                                    self.db.insert_trade(
+                                        symbol=symbol, action="TRAIL_STOP",
+                                        qty=existing[0].qty, price=new_stop,
+                                        reasoning=action_item.get("reason", "midday trailing stop"),
+                                        run_id=run_id,
+                                        stop_loss=new_stop,
+                                    )
+                                    logger.info(
+                                        "Midday action: TRAIL_STOP %s → $%.2f — %s",
+                                        symbol, new_stop, action_item.get("reason"),
+                                    )
+                                continue
+
+                            if act == "REDUCE":
                                 qty = self._reduce_sell_qty(existing[0].qty)
                             else:
                                 qty = self._full_sell_qty(existing[0].qty)
@@ -931,14 +1047,14 @@ class TradingPipeline:
                                 symbol=symbol, qty=qty, side="sell", limit_price=sell_limit)
                             orders.append(order)
                             self.db.insert_trade(
-                                symbol=symbol, action=action_item["action"], qty=qty,
+                                symbol=symbol, action=act, qty=qty,
                                 price=existing[0].current_price,
                                 reasoning=action_item.get("reason", "midday review"),
                                 run_id=run_id,
                             )
                             logger.info(
                                 "Midday action: %s %s %s — %s",
-                                action_item["action"], self._format_qty(qty),
+                                act, self._format_qty(qty),
                                 symbol, action_item.get("reason"),
                             )
                         except Exception as e:

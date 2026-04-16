@@ -114,6 +114,64 @@ def test_cancel_open_entry_orders_preserves_sell_protection(mock_tc_cls):
 
 
 @patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_cancels_old_and_submits_new(mock_tc_cls):
+    """Trailing-stop path: cancel any open sell-stop for symbol, submit new stop at new price."""
+    old_stop = MagicMock()
+    old_stop.id = "old-stop"
+    old_stop.order_type = "stop"
+    old_stop.side = "sell"
+
+    buy_order = MagicMock()
+    buy_order.id = "some-buy"
+    buy_order.order_type = "limit"
+    buy_order.side = "buy"
+
+    new_order = MagicMock()
+    new_order.id = "new-stop"
+    new_order.status = "accepted"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [old_stop, buy_order]
+    mock_client.submit_order.return_value = new_order
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("NVDA", 10, 180.0, 200.0, 2000.0, 200.0),
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.replace_stop_loss("NVDA", 192.0)
+
+    assert result is not None
+    assert result["id"] == "new-stop"
+    # The old stop must be cancelled, the buy order untouched.
+    mock_client.cancel_order_by_id.assert_called_once_with("old-stop")
+    mock_client.submit_order.assert_called_once()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_no_position_returns_none(mock_tc_cls):
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = []
+    mock_client.get_all_positions.return_value = []
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    assert broker.replace_stop_loss("NVDA", 192.0) is None
+    mock_client.submit_order.assert_not_called()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_rejects_non_positive_price(mock_tc_cls):
+    mock_client = MagicMock()
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    assert broker.replace_stop_loss("NVDA", 0.0) is None
+    assert broker.replace_stop_loss("NVDA", -5.0) is None
+    mock_client.submit_order.assert_not_called()
+
+
+@patch("src.execution.broker.TradingClient")
 def test_wait_for_order_terminal_polls_until_filled(mock_tc_cls):
     open_order = MagicMock()
     open_order.status = "new"

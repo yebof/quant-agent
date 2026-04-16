@@ -6,7 +6,7 @@ from datetime import date
 import yfinance as yf
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    MarketOrderRequest, LimitOrderRequest,
+    MarketOrderRequest, LimitOrderRequest, StopOrderRequest,
     TakeProfitRequest, StopLossRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
@@ -247,3 +247,65 @@ class AlpacaBroker:
         order = self.client.close_position(symbol)
         logger.info("Closed position: %s", symbol)
         return {"id": str(order.id), "status": str(order.status)}
+
+    def replace_stop_loss(self, symbol: str, new_stop_price: float) -> dict | None:
+        """Cancel any existing sell-stop order for this symbol and submit a new stop at new_stop_price.
+
+        Used by the midday trailing-stop logic. Alpaca's OTO stop-loss leg cannot be edited
+        in place, so we cancel + resubmit. Returns {id, status, symbol} or None if no
+        position or broker call fails.
+        """
+        if new_stop_price <= 0:
+            logger.warning("replace_stop_loss ignored: non-positive new_stop_price=%s", new_stop_price)
+            return None
+
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+
+            orders = self.client.get_orders(
+                filter=GetOrdersRequest(
+                    status=QueryOrderStatus.OPEN,
+                    symbols=[symbol],
+                    nested=True,
+                )
+            )
+        except Exception as exc:
+            logger.warning("replace_stop_loss: failed to list open orders for %s: %s", symbol, exc)
+            orders = []
+
+        cancelled = 0
+        for order in orders or []:
+            order_type = str(getattr(getattr(order, "order_type", None), "value",
+                                    getattr(order, "order_type", ""))).lower()
+            order_side = str(getattr(getattr(order, "side", None), "value",
+                                    getattr(order, "side", ""))).lower()
+            if "stop" in order_type and order_side == "sell":
+                try:
+                    self.client.cancel_order_by_id(order.id)
+                    cancelled += 1
+                except Exception as exc:
+                    logger.warning("replace_stop_loss: cancel failed for order %s: %s", order.id, exc)
+
+        positions = [p for p in self.get_positions() if p.symbol == symbol]
+        if not positions or positions[0].qty <= 0:
+            logger.warning("replace_stop_loss: no open position in %s, nothing to protect", symbol)
+            return None
+        qty = positions[0].qty
+
+        try:
+            req = StopOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                stop_price=round(new_stop_price, 2),
+            )
+            order = self.client.submit_order(req)
+            logger.info(
+                "Trailing stop placed for %s: cancelled %d old, new stop @ $%.2f",
+                symbol, cancelled, new_stop_price,
+            )
+            return {"id": str(order.id), "status": str(order.status), "symbol": symbol}
+        except Exception as exc:
+            logger.error("replace_stop_loss: failed to submit new stop for %s: %s", symbol, exc)
+            return None

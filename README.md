@@ -32,17 +32,18 @@ Morning (pre-market)
 
 Midday (intraday)
      │
-     ├─ Sync positions
+     ├─ Sync positions (closed symbols purged)
      ├─ Load morning trade context (stop/target/reasoning)
      ▼
-  Midday Reviewer (trailing stop profit management)
+  Midday Reviewer (real trailing stop + profit management)
      │  < 3%  profit → keep original stop
      │  3-8%  profit → trail to breakeven
      │  8-15% profit → trail to halfway
      │  > 15% profit → trail to 70% of move
      │
      ├─ Daily loss check → emergency sell-all if > 3%
-     └─ Execute SELL/REDUCE recommendations
+     └─ Execute SELL / REDUCE / TRAIL_STOP recommendations
+        (TRAIL_STOP actually cancels broker stop + submits new one)
 
 Evening (post-market)
      │
@@ -61,8 +62,8 @@ Evening (post-market)
 | **Macro Analyst** | Regime assessment & sector guidance | 6-step CoT (vol / curve / monetary / inflation+labor+credit / cross-signal / sector). Inputs: VIX, 2Y/10Y yields, **DFF** (daily fed funds), **core & headline CPI**, **UNRATE**, **HY OAS**. Persists yesterday's regime → detects `regime_shift`. Cross-references News narrative via `alignment_with_news`. Emits bull/bear view-change triggers. |
 | **Earnings Analyst** | SEC 10-Q/10-K analysis | Revenue, margins, strategic direction, competitive positioning, strategic vs operational risks, strategy consistency across filings |
 | **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain (macro → news → earnings → signal conflicts → sizing → balance → cash). Each decision traces which signals aligned/conflicted |
-| **Risk Manager** | Trade review with veto power | Audits PM's reasoning chain for logic errors. Sees full macro context (VIX + yields + spread + fed funds). Can modify allocation, stop, target |
-| **Midday Reviewer** | Profit management & risk check | Trailing stop logic. Receives morning trade stop/target/thesis. Lets winners run, cuts losers |
+| **Risk Manager** | Trade review with veto power | Audits PM's reasoning chain for logic errors. Also receives the **raw Tech Analyst ratings** to audit PM's fidelity to underlying signals. Sees full macro context (VIX + yields + spread + fed funds). Can modify per-symbol fields OR apply portfolio-wide `scale_all_buys` (0.0-1.0) to pull all BUY sizes down uniformly. |
+| **Midday Reviewer** | Profit management & trailing-stop execution | Trailing-stop logic is **real**, not cosmetic — `TRAIL_STOP` action actually cancels the broker's old stop and submits a new one at the specified price via `AlpacaBroker.replace_stop_loss`. Sees VIX + HY OAS + core CPI to gauge whether to tighten stops broadly. |
 | **Evening Analyst** | Daily P&L review & learning | Outputs feed into next morning's PM prompt (cross-session memory) |
 
 ## Risk Management
@@ -74,6 +75,7 @@ Evening (post-market)
 - Sector concentration: max 40% (gross, cumulative including pending same-sector buys)
 - Stop loss required
 - Inverse ETFs (SH, SDS, PSQ, SQQQ) carry signed multipliers for net exposure and gross magnitude for sizing/sector caps
+- **Advisory**: if projected net exposure deviates > 15pp from Macro's `target_invested_pct`, emits a non-blocking `macro_exposure_deviation` violation — RiskManager sees it and can respond with `scale_all_buys`
 
 ### Execution Safety
 - Stale orders cancelled before each session
@@ -86,10 +88,11 @@ Evening (post-market)
 
 ### LLM Risk Manager
 - Audits PM's 7-step reasoning chain for internal contradictions
+- Receives TechAnalyst signals to verify PM translated them faithfully
 - Reviews risk/reward ratios (min 1:2 preferred)
 - Checks correlation and concentration risk
-- Can modify trades (field aliases: `target`→`take_profit`, `stop`→`stop_loss`)
-- Modifications re-validated through risk engine
+- Can modify per-symbol fields (aliases: `target`→`take_profit`, `stop`→`stop_loss`) OR set portfolio-level `scale_all_buys` (0.0-1.0) to shrink all BUYs uniformly
+- Modifications and scaling re-validated through risk engine
 
 ## Setup
 
@@ -171,7 +174,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 133 tests
+├── tests/                         # 139 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -182,7 +185,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 133 tests
+pytest tests/ -v    # 139 tests
 ```
 
 ## Data Sources

@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 
 from src.agents.base import BaseAgent
-from src.models import PortfolioDecision, Position, RiskVerdict
+from src.models import PortfolioDecision, Position, RiskVerdict, TechAnalysisResult
 from src.risk.rules import RiskViolation
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,7 @@ class RiskManagerAgent(BaseAgent):
         positions: list[Position] = kwargs["positions"]
         macro_summary: dict = kwargs["macro_summary"]
         rule_violations: list[RiskViolation] = kwargs["rule_violations"]
+        tech_analyses: list[TechAnalysisResult] = kwargs.get("tech_analyses", []) or []
 
         decisions_text = "\n".join(
             f"- {d.action} {d.symbol}: {d.allocation_pct}% allocation | Entry: ${d.entry_price} | Stop: ${d.stop_loss} | Target: ${d.take_profit}\n  Reasoning: {d.reasoning}"
@@ -66,6 +67,18 @@ class RiskManagerAgent(BaseAgent):
         else:
             reasoning_section = ""
 
+        # Tech Analyst Signals — lets RM audit PM's fidelity to the underlying ratings.
+        if tech_analyses:
+            tech_lines = [
+                f"- {a.symbol}: {a.rating}"
+                + (f" | entry ${a.entry_price}, stop ${a.stop_loss}" if a.entry_price else "")
+                + f" — {a.reasoning[:120]}"
+                for a in tech_analyses
+            ]
+            tech_section = "## Tech Analyst Signals (cross-check PM's decisions)\n" + "\n".join(tech_lines)
+        else:
+            tech_section = "## Tech Analyst Signals\n(not provided)"
+
         return f"""{reasoning_section}## Proposed Trades
 {decisions_text}
 
@@ -73,6 +86,8 @@ Portfolio View: {portfolio_decision.portfolio_view}
 
 ## Current Positions
 {positions_text}
+
+{tech_section}
 
 ## Macro Context
 - VIX: {vix.get('current', 'N/A')} (5d avg: {vix.get('mean_5d', 'N/A')}, trend: {vix.get('trend', 'N/A')})
@@ -87,12 +102,14 @@ Portfolio View: {portfolio_decision.portfolio_view}
 Review these proposed trades and provide your verdict as JSON."""
 
     def review(self, portfolio_decision: PortfolioDecision, positions: list[Position],
-               macro_summary: dict, rule_violations: list[RiskViolation]) -> tuple[RiskVerdict | None, "AgentResult"]:
+               macro_summary: dict, rule_violations: list[RiskViolation],
+               tech_analyses: list[TechAnalysisResult] | None = None) -> tuple[RiskVerdict | None, "AgentResult"]:
         result = self.run(
             portfolio_decision=portfolio_decision,
             positions=positions,
             macro_summary=macro_summary,
             rule_violations=rule_violations,
+            tech_analyses=tech_analyses or [],
         )
         parsed = result.parse_json()
         if parsed is None:

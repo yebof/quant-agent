@@ -55,7 +55,9 @@ class MiddayReviewerAgent(BaseAgent):
             positions_lines.append(line)
         positions_text = "\n".join(positions_lines) if positions_lines else "No open positions."
 
-        vix = macro_summary.get("vix", {})
+        vix = macro_summary.get("vix", {}) or {}
+        hy = macro_summary.get("credit_spread", {}) or {}
+        infl = macro_summary.get("inflation", {}) or {}
         cash_pct = f"{cash_balance / total_value * 100:.1f}%" if total_value else "N/A"
 
         return f"""## Midday Position Review
@@ -67,8 +69,10 @@ class MiddayReviewerAgent(BaseAgent):
 ### Open Positions (with stop/target from morning decisions)
 {positions_text}
 
-### Macro
+### Macro (risk-regime context — use to decide whether to tighten stops broadly)
 - VIX: {vix.get('current', 'N/A')} (trend: {vix.get('trend', 'N/A')})
+- HY OAS: {hy.get('current_bps', 'N/A')}bps (30d change: {hy.get('change_30d_bps', 'N/A')}bps)  — credit stress leads equity vol
+- Core CPI YoY: {infl.get('core_cpi_yoy', 'N/A')}% (MoM: {infl.get('core_cpi_mom', 'N/A')}%) — inflation backdrop
 
 Review each position against its stop loss and target. Recommend actions. Respond as JSON."""
 

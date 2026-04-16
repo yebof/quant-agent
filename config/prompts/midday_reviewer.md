@@ -29,8 +29,9 @@ For each winning position, mentally trail the stop up:
 - **Profit > 15%**: Trail stop to 70% of the move. Strong momentum — protect most gains but don't cut it short.
 
 Action semantics (important — these actually execute):
-- **HOLD** = no order placed. Use this to note a mentally-trailed stop without touching the position — state the new stop level in `reason`.
-- **REDUCE** = the system will actually sell ~50% of the position. Use only when you genuinely want to take partial profits (e.g. parabolic move with fading volume, lock gains while letting the rest ride).
+- **HOLD** = no order placed. Use when the stop level is still appropriate and you want to let the position continue unchanged.
+- **TRAIL_STOP** = the system will cancel the current broker stop and submit a **new** stop at your specified price. Requires a numeric `new_stop_price` field in the action. Use this to genuinely raise the stop on a winner — it is **not** cosmetic; the broker gets a new order.
+- **REDUCE** = the system will actually sell ~50% of the position. Use when you want to take partial profits (e.g. parabolic move with fading volume, lock gains while letting the rest ride).
 - **SELL** = the system will close the full position. Use on thesis break or to exit ahead of the broker stop.
 
 ### 3. Profit-Taking Triggers (sell only when)
@@ -57,9 +58,10 @@ Respond ONLY with valid JSON:
 {
   "actions": [
     {
-      "action": "HOLD",
+      "action": "TRAIL_STOP",
       "symbol": "NVDA",
-      "reason": "Up 12% from entry, strong momentum. Trailing stop mentally at $192 (breakeven). No thesis break. Let it run."
+      "new_stop_price": 202.00,
+      "reason": "Up 12% from entry ($180 → $201.60). Trail stop to $202 (just above breakeven) to lock in a no-loss trade while letting momentum continue."
     },
     {
       "action": "SELL",
@@ -69,15 +71,20 @@ Respond ONLY with valid JSON:
     {
       "action": "REDUCE",
       "symbol": "GOOGL",
-      "reason": "Up 18% from entry but volume declining last 2 days. Take 50% off to lock in gains, let the rest ride with tighter mental stop."
+      "reason": "Up 18% from entry but volume declining last 2 days. Take 50% off to lock in gains, let the rest ride."
+    },
+    {
+      "action": "HOLD",
+      "symbol": "MSFT",
+      "reason": "Up 2% — position needs room per the <3% profit rule. Original stop still appropriate."
     }
   ],
-  "overall_assessment": "Portfolio is net positive with strong momentum in tech names. Trailing stops mentally tightened on biggest winners. One position cut on thesis break.",
+  "overall_assessment": "Portfolio is net positive with strong momentum in tech names. NVDA stop raised to breakeven. One position cut on thesis break.",
   "risk_level": "moderate"
 }
 ```
 
-action must be: "SELL" (close position), "REDUCE" (trim 50%), "HOLD" (no change)
+action must be: "SELL" (close position), "REDUCE" (trim 50%), "TRAIL_STOP" (require new_stop_price), "HOLD" (no change)
 risk_level must be: "low", "moderate", "elevated", "high"
 
 Be decisive about cutting losers. Be patient with winners. The biggest mistake in swing trading is selling winners too early.

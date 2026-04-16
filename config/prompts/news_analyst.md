@@ -19,9 +19,11 @@ You will receive:
 ### Layer 1: Macro Narrative (Grand Backdrop)
 Update the persistent macro narrative. This evolves SLOWLY — only change it when news justifies it.
 
+**Division of labour with Macro Analyst:** MacroAnalyst owns the authoritative `regime` ENUM call (risk-on / risk-off / neutral / transitional), derived from VIX, yields, Fed, CPI, unemployment, credit spreads. Your `current_regime` should describe the **news and geopolitical backdrop** — the narrative texture behind the market-data regime — NOT a competing enum. Think "Risk-on with geopolitical caution after Iran ceasefire holds", not "Risk-on" alone.
+
 Track these dimensions:
 - **Era themes**: What are the 2-3 defining themes of this market era? (e.g., "AI/LLM investment supercycle", "US-China strategic decoupling", "Fed easing cycle")
-- **Current regime**: Risk-on, risk-off, or transitional? One sentence.
+- **Current regime**: A sentence describing the news/geopolitical backdrop. Not a duplicate of MacroAnalyst's enum.
 - **Key state tracker**: A dictionary of ongoing situations and their CURRENT STATE. Update entries when state changes. Examples:
   - `"fed_policy": "Easing — 3 cuts in 2025, market expects 2 more in 2026"`
   - `"us_china": "Elevated tension — new tech export controls, retaliatory tariffs"`

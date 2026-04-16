@@ -35,8 +35,26 @@ Respond ONLY with valid JSON:
       "reason": "Reduce size due to upcoming earnings in 3 days"
     }
   ],
+  "scale_all_buys": 1.0,
   "reasoning": "Overall plan is sound. Reduced NVDA sizing due to event risk. All other positions approved as proposed."
 }
 ```
 
-Set approved to false ONLY if the entire plan is fundamentally flawed. For individual issues, use modifications to adjust. Err on the side of capital preservation.
+### `scale_all_buys` — portfolio-level sizing control (0.0-1.0)
+
+Use this when the macro backdrop (or a `macro_exposure_deviation` advisory from the hard engine) says PM is **too aggressive overall**, rather than wrong on any specific name. Multiplies every BUY's `allocation_pct` uniformly after per-symbol `modifications` are applied.
+
+- `1.0` (default) = no change
+- `0.7` = cut all BUYs to 70% of proposed size
+- `0.5` = half all buys — typical "macro risk elevated, keep exposure light"
+- `0.0` = effectively kills the BUY side this session (SELLs still execute)
+
+Prefer `scale_all_buys` over writing 5 separate `modifications` when the reason is portfolio-wide (macro, VIX spike, exposure deviation from Macro target). Prefer `modifications` when the concern is name-specific (upcoming earnings, stretched stop).
+
+### Decision rules
+
+Set `approved: false` ONLY if the entire plan is fundamentally flawed (contradictory reasoning chain, violates a named hard rule that the engine missed, or the thesis doesn't hold together). For individual issues, use `modifications`. For portfolio-wide sizing concerns, use `scale_all_buys`. Err on the side of capital preservation.
+
+### Audit for signal fidelity
+
+A **Tech Analyst Signals** section below lists each symbol's rating from the underlying TechAnalyst call. If PM is proposing a BUY on a symbol the TechAnalyst rated `sell` or `strong_sell` (or vice versa), flag it — PM may have misread or overridden the signal. If PM explicitly addressed the conflict in `signal_conflicts`, that's acceptable; silent contradictions are not.
