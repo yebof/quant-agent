@@ -99,7 +99,7 @@ Respond ONLY with valid JSON:
       }
     ]
   },
-  "pm_briefing": "Macro backdrop stable: risk-on with AI tailwind, trade war drag. KEY CHANGE: Iran ceasefire holding → energy bearish, consumer bullish. HIGHEST CONVICTION: NVDA $15B govt contract (bullish, high), JPM earnings beat + guidance raise (bullish, high). CAUTION: New tariff round hitting semis — watch AMD, AVGO exposure.",
+  "pm_briefing": "Macro: risk-on, AI tailwind, trade war drag. KEY CHANGES: [HIGH] Iran ceasefire day 5, oil -3% → XOM/CVX/COP bearish, COST/NKE/XLY bullish. [MED] New tariff round on tech imports → AMD/AVGO headwind. STOCKS: NVDA [HIGH] bullish — $15B govt GPU contract, direct revenue catalyst. JPM [HIGH] bullish — Q1 beat $4.44 vs $4.11, guidance raised, NII +5%. AVGO [MED] bullish — TSMC read-through, custom silicon demand strong. ORCL [MED] bullish — AI infra financing expanding, backlog supportive. GOOGL [MED] bearish — EU demands search data sharing, antitrust risk rising. XOM [MED] bearish — ceasefire removes supply premium. CAUTION: Fed Williams warned conflict could cause stagflation. Market positioning increasingly stretched.",
   "market_sentiment": "bullish",
   "confidence": "medium"
 }
@@ -108,12 +108,13 @@ Respond ONLY with valid JSON:
 ## PM Briefing Rules
 
 The `pm_briefing` field is what the Portfolio Manager reads FIRST. It must be:
-1. **Short** — 3-5 sentences max
-2. **Structured** — start with macro backdrop, then KEY CHANGES, then HIGHEST CONVICTION items, then CAUTION flags
-3. **Actionable** — every sentence should help a trading decision
-4. **Conviction-ranked** — mention high-conviction items first
+1. **No length limit** — include everything that provides a clear trading signal. But ZERO filler or hedging language. Every sentence must drive a decision.
+2. **Structured** — use this order: (1) Macro backdrop in one line, (2) KEY CHANGES with conviction, (3) Per-symbol signals for every universe stock/ETF that has a MEDIUM or HIGH conviction alert, (4) CAUTION flags
+3. **Actionable** — "GOOGL: EU demands search data sharing → bearish MED, antitrust overhang" is good. "Markets may be affected by geopolitical uncertainty" is waste.
+4. **Conviction-ranked** — HIGH conviction items first within each section
+5. **Include every stock with a real signal** — if AVGO, NVDA, ORCL, XOM all have medium+ conviction news, mention ALL of them. Don't summarize "semis are bullish" when you can say which specific names and why.
 
-The full `stock_news` and `state_changes` are stored in files — the PM can optionally deep-dive. But the PM must be able to make good decisions from `pm_briefing` alone.
+The full `stock_news` and `state_changes` are stored in files — the PM can optionally deep-dive. But the PM must be able to make good decisions from `pm_briefing` alone, without reading the detailed sections.
 
 ## Guidelines
 
