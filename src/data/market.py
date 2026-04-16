@@ -5,18 +5,19 @@ import yfinance as yf
 
 from src.models import OHLCV
 
+# Keyed by the canonical sector name used everywhere else (yfinance + MacroSectorGuidance enum).
 SECTOR_ETFS = {
     "Technology": "XLK",
     "Healthcare": "XLV",
-    "Financials": "XLF",
-    "Consumer Discretionary": "XLY",
+    "Financial Services": "XLF",
+    "Consumer Cyclical": "XLY",
     "Communication Services": "XLC",
     "Industrials": "XLI",
-    "Consumer Staples": "XLP",
+    "Consumer Defensive": "XLP",
     "Energy": "XLE",
     "Utilities": "XLU",
     "Real Estate": "XLRE",
-    "Materials": "XLB",
+    "Basic Materials": "XLB",
 }
 
 

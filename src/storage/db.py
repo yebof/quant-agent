@@ -198,6 +198,20 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def prune_trades(self, keep_days: int = 365 * 5) -> int:
+        """Delete trades rows older than keep_days. Default retention 5 years.
+
+        Kept long for audit purposes — still finite to bound table size over a
+        decade-plus horizon. Returns count deleted.
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                "DELETE FROM trades WHERE timestamp < datetime('now', ?)",
+                (f"-{keep_days} days",),
+            )
+            self.conn.commit()
+            return cursor.rowcount or 0
+
     def prune_agent_logs(self, keep_days: int = 30) -> int:
         """Delete agent_logs rows older than keep_days. Returns count deleted.
 

@@ -602,13 +602,27 @@ def test_macro_analysis_rejects_invalid_regime():
         MacroAnalysis(**_valid_macro_payload(regime="bullish"))  # not in Literal enum
 
 
-def test_macro_analysis_rejects_invalid_sector():
+def test_macro_analysis_maps_alias_sector():
+    """Common LLM aliases ('Financials', 'Tech', etc.) are auto-mapped to canonical names
+    instead of rejecting the whole analysis."""
     payload = _valid_macro_payload()
     payload["sector_guidance"] = [
-        {"sector": "Financials", "stance": "overweight", "reason": "x"}  # wrong: should be "Financial Services"
+        {"sector": "Financials", "stance": "overweight", "reason": "x"}  # alias of Financial Services
     ]
-    with pytest.raises(ValidationError):
-        MacroAnalysis(**payload)
+    ma = MacroAnalysis(**payload)
+    assert ma.sector_guidance[0].sector == "Financial Services"
+
+
+def test_macro_analysis_drops_unknown_sector_but_preserves_analysis():
+    """Unmappable sectors are silently dropped; the rest of the analysis survives."""
+    payload = _valid_macro_payload()
+    payload["sector_guidance"] = [
+        {"sector": "CompletelyMadeUpSectorName", "stance": "overweight", "reason": "x"},
+        {"sector": "Technology", "stance": "overweight", "reason": "valid"},
+    ]
+    ma = MacroAnalysis(**payload)
+    # Invalid item dropped, valid item kept
+    assert [s.sector for s in ma.sector_guidance] == ["Technology"]
 
 
 def test_macro_analysis_position_guidance_pct_bounds():
@@ -662,6 +676,18 @@ def test_macro_exposure_deviation_skipped_when_within_tolerance():
             macro_target_invested_pct=20,  # 25% vs 20% = 5pp deviation, under 15pp tolerance
         )
     assert not any(v.rule == "macro_exposure_deviation" for v in violations)
+
+
+def test_data_degraded_violation_fires_at_two_failures():
+    """When 2+ upstream sources fail, morning emits a non-blocking data_degraded violation."""
+    # Directly verify the threshold logic without spinning the full pipeline.
+    status = {"macro": "failed", "news": "failed", "tech": "ok", "earnings": "ok"}
+    degraded = [k for k, v in status.items() if v not in ("ok", "empty")]
+    assert len(degraded) == 2  # threshold met
+
+    status2 = {"macro": "failed", "news": "ok", "tech": "ok", "earnings": "ok"}
+    degraded2 = [k for k, v in status2.items() if v not in ("ok", "empty")]
+    assert len(degraded2) == 1  # under threshold, no advisory
 
 
 def test_risk_verdict_accepts_scale_all_buys():

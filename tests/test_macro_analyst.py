@@ -63,9 +63,10 @@ def test_macro_analyze_parses_valid_response(mock_cls):
 
 
 @patch("anthropic.Anthropic")
-def test_macro_analyze_rejects_invalid_schema(mock_cls):
-    """If LLM returns wrong sector, validation fails → returns None with error logged."""
-    bad_response = json.dumps({
+def test_macro_analyze_heals_alias_sector(mock_cls):
+    """LLM emitting 'Financials' (common alias) is auto-canonicalized to 'Financial Services'
+    instead of rejecting the whole analysis."""
+    response = json.dumps({
         "reasoning_chain": {
             "volatility_analysis": "a", "yield_curve_analysis": "b",
             "monetary_policy_analysis": "c", "inflation_labor_credit": "d",
@@ -74,7 +75,7 @@ def test_macro_analyze_rejects_invalid_schema(mock_cls):
         "regime": "risk-on",
         "confidence": "medium",
         "equity_outlook": "bullish",
-        "sector_guidance": [{"sector": "Financials", "stance": "overweight", "reason": "x"}],  # wrong name
+        "sector_guidance": [{"sector": "Financials", "stance": "overweight", "reason": "x"}],
         "position_guidance": {
             "target_invested_pct": 60, "cash_recommendation_pct": 40, "reasoning": "y"
         },
@@ -82,7 +83,7 @@ def test_macro_analyze_rejects_invalid_schema(mock_cls):
     })
     mock_client = MagicMock()
     mock_resp = MagicMock()
-    mock_resp.content = [MagicMock(text=bad_response)]
+    mock_resp.content = [MagicMock(text=response)]
     mock_resp.usage.input_tokens = 100
     mock_resp.usage.output_tokens = 50
     mock_client.messages.create.return_value = mock_resp
@@ -91,7 +92,8 @@ def test_macro_analyze_rejects_invalid_schema(mock_cls):
     agent = MacroAnalystAgent(api_key="test", model="claude-sonnet-4-6")
     analysis, _ = agent.analyze(macro_summary=MACRO_SUMMARY)
 
-    assert analysis is None  # schema validation rejects "Financials"
+    assert analysis is not None
+    assert analysis["sector_guidance"][0]["sector"] == "Financial Services"
 
 
 @patch("anthropic.Anthropic")

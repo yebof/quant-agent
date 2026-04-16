@@ -131,6 +131,27 @@ _ALLOWED_SECTORS = (
     "Utilities", "Basic Materials", "Real Estate", "Broad",
 )
 
+# Common LLM-emitted aliases → canonical name. Applied before the Literal check
+# so a single bad label doesn't discard the whole MacroAnalysis.
+_SECTOR_ALIASES = {
+    "tech": "Technology",
+    "technology": "Technology",
+    "financials": "Financial Services",
+    "financial": "Financial Services",
+    "banks": "Financial Services",
+    "consumer discretionary": "Consumer Cyclical",
+    "consumer staples": "Consumer Defensive",
+    "materials": "Basic Materials",
+    "comm services": "Communication Services",
+    "communication": "Communication Services",
+    "telecom": "Communication Services",
+    "reits": "Real Estate",
+    "real-estate": "Real Estate",
+    "index": "Broad",
+    "broad market": "Broad",
+    "etf": "Broad",
+}
+
 
 class MacroSectorGuidance(BaseModel):
     sector: Literal[
@@ -173,6 +194,35 @@ class MacroAnalysis(BaseModel):
     bear_triggers: list[str] = []
     alignment_with_news: str = ""
     summary: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sanitize_sector_guidance(cls, values):
+        """Map aliases, drop unknown sectors — preserves the rest of the analysis.
+
+        Previously a single bad sector name (e.g. "Financials" instead of
+        "Financial Services") rejected the whole MacroAnalysis and left PM blind.
+        """
+        if not isinstance(values, dict):
+            return values
+        sg = values.get("sector_guidance")
+        if not isinstance(sg, list):
+            return values
+        cleaned: list[dict] = []
+        for item in sg:
+            if not isinstance(item, dict):
+                continue
+            sec = item.get("sector")
+            if not isinstance(sec, str):
+                continue
+            canon = _SECTOR_ALIASES.get(sec.strip().lower(), sec.strip())
+            if canon in _ALLOWED_SECTORS:
+                new_item = dict(item)
+                new_item["sector"] = canon
+                cleaned.append(new_item)
+            # else: silently drop — we'd rather lose one guidance row than the whole analysis
+        values["sector_guidance"] = cleaned
+        return values
 
 
 class NewsEvent(BaseModel):

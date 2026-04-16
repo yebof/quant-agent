@@ -11,24 +11,55 @@ from alpaca.trading.requests import (
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
 
-from src.models import Position
+from src.models import Position, _ALLOWED_SECTORS, _SECTOR_ALIASES
 
 logger = logging.getLogger(__name__)
+
+# Index ETFs that have no single sector — bucket them as "Broad".
+_INDEX_ETFS = {"SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "IVV"}
 
 # Cache sector lookups to avoid repeated API calls
 _sector_cache: dict[str, str] = {}
 _sector_lock = threading.Lock()
 
 
+def _canonicalize_sector(raw: str | None) -> str:
+    """Normalize yfinance / LLM sector strings to the 12-value canonical enum.
+
+    Returns "Unknown" for anything that can't be mapped — callers must decide
+    whether to skip or fall back. The MacroAnalysis pydantic model uses the
+    same alias table to self-heal LLM output.
+    """
+    if not raw:
+        return "Unknown"
+    s = str(raw).strip()
+    if s in _ALLOWED_SECTORS:
+        return s
+    canon = _SECTOR_ALIASES.get(s.lower())
+    if canon in _ALLOWED_SECTORS:
+        return canon
+    return "Unknown"
+
+
 def _get_sector(symbol: str) -> str:
-    """Look up sector for a symbol using yfinance. Thread-safe, cached per process."""
+    """Look up sector for a symbol using yfinance. Thread-safe, cached per process.
+
+    Output is canonicalized to the 12-value MacroSectorGuidance enum (or "Unknown"
+    for un-classifiable names), so macro sector_guidance and position.sector share
+    a namespace.
+    """
     with _sector_lock:
-        if symbol not in _sector_cache:
-            try:
-                info = yf.Ticker(symbol).info
-                _sector_cache[symbol] = info.get("sector", "Unknown")
-            except Exception:
-                _sector_cache[symbol] = "Unknown"
+        if symbol in _sector_cache:
+            return _sector_cache[symbol]
+        if symbol.upper() in _INDEX_ETFS:
+            _sector_cache[symbol] = "Broad"
+            return "Broad"
+        try:
+            info = yf.Ticker(symbol).info
+            raw = info.get("sector", "")
+        except Exception:
+            raw = ""
+        _sector_cache[symbol] = _canonicalize_sector(raw)
         return _sector_cache[symbol]
 
 

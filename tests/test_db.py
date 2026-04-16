@@ -142,6 +142,22 @@ def test_sync_positions_empty_clears_table(db):
     assert db.get_positions() == []
 
 
+def test_prune_trades_respects_ttl(db):
+    """Trades older than keep_days are dropped; recent ones are retained."""
+    db.insert_trade("OLD", "BUY", 1.0, 100.0, "ancient", "r-old")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-2000 days') WHERE symbol='OLD'"
+    )
+    db.conn.commit()
+    db.insert_trade("RECENT", "BUY", 2.0, 200.0, "fresh", "r-new")
+
+    deleted = db.prune_trades(keep_days=365 * 5)  # 5-year retention
+    assert deleted == 1
+
+    remaining = {r["symbol"] for r in db.get_trades()}
+    assert remaining == {"RECENT"}
+
+
 def test_prune_agent_logs(db):
     """Old rows dropped; recent rows retained."""
     db.insert_agent_log(
