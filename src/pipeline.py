@@ -284,6 +284,46 @@ class TradingPipeline:
         price_map = {p.symbol: p.current_price for p in positions}
         return account, positions, price_map
 
+    def _run_news_update(self, run_id: str, session: str = "morning") -> "NewsIntelligenceReport | None":
+        """Fetch news, run intelligence analysis, save report. Reusable across sessions."""
+        try:
+            news_items = self.news_provider.fetch_news()
+            news_text = self.news_provider.format_for_prompt(news_items)
+            stock_mentions = self.news_provider.tag_symbol_mentions(
+                news_items, self.config.trading.universe)
+            previous_narrative = self.news_store.load_macro_narrative()
+            intel_report, result = self.news_analyst.analyze(
+                news_text=news_text,
+                universe=self.config.trading.universe,
+                stock_mentions=stock_mentions,
+                previous_narrative=previous_narrative,
+            )
+            if intel_report:
+                report_dict = intel_report.model_dump()
+                self.news_store.save_daily_report(report_dict)
+                self.news_store.save_macro_narrative(report_dict["macro_narrative"])
+                if report_dict.get("stock_news"):
+                    self.news_store.save_stock_alerts(report_dict["stock_news"])
+                self.news_store.save_raw_headlines(
+                    [{"title": i.title, "source": i.source, "summary": i.summary} for i in news_items])
+                n_changes = len(intel_report.state_changes)
+                n_stocks = len(intel_report.stock_news)
+                logger.info("[%s] News intelligence: sentiment=%s, changes=%d, stocks=%d",
+                            session, intel_report.market_sentiment, n_changes, n_stocks)
+            self.db.insert_agent_log(
+                agent_name=f"news_analyst_{session}", run_id=run_id,
+                input_summary=f"{len(news_items)} news items",
+                input_message=result.user_message,
+                output_summary=f"sentiment={intel_report.market_sentiment}, changes={len(intel_report.state_changes)}" if intel_report else "parse_error",
+                full_response=result.raw_text,
+                model=self.config.llm.news_analyst_model,
+                tokens_used=result.tokens_used,
+            )
+            return intel_report
+        except Exception as e:
+            logger.error("[%s] News analyst failed: %s", session, e)
+            return None
+
     def run_morning(self) -> dict:
         run_id = f"run-{uuid.uuid4().hex[:8]}"
         logger.info("=== Morning run started: %s ===", run_id)
@@ -314,27 +354,8 @@ class TradingPipeline:
             return macro_summary, analysis, result
 
         def _run_news():
-            news_items = self.news_provider.fetch_news()
-            news_text = self.news_provider.format_for_prompt(news_items)
-            stock_mentions = self.news_provider.tag_symbol_mentions(
-                news_items, self.config.trading.universe)
-            previous_narrative = self.news_store.load_macro_narrative()
-            intel_report, result = self.news_analyst.analyze(
-                news_text=news_text,
-                universe=self.config.trading.universe,
-                stock_mentions=stock_mentions,
-                previous_narrative=previous_narrative,
-            )
-            # Save detailed report and update narrative
-            if intel_report:
-                report_dict = intel_report.model_dump()
-                self.news_store.save_daily_report(report_dict)
-                self.news_store.save_macro_narrative(report_dict["macro_narrative"])
-                if report_dict.get("stock_news"):
-                    self.news_store.save_stock_alerts(report_dict["stock_news"])
-                self.news_store.save_raw_headlines(
-                    [{"title": i.title, "source": i.source, "summary": i.summary} for i in news_items])
-            return news_items, intel_report, result
+            intel = self._run_news_update(run_id, session="morning")
+            return intel
 
         def _has_actionable_signal(indicators, symbol: str) -> bool:
             """Pre-filter: only send symbols with interesting signals to the LLM."""
@@ -459,23 +480,9 @@ class TradingPipeline:
 
         news_intel: NewsIntelligenceReport | None = None
         try:
-            news_items, news_intel, na_result = news_future.result()
-            summary = "parse_error"
+            news_intel = news_future.result()
             if news_intel:
-                n_changes = len(news_intel.state_changes)
-                n_stocks = len(news_intel.stock_news)
-                summary = f"sentiment={news_intel.market_sentiment}, changes={n_changes}, stocks={n_stocks}"
-                logger.info("News intelligence: %s, briefing: %s",
-                            summary, news_intel.pm_briefing[:150])
-            self.db.insert_agent_log(
-                agent_name="news_analyst", run_id=run_id,
-                input_summary=f"{len(news_items)} news items",
-                input_message=na_result.user_message,
-                output_summary=summary,
-                full_response=na_result.raw_text,
-                model=self.config.llm.news_analyst_model,
-                tokens_used=na_result.tokens_used,
-            )
+                logger.info("News briefing: %s", news_intel.pm_briefing[:200])
         except Exception as e:
             logger.error("News analyst failed: %s. Continuing without news.", e)
 
@@ -785,7 +792,12 @@ class TradingPipeline:
                 unrealized_pnl=p.unrealized_pnl, sector=p.sector,
             )
 
-        # 2. LLM midday review — assess positions and recommend actions
+        # 2. News update — capture midday developments
+        midday_news = self._run_news_update(run_id, session="midday")
+        if midday_news:
+            logger.info("Midday news: %s", midday_news.pm_briefing[:200])
+
+        # 3. LLM midday review — assess positions and recommend actions
         macro_summary = self.macro.get_macro_summary()
         review = None
         orders = []
@@ -906,7 +918,12 @@ class TradingPipeline:
             daily_return_pct=daily_return_pct,
         )
 
-        # 2. LLM evening analysis — daily review and tomorrow outlook
+        # 2. News update — capture end-of-day developments
+        evening_news = self._run_news_update(run_id, session="evening")
+        if evening_news:
+            logger.info("Evening news: %s", evening_news.pm_briefing[:200])
+
+        # 3. LLM evening analysis — daily review and tomorrow outlook
         macro_summary = self.macro.get_macro_summary()
         today_trades = self.db.get_trades(limit=20, today_only=True)
         analysis, ev_result = self.evening_analyst.analyze(
