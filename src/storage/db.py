@@ -12,6 +12,13 @@ class Database:
     def initialize(self):
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # WAL allows concurrent readers alongside the writer — avoids occasional
+        # "database is locked" when parallel agent threads each insert logs.
+        # No-op for :memory: databases (stays "memory" journal).
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:
+            pass
         self._create_tables()
 
     def _create_tables(self):
@@ -133,6 +140,36 @@ class Database:
             )
             self.conn.commit()
 
+    def sync_positions(self, positions) -> None:
+        """Replace positions table with a fresh broker snapshot.
+
+        Upserts rows for currently-held symbols and deletes rows for any symbol
+        no longer present. Prevents stale closed positions from lingering in the DB.
+        """
+        current_symbols = {p.symbol for p in positions}
+        with self._lock:
+            if current_symbols:
+                placeholders = ",".join("?" for _ in current_symbols)
+                self.conn.execute(
+                    f"DELETE FROM positions WHERE symbol NOT IN ({placeholders})",
+                    tuple(current_symbols),
+                )
+            else:
+                self.conn.execute("DELETE FROM positions")
+            for p in positions:
+                self.conn.execute(
+                    """INSERT INTO positions (symbol, qty, avg_entry, current_price, market_value, unrealized_pnl, sector, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                       ON CONFLICT(symbol) DO UPDATE SET
+                         qty=excluded.qty, avg_entry=excluded.avg_entry,
+                         current_price=excluded.current_price, market_value=excluded.market_value,
+                         unrealized_pnl=excluded.unrealized_pnl, sector=excluded.sector,
+                         updated_at=datetime('now')""",
+                    (p.symbol, p.qty, p.avg_entry, p.current_price, p.market_value,
+                     p.unrealized_pnl, p.sector),
+                )
+            self.conn.commit()
+
     def get_positions(self, open_only: bool = False) -> list[dict]:
         with self._lock:
             if open_only:
@@ -160,6 +197,20 @@ class Database:
                 "SELECT * FROM agent_logs WHERE run_id = ? ORDER BY timestamp", (run_id,)
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def prune_agent_logs(self, keep_days: int = 30) -> int:
+        """Delete agent_logs rows older than keep_days. Returns count deleted.
+
+        agent_logs.full_response can be tens of KB per entry and ~24 entries land
+        per day; without pruning the DB grows without bound.
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                "DELETE FROM agent_logs WHERE timestamp < datetime('now', ?)",
+                (f"-{keep_days} days",),
+            )
+            self.conn.commit()
+            return cursor.rowcount or 0
 
     def insert_daily_pnl(self, date: str, total_value: float, daily_pnl: float,
                          daily_return_pct: float):

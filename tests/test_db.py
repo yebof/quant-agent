@@ -111,3 +111,57 @@ def test_get_open_positions(db):
     open_pos = db.get_positions(open_only=True)
     assert len(open_pos) == 1
     assert open_pos[0]["symbol"] == "SPY"
+
+
+def test_sync_positions_removes_closed_symbols(db):
+    """sync_positions must drop rows for symbols no longer held."""
+    from types import SimpleNamespace
+
+    db.upsert_position("SPY", 10.0, 500.0, 510.0, 5100.0, 100.0, "ETF")
+    db.upsert_position("QQQ", 5.0, 400.0, 410.0, 2050.0, 50.0, "ETF")
+    assert len(db.get_positions()) == 2
+
+    # Broker now reports only SPY — QQQ should be purged.
+    snapshot = [SimpleNamespace(
+        symbol="SPY", qty=12.0, avg_entry=502.0, current_price=515.0,
+        market_value=6180.0, unrealized_pnl=156.0, sector="ETF",
+    )]
+    db.sync_positions(snapshot)
+
+    remaining = db.get_positions()
+    assert len(remaining) == 1
+    assert remaining[0]["symbol"] == "SPY"
+    assert remaining[0]["qty"] == 12.0
+
+
+def test_sync_positions_empty_clears_table(db):
+    from types import SimpleNamespace  # noqa: F401
+
+    db.upsert_position("SPY", 10.0, 500.0, 510.0, 5100.0, 100.0, "ETF")
+    db.sync_positions([])
+    assert db.get_positions() == []
+
+
+def test_prune_agent_logs(db):
+    """Old rows dropped; recent rows retained."""
+    db.insert_agent_log(
+        agent_name="old_agent", run_id="run-old", input_summary="old",
+        output_summary="", full_response="", model="m", tokens_used=1,
+    )
+    # Force timestamp backdate on the just-inserted row.
+    db.conn.execute(
+        "UPDATE agent_logs SET timestamp = datetime('now', '-45 days') WHERE agent_name = 'old_agent'"
+    )
+    db.conn.commit()
+
+    db.insert_agent_log(
+        agent_name="recent_agent", run_id="run-new", input_summary="new",
+        output_summary="", full_response="", model="m", tokens_used=1,
+    )
+
+    deleted = db.prune_agent_logs(keep_days=30)
+    assert deleted == 1
+
+    rows = db.conn.execute("SELECT agent_name FROM agent_logs").fetchall()
+    names = {r[0] for r in rows}
+    assert names == {"recent_agent"}

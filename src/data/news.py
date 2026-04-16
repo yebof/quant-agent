@@ -63,7 +63,15 @@ class NewsDataProvider:
 
     def _fetch_feed(self, source_name: str, url: str, cutoff: datetime) -> list[NewsItem]:
         """Fetch and parse a single RSS feed."""
-        feed = feedparser.parse(url, agent=USER_AGENT)
+        try:
+            req = Request(url, headers={"User-Agent": USER_AGENT})
+            with urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+                raw = resp.read()
+        except Exception as e:
+            logger.warning("Feed %s fetch failed: %s", source_name, e)
+            return []
+
+        feed = feedparser.parse(raw)
 
         if feed.bozo and not feed.entries:
             logger.warning("Feed %s returned no entries: %s", source_name, feed.bozo_exception)

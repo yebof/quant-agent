@@ -178,6 +178,7 @@ class TradingPipeline:
         positions,
         total_value: float,
         daily_pnl: float,
+        baseline: float | None = None,
     ) -> tuple[list[TradeDecision], list, list[str]]:
         allowed_decisions: list[TradeDecision] = []
         remaining_violations = []
@@ -199,6 +200,7 @@ class TradingPipeline:
                 pending_investment=pending_investment,
                 pending_sector_investment=pending_sector_investment,
                 pending_symbol_investment=pending_symbol_investment,
+                baseline=baseline,
             )
             hard_violations = [v for v in violations if v.rule in HARD_BLOCK_RULES]
             if hard_violations:
@@ -210,16 +212,19 @@ class TradingPipeline:
             remaining_violations.extend(violations)
             allowed_decisions.append(decision)
 
-            from src.risk.rules import _effective_multiplier
+            from src.risk.rules import _effective_multiplier, _gross_multiplier
             raw_investment = total_value * (decision.allocation_pct / 100)
-            effective_investment = raw_investment * _effective_multiplier(decision.symbol)
-            pending_investment += effective_investment
+            # Total exposure accumulates SIGNED contribution (hedges net out).
+            # Sector exposure accumulates GROSS (direction-agnostic magnitude).
+            signed_investment = raw_investment * _effective_multiplier(decision.symbol)
+            gross_investment = raw_investment * _gross_multiplier(decision.symbol)
+            pending_investment += signed_investment
             pending_symbol_investment[decision.symbol] = (
                 pending_symbol_investment.get(decision.symbol, 0.0) + raw_investment
             )
             sector = _get_sector(decision.symbol)
             if sector and sector != "Unknown":
-                pending_sector_investment[sector] = pending_sector_investment.get(sector, 0.0) + effective_investment
+                pending_sector_investment[sector] = pending_sector_investment.get(sector, 0.0) + gross_investment
 
         return allowed_decisions, remaining_violations, blocked_reasons
 
@@ -381,8 +386,9 @@ class TradingPipeline:
         positions = self.broker.get_positions()
         cash = account["cash"]
         total_value = account["portfolio_value"]
-        logger.info("Account: $%.2f total, $%.2f cash, %d positions",
-                     total_value, cash, len(positions))
+        last_equity = account.get("last_equity", total_value)
+        logger.info("Account: $%.2f total, $%.2f cash, %d positions (last close $%.2f)",
+                     total_value, cash, len(positions), last_equity)
 
         # 2. Parallel: Macro Analyst + News Analyst + Tech Analyst
         def _run_macro():
@@ -398,7 +404,7 @@ class TradingPipeline:
             intel = self._run_news_update(run_id, session="morning")
             return intel
 
-        def _has_actionable_signal(indicators, symbol: str) -> bool:
+        def _has_actionable_signal(indicators, symbol: str, bars) -> bool:
             """Pre-filter: only send symbols with interesting signals to the LLM."""
             # Always analyze held positions
             held_symbols = {p.symbol for p in positions}
@@ -409,9 +415,11 @@ class TradingPipeline:
             # RSI extremes (oversold < 35 or overbought > 65)
             if indicators.rsi_14 is not None and (indicators.rsi_14 < 35 or indicators.rsi_14 > 65):
                 return True
-            # Price near Bollinger Bands (within 1% of upper or lower)
-            if indicators.bb_upper and indicators.bb_lower and indicators.ma_20:
-                last_close = indicators.ma_20  # approximate current price
+            # Price near Bollinger Bands (within 10% of band_width from upper/lower).
+            # Use the latest close (not ma_20 — ma_20 IS the middle band, so the old
+            # check was always ~50% away from both extremes and never fired).
+            if indicators.bb_upper and indicators.bb_lower and bars:
+                last_close = bars[-1].close
                 band_width = indicators.bb_upper - indicators.bb_lower
                 if band_width > 0:
                     if abs(last_close - indicators.bb_upper) / band_width < 0.1:
@@ -443,7 +451,10 @@ class TradingPipeline:
                 indicators = compute_indicators(symbol, bars)
                 all_symbols_data.append({"symbol": symbol, "bars": bars, "indicators": indicators})
             # Pre-filter: only send actionable symbols to the LLM
-            symbols_data = [s for s in all_symbols_data if _has_actionable_signal(s["indicators"], s["symbol"])]
+            symbols_data = [
+                s for s in all_symbols_data
+                if _has_actionable_signal(s["indicators"], s["symbol"], s["bars"])
+            ]
             logger.info("Tech pre-filter: %d/%d symbols have actionable signals",
                         len(symbols_data), len(all_symbols_data))
             if symbols_data:
@@ -571,12 +582,16 @@ class TradingPipeline:
                 len(portfolio_decision.decisions),
             )
 
-        daily_pnl = sum(p.unrealized_intraday_pnl for p in positions)
+        # Include realized P&L: (equity - last_equity) captures both unrealized
+        # marks and any fills (including broker-triggered OTO stop-losses we never
+        # submitted ourselves). Avoids the old unrealized-only blind spot.
+        daily_pnl = total_value - last_equity
         portfolio_decision.decisions, rule_violations, blocked_reasons = self._filter_hard_risk_decisions(
             portfolio_decision.decisions,
             positions,
             total_value,
             daily_pnl,
+            baseline=last_equity,
         )
         if blocked_reasons:
             reasons = "; ".join(dict.fromkeys(blocked_reasons))
@@ -621,6 +636,7 @@ class TradingPipeline:
                 positions,
                 total_value,
                 daily_pnl,
+                baseline=last_equity,
             )
             if blocked_reasons:
                 reasons = "; ".join(dict.fromkeys(blocked_reasons))
@@ -639,7 +655,14 @@ class TradingPipeline:
                 existing = [p for p in positions if p.symbol == decision.symbol]
                 if not existing or existing[0].qty <= 0:
                     continue
-                # Partial sell: 0 < allocation_pct < 100 = sell that fraction; 0 or 100 = full sell
+                # allocation_pct=0 is ambiguous — skip rather than silently treating as full sell.
+                if decision.allocation_pct == 0:
+                    logger.warning(
+                        "Skipping SELL %s with allocation_pct=0 (ambiguous — use 100 for full exit)",
+                        decision.symbol,
+                    )
+                    continue
+                # Partial sell: 0 < allocation_pct < 100 = sell that fraction; 100 = full sell
                 if 0 < decision.allocation_pct < 100:
                     sell_fraction = decision.allocation_pct / 100
                     qty = existing[0].qty * sell_fraction
@@ -647,7 +670,16 @@ class TradingPipeline:
                         qty = max(1.0, float(int(qty)))
                     if qty <= 0:
                         continue
-                    action_label = f"PARTIAL_SELL({decision.allocation_pct:.0f}%)"
+                    # Rounding up can push qty to the full position (e.g., 1-share holding
+                    # with 30% request → 1 share = 100%). Re-label as a full sell so the
+                    # audit log matches what actually happens.
+                    if qty >= existing[0].qty:
+                        qty = self._full_sell_qty(existing[0].qty)
+                        if qty is None:
+                            continue
+                        action_label = "SELL"
+                    else:
+                        action_label = f"PARTIAL_SELL({decision.allocation_pct:.0f}%)"
                 else:
                     qty = self._full_sell_qty(existing[0].qty)
                     if qty is None:
@@ -761,12 +793,16 @@ class TradingPipeline:
                 )
                 orders.append(order)
                 available_cash -= estimated_cost
+                # Record the actual submitted price, not the LLM's original entry_price
+                # (it may have been raised to market or converted to a market order).
+                executed_price = limit_price if limit_price is not None else sizing_price
                 self.db.insert_trade(
                     symbol=decision.symbol, action="BUY", qty=qty,
-                    price=decision.entry_price, reasoning=decision.reasoning, run_id=run_id,
+                    price=executed_price, reasoning=decision.reasoning, run_id=run_id,
                     stop_loss=decision.stop_loss, take_profit=decision.take_profit,
                 )
-                logger.info("Executed: buy %d %s @ limit $%.2f", qty, decision.symbol, decision.entry_price)
+                order_type = "limit" if limit_price is not None else "market"
+                logger.info("Executed: buy %d %s @ %s $%.2f", qty, decision.symbol, order_type, executed_price)
             except Exception as e:
                 logger.error("Order failed for %s %s: %s", decision.action, decision.symbol, e)
 
@@ -786,13 +822,10 @@ class TradingPipeline:
         positions = self.broker.get_positions()
         cash = account["cash"]
         total_value = account["portfolio_value"]
+        last_equity = account.get("last_equity", total_value)
 
-        for p in positions:
-            self.db.upsert_position(
-                symbol=p.symbol, qty=p.qty, avg_entry=p.avg_entry,
-                current_price=p.current_price, market_value=p.market_value,
-                unrealized_pnl=p.unrealized_pnl, sector=p.sector,
-            )
+        # Replace the positions snapshot (drops rows for symbols no longer held).
+        self.db.sync_positions(positions)
 
         # 2. News + Earnings update — capture midday developments
         midday_news = self._run_news_update(run_id, session="midday")
@@ -823,9 +856,11 @@ class TradingPipeline:
                 tokens_used=md_result.tokens_used,
             )
 
-            # 3. Risk check: if daily loss limit breached, force-sell all positions
-            daily_pnl = sum(p.unrealized_intraday_pnl for p in positions)
-            loss_violation = self.risk_engine.check_daily_loss(total_value, daily_pnl)
+            # 3. Risk check: if daily loss limit breached, force-sell all positions.
+            # Use (equity - last_equity) so realized losses from morning fills
+            # and broker-triggered stops are counted — not just mark-to-market.
+            daily_pnl = total_value - last_equity
+            loss_violation = self.risk_engine.check_daily_loss(last_equity, daily_pnl)
             if loss_violation:
                 logger.warning("MIDDAY RISK ALERT: %s — force-closing all positions", loss_violation.message)
                 for p in positions:
@@ -833,17 +868,24 @@ class TradingPipeline:
                         qty = self._full_sell_qty(p.qty)
                         if qty is None:
                             continue
-                        order = self.broker.submit_order(symbol=p.symbol, qty=qty, side="sell")
+                        # Use a wider 1% limit buffer for emergency exits — prevents
+                        # catastrophic slippage in a fast selloff while still crossing
+                        # bid/ask in most cases.
+                        emergency_limit = round(p.current_price * 0.99, 2)
+                        order = self.broker.submit_order(
+                            symbol=p.symbol, qty=qty, side="sell",
+                            limit_price=emergency_limit,
+                        )
                         orders.append(order)
                         self.db.insert_trade(
                             symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,
-                            price=p.current_price,
+                            price=emergency_limit,
                             reasoning=f"Daily loss limit breached: {loss_violation.message}",
                             run_id=run_id,
                         )
                         logger.info(
-                            "Emergency sell: %s %s @ $%.2f",
-                            self._format_qty(qty), p.symbol, p.current_price,
+                            "Emergency sell: %s %s @ limit $%.2f",
+                            self._format_qty(qty), p.symbol, emergency_limit,
                         )
                     except Exception as e:
                         logger.error("Emergency sell failed for %s: %s", p.symbol, e)
@@ -899,17 +941,19 @@ class TradingPipeline:
             logger.info("Evening run skipped: market closed for non-trading day")
             return {"status": "market_holiday", "analysis": None, "run_id": run_id}
 
-        # 1. Record daily PnL
+        # 1. Record daily PnL — use Alpaca's last_equity (previous trading-day close)
+        # as the baseline. This correctly handles weekends/holidays (Alpaca updates
+        # last_equity only on trading days) and doesn't depend on whether yesterday's
+        # evening run actually persisted a snapshot to our own DB.
         account = self.broker.get_account()
         positions = self.broker.get_positions()
         total_value = account["portfolio_value"]
+        last_equity = account.get("last_equity", total_value)
         today_str = str(date.today())
 
-        recent_pnl = self.db.get_daily_pnl(limit=1, before_date=today_str)
-        if recent_pnl:
-            prev_value = recent_pnl[0]["total_value"]
-            daily_pnl = total_value - prev_value
-            daily_return_pct = (daily_pnl / prev_value) * 100 if prev_value > 0 else 0.0
+        if last_equity > 0:
+            daily_pnl = total_value - last_equity
+            daily_return_pct = daily_pnl / last_equity * 100
         else:
             daily_pnl = 0.0
             daily_return_pct = 0.0
@@ -958,6 +1002,14 @@ class TradingPipeline:
                 suggested_actions=analysis.get("suggested_actions", []),
                 risk_rating=analysis.get("risk_rating", ""),
             )
+
+        # Housekeeping: drop agent_logs older than 30 days (full_response bloats the DB).
+        try:
+            pruned = self.db.prune_agent_logs(keep_days=30)
+            if pruned:
+                logger.info("Pruned %d old agent_log rows", pruned)
+        except Exception as e:
+            logger.warning("Agent log prune failed: %s", e)
 
         logger.info("Evening: value=$%.2f, PnL=$%.2f (%.2f%%), risk=%s",
                      total_value, daily_pnl, daily_return_pct,

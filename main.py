@@ -1,18 +1,25 @@
 import argparse
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from src.config import load_config
 from src.pipeline import TradingPipeline
 from src.scheduler import TradingScheduler
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("quant_agent.log"),
+        RotatingFileHandler(
+            PROJECT_ROOT / "quant_agent.log",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+        ),
     ],
 )
 logger = logging.getLogger(__name__)
@@ -26,6 +33,8 @@ def main():
     args = parser.parse_args()
 
     config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = PROJECT_ROOT / config_path
     if not config_path.exists():
         logger.error("Config file not found: %s", config_path)
         sys.exit(1)

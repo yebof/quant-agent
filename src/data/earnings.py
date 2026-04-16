@@ -223,7 +223,7 @@ class EarningsDataProvider:
 
         filings = self._get_recent_filings(cik, symbol)
         if not filings:
-            # No recent filings — check for existing analysis
+            # No recent filings — check for existing analysis (any form)
             return self._get_existing_analysis(symbol)
 
         # Take the most recent filing
@@ -232,8 +232,8 @@ class EarningsDataProvider:
         last_known = self.manifest.get(manifest_key, {}).get("filing_date")
 
         if last_known == latest.filing_date:
-            # Already processed this filing — return existing analysis if it exists
-            existing = self._get_existing_analysis(symbol)
+            # Already processed this filing — return existing analysis matching this form_type
+            existing = self._get_existing_analysis(symbol, form_type=latest.form_type)
             if existing:
                 return existing
             # Analysis file missing (e.g. killed mid-analysis) — re-download
@@ -241,7 +241,7 @@ class EarningsDataProvider:
         # New filing — download it
         local_path = self._download_filing(cik, latest)
         if not local_path:
-            return self._get_existing_analysis(symbol)
+            return self._get_existing_analysis(symbol, form_type=latest.form_type)
 
         text = self._extract_text(local_path)
         analysis_path = self._get_analysis_path(symbol, latest.form_type, latest.filing_date)
@@ -256,13 +256,27 @@ class EarningsDataProvider:
             is_new=True,
         )
 
-    def _get_existing_analysis(self, symbol: str) -> EarningsReport | None:
-        """Find the latest existing analysis for a symbol."""
+    def _get_existing_analysis(
+        self, symbol: str, form_type: str | None = None
+    ) -> EarningsReport | None:
+        """Find the latest existing analysis for a symbol.
+
+        When form_type is given, only analyses of that form are considered; otherwise
+        any form's most-recent analysis is returned. Ordering is by filing_date from
+        the filename, not by lexicographic sort (so 10-K 2026-03-01 beats 10-Q 2026-02-15).
+        """
         symbol_dir = self.data_dir / symbol
         if not symbol_dir.exists():
             return None
 
-        analyses = sorted(symbol_dir.glob("analysis_*.md"), reverse=True)
+        pattern = f"analysis_{form_type}_*.md" if form_type else "analysis_*.md"
+
+        def _filing_date(path: Path) -> str:
+            # filename format: analysis_<form_type>_<YYYY-MM-DD>.md
+            parts = path.stem.split("_", 2)
+            return parts[2] if len(parts) > 2 else ""
+
+        analyses = sorted(symbol_dir.glob(pattern), key=_filing_date, reverse=True)
         if not analyses:
             return None
 

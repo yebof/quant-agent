@@ -2,7 +2,8 @@ from dataclasses import dataclass
 from src.config import RiskConfig
 from src.models import TradeDecision, Position
 
-# Leveraged/inverse ETF multipliers for effective exposure calculation
+# Leveraged/inverse ETF multipliers for effective exposure calculation.
+# Negative = inverse/short (hedge-like against the underlying index).
 _ETF_LEVERAGE = {
     "SH": -1.0,    # -1x S&P 500
     "SDS": -2.0,   # -2x S&P 500
@@ -14,7 +15,19 @@ _ETF_LEVERAGE = {
 
 
 def _effective_multiplier(symbol: str) -> float:
-    """Return the effective exposure multiplier for a symbol."""
+    """Signed exposure multiplier (negative for inverse ETFs).
+
+    Used for net directional exposure — hedges cancel out.
+    """
+    return _ETF_LEVERAGE.get(symbol, 1.0)
+
+
+def _gross_multiplier(symbol: str) -> float:
+    """Unsigned leverage magnitude.
+
+    Used for per-symbol and per-sector size limits where direction doesn't matter
+    (a 3x ETF still consumes 3x notional regardless of long/short bias).
+    """
     return abs(_ETF_LEVERAGE.get(symbol, 1.0))
 
 
@@ -34,21 +47,28 @@ class RiskRuleEngine:
               total_value: float, daily_pnl: float,
               pending_investment: float = 0.0,
               pending_sector_investment: dict[str, float] | None = None,
-              pending_symbol_investment: dict[str, float] | None = None) -> list[RiskViolation]:
+              pending_symbol_investment: dict[str, float] | None = None,
+              baseline: float | None = None) -> list[RiskViolation]:
         if decision.action == "SELL":
             return []
         if total_value <= 0:
             return []
 
-        violations = []
-        multiplier = _effective_multiplier(decision.symbol)
-        new_investment = total_value * (decision.allocation_pct / 100)
-        effective_new_investment = new_investment * multiplier
+        # Daily-loss denominator: yesterday-close equity if provided, else current equity.
+        if baseline is None or baseline <= 0:
+            baseline = total_value
 
-        # 1. Single position size limit (hard block) — uses effective exposure for leveraged ETFs
-        current_symbol_value = sum(p.market_value for p in positions if p.symbol == decision.symbol)
-        current_symbol_value += (pending_symbol_investment or {}).get(decision.symbol, 0.0)
-        position_pct = (current_symbol_value * multiplier + effective_new_investment) / total_value * 100
+        violations = []
+        signed_mul = _effective_multiplier(decision.symbol)  # net direction
+        gross_mul = _gross_multiplier(decision.symbol)       # size magnitude
+        new_investment = total_value * (decision.allocation_pct / 100)
+        signed_new = new_investment * signed_mul
+        gross_new = new_investment * gross_mul
+
+        # 1. Single position size limit (gross — a 3x ETF consumes 3x regardless of direction)
+        current_symbol_raw = sum(p.market_value for p in positions if p.symbol == decision.symbol)
+        current_symbol_raw += (pending_symbol_investment or {}).get(decision.symbol, 0.0)
+        position_pct = (current_symbol_raw + new_investment) * gross_mul / total_value * 100
         if position_pct > self.config.max_position_pct:
             violations.append(RiskViolation(
                 rule="max_position_pct",
@@ -57,19 +77,20 @@ class RiskRuleEngine:
                 limit=self.config.max_position_pct,
             ))
 
-        # 2. Total exposure limit (includes pending buys, adjusted for leverage)
-        current_invested = sum(p.market_value * _effective_multiplier(p.symbol) for p in positions)
-        total_pct = (current_invested + pending_investment + effective_new_investment) / total_value * 100
+        # 2. Total net exposure limit — signed, so long+short hedges cancel
+        current_net = sum(p.market_value * _effective_multiplier(p.symbol) for p in positions)
+        net_exposure = current_net + pending_investment + signed_new
+        total_pct = abs(net_exposure) / total_value * 100
         if total_pct > self.config.max_total_position_pct:
             violations.append(RiskViolation(
                 rule="max_total_position_pct",
-                message=f"Total exposure {total_pct:.1f}% would exceed max {self.config.max_total_position_pct}%",
+                message=f"Net exposure {total_pct:.1f}% would exceed max {self.config.max_total_position_pct}%",
                 value=total_pct,
                 limit=self.config.max_total_position_pct,
             ))
 
-        # 3. Daily loss limit
-        daily_loss_pct = abs(daily_pnl / total_value * 100) if daily_pnl < 0 else 0
+        # 3. Daily loss limit (% of the baseline — prior close equity)
+        daily_loss_pct = abs(daily_pnl / baseline * 100) if daily_pnl < 0 else 0
         if daily_loss_pct > self.config.max_daily_loss_pct:
             violations.append(RiskViolation(
                 rule="max_daily_loss_pct",
@@ -87,13 +108,14 @@ class RiskRuleEngine:
                 limit=0,
             ))
 
-        # 5. Sector concentration (uses sector from positions)
+        # 5. Sector concentration — gross (existing, pending, and new all use unsigned magnitude)
         from src.execution.broker import _get_sector
         new_sector = _get_sector(decision.symbol)
         if new_sector and new_sector != "Unknown":
-            sector_value = sum(p.market_value for p in positions if p.sector == new_sector)
+            sector_value = sum(p.market_value * _gross_multiplier(p.symbol)
+                               for p in positions if p.sector == new_sector)
             sector_value += (pending_sector_investment or {}).get(new_sector, 0.0)
-            sector_value += effective_new_investment
+            sector_value += gross_new
             sector_pct = sector_value / total_value * 100
             if sector_pct > self.config.max_sector_pct:
                 violations.append(RiskViolation(
@@ -105,11 +127,11 @@ class RiskRuleEngine:
 
         return violations
 
-    def check_daily_loss(self, total_value: float, daily_pnl: float) -> RiskViolation | None:
-        """Standalone daily loss check for midday session."""
-        if total_value <= 0:
+    def check_daily_loss(self, baseline: float, daily_pnl: float) -> RiskViolation | None:
+        """Standalone daily loss check. `baseline` is the % denominator (e.g. last_equity)."""
+        if baseline <= 0:
             return None
-        daily_loss_pct = abs(daily_pnl / total_value * 100) if daily_pnl < 0 else 0
+        daily_loss_pct = abs(daily_pnl / baseline * 100) if daily_pnl < 0 else 0
         if daily_loss_pct > self.config.max_daily_loss_pct:
             return RiskViolation(
                 rule="max_daily_loss_pct",

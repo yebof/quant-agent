@@ -374,7 +374,8 @@ def test_fractional_sell_helpers_preserve_position_size():
     assert pipeline._reduce_sell_qty(5.0) == pytest.approx(2.0)
 
 
-def test_evening_return_pct_handles_zero_previous_value():
+def test_evening_return_pct_handles_zero_last_equity():
+    """Evening must not divide-by-zero when last_equity is 0 (brand-new account)."""
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.broker = MagicMock()
     pipeline.db = MagicMock()
@@ -383,9 +384,9 @@ def test_evening_return_pct_handles_zero_previous_value():
     pipeline.config = MagicMock()
     pipeline.config.llm.evening_analyst_model = "test-model"
 
-    pipeline.broker.get_account.return_value = {"portfolio_value": 1000.0}
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.get_account.return_value = {"portfolio_value": 1000.0, "last_equity": 0.0}
     pipeline.broker.get_positions.return_value = []
-    pipeline.db.get_daily_pnl.return_value = [{"total_value": 0.0}]
     pipeline.db.get_trades.return_value = []
     pipeline.macro.get_macro_summary.return_value = {}
     pipeline.evening_analyst.analyze.return_value = (
@@ -395,9 +396,37 @@ def test_evening_return_pct_handles_zero_previous_value():
 
     result = pipeline.run_evening()
 
-    assert result["daily_pnl"] == 1000.0
+    # last_equity=0 → fall back to 0.0 daily_pnl rather than dividing by zero
+    assert result["daily_pnl"] == 0.0
     assert result["daily_return_pct"] == 0.0
-    pipeline.db.get_daily_pnl.assert_called_once_with(limit=1, before_date=str(date.today()))
+
+
+def test_evening_daily_pnl_uses_last_equity():
+    """daily_pnl = total_value - last_equity (includes realized fills)."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+    pipeline.macro = MagicMock()
+    pipeline.evening_analyst = MagicMock()
+    pipeline.config = MagicMock()
+    pipeline.config.llm.evening_analyst_model = "test-model"
+
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.get_account.return_value = {"portfolio_value": 10200.0, "last_equity": 10000.0}
+    pipeline.broker.get_positions.return_value = []
+    pipeline.db.get_trades.return_value = []
+    pipeline.macro.get_macro_summary.return_value = {}
+    pipeline.evening_analyst.analyze.return_value = (
+        {"daily_summary": "Up", "tomorrow_outlook": "Watch", "risk_rating": "low"},
+        AgentResult(raw_text="{}", tokens_used=10, model="test", user_message="test"),
+    )
+
+    result = pipeline.run_evening()
+
+    assert result["daily_pnl"] == 200.0
+    assert result["daily_return_pct"] == pytest.approx(2.0)
+    # DB should no longer be consulted for previous total_value
+    pipeline.db.get_daily_pnl.assert_not_called()
 
 
 # === Fix 9: get_trades today_only filter ===
@@ -457,8 +486,8 @@ def test_broker_limit_price_none_vs_zero():
 
 # === Final review: leverage-adjusted pending investment ===
 
-def test_pending_investment_is_leverage_adjusted():
-    """SQQQ (3x) pending investment should be counted as 3x in total exposure."""
+def test_hedge_nets_out_for_total_exposure():
+    """Inverse ETFs are hedges: SQQQ short + SPY long should NET, not sum."""
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.risk_engine = RiskRuleEngine(RiskConfig(
         max_position_pct=40,
@@ -467,13 +496,9 @@ def test_pending_investment_is_leverage_adjusted():
         max_sector_pct=90,  # high to not interfere
         require_stop_loss=True,
     ))
-    # SQQQ 10% raw → 30% effective. Then SPY 15% → 15% effective.
-    # Total effective = 45% < 50%. Both should pass if leverage is correctly tracked.
-    # Without adjustment: pending=10% (raw), SPY new=15%, total=25% → incorrectly passes
-    # even if we later raise the limit.
-    #
-    # To prove adjustment works, we make total limit tight enough that
-    # SQQQ (30% effective) + SPY (25% effective) = 55% > 50% → SPY blocked
+    # SQQQ 10% raw * -3 = -30% signed (short Nasdaq via inverse 3x)
+    # SPY  25% raw * +1 = +25% signed (long S&P)
+    # Net exposure = |-30 + 25| = 5% << 50% → both pass as a hedge.
     decisions = [
         TradeDecision(
             action="BUY", symbol="SQQQ", allocation_pct=10,
@@ -492,10 +517,61 @@ def test_pending_investment_is_leverage_adjusted():
             decisions, positions=[], total_value=100000, daily_pnl=0,
         )
 
-    # SQQQ passes (30% effective < 40% pos limit, 30% < 50% total)
-    # SPY: pending_investment=30000 (leverage-adjusted) + new=25000 = 55% > 50% → BLOCKED
-    assert [d.symbol for d in allowed] == ["SQQQ"]
-    assert any("Total exposure" in r for r in blocked)
+    assert [d.symbol for d in allowed] == ["SQQQ", "SPY"]
+
+
+def test_same_direction_longs_sum_for_total_exposure():
+    """Two longs (no hedge) sum to net exposure and can exceed the cap."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.risk_engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=40,
+        max_total_position_pct=50,
+        max_daily_loss_pct=3,
+        max_sector_pct=90,
+        require_stop_loss=True,
+    ))
+    # SPY 30% + QQQ 30% both long → net 60% > 50% → QQQ blocked
+    decisions = [
+        TradeDecision(
+            action="BUY", symbol="SPY", allocation_pct=30,
+            entry_price=500, stop_loss=480, take_profit=530, reasoning="core",
+        ),
+        TradeDecision(
+            action="BUY", symbol="QQQ", allocation_pct=30,
+            entry_price=400, stop_loss=380, take_profit=430, reasoning="also core",
+        ),
+    ]
+
+    with patch("src.pipeline._get_sector", return_value="Broad"), patch(
+        "src.execution.broker._get_sector", return_value="Broad"
+    ):
+        allowed, violations, blocked = pipeline._filter_hard_risk_decisions(
+            decisions, positions=[], total_value=100000, daily_pnl=0,
+        )
+
+    assert [d.symbol for d in allowed] == ["SPY"]
+    assert any("Net exposure" in r for r in blocked)
+
+
+def test_single_position_cap_uses_gross_leverage():
+    """SQQQ 8% raw * 3x = 24% gross > max_position_pct=20 → blocks at single-position cap."""
+    engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=20,
+        max_total_position_pct=90,  # high, doesn't interfere
+        max_daily_loss_pct=3,
+        max_sector_pct=90,
+        require_stop_loss=True,
+    ))
+    decision = TradeDecision(
+        action="BUY", symbol="SQQQ", allocation_pct=8,
+        entry_price=30, stop_loss=28, take_profit=35, reasoning="hedge",
+    )
+    with patch("src.execution.broker._get_sector", return_value="Unknown"):
+        violations = engine.check(
+            decision=decision, positions=[], total_value=100000, daily_pnl=0,
+        )
+    rules = [v.rule for v in violations]
+    assert "max_position_pct" in rules
 
 
 def test_insights_excludes_today(tmp_path):

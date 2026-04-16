@@ -41,9 +41,18 @@ class AlpacaBroker:
 
     def get_account(self) -> dict:
         acct = self.client.get_account()
+        portfolio_value = float(acct.portfolio_value)
+        # last_equity = equity at previous trading-day close (Alpaca-provided).
+        # Fall back to current portfolio value for brand-new accounts where
+        # Alpaca hasn't stamped a prior close yet.
+        raw_last = getattr(acct, "last_equity", None)
+        last_equity = float(raw_last) if raw_last else portfolio_value
+        if last_equity <= 0:
+            last_equity = portfolio_value
         return {
             "cash": float(acct.cash),
-            "portfolio_value": float(acct.portfolio_value),
+            "portfolio_value": portfolio_value,
+            "last_equity": last_equity,
         }
 
     def get_positions(self) -> list[Position]:
