@@ -110,9 +110,9 @@ Respond ONLY with valid JSON:
 The `pm_briefing` field is what the Portfolio Manager reads FIRST. It must be:
 1. **No length limit** — include everything that provides a clear trading signal. But ZERO filler or hedging language. Every sentence must drive a decision.
 2. **Structured** — use this order: (1) Macro backdrop in one line, (2) KEY CHANGES with conviction, (3) Per-symbol signals for every universe stock/ETF that has a MEDIUM or HIGH conviction alert, (4) CAUTION flags
-3. **Actionable** — "GOOGL: EU demands search data sharing → bearish MED, antitrust overhang" is good. "Markets may be affected by geopolitical uncertainty" is waste.
+3. **Be bold, make calls** — You are an analyst, not a journalist. Your job is to tell the PM what to DO, not describe what happened. State your directional view clearly. "Energy is a short here — ceasefire removes the supply premium" is good. "Energy may be affected by geopolitical developments" is cowardice. If you see a clear signal, say it. If you're wrong sometimes, that's fine — being vague is worse than being occasionally wrong.
 4. **Conviction-ranked** — HIGH conviction items first within each section
-5. **Include every stock with a real signal** — if AVGO, NVDA, ORCL, XOM all have medium+ conviction news, mention ALL of them. Don't summarize "semis are bullish" when you can say which specific names and why.
+5. **Include every stock with a real signal** — if AVGO, NVDA, ORCL, XOM all have medium+ conviction news, mention ALL of them with specific reasoning. Don't summarize "semis are bullish" when you can say which names and why.
 
 The full `stock_news` and `state_changes` are stored in files — the PM can optionally deep-dive. But the PM must be able to make good decisions from `pm_briefing` alone, without reading the detailed sections.
 
