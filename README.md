@@ -68,21 +68,21 @@ Evening (post-market)
 ## Risk Management
 
 ### Hard Risk Engine (non-negotiable, per-BUY)
-- Single position: max 20% (cumulative including pending same-symbol buys)
-- Total exposure: max 90% (cumulative across batch, leverage-adjusted)
-- Daily loss: max 3% (uses Alpaca intraday P&L)
-- Sector concentration: max 40% (cumulative including pending same-sector buys)
+- Single position: max 20% (gross exposure — SQQQ 3x, SDS 2x counted at full magnitude)
+- Total **net** exposure: max 90% (hedges cancel — e.g. long SPY + short SH ≈ zero net)
+- Daily loss: max 3% of prior-close equity (`equity − last_equity`; includes realized fills from broker-triggered OTO stops, not just marks)
+- Sector concentration: max 40% (gross, cumulative including pending same-sector buys)
 - Stop loss required
-- Inverse/leveraged ETF correction: SQQQ counted as 3x, SDS as 2x effective exposure
+- Inverse ETFs (SH, SDS, PSQ, SQQQ) carry signed multipliers for net exposure and gross magnitude for sizing/sector caps
 
 ### Execution Safety
 - Stale orders cancelled before each session
 - SELLs execute before BUYs (free cash first)
-- SELL uses limit price (0.5% below market for slippage protection)
+- SELL uses limit price (0.5% below market for slippage protection); midday emergency sells use a wider 1% buffer to ensure fill during cascades
 - BUY limit price auto-raised to market if below (prevents unfilled orders)
 - BUY attaches OTO stop-loss via Alpaca (broker-enforced)
 - No hard take-profit — profit managed by midday reviewer's trailing stop logic
-- Partial sell support via `allocation_pct`
+- Partial sell via `allocation_pct` (1–99 = partial, 100 = full exit; 0 is treated as a no-op)
 
 ### LLM Risk Manager
 - Audits PM's 7-step reasoning chain for internal contradictions
@@ -170,7 +170,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 109 tests
+├── tests/                         # 115 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -181,7 +181,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 109 tests
+pytest tests/ -v    # 115 tests
 ```
 
 ## Data Sources
@@ -196,10 +196,10 @@ pytest tests/ -v    # 109 tests
 
 ## Storage
 
-**SQLite** (`data/quant_agent.db`):
-- Trades (with stop/target, reasoning)
-- Position snapshots
-- Agent logs (full input/output, tokens, model)
+**SQLite** (`data/quant_agent.db`, WAL mode):
+- Trades (with stop/target, reasoning, actual submitted fill price)
+- Position snapshots (synced each midday — rows for closed symbols are purged)
+- Agent logs (full input/output, tokens, model — auto-pruned after 30 days)
 - Daily P&L records
 - Evening insights (cross-session memory)
 

@@ -113,7 +113,7 @@ Respond ONLY with valid JSON. The `reasoning_chain` object is MANDATORY — it p
     {
       "action": "SELL",
       "symbol": "AAPL",
-      "allocation_pct": 0,
+      "allocation_pct": 100,
       "entry_price": 0,
       "stop_loss": 0,
       "take_profit": 0,
@@ -128,7 +128,7 @@ Respond ONLY with valid JSON. The `reasoning_chain` object is MANDATORY — it p
 
 - `reasoning_chain` is MANDATORY. Every field must be a substantive sentence, not a placeholder.
 - `action` must be: "BUY", "SELL", "HOLD"
-- For SELL: `allocation_pct` > 0 means partial sell (that percentage of the position); 0 means full sell
+- For SELL: `allocation_pct` specifies the fraction of the position to close. Use `100` for a full exit. Use `1`–`99` for a partial sell of that percentage. Do NOT use `0` — it is treated as ambiguous and the system will skip the order with a warning.
 - If no action needed, return empty decisions array with reasoning_chain explaining why.
 - Each decision's `reasoning` must reference which signals aligned and which conflicted.
 - 7. **Symbol Discipline**: Only emit `BUY` decisions for symbols that appear in the Technical Analysis Reports section for this run. Only emit `SELL` decisions for symbols that are already in Current Positions. Never invent, alias, or correct a ticker beyond the symbols shown in the prompt.

@@ -28,7 +28,10 @@ For each winning position, mentally trail the stop up:
 - **Profit 8-15%**: Trail stop to halfway between entry and current price. Lock in some gains while letting momentum run.
 - **Profit > 15%**: Trail stop to 70% of the move. Strong momentum — protect most gains but don't cut it short.
 
-When you recommend a trailing stop adjustment, output it as a REDUCE action with reason explaining the new stop level. The system will not actually reduce — use HOLD with the trailing stop noted in the reason.
+Action semantics (important — these actually execute):
+- **HOLD** = no order placed. Use this to note a mentally-trailed stop without touching the position — state the new stop level in `reason`.
+- **REDUCE** = the system will actually sell ~50% of the position. Use only when you genuinely want to take partial profits (e.g. parabolic move with fading volume, lock gains while letting the rest ride).
+- **SELL** = the system will close the full position. Use on thesis break or to exit ahead of the broker stop.
 
 ### 3. Profit-Taking Triggers (sell only when)
 - Thesis has fundamentally broken (news event, earnings miss, sector rotation)

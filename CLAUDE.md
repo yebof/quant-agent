@@ -13,7 +13,7 @@ LLM multi-agent 美股量化交易系统，通过 Alpaca 执行交易（默认 p
 ## 开发规范
 
 - Python 3.11+，依赖管理用 pyproject.toml
-- 测试：`pytest tests/ -v`（74 tests）
+- 测试：`pytest tests/ -v`（115 tests）
 - 配置：`config/settings.yaml`，API key 通过 `${ENV_VAR}` 引用 `.env`
 - Agent prompts 在 `config/prompts/*.md`
 - DB：SQLite，线程安全（`threading.Lock`）
