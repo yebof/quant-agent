@@ -143,6 +143,38 @@ def test_reconcile_fills_flags_canceled_orders(tmp_path):
     assert db.get_symbol_last_buy("NVDA") is None
 
 
+def test_reconcile_fills_preserves_partial_terminal_fill(tmp_path):
+    from src.pipeline_context import RunContext
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    db.insert_trade(
+        symbol="NVDA", action="BUY", qty=10, price=100.0,
+        reasoning="partially filled then canceled", run_id="r1",
+        broker_order_id="ord-partial", fill_status="submitted",
+    )
+
+    broker = MagicMock()
+    broker.get_order_fill_info.return_value = {
+        "status": "canceled", "filled_qty": 3.0, "filled_avg_price": 101.25,
+    }
+
+    pipeline = _mk_pipeline(db, broker)
+    ctx = RunContext.start("morning")
+    ctx.run_id = "r1"
+    pipeline._reconcile_fills(ctx)
+
+    row = db.get_symbol_last_buy("NVDA")
+    assert row is not None
+    assert row["fill_status"] == "canceled"
+    assert row["fill_qty"] == 3.0
+    assert row["fill_price"] == 101.25
+
+    executed_rows = db.get_trades(symbol="NVDA", executed_only=True)
+    assert len(executed_rows) == 1
+    assert executed_rows[0]["broker_order_id"] == "ord-partial"
+
+
 def test_reconcile_fills_leaves_non_terminal_for_next_pass(tmp_path):
     """A still-pending order should stay 'submitted' for a later sweep."""
     from src.pipeline_context import RunContext

@@ -7,7 +7,7 @@ MorningResearchStage's parallel fan-out is covered indirectly by the
 existing pipeline integration tests in test_pipeline.py.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.pipeline_context import RunContext
 from src.pipeline_stages import MorningResearchStage
@@ -104,3 +104,105 @@ def test_morning_research_stage_populates_ctx_on_success():
     assert result_ctx.news_intel is None
     assert result_ctx.analyses == []
     assert result_ctx.earnings_results == []
+
+
+@patch("src.pipeline_stages.compute_indicators")
+def test_morning_research_stage_tech_uses_prior_macro_snapshot(mock_compute_indicators):
+    from src.agents.base import AgentResult
+    from src.models import (
+        MacroAnalysis,
+        MacroPositionGuidance,
+        MacroReasoningChain,
+        TechAnalysisResult,
+    )
+
+    mock_compute_indicators.return_value = MagicMock()
+
+    ma = MacroAnalysis(
+        reasoning_chain=MacroReasoningChain(
+            volatility_analysis="a", yield_curve_analysis="b",
+            monetary_policy_analysis="c", inflation_labor_credit="d",
+            cross_signal_synthesis="e", sector_implications="f",
+        ),
+        regime="risk-on", confidence="high", equity_outlook="bullish",
+        position_guidance=MacroPositionGuidance(
+            target_invested_pct=70, cash_recommendation_pct=30, reasoning="y",
+        ),
+        summary="z",
+    )
+    agent_result = AgentResult(raw_text="{}", tokens_used=100, model="test", user_message="x")
+
+    mock_config = MagicMock()
+    mock_config.trading.universe = ["NVDA"]
+    mock_config.trading.lookback_days = 30
+    mock_config.llm.macro_analyst_model = "claude-opus-4-6"
+    mock_config.llm.tech_analyst_model = "claude-opus-4-6"
+
+    market = MagicMock()
+    market.get_ohlcv.return_value = [
+        MagicMock(date="2026-04-17", open=99, high=101, low=98, close=100, volume=1000)
+    ]
+    market.get_valuation_metrics.return_value = {}
+
+    macro_provider = MagicMock()
+    macro_provider.get_macro_summary.return_value = {
+        "vix": {"current": 18.0},
+        "credit_spread": {"current_bps": 300},
+        "inflation": {"core_cpi_yoy": 3.0},
+        "unemployment": {"current": 4.2},
+    }
+
+    macro_store = MagicMock()
+    macro_store.load_last_state.return_value = {
+        "regime": "risk-off",
+        "equity_outlook": "bearish",
+    }
+    news_store = MagicMock()
+    news_store.load_macro_narrative.return_value = "prior narrative"
+
+    macro_agent = MagicMock()
+    macro_agent.analyze.return_value = (ma, agent_result)
+
+    tech_agent = MagicMock()
+    tech_agent.analyze_batch.return_value = (
+        {
+            "NVDA": TechAnalysisResult(
+                symbol="NVDA", rating="buy", conviction="high",
+                entry_price=100.0, reference_target=110.0, stop_loss=95.0,
+                reasoning="fresh setup",
+            )
+        },
+        agent_result,
+    )
+
+    tech_store = MagicMock()
+    tech_store.load.return_value = {}
+    tech_store.compute_ages.return_value = {}
+
+    stage = MorningResearchStage(
+        config=mock_config,
+        db=MagicMock(),
+        market=market,
+        macro=macro_provider,
+        news_provider=MagicMock(),
+        news_store=news_store,
+        macro_store=macro_store,
+        tech_store=tech_store,
+        earnings_provider=MagicMock(),
+        macro_analyst=macro_agent,
+        news_analyst=MagicMock(),
+        tech_analyst=tech_agent,
+        earnings_analyst=MagicMock(),
+        has_actionable_signal_fn=lambda *args, **kw: True,
+        run_news_update_fn=lambda run_id, session: None,
+        run_earnings_check_fn=lambda run_id, session, ctx=None: ([], []),
+    )
+
+    ctx = RunContext.start("morning")
+    ctx.positions = []
+    stage.run(ctx)
+
+    assert macro_store.load_last_state.call_count == 1
+    tech_kwargs = tech_agent.analyze_batch.call_args.kwargs
+    assert tech_kwargs["prior_macro_regime"] == "risk-off"
+    assert tech_kwargs["prior_macro_outlook"] == "bearish"

@@ -436,6 +436,57 @@ def test_evening_daily_pnl_uses_last_equity():
     pipeline.db.get_daily_pnl.assert_not_called()
 
 
+def test_evening_reconciles_before_loading_trade_inputs():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+    pipeline.macro = MagicMock()
+    pipeline.evening_analyst = MagicMock()
+    pipeline.config = MagicMock()
+    pipeline.config.llm.evening_analyst_model = "test-model"
+    pipeline._run_news_update = MagicMock(return_value=None)
+    pipeline._run_earnings_check = MagicMock(return_value=([], []))
+    pipeline._wait_bg_threads = MagicMock()
+
+    events: list = []
+
+    def _reconcile(*args, **kwargs):
+        events.append("reconcile")
+
+    def _get_trades(*args, **kwargs):
+        events.append(("get_trades", kwargs))
+        return []
+
+    pipeline._reconcile_fills = MagicMock(side_effect=_reconcile)
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.get_account.return_value = {"portfolio_value": 1000.0, "last_equity": 900.0}
+    pipeline.broker.get_positions.return_value = []
+    pipeline.db.get_trades.side_effect = _get_trades
+    pipeline.db.get_latest_insights.return_value = None
+    pipeline.macro.get_macro_summary.return_value = {}
+    pipeline._build_recent_sells_for_grading = MagicMock(return_value=[])
+    pipeline.evening_analyst.analyze.return_value = (
+        EveningReport(daily_summary="Up", lessons="", tomorrow_outlook="Watch", risk_rating="low"),
+        AgentResult(raw_text="{}", tokens_used=10, model="test", user_message="test"),
+    )
+
+    pipeline.run_evening()
+
+    assert events[0] == "reconcile"
+    assert ("get_trades", {"limit": 20, "today_only": True, "executed_only": True}) in events
+    assert pipeline._reconcile_fills.call_count == 2
+
+
+def test_recent_sells_builder_reads_only_executed_trades():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = MagicMock()
+    pipeline.broker = MagicMock()
+    pipeline.db.get_trades.return_value = []
+
+    assert pipeline._build_recent_sells_for_grading() == []
+    pipeline.db.get_trades.assert_called_once_with(limit=200, executed_only=True)
+
+
 # === Fix 9: get_trades today_only filter ===
 
 def test_get_trades_today_only(tmp_path):

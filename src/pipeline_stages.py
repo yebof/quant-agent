@@ -111,6 +111,16 @@ class MorningResearchStage:
     def run(self, ctx: RunContext) -> RunContext:
         logger.info("=== Stage: MorningResearch ===")
         data_status: dict[str, str] = {}
+        try:
+            prior_macro_state = self.macro_store.load_last_state() or {}
+        except Exception as e:
+            logger.warning("Failed to load prior macro state: %s", e)
+            prior_macro_state = {}
+        try:
+            news_narrative = self.news_store.load_macro_narrative()
+        except Exception as e:
+            logger.warning("Failed to load macro news narrative: %s", e)
+            news_narrative = None
 
         def _run_macro():
             macro_summary = self.macro.get_macro_summary()
@@ -121,12 +131,10 @@ class MorningResearchStage:
                 macro_summary.get("inflation", {}).get("core_cpi_yoy"),
                 macro_summary.get("unemployment", {}).get("current"),
             )
-            last_state = self.macro_store.load_last_state()
-            news_narrative = self.news_store.load_macro_narrative()
             analysis, result = self.macro_analyst.analyze(
                 macro_summary=macro_summary,
                 universe=self.config.trading.universe,
-                last_state=last_state,
+                last_state=prior_macro_state,
                 news_narrative=news_narrative,
             )
             if analysis:
@@ -171,7 +179,6 @@ class MorningResearchStage:
                     except Exception as e:
                         logger.warning("valuation fetch crashed for %s: %s", sym, e)
             ctx.valuations = valuations
-            prior_macro_state = self.macro_store.load_last_state() or {}
             analyses_map, ta_res = self.tech_analyst.analyze_batch(
                 symbols_data,
                 prior_ratings=prior_ratings,
