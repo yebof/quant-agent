@@ -1970,6 +1970,90 @@ class TradingPipeline:
         return {"status": "reviewed", "positions": len(positions),
                 "review": review, "orders": orders, "run_id": run_id}
 
+    def run_intra_check(self) -> dict:
+        """Lightweight intra-session circuit-breaker check (no LLM calls).
+
+        Scheduled between morning and midday (typically 12:00 ET) to catch a
+        flash crash that would otherwise accumulate unchecked through the
+        busiest trading hour. Only one rule: daily P&L vs loss limit. If
+        breached, emergency-sell every position. Runs in ~5 seconds; OK for
+        a 30-minute cadence if the user wants even tighter coverage.
+        """
+        run_id = f"intra-{uuid.uuid4().hex[:8]}"
+        logger.info("=== Intra-session risk check: %s ===", run_id)
+
+        if not self._is_trading_day():
+            logger.info("Intra check skipped: market closed for non-trading day")
+            return {"status": "market_holiday", "run_id": run_id}
+
+        try:
+            account = self.broker.get_account()
+            positions = self.broker.get_positions()
+        except Exception as e:
+            logger.error("Intra check: broker query failed: %s", e)
+            return {"status": "broker_error", "run_id": run_id, "error": str(e)}
+
+        total_value = account["portfolio_value"]
+        last_equity = account.get("last_equity", total_value)
+        daily_pnl = total_value - last_equity
+        daily_return_pct = (daily_pnl / last_equity * 100) if last_equity > 0 else 0
+        logger.info(
+            "Intra snapshot: equity=$%.2f, last_close=$%.2f, pnl=$%.2f (%.2f%%), positions=%d",
+            total_value, last_equity, daily_pnl, daily_return_pct, len(positions),
+        )
+
+        loss_violation = self.risk_engine.check_daily_loss(last_equity, daily_pnl)
+        if not loss_violation or not positions:
+            return {
+                "status": "ok",
+                "daily_pnl": daily_pnl,
+                "daily_return_pct": daily_return_pct,
+                "positions": len(positions),
+                "run_id": run_id,
+            }
+
+        logger.warning(
+            "INTRA RISK ALERT: %s — force-closing all %d positions",
+            loss_violation.message, len(positions),
+        )
+        orders: list[dict] = []
+        for p in positions:
+            try:
+                qty = self._full_sell_qty(p.qty)
+                if qty is None:
+                    continue
+                emergency_limit = round(p.current_price * 0.99, 2)
+                order = self.broker.submit_order(
+                    symbol=p.symbol, qty=qty, side="sell",
+                    limit_price=emergency_limit,
+                    reference_price=p.current_price,
+                )
+                if not self._order_accepted(order, p.symbol, "sell"):
+                    continue
+                orders.append(order)
+                self.db.insert_trade(
+                    symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,
+                    price=emergency_limit,
+                    reasoning=(
+                        f"Intra-session daily-loss breach: {loss_violation.message}"
+                    ),
+                    run_id=run_id,
+                )
+                logger.info(
+                    "Intra emergency sell: %s %s @ limit $%.2f",
+                    self._format_qty(qty), p.symbol, emergency_limit,
+                )
+            except Exception as e:
+                logger.error("Intra emergency sell failed for %s: %s", p.symbol, e)
+
+        return {
+            "status": "emergency_sold",
+            "daily_pnl": daily_pnl,
+            "daily_return_pct": daily_return_pct,
+            "orders": orders,
+            "run_id": run_id,
+        }
+
     def run_evening(self) -> dict:
         run_id = f"evening-{uuid.uuid4().hex[:8]}"
         logger.info("=== Evening report: %s ===", run_id)

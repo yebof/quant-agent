@@ -13,7 +13,7 @@ set -eu
 
 MODE="${1:-}"
 if [[ -z "$MODE" ]]; then
-    echo "usage: $0 <morning|midday|evening>" >&2
+    echo "usage: $0 <morning|intra_check|midday|evening>" >&2
     exit 2
 fi
 
@@ -38,13 +38,15 @@ if [[ "$ET_DOW" -gt 5 ]]; then
 fi
 
 # === Window per mode (minutes past ET midnight) ===
-# morning: 09:30-12:00 ET (pre-market / early session, wide for late-wake grace)
-# midday : 15:00-16:30 ET (last hour of regular session)
-# evening: 20:00-22:00 ET (post-market, insights written before next morning)
+# morning    : 09:30-12:00 ET (pre-market / early session, wide for late-wake grace)
+# intra_check: 12:00-13:30 ET (flash-crash circuit breaker midway through session)
+# midday     : 15:00-16:30 ET (last hour of regular session)
+# evening    : 20:00-22:00 ET (post-market, insights written before next morning)
 case "$MODE" in
-    morning) LO=570;  HI=720  ;;
-    midday)  LO=900;  HI=990  ;;
-    evening) LO=1200; HI=1320 ;;
+    morning)     LO=570;  HI=720  ;;
+    intra_check) LO=720;  HI=810  ;;
+    midday)      LO=900;  HI=990  ;;
+    evening)     LO=1200; HI=1320 ;;
     *) echo "unknown mode: $MODE" >&2; exit 2 ;;
 esac
 

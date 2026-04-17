@@ -196,6 +196,78 @@ def test_rm_verdicts_builder_parses_agent_logs(tmp_path):
     assert "All trades pass" in lines[1]
 
 
+def test_run_intra_check_emergency_sells_on_breach(tmp_path):
+    """Intra check at -4% daily: force-sells every position."""
+    from unittest.mock import MagicMock
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+    from src.risk.rules import RiskRuleEngine
+    from src.config import RiskConfig
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.risk_engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=20, max_total_position_pct=90,
+        max_daily_loss_pct=3.0, max_sector_pct=40,
+        require_stop_loss=False,
+    ))
+    pipeline.broker = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.get_account.return_value = {
+        "portfolio_value": 96_000.0, "last_equity": 100_000.0, "cash": 10_000.0,
+    }
+    pos = Position(
+        symbol="NVDA", qty=50, avg_entry=200, current_price=192,
+        market_value=9600, unrealized_pnl=-400, sector="Technology",
+    )
+    pipeline.broker.get_positions.return_value = [pos]
+    pipeline.broker.submit_order.return_value = {
+        "id": "sell-1", "status": "accepted", "symbol": "NVDA",
+    }
+
+    result = pipeline.run_intra_check()
+    assert result["status"] == "emergency_sold"
+    assert len(result["orders"]) == 1
+    # Verify the order was a real sell at ~1% below market
+    kw = pipeline.broker.submit_order.call_args.kwargs
+    assert kw["side"] == "sell"
+    assert kw["qty"] == 50
+    assert kw["limit_price"] == round(192 * 0.99, 2)
+
+
+def test_run_intra_check_ok_when_within_loss_budget(tmp_path):
+    """Intra check at -1% daily: no action, status 'ok'."""
+    from unittest.mock import MagicMock
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+    from src.risk.rules import RiskRuleEngine
+    from src.config import RiskConfig
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.risk_engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=20, max_total_position_pct=90,
+        max_daily_loss_pct=3.0, max_sector_pct=40,
+        require_stop_loss=False,
+    ))
+    pipeline.broker = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.get_account.return_value = {
+        "portfolio_value": 99_000.0, "last_equity": 100_000.0, "cash": 10_000.0,
+    }
+    pipeline.broker.get_positions.return_value = []
+
+    result = pipeline.run_intra_check()
+    assert result["status"] == "ok"
+    pipeline.broker.submit_order.assert_not_called()
+
+
 def test_auto_take_profit_triggers_once_at_15pct(tmp_path):
     """A position up ≥ 15% gets trimmed 33%, and only once per holding."""
     from unittest.mock import MagicMock

@@ -28,8 +28,11 @@ logger = logging.getLogger(__name__)
 def main():
     parser = argparse.ArgumentParser(description="LLM Agent Quantitative Trading System")
     parser.add_argument("--config", default="config/settings.yaml", help="Path to config file")
-    parser.add_argument("--mode", choices=["live", "once", "morning", "midday", "evening"],
-                        default="once", help="Run mode")
+    parser.add_argument(
+        "--mode",
+        choices=["live", "once", "morning", "midday", "evening", "intra_check"],
+        default="once", help="Run mode",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -54,6 +57,8 @@ def main():
             result = pipeline.run_midday()
         elif args.mode == "evening":
             result = pipeline.run_evening()
+        elif args.mode == "intra_check":
+            result = pipeline.run_intra_check()
         logger.info("Result: %s", result)
 
 
