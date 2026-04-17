@@ -19,15 +19,19 @@ Morning (pre-market)
      ├─ Load yesterday's evening insights (cross-session memory)
      │
      ▼
-  Portfolio Manager (7-step CoT reasoning chain)
+  Portfolio Manager (7-step CoT; R/R-weighted sizing; drawdown-aware)
      │
      ├─ Symbol Guard (universe + analysis check)
      ├─ Hard Risk Engine (per-BUY, leverage-adjusted)
-     ├─ Risk Manager LLM (audits PM reasoning chain)
+     │     includes advisory violations:
+     │     • macro_exposure_deviation  (>15pp from Macro target)
+     │     • correlation_cluster       (>50% of book in corr>0.7 peers)
+     │     • data_degraded             (>=2 upstream sources failed)
+     ├─ Risk Manager LLM (6-step CoT; R/R veto; scale_all_buys; tech fidelity)
      │
      ▼
   Execute: SELLs first → refresh cash → BUYs
-           (limit orders, auto-raised to market price)
+           (limit orders, auto-raised to market price, tick-size quantized)
            (OTO bracket: stop-loss only, no hard take-profit)
 
 Midday (intraday)
@@ -60,11 +64,11 @@ Evening (post-market)
 | **Tech Analyst** | Batch technical analysis | 5-step CoT (trend / momentum / volatility / volume / S&R). ATR-based default stop (`entry − 2*ATR`). Output rating + `conviction` (high/medium/low) + `reference_target` + `thesis_invalid_if` (soft exit condition). **Auto-computed `risk_reward`** (Python-calculated, not LLM-trusted) flows into PM sizing and RM veto logic. Pre-filter thresholds normalized by ATR. Auto-chunks batch > 30 symbols. Cross-field validator: BUY stop must be below entry, SELL above. |
 | **News Intelligence** | 3-layer news analysis | Layer 1: Persistent macro narrative. Layer 2: State change detection. Layer 3: Per-symbol alerts with conviction. Daily storage in `data/news/` |
 | **Macro Analyst** | Regime assessment & sector guidance | 6-step CoT (vol / curve / monetary / inflation+labor+credit / cross-signal / sector). Inputs: VIX, 2Y/10Y yields, **DFF** (daily fed funds), **core & headline CPI**, **UNRATE**, **HY OAS**. Persists yesterday's regime → detects `regime_shift`. Cross-references News narrative via `alignment_with_news`. Emits bull/bear view-change triggers. |
-| **Earnings Analyst** | SEC 10-Q/10-K analysis | Revenue, margins, strategic direction, competitive positioning, strategic vs operational risks, strategy consistency across filings |
-| **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain (macro → news → earnings → signal conflicts → sizing → balance → cash). Sizing explicitly scales by the TechAnalyst's `risk_reward`: R/R ≥ 3 boost, R/R < 1.5 requires an explicit catalyst or shrinks. Step 6 checks `thesis_invalid_if` on each held position for early exits before stop triggers. |
-| **Risk Manager** | Trade review with veto power | Audits PM's reasoning chain + enforces R/R discipline: BUYs with R/R < 1.5 must be downsized via modifications or rejected unless PM named a catalyst. Sees raw Tech ratings + R/R + full macro context. Can modify per-symbol fields OR apply portfolio-wide `scale_all_buys` (0.0-1.0). |
-| **Midday Reviewer** | Profit management & trailing-stop execution | Trailing-stop logic is **real**, not cosmetic — `TRAIL_STOP` action actually cancels the broker's old stop and submits a new one at the specified price via `AlpacaBroker.replace_stop_loss`. Sees VIX + HY OAS + core CPI to gauge whether to tighten stops broadly. |
-| **Evening Analyst** | Daily P&L review & learning | Outputs feed into next morning's PM prompt (cross-session memory) |
+| **Earnings Analyst** | SEC 10-Q/10-K analysis | Revenue, margins, cash flow, strategic direction, competitive positioning, strategic vs operational risks, strategy consistency across filings. `investment_implications` carries a 5-step `reasoning_chain` (fundamental_quality / growth_trajectory / strategic_risks / management_execution / valuation_context) — sentiment call is derivable from the numbers, not a vibe check. |
+| **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain (macro → news → earnings → signal conflicts → sizing → balance → cash). Sizing scales by the TechAnalyst's `risk_reward`: R/R ≥ 3 boost, R/R < 1.5 requires an explicit catalyst or shrinks. **Drawdown-aware**: receives rolling 5d/20d returns; when `in_drawdown` (5d < −3% OR 20d < −8%), halves all new BUY sizes until recovery. Step 6 checks `thesis_invalid_if` on held positions for early exits before stop triggers. |
+| **Risk Manager** | Trade review with veto power | Mandatory 6-step `reasoning_chain` (rr_audit / signal_fidelity / correlation_check / event_risk / sizing_sanity / overall) — vague approvals rejected. Enforces R/R discipline: BUYs with R/R < 1.5 must be downsized via modifications or rejected unless PM named a catalyst. Sees raw Tech ratings + R/R + full macro context. Can modify per-symbol fields OR apply portfolio-wide `scale_all_buys` (0.0-1.0). |
+| **Midday Reviewer** | Profit management & trailing-stop execution | Trailing-stop logic is **real**, not cosmetic — `TRAIL_STOP` action actually cancels the broker's old stop and submits a new one at the specified price via `AlpacaBroker.replace_stop_loss`. Sees VIX + HY OAS + core CPI to gauge whether to tighten stops broadly. Output is Pydantic `MiddayReview` — action enum enforced (typos like `TRIAL_STOP` rejected); `TRAIL_STOP` requires `new_stop_price > 0`. |
+| **Evening Analyst** | Daily P&L review & learning | Pydantic `EveningReport` with enum `risk_rating`. **Outlook retrospective**: reads yesterday's `tomorrow_outlook` and grades it honestly against today's reality via `previous_outlook_assessment` — builds calibration over time. Outputs feed into next morning's PM prompt (cross-session memory). |
 
 ## Risk Management
 
@@ -88,12 +92,13 @@ Evening (post-market)
 - Partial sell via `allocation_pct` (1–99 = partial, 100 = full exit; 0 is treated as a no-op)
 
 ### LLM Risk Manager
-- Audits PM's 7-step reasoning chain for internal contradictions
-- Receives TechAnalyst signals to verify PM translated them faithfully
-- Reviews risk/reward ratios (min 1:2 preferred)
-- Checks correlation and concentration risk
+- Mandatory 6-step `reasoning_chain`: rr_audit → signal_fidelity → correlation_check → event_risk → sizing_sanity → overall
+- Enforces R/R ≥ 1.5 discipline; downsizes or rejects BUYs that miss without an explicit catalyst
+- Receives raw TechAnalyst signals + computed R/R to verify PM's fidelity (no silent contradictions)
+- Sees hard-engine advisories inline: `correlation_cluster`, `macro_exposure_deviation`, `data_degraded` — must address each in `reasoning_chain`
+- Reviews risk/reward, correlation concentration, and imminent event risk (earnings / FOMC within 3 days)
 - Can modify per-symbol fields (aliases: `target`→`take_profit`, `stop`→`stop_loss`) OR set portfolio-level `scale_all_buys` (0.0-1.0) to shrink all BUYs uniformly
-- Modifications and scaling re-validated through risk engine
+- Modifications and scaling re-validated through the risk engine
 
 ## Setup
 
@@ -168,7 +173,8 @@ quant-agent/
 │   │   ├── news.py                # RSS feeds + symbol mention tagging
 │   │   ├── news_store.py          # Dated news storage + narrative persistence
 │   │   ├── earnings.py            # SEC EDGAR provider
-│   │   └── technical.py           # TA indicators (MA, RSI, MACD, BB, ATR)
+│   │   ├── technical.py           # TA indicators (MA, RSI, MACD, BB, ATR)
+│   │   └── correlation.py         # 120d pairwise return correlations + cluster detection
 │   ├── execution/
 │   │   └── broker.py              # Alpaca (OTO brackets, calendar, live prices)
 │   ├── risk/
