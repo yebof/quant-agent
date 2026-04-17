@@ -196,6 +196,57 @@ def test_rm_verdicts_builder_parses_agent_logs(tmp_path):
     assert "All trades pass" in lines[1]
 
 
+def test_auto_take_profit_triggers_once_at_15pct(tmp_path):
+    """A position up ≥ 15% gets trimmed 33%, and only once per holding."""
+    from unittest.mock import MagicMock
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    # Insert the BUY that opened this holding
+    db.insert_trade("NVDA", "BUY", 100, 100.0, "opened", "r1")
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    # broker.submit_order returns success
+    pipeline.broker = MagicMock()
+    pipeline.broker.submit_order.return_value = {
+        "id": "tp-1", "status": "accepted", "symbol": "NVDA",
+    }
+
+    # Position: 100 shares @ $100 cost, current $118 → 18% gain → triggers TP
+    winner = Position(
+        symbol="NVDA", qty=100, avg_entry=100, current_price=118,
+        market_value=11800, unrealized_pnl=1800, sector="Technology",
+    )
+    # Position: 100 shares @ $100, current $105 → 5% gain → no TP yet
+    small_winner = Position(
+        symbol="JPM", qty=100, avg_entry=100, current_price=105,
+        market_value=10500, unrealized_pnl=500, sector="Financial Services",
+    )
+    db.insert_trade("JPM", "BUY", 100, 100.0, "opened", "r1")
+
+    orders_1 = pipeline._auto_take_profit([winner, small_winner], run_id="r2")
+    assert len(orders_1) == 1
+    # Trim qty = 33% of 100 = 33 shares
+    kw = pipeline.broker.submit_order.call_args.kwargs
+    assert kw["symbol"] == "NVDA"
+    assert kw["qty"] == 33
+    assert kw["side"] == "sell"
+
+    # Trade row inserted with TAKE_PROFIT tag
+    rows = db.get_trades(symbol="NVDA", limit=10)
+    tp_rows = [r for r in rows if (r.get("action") or "").upper() == "TAKE_PROFIT"]
+    assert len(tp_rows) == 1
+
+    # Running again on the SAME holding → no duplicate TP
+    pipeline.broker.submit_order.reset_mock()
+    orders_2 = pipeline._auto_take_profit([winner, small_winner], run_id="r3")
+    assert orders_2 == []
+    pipeline.broker.submit_order.assert_not_called()
+
+
 def test_vol_adjusted_sizing_caps_qty_on_wide_stops():
     """SQQQ-style wide-stop name gets fewer shares than raw allocation would suggest.
 

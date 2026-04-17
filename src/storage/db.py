@@ -140,8 +140,15 @@ class Database:
             conditions.append("date(timestamp) = date('now')")
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._lock:
+            # Secondary order-by on id ensures tie-break ordering is
+            # deterministic — SQLite's timestamp precision is 1 second, so
+            # a BUY inserted at T0 and TAKE_PROFIT inserted at T0+0.01 both
+            # carry the same timestamp string. Without id DESC, duplicate-
+            # timestamp rows come back in indeterminate order and logic
+            # that scans "trades newer than the most recent BUY" can miss
+            # the newer row.
             rows = self.conn.execute(
-                f"SELECT * FROM trades {where} ORDER BY timestamp DESC LIMIT ?",
+                f"SELECT * FROM trades {where} ORDER BY timestamp DESC, id DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
         return [dict(row) for row in rows]
