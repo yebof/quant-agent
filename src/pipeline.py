@@ -309,6 +309,30 @@ class TradingPipeline:
         return updated_decisions
 
     @staticmethod
+    def _order_accepted(order: dict, symbol: str, side: str) -> bool:
+        """Returns True iff the order payload looks like a live broker order.
+
+        Used before appending to the trades audit log so we don't record
+        phantom fills. Alpaca can return an error-shaped dict (missing id, or
+        status like 'rejected' / 'expired'); recording those as BUY / SELL
+        would make the audit log diverge from broker reality.
+        """
+        if not order or not order.get("id"):
+            logger.error(
+                "%s %s: broker returned no order id (payload=%s) — skipping audit",
+                side.upper(), symbol, order,
+            )
+            return False
+        status = (order.get("status") or "").lower()
+        if status in ("rejected", "canceled", "cancelled", "expired", "error"):
+            logger.error(
+                "%s %s: broker rejected order (status=%s) — skipping audit",
+                side.upper(), symbol, status,
+            )
+            return False
+        return True
+
+    @staticmethod
     def _clamp_queued_earnings_buys(
         decisions: list[TradeDecision],
         earnings_results: list[dict],
@@ -1403,9 +1427,10 @@ class TradingPipeline:
                     symbol=decision.symbol, qty=qty, side="sell",
                     limit_price=sell_limit,
                 )
+                if not self._order_accepted(order, decision.symbol, "sell"):
+                    continue
                 orders.append(order)
-                if order.get("id"):
-                    sell_order_ids.append(order["id"])
+                sell_order_ids.append(order["id"])
                 self.db.insert_trade(
                     symbol=decision.symbol, action=action_label, qty=qty,
                     price=sell_price, reasoning=decision.reasoning, run_id=run_id,
@@ -1503,22 +1528,11 @@ class TradingPipeline:
                     # No hard take-profit — profit managed by midday trailing stop logic
                 )
                 # Symmetric with SELL phase: if Alpaca returns an error-shaped
-                # dict (missing id, or status not in the accepted set), treat
-                # the submission as failed. Don't decrement available_cash and
-                # don't record the trade — otherwise risk math thinks we spent
-                # money we didn't spend, and the audit log shows a phantom BUY.
-                if not order or not order.get("id"):
-                    logger.error(
-                        "BUY %s: broker returned no order id (payload=%s) — skipping, "
-                        "cash untouched", decision.symbol, order,
-                    )
-                    continue
-                status = (order.get("status") or "").lower()
-                if status in ("rejected", "canceled", "cancelled", "expired", "error"):
-                    logger.error(
-                        "BUY %s: broker rejected order (status=%s) — skipping, cash untouched",
-                        decision.symbol, status,
-                    )
+                # dict, treat the submission as failed. Don't decrement
+                # available_cash and don't record the trade — otherwise risk
+                # math thinks we spent money we didn't spend and the audit log
+                # shows a phantom BUY.
+                if not self._order_accepted(order, decision.symbol, "buy"):
                     continue
                 orders.append(order)
                 available_cash -= estimated_cost
@@ -1606,6 +1620,8 @@ class TradingPipeline:
                             symbol=p.symbol, qty=qty, side="sell",
                             limit_price=emergency_limit,
                         )
+                        if not self._order_accepted(order, p.symbol, "sell"):
+                            continue
                         orders.append(order)
                         self.db.insert_trade(
                             symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,
@@ -1702,6 +1718,8 @@ class TradingPipeline:
                             sell_limit = round(existing[0].current_price * 0.995, 2)
                             order = self.broker.submit_order(
                                 symbol=symbol, qty=qty, side="sell", limit_price=sell_limit)
+                            if not self._order_accepted(order, symbol, "sell"):
+                                continue
                             orders.append(order)
                             self.db.insert_trade(
                                 symbol=symbol, action=act, qty=qty,
