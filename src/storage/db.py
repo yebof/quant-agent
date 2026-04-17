@@ -79,19 +79,35 @@ class Database:
         self._migrate()
 
     def _migrate(self):
-        """Add columns that may be missing in older databases."""
-        cursor = self.conn.execute("PRAGMA table_info(agent_logs)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "input_message" not in columns:
-            self.conn.execute("ALTER TABLE agent_logs ADD COLUMN input_message TEXT DEFAULT ''")
-            self.conn.commit()
+        """Add columns that may be missing in older databases.
 
-        cursor = self.conn.execute("PRAGMA table_info(trades)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "stop_loss" not in columns:
-            self.conn.execute("ALTER TABLE trades ADD COLUMN stop_loss REAL DEFAULT 0")
-            self.conn.execute("ALTER TABLE trades ADD COLUMN take_profit REAL DEFAULT 0")
-            self.conn.commit()
+        Each ALTER is independent and wrapped in try/except so one partial
+        migration (e.g., stop_loss added but take_profit ALTER crashed on the
+        prior run) can still be recovered by the next startup. The old pattern
+        of bundling both ALTERs under a single 'if stop_loss not in columns'
+        guard would permanently skip take_profit if it wasn't added together.
+        """
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+
+        def _ensure_column(table: str, column: str, ddl: str) -> None:
+            try:
+                cursor = self.conn.execute(f"PRAGMA table_info({table})")
+                existing = {row[1] for row in cursor.fetchall()}
+                if column in existing:
+                    return
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+                self.conn.commit()
+                _log.info("Schema migration: added %s.%s", table, column)
+            except Exception as e:
+                # Don't bring down initialization on a migration hiccup — the
+                # table is still usable with the old schema, just missing this
+                # one column. Caller will see reduced functionality, not a crash.
+                _log.error("Schema migration failed for %s.%s: %s", table, column, e)
+
+        _ensure_column("agent_logs", "input_message", "input_message TEXT DEFAULT ''")
+        _ensure_column("trades", "stop_loss", "stop_loss REAL DEFAULT 0")
+        _ensure_column("trades", "take_profit", "take_profit REAL DEFAULT 0")
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
