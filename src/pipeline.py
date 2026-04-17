@@ -1473,6 +1473,21 @@ class TradingPipeline:
                         market_price = live_price
                         price_map[decision.symbol] = live_price
 
+                # Reference price fallback: if broker pricing is unavailable,
+                # use the last OHLCV bar close from this morning's tech fetch.
+                # Better than trusting the LLM's entry_price blindly when we
+                # have no way to sanity-check it.
+                if not market_price or market_price <= 0:
+                    bars = getattr(self, "_last_symbols_bars", {}).get(decision.symbol) or []
+                    if bars:
+                        last_close = float(bars[-1].close)
+                        if last_close > 0:
+                            logger.info(
+                                "Using last-bar close $%.2f as price reference for %s (broker pricing unavailable)",
+                                last_close, decision.symbol,
+                            )
+                            market_price = last_close
+
                 limit_price = None
                 sizing_price = None
                 if decision.entry_price > 0:
@@ -1495,15 +1510,19 @@ class TradingPipeline:
                             sizing_price = max(market_price, limit_price)
                     else:
                         sizing_price = market_price
-                elif limit_price is not None:
-                    logger.warning(
-                        "No live market price for %s; sizing and submitting as a limit order at $%.2f",
-                        decision.symbol,
-                        limit_price,
-                    )
-                    sizing_price = limit_price
                 else:
-                    logger.warning("Invalid price for %s, skipping", decision.symbol)
+                    # No broker pricing AND no bar fallback — we have nothing
+                    # to sanity-check the LLM's entry_price against. Submitting
+                    # at the LLM's number risks sending an unfillable stale
+                    # limit that gets recorded in the audit log as a BUY even
+                    # though it never fills. Safer to skip and let the next
+                    # session re-evaluate with fresh data.
+                    logger.error(
+                        "BUY %s skipped: no verifiable price reference (broker + bars both unavailable). "
+                        "LLM proposed entry $%.2f but cannot be validated.",
+                        decision.symbol,
+                        decision.entry_price,
+                    )
                     continue
 
                 qty = int((total_value * decision.allocation_pct / 100) / sizing_price)
