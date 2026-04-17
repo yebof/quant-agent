@@ -461,6 +461,37 @@ class TradingPipeline:
                 def _bg_analyze(bg_reports):
                     try:
                         results = self.earnings_analyst.analyze_reports(bg_reports)
+
+                        # Log every fresh LLM call to db.agent_logs — full prompt +
+                        # full raw_text (includes the investment_reasoning_chain JSON).
+                        # Parity with the 7 other agents that already write here.
+                        for res in results:
+                            agent_result = res.get("agent_result")
+                            if agent_result is None:
+                                continue  # cached reads — no LLM call to log
+                            sym = res.get("symbol", "?")
+                            analysis = res.get("analysis") or {}
+                            sentiment = (analysis.get("investment_implications") or {}).get("sentiment", "?")
+                            try:
+                                self.db.insert_agent_log(
+                                    agent_name=f"earnings_analyst_{session}",
+                                    run_id=run_id,
+                                    input_summary=f"{sym} {res.get('form_type', '?')} filed {res.get('filing_date', '?')}",
+                                    input_message=agent_result.user_message,
+                                    output_summary=(
+                                        f"sentiment={sentiment}"
+                                        if res.get("analysis") else "parse_error"
+                                    ),
+                                    full_response=agent_result.raw_text,
+                                    model=self.config.llm.earnings_analyst_model,
+                                    tokens_used=agent_result.tokens_used,
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    "[%s] Failed to insert earnings agent_log for %s: %s",
+                                    session, sym, e,
+                                )
+
                         for r in bg_reports:
                             if any(res["symbol"] == r.symbol and res["is_new"] for res in results):
                                 self.earnings_provider.confirm_filing(r)
@@ -1338,10 +1369,11 @@ class TradingPipeline:
                 risk_rating=analysis.get("risk_rating", ""),
             )
 
-        # Housekeeping: drop agent_logs older than 30 days (full_response bloats the DB),
-        # and trades older than 5 years (keep a long audit tail but bound it).
+        # Housekeeping: drop agent_logs older than 2 years (full_response bloats the DB
+        # but 730 days supports quarter-over-quarter learning), and trades older than
+        # 5 years (keep a long audit tail but bound it).
         try:
-            pruned = self.db.prune_agent_logs(keep_days=30)
+            pruned = self.db.prune_agent_logs(keep_days=730)
             if pruned:
                 logger.info("Pruned %d old agent_log rows", pruned)
         except Exception as e:

@@ -212,11 +212,12 @@ class Database:
             self.conn.commit()
             return cursor.rowcount or 0
 
-    def prune_agent_logs(self, keep_days: int = 30) -> int:
+    def prune_agent_logs(self, keep_days: int = 730) -> int:
         """Delete agent_logs rows older than keep_days. Returns count deleted.
 
-        agent_logs.full_response can be tens of KB per entry and ~24 entries land
-        per day; without pruning the DB grows without bound.
+        Default is 2 years — long enough for quarter-over-quarter learning loops
+        on what decisions worked while still bounding table size. agent_logs.full_response
+        runs ~20-40KB per row with ~15-25 rows/day, so 730 days is ~200-300MB total.
         """
         with self._lock:
             cursor = self.conn.execute(
