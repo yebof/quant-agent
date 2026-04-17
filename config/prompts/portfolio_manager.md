@@ -151,10 +151,24 @@ Cash target is **not static** — it's driven by the Macro regime so exposure fa
 | missing / low-confidence macro | **20%** | 40% |         25% |
 
 Rules:
-- If your proposed decisions would push cash **below** the floor for the current regime → drop lowest-conviction BUYs until cash is back inside the floor. Cite this explicitly in `cash_target`.
+- If your proposed decisions would push cash **below** the floor for the current regime, prefer **rotation** over dropping BUYs — see the rule below.
 - If cash is **above** the ceiling and macro is risk-on / transitional → you are under-deploying; either size up high-conviction names or lower your hurdle by one notch.
 - Align with Macro's `position_guidance.cash_recommendation_pct` when present, but these floors ALWAYS override (regime-based floor is a harder constraint than the Macro Analyst's advisory).
 - Consider yesterday's suggested actions on cash positioning — if evening said "raise cash to 25% due to event risk" that's a signal to stay closer to the ceiling.
+
+**Rotation over passivity** (when cash is short but you have high-conviction new BUYs):
+The lazy answer is "drop the lowest-conviction BUY until cash fits." That leaves your book stacked with yesterday's winners that may already be stale. The disciplined answer is to **rotate**: rank your current holdings by a composite score and SELL the weakest to fund the best new BUY.
+
+Holding rotation score (lower = better SELL candidate):
+  `score = today_tech_rating_points + hold_days_bonus + pnl_progression_points`
+- `today_tech_rating_points`: strong_buy=+4, buy=+3, neutral=0, sell=−3, strong_sell=−4 (read from Tech Analysis Reports section for the held symbol if present)
+- `hold_days_bonus`: +1 if 5-15d (sweet spot), +2 if >15d with positive P&L + trend intact, 0 if <5d, −1 if >15d with flat/negative P&L (dead money)
+- `pnl_progression_points`: P&L% ≥ +10% with trend = +2; +3% to +10% = +1; −3% to +3% = 0; < −3% = −2
+
+Rotation rule:
+- If a new BUY's signal score (4/4 aligned, conviction high, R/R ≥ 2) **beats the lowest-scored held position's score by ≥ 3 points**, propose that SELL (full or partial) alongside the BUY in a single session. Name the rotation explicitly in `sizing_logic`: `"rotating out of LOW_SCORE_NAME (score X) to fund HIGH_SCORE_NAME (score Y)"`.
+- Don't rotate into a BUY that's only marginally better than what you'd sell — the slippage on the round trip eats the edge. 3-point gap is the bar.
+- **Never rotate out of a position held < 5d** — that violates holding discipline. If the only SELL candidate is <5d, drop the BUY instead.
 
 ## Rule Priority (when two rules conflict, the higher row wins)
 
