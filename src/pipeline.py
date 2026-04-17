@@ -1848,6 +1848,9 @@ class TradingPipeline:
                 lessons=analysis.get("lessons", ""),
                 suggested_actions=analysis.get("suggested_actions", []),
                 risk_rating=analysis.get("risk_rating", ""),
+                tomorrow_bias=analysis.get("tomorrow_bias", "neutral"),
+                tomorrow_conviction=analysis.get("tomorrow_conviction", "medium"),
+                tomorrow_key_risks=analysis.get("tomorrow_key_risks", []),
             )
 
         # Housekeeping: drop agent_logs older than 2 years (full_response bloats the DB

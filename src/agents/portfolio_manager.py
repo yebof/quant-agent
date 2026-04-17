@@ -296,14 +296,30 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
                 except (json.JSONDecodeError, TypeError):
                     pass
             actions_text = "\n".join(f"  - {a}" for a in actions) if isinstance(actions, list) else f"  - {actions}"
+            key_risks = yesterday_insights.get("tomorrow_key_risks", "[]")
+            if isinstance(key_risks, str):
+                try:
+                    key_risks = json.loads(key_risks)
+                except (json.JSONDecodeError, TypeError):
+                    key_risks = []
+            risks_text = (
+                "\n".join(f"  - {r}" for r in key_risks)
+                if isinstance(key_risks, list) and key_risks
+                else "  (none named)"
+            )
             insights_date = yesterday_insights.get("date", "unknown")
             insights_ts = yesterday_insights.get("timestamp", "")
             freshness = f" (from {insights_date}"
             if insights_ts:
                 freshness += f", written {insights_ts}"
             freshness += ")"
+            bias = yesterday_insights.get("tomorrow_bias") or "neutral"
+            conviction = yesterday_insights.get("tomorrow_conviction") or "medium"
             insights_section = f"""## Prior Evening Insights{freshness}
-- Outlook: {yesterday_insights.get('tomorrow_outlook', 'N/A')}
+- **Tilt for today**: bias={bias}, conviction={conviction}
+- Outlook (prose): {yesterday_insights.get('tomorrow_outlook', 'N/A')}
+- Key risks to watch today:
+{risks_text}
 - Lessons: {yesterday_insights.get('lessons', 'N/A')}
 - Risk Rating: {yesterday_insights.get('risk_rating', 'N/A')}
 - Suggested Actions:

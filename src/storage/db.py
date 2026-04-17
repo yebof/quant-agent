@@ -72,6 +72,9 @@ class Database:
                 lessons TEXT,
                 suggested_actions TEXT,
                 risk_rating TEXT,
+                tomorrow_bias TEXT DEFAULT 'neutral',
+                tomorrow_conviction TEXT DEFAULT 'medium',
+                tomorrow_key_risks TEXT DEFAULT '[]',
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
         """)
@@ -108,6 +111,9 @@ class Database:
         _ensure_column("agent_logs", "input_message", "input_message TEXT DEFAULT ''")
         _ensure_column("trades", "stop_loss", "stop_loss REAL DEFAULT 0")
         _ensure_column("trades", "take_profit", "take_profit REAL DEFAULT 0")
+        _ensure_column("insights", "tomorrow_bias", "tomorrow_bias TEXT DEFAULT 'neutral'")
+        _ensure_column("insights", "tomorrow_conviction", "tomorrow_conviction TEXT DEFAULT 'medium'")
+        _ensure_column("insights", "tomorrow_key_risks", "tomorrow_key_risks TEXT DEFAULT '[]'")
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
@@ -268,14 +274,24 @@ class Database:
         return [dict(row) for row in rows]
 
     def save_insights(self, date: str, tomorrow_outlook: str, lessons: str,
-                      suggested_actions: str, risk_rating: str):
+                      suggested_actions: str, risk_rating: str,
+                      tomorrow_bias: str = "neutral",
+                      tomorrow_conviction: str = "medium",
+                      tomorrow_key_risks: list | str = ()):
         import json
         actions_json = json.dumps(suggested_actions) if isinstance(suggested_actions, list) else suggested_actions
+        risks_json = (
+            json.dumps(list(tomorrow_key_risks))
+            if not isinstance(tomorrow_key_risks, str) else tomorrow_key_risks
+        )
         with self._lock:
             self.conn.execute(
-                """INSERT OR REPLACE INTO insights (date, tomorrow_outlook, lessons, suggested_actions, risk_rating)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (date, tomorrow_outlook, lessons, actions_json, risk_rating),
+                """INSERT OR REPLACE INTO insights
+                   (date, tomorrow_outlook, lessons, suggested_actions, risk_rating,
+                    tomorrow_bias, tomorrow_conviction, tomorrow_key_risks)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (date, tomorrow_outlook, lessons, actions_json, risk_rating,
+                 tomorrow_bias, tomorrow_conviction, risks_json),
             )
             self.conn.commit()
 

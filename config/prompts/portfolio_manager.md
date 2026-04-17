@@ -28,12 +28,18 @@ Before producing any trade decisions, you MUST work through the 7-step reasoning
 
 ## 7-Step Decision Framework
 
-### Step 1: Macro Filter
+### Step 1: Macro Filter + Evening Tilt
 Read the Macro Analyst's regime and position guidance.
 - What is the current regime? (risk-on, risk-off, transitional)
 - What is the recommended overall exposure level?
 - Which sectors are overweight/underweight?
-- Does yesterday's outlook align or conflict with today's macro?
+
+Then check **Prior Evening Insights → Tilt for today** (`bias` + `conviction`):
+- `bullish` + high conviction → bias base allocations **+20%** on high-conviction BUYs (still within the 20% single-position hard cap).
+- `bearish` + high conviction → bias base allocations **−20%** on all new BUYs; favor SELLs / HOLDs where ambiguous.
+- Medium conviction → ±10% tilt. Low conviction → no tilt (evening had no edge; don't pretend to either).
+- `Key risks` named by evening → treat them as event_risk for sizing decisions on affected names / sectors.
+- If today's Macro contradicts evening's bias (evening bearish + today's macro risk-on) → resolve in `macro_filter` explicitly and follow today's macro (it's fresher).
 
 ### Step 2: News Check
 Read **PM Briefing** first for orientation, then drill down:

@@ -552,11 +552,17 @@ class MiddayReview(BaseModel):
 class EveningReport(BaseModel):
     daily_summary: str
     lessons: str
-    tomorrow_outlook: str
+    tomorrow_outlook: str  # prose; retained for evening narrative + PM context
     risk_rating: Literal["low", "moderate", "elevated", "high"]
     suggested_actions: list[str] = []
     # Outlook-vs-reality retrospection — was yesterday's tomorrow_outlook right?
     previous_outlook_assessment: str = ""
+    # Structured version of tomorrow_outlook so PM can act on it deterministically
+    # instead of re-parsing prose. PM tilts base sizing ±20% on the bias/conviction
+    # pair at morning open.
+    tomorrow_bias: Literal["bullish", "neutral", "bearish"] = "neutral"
+    tomorrow_conviction: Literal["high", "medium", "low"] = "medium"
+    tomorrow_key_risks: list[str] = []
 
 
 class AgentLog(BaseModel):

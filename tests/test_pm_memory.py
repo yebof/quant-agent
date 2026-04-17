@@ -196,6 +196,80 @@ def test_rm_verdicts_builder_parses_agent_logs(tmp_path):
     assert "All trades pass" in lines[1]
 
 
+def test_pm_renders_structured_evening_tilt():
+    """PM surfaces tomorrow_bias + conviction + key_risks from evening insights."""
+    import json
+    with patch("anthropic.Anthropic"):
+        agent = PortfolioManagerAgent(api_key="test", model="claude-opus-4-6")
+        msg = agent.build_user_message(
+            analyses=[], positions=[], macro_analysis=None,
+            cash_balance=5000.0, total_value=10000.0,
+            yesterday_insights={
+                "date": "2026-04-17",
+                "tomorrow_outlook": "Defensive bias; FOMC minutes risk.",
+                "lessons": "Don't chase.",
+                "risk_rating": "elevated",
+                "suggested_actions": ["Raise cash to 25%"],
+                "tomorrow_bias": "bearish",
+                "tomorrow_conviction": "high",
+                "tomorrow_key_risks": json.dumps(["FOMC minutes 2pm", "VIX > 20"]),
+            },
+        )
+        assert "bias=bearish" in msg
+        assert "conviction=high" in msg
+        assert "FOMC minutes 2pm" in msg
+        assert "VIX > 20" in msg
+
+
+def test_evening_report_parses_structured_fields():
+    """EveningReport accepts and defaults the new structured fields."""
+    from src.models import EveningReport
+
+    # Defaults kick in when fields are omitted (backward compat)
+    r = EveningReport(
+        daily_summary="x", lessons="x", tomorrow_outlook="x",
+        risk_rating="low",
+    )
+    assert r.tomorrow_bias == "neutral"
+    assert r.tomorrow_conviction == "medium"
+    assert r.tomorrow_key_risks == []
+
+    # Explicit values parse
+    r2 = EveningReport(
+        daily_summary="x", lessons="x", tomorrow_outlook="x",
+        risk_rating="high",
+        tomorrow_bias="bearish", tomorrow_conviction="high",
+        tomorrow_key_risks=["FOMC", "NVDA earnings"],
+    )
+    assert r2.tomorrow_bias == "bearish"
+    assert r2.tomorrow_key_risks == ["FOMC", "NVDA earnings"]
+
+
+def test_save_and_load_insights_roundtrip_structured_fields(tmp_path):
+    """db.save_insights persists the new columns; get_recent_insights returns them."""
+    from src.storage.db import Database
+    import json
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    db.save_insights(
+        date="2026-04-17",
+        tomorrow_outlook="Watch FOMC.",
+        lessons="Don't chase.",
+        suggested_actions=["raise cash"],
+        risk_rating="elevated",
+        tomorrow_bias="bearish",
+        tomorrow_conviction="high",
+        tomorrow_key_risks=["FOMC 2pm", "VIX > 20"],
+    )
+    rows = db.get_recent_insights(limit=1)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["tomorrow_bias"] == "bearish"
+    assert row["tomorrow_conviction"] == "high"
+    assert json.loads(row["tomorrow_key_risks"]) == ["FOMC 2pm", "VIX > 20"]
+
+
 def test_risk_verdict_accepts_reason_category():
     """RiskVerdict parses the new reason_category enum; default is 'clean'."""
     from src.models import RiskVerdict
