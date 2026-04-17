@@ -196,6 +196,45 @@ def test_rm_verdicts_builder_parses_agent_logs(tmp_path):
     assert "All trades pass" in lines[1]
 
 
+def test_build_recent_sells_joins_current_prices(tmp_path):
+    """_build_recent_sells_for_grading pulls SELL trades and computes pct move."""
+    from unittest.mock import MagicMock
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    # Insert a SELL trade 1 day ago
+    db.insert_trade("NVDA", "SELL", 10, 500.0, "thesis break", "r1")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-1 day') "
+        "WHERE symbol='NVDA'"
+    )
+    db.conn.commit()
+    # Old trade (5 days) — should NOT appear (outside 2d window)
+    db.insert_trade("AAPL", "SELL", 10, 200.0, "old", "r2")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-5 days') "
+        "WHERE symbol='AAPL'"
+    )
+    db.conn.commit()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    # Mock broker to return a specific current price
+    pipeline.broker = MagicMock()
+    pipeline.broker.get_latest_price = MagicMock(return_value=530.0)
+
+    out = pipeline._build_recent_sells_for_grading(lookback_days=2)
+    assert len(out) == 1
+    row = out[0]
+    assert row["symbol"] == "NVDA"
+    assert row["sell_price"] == 500.0
+    assert row["current_price"] == 530.0
+    # (530/500 - 1) * 100 = 6.0 — stock moved UP after we sold → premature exit
+    assert row["pct_move_since_sell"] == 6.0
+
+
 def test_pm_renders_structured_evening_tilt():
     """PM surfaces tomorrow_bias + conviction + key_risks from evening insights."""
     import json

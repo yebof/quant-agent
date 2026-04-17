@@ -30,6 +30,7 @@ class EveningAnalystAgent(BaseAgent):
         daily_return_pct: float = kwargs["daily_return_pct"]
         today_trades: list[dict] = kwargs.get("today_trades", []) or []
         prior_outlook: dict | None = kwargs.get("prior_outlook")
+        recent_sells: list[dict] = kwargs.get("recent_sells", []) or []
 
         positions_text = "\n".join(
             f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Close: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} | Sector: {p.sector}"
@@ -42,6 +43,26 @@ class EveningAnalystAgent(BaseAgent):
         ) if today_trades else "No trades today."
 
         vix = macro_summary.get("vix", {}) or {}
+
+        # SELL decisions to grade. Each entry compares the sell price with the
+        # stock's current close, so evening can judge whether the exit was
+        # correct / premature / wrong. Grounds the discipline in outcomes.
+        if recent_sells:
+            sells_lines = []
+            for s in recent_sells:
+                sym = s.get("symbol", "?")
+                sell_date = s.get("sell_date", "?")
+                sell_price = s.get("sell_price", 0.0) or 0.0
+                curr = s.get("current_price", 0.0) or 0.0
+                pct = s.get("pct_move_since_sell", 0.0) or 0.0
+                reason = (s.get("reasoning") or "").strip()[:140]
+                sells_lines.append(
+                    f"- {sell_date} {sym}: sold @ ${sell_price:.2f}, now ${curr:.2f} ({pct:+.2f}%) — "
+                    f"reason at sell: \"{reason}\""
+                )
+            sells_section = "\n".join(sells_lines)
+        else:
+            sells_section = "(no SELL trades in the last 2 trading days)"
 
         # Retrospection input — yesterday's outlook and suggested_actions to evaluate honestly.
         if prior_outlook:
@@ -72,6 +93,9 @@ market ripped, say so. Calibration matters more than looking smart."""
 ### Macro
 - VIX: {vix.get('current', 'N/A')} (trend: {vix.get('trend', 'N/A')})
 
+## Recent SELL decisions to grade (last 2 days)
+{sells_section}
+
 {prior_section}
 
 Provide your end-of-day analysis as JSON."""
@@ -79,7 +103,8 @@ Provide your end-of-day analysis as JSON."""
     def analyze(self, positions: list[Position], macro_summary: dict,
                 total_value: float, daily_pnl: float, daily_return_pct: float,
                 today_trades: list[dict] | None = None,
-                prior_outlook: dict | None = None) -> tuple[dict | None, "AgentResult"]:
+                prior_outlook: dict | None = None,
+                recent_sells: list[dict] | None = None) -> tuple[dict | None, "AgentResult"]:
         result = self.run(
             positions=positions,
             macro_summary=macro_summary,
@@ -88,6 +113,7 @@ Provide your end-of-day analysis as JSON."""
             daily_return_pct=daily_return_pct,
             today_trades=today_trades or [],
             prior_outlook=prior_outlook,
+            recent_sells=recent_sells or [],
         )
         parsed = result.parse_json()
         if parsed is None:

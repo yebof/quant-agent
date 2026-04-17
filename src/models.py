@@ -563,6 +563,11 @@ class EveningReport(BaseModel):
     tomorrow_bias: Literal["bullish", "neutral", "bearish"] = "neutral"
     tomorrow_conviction: Literal["high", "medium", "low"] = "medium"
     tomorrow_key_risks: list[str] = []
+    # SELL discipline feedback loop. Evening grades each recent SELL against
+    # what actually happened to the stock afterwards. Pure-prose field so the
+    # LLM can reference specific trades and the "should we have sold" judgment;
+    # PM doesn't consume it directly but EveningAnalyst logs it for learning.
+    sell_decisions_assessment: str = ""
 
 
 class AgentLog(BaseModel):

@@ -671,6 +671,64 @@ class TradingPipeline:
                 )
         return "\n".join(lines)
 
+    def _build_recent_sells_for_grading(self, lookback_days: int = 2) -> list[dict]:
+        """Return recent SELL-family trades joined with current quote for grading.
+
+        Used by evening to produce `sell_decisions_assessment`. For each SELL
+        in the window, we fetch the current price and compute pct move since
+        the sell — positive means we left money on the table, negative means
+        the exit saved capital. Broker lookup errors fall back to 0% (log).
+        """
+        try:
+            all_rows = self.db.get_trades(limit=200)
+        except Exception as e:
+            logger.warning("recent_sells: db fetch failed: %s", e)
+            return []
+        if not all_rows:
+            return []
+        from datetime import date as _date, timedelta as _td
+        cutoff = et_today() - _td(days=lookback_days)
+        sell_actions = ("SELL", "EMERGENCY_SELL")
+        out: list[dict] = []
+        for row in all_rows:
+            action = row.get("action") or ""
+            if not (action in sell_actions or action.startswith("PARTIAL_SELL")):
+                continue
+            ts = row.get("timestamp") or ""
+            try:
+                sell_date = _date.fromisoformat(ts[:10])
+            except ValueError:
+                continue
+            if sell_date < cutoff:
+                continue
+            sym = row.get("symbol")
+            sell_price = float(row.get("price") or 0) or 0.0
+            if not sym or sell_price <= 0:
+                continue
+            # Current price: prefer live broker quote; degrade to position map;
+            # degrade to last known OHLCV close.
+            curr = 0.0
+            try:
+                curr = float(self.broker.get_latest_price(sym) or 0) or 0.0
+            except Exception as e:
+                logger.warning("recent_sells: latest price failed for %s: %s", sym, e)
+            if curr <= 0:
+                bars = getattr(self, "_last_symbols_bars", {}).get(sym) or []
+                if bars:
+                    curr = float(bars[-1].close or 0)
+            pct = ((curr / sell_price - 1) * 100) if (curr > 0 and sell_price > 0) else 0.0
+            out.append({
+                "symbol": sym,
+                "sell_date": str(sell_date),
+                "sell_price": sell_price,
+                "current_price": round(curr, 2) if curr else 0.0,
+                "pct_move_since_sell": round(pct, 2),
+                "reasoning": row.get("reasoning") or "",
+            })
+        # Newest first, cap to avoid bloating the evening prompt
+        out.sort(key=lambda r: r["sell_date"], reverse=True)
+        return out[:10]
+
     def _build_calibration_note(self, lookback_days: int = 45) -> str:
         """Render PM's own hit rate + avg return on closed BUYs in the window.
 
@@ -1819,6 +1877,10 @@ class TradingPipeline:
         # Feed yesterday's insights back so evening can grade its own prior outlook
         # against today's reality — enables calibration over time.
         prior_outlook = self.db.get_latest_insights(before_date=today_str)
+        # SELL decisions from the last 2 days + each symbol's move since sell.
+        # Evening grades each one {correct|premature|wrong} — the feedback loop
+        # on selling discipline.
+        recent_sells = self._build_recent_sells_for_grading(lookback_days=2)
 
         analysis, ev_result = self.evening_analyst.analyze(
             positions=positions,
@@ -1828,6 +1890,7 @@ class TradingPipeline:
             daily_return_pct=daily_return_pct,
             today_trades=today_trades,
             prior_outlook=prior_outlook,
+            recent_sells=recent_sells,
         )
 
         self.db.insert_agent_log(

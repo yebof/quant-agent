@@ -15,10 +15,15 @@ You will receive:
 
 1. **Previous Outlook Review**: If yesterday's `tomorrow_outlook` was provided, grade it honestly against today's actual performance. Were the calls right? Missed? Off by magnitude? This builds calibration over time.
 2. **Performance Attribution**: What drove today's P&L? Which positions contributed most (positive and negative)?
-3. **Decision Review**: Were today's trades good decisions in hindsight? Would you make the same call?
-4. **Market Context**: How did the broader market perform? Did our positions outperform or underperform?
-5. **Risk Assessment**: Has the portfolio's risk profile changed? Any concentration or correlation concerns?
-6. **Tomorrow's Outlook**: Key events, levels to watch, potential catalysts.
+3. **SELL Discipline Review**: For each recent SELL (last 2 days) shown in the prompt, grade it:
+   - **correct** — stock is flat or down since the sell; the exit saved money or at least didn't cost any
+   - **premature** — stock is up > 2% since the sell; we left money on the table, but the thesis for selling may still have been defensible
+   - **wrong** — stock is up > 5% since the sell AND the thesis for selling has been invalidated by today's data
+   State each verdict + a 1-sentence reason in `sell_decisions_assessment`. This is the feedback loop on "don't sell winners too early."
+4. **Decision Review**: Were today's BUY/HOLD trades good decisions in hindsight? Would you make the same call?
+5. **Market Context**: How did the broader market perform? Did our positions outperform or underperform?
+6. **Risk Assessment**: Has the portfolio's risk profile changed? Any concentration or correlation concerns?
+7. **Tomorrow's Outlook**: Key events, levels to watch, potential catalysts.
 
 ## Output
 
@@ -27,6 +32,7 @@ Respond ONLY with valid JSON:
 ```json
 {
   "previous_outlook_assessment": "Yesterday's outlook called for caution on falling VIX; VIX actually rose from 18 to 21 today and portfolio gave back 0.4%. Direction was right (defensive bias) but the specific VIX call was wrong. Calibrate toward less-precise VIX predictions — the regime stance was correct.",
+  "sell_decisions_assessment": "AAPL sell at $188 yesterday (up 2.3% since) → premature — trend was still intact and my tariff-risk thesis was weaker than I framed it. XOM sell at $108 yesterday (down 1.8%) → correct — ceasefire state change held. Net SELL discipline: ok but erring toward early exits on positive-P&L names.",
   "daily_summary": "Portfolio returned +0.8% vs SPY +0.3%. GOOGL and IWM buys from this morning are both in profit. IWM entry was slightly early — RSI was still declining when we bought.",
   "lessons": "Entry timing on IWM was slightly early — RSI was still declining when we bought. Next time, wait for RSI to bottom and turn before adding small caps on a recovery thesis.",
   "tomorrow_outlook": "Watch for FOMC minutes release at 2pm ET. VIX elevated at 24 suggests caution. Consider tightening stops if market weakness persists.",
