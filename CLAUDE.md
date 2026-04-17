@@ -31,12 +31,13 @@ LLM multi-agent 美股量化交易系统，通过 Alpaca 执行交易（默认 p
 - **EarningsAnalyst**：`investment_implications` 必含 5 步 `reasoning_chain` (fundamental_quality / growth_trajectory / strategic_risks / management_execution / valuation_context) —— sentiment 必须可从这 5 字段推导
 - **生产侧防挂死**：所有 Alpaca SDK 调用注入 30s HTTP timeout（`_install_http_timeout`），且 launchd plist 外层用 `/opt/homebrew/bin/timeout --kill-after=30 600 ...` 10 分钟兜底——双层防护，防再次出现 13 小时 hang
 - **价格 quantize**：`broker.submit_order` 提交前 `_quantize_price(price)` 按 Alpaca tick 规则归整（≥$1 用 2 位小数、<$1 用 4 位）——防 sub-penny reject
-- **生产调度**：macOS launchd，Mon-Fri SGT 22:00/04:00/08:30 → morning/midday/evening（对应美东 10:00/16:00/20:30）
+- **生产调度（时区弹性）**：launchd 每 30 分钟触发 wrapper（`scripts/run_if_et_window.sh`），wrapper 看 **ET 时间**判断是否在 session 窗口 + 看 last-run 文件去重。morning 09:30-12:00 ET、midday 15:00-16:30 ET、evening 20:00-22:00 ET、Mon-Fri ET。用户出差到任何时区都能正确时刻触发
+- **ET 时间统一**：`src/util/time.py` 提供 `et_today()` / `et_now()`；daily_pnl key、insights 查询、broker.is_trading_day、news/macro 快照目录、earnings cutoff、market OHLCV 全部走 ET——跨时区 host 上数据一致
 
 ## 开发规范
 
 - Python 3.11+，依赖管理用 pyproject.toml
-- 测试：`pytest tests/ -v`（175 tests）
+- 测试：`pytest tests/ -v`（180 tests）
 - 配置：`config/settings.yaml`，API key 通过 `${ENV_VAR}` 引用 `.env`
 - Agent prompts 在 `config/prompts/*.md`
 - 入口：`python main.py --mode morning|midday|evening|live`

@@ -12,6 +12,8 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+
+from src.util.time import et_now
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
@@ -126,7 +128,7 @@ class EarningsDataProvider:
         accessions = recent.get("accessionNumber", [])
         primary_docs = recent.get("primaryDocument", [])
 
-        cutoff = (datetime.now() - timedelta(days=self.lookback_days)).strftime("%Y-%m-%d")
+        cutoff = (et_now() - timedelta(days=self.lookback_days)).strftime("%Y-%m-%d")
         filings = []
         for i, form in enumerate(forms):
             if form not in ("10-Q", "10-K"):

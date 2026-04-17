@@ -142,7 +142,8 @@ class AlpacaBroker:
         return positions
 
     def is_trading_day(self, on_date: date | None = None) -> bool:
-        target_date = on_date or date.today()
+        from src.util.time import et_today
+        target_date = on_date or et_today()  # ET trading-day, not host-local
         try:
             from alpaca.trading.requests import GetCalendarRequest
 

@@ -3,8 +3,9 @@
 import json
 import logging
 import os
-from datetime import date
 from pathlib import Path
+
+from src.util.time import et_today
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ class MacroStore:
         if not isinstance(analysis, dict):
             return
         snapshot = {
-            "date": str(date.today()),
+            "date": str(et_today()),
             "regime": analysis.get("regime"),
             "confidence": analysis.get("confidence"),
             "equity_outlook": analysis.get("equity_outlook"),

@@ -3,8 +3,9 @@
 import json
 import logging
 import os
-from datetime import date
 from pathlib import Path
+
+from src.util.time import et_today
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ class NewsStore:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
     def _today_dir(self) -> Path:
-        d = self.data_dir / str(date.today())
+        d = self.data_dir / str(et_today())
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -40,7 +41,7 @@ class NewsStore:
     def save_macro_narrative(self, narrative: dict):
         path = self.data_dir / "macro_narrative.json"
         # Keep a dated backup before overwriting
-        backup = self.data_dir / f"macro_narrative_{date.today()}.json"
+        backup = self.data_dir / f"macro_narrative_{et_today()}.json"
         if path.exists() and not backup.exists():
             try:
                 backup.write_text(path.read_text())

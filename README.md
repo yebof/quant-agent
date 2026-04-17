@@ -142,7 +142,9 @@ python main.py --mode evening    # PnL report + insights for tomorrow
 python main.py --mode live       # Scheduler (all three on cron, weekdays)
 ```
 
-Automated via macOS launchd — plist files in `~/Library/LaunchAgents/com.quant-agent.*.plist`
+Automated via macOS launchd — plist files in `~/Library/LaunchAgents/com.quant-agent.*.plist`.
+
+**Timezone-resilient scheduling**: plists fire every 30 minutes (`StartInterval=1800`); a bash wrapper `scripts/run_if_et_window.sh` checks whether the current **US/Eastern** time is inside the target window and whether the mode already ran in the last hour. Runs the right session at the right ET moment regardless of the host's timezone (handy when traveling). Windows: morning 09:30-12:00 ET, midday 15:00-16:30 ET, evening 20:00-22:00 ET, Mon-Fri.
 
 ## Trading Universe
 
@@ -181,7 +183,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 175 tests
+├── tests/                         # 180 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -192,7 +194,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 175 tests
+pytest tests/ -v    # 180 tests
 ```
 
 ## Data Sources

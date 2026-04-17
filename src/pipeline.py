@@ -4,6 +4,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from src.util.time import et_today
 
 from pydantic import ValidationError
 
@@ -689,7 +690,7 @@ class TradingPipeline:
             return {"status": "no_data", "orders": [], "run_id": run_id}
 
         # 5. Portfolio Manager decision
-        yesterday_insights = self.db.get_latest_insights(before_date=str(date.today()))
+        yesterday_insights = self.db.get_latest_insights(before_date=str(et_today()))
 
         # Recent performance context — if the system is in drawdown, PM should size down
         # until it recovers. Meta-cognitive risk management, independent of market regime.
@@ -1260,7 +1261,7 @@ class TradingPipeline:
         positions = self.broker.get_positions()
         total_value = account["portfolio_value"]
         last_equity = account.get("last_equity", total_value)
-        today_str = str(date.today())
+        today_str = str(et_today())  # trading-day date in ET — stable across host TZ
 
         if last_equity > 0:
             daily_pnl = total_value - last_equity

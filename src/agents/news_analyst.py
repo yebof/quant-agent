@@ -55,8 +55,8 @@ class NewsAnalystAgent(BaseAgent):
         else:
             stock_section = "## Stock-Specific News\nNo universe symbols detected in today's headlines."
 
-        from datetime import date as _date
-        today = str(_date.today())
+        from src.util.time import et_today
+        today = str(et_today())
 
         return f"""## Today's Date: {today}
 
