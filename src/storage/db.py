@@ -1,6 +1,8 @@
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
+
+from src.util.time import ET, UTC, et_today
 
 
 class Database:
@@ -267,6 +269,26 @@ class Database:
             "OR COALESCE(fill_qty, 0) > 0)"
         )
 
+    @staticmethod
+    def _sqlite_utc_timestamp(when: datetime) -> str:
+        """Format a datetime the same way SQLite stores `datetime('now')`.
+
+        Trades are stored as naive UTC strings. Converting ET day boundaries
+        into this format lets `today_only=True` mean "this ET trading day"
+        regardless of the host timezone.
+        """
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        return when.astimezone(UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+    @classmethod
+    def _et_day_utc_bounds(cls, trading_day: date | None = None) -> tuple[str, str]:
+        """UTC timestamp bounds [start, end) for an ET trading-day date."""
+        day = trading_day or et_today()
+        start_et = datetime.combine(day, time.min, tzinfo=ET)
+        end_et = start_et + timedelta(days=1)
+        return cls._sqlite_utc_timestamp(start_et), cls._sqlite_utc_timestamp(end_et)
+
     def get_trades(self, symbol: str | None = None, limit: int = 100,
                     today_only: bool = False,
                     executed_only: bool = False) -> list[dict]:
@@ -276,7 +298,9 @@ class Database:
             conditions.append("symbol = ?")
             params.append(symbol)
         if today_only:
-            conditions.append("date(timestamp) = date('now')")
+            start_utc, end_utc = self._et_day_utc_bounds()
+            conditions.append("timestamp >= ? AND timestamp < ?")
+            params.extend([start_utc, end_utc])
         if executed_only:
             conditions.append(self._executed_trade_predicate())
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""

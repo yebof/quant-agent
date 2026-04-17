@@ -12,6 +12,19 @@ PROMPT_PATH = Path(__file__).parent.parent.parent / "config" / "prompts" / "midd
 
 
 class MiddayReviewerAgent(BaseAgent):
+    @staticmethod
+    def _trade_executed(trade: dict) -> bool:
+        """Match DB executed_only semantics for safety in prompt assembly."""
+        status = trade.get("fill_status")
+        if status is None:
+            return True
+        if str(status).lower() == "filled":
+            return True
+        try:
+            return float(trade.get("fill_qty") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
     @property
     def name(self) -> str:
         return "midday_reviewer"
@@ -39,7 +52,12 @@ class MiddayReviewerAgent(BaseAgent):
         trade_context = {}
         for t in morning_trades:
             sym = t.get("symbol", "")
-            if t.get("action") == "BUY" and sym:
+            if (
+                t.get("action") == "BUY"
+                and sym
+                and sym not in trade_context
+                and self._trade_executed(t)
+            ):
                 trade_context[sym] = t
 
         positions_lines = []
