@@ -248,10 +248,15 @@ def test_pipeline_market_order_sizes_from_live_market_price(
     result = pipeline.run_morning()
 
     assert result["status"] == "executed"
-    mock_broker.submit_order.assert_called_once_with(
-        symbol="SPY", qty=10, side="buy", limit_price=None,
-        stop_loss_price=90.0,
-    )
+    # Verify by-field rather than full-equality so optional kwargs (reference_price
+    # for fat-finger guard) don't brittle-break the test.
+    mock_broker.submit_order.assert_called_once()
+    kw = mock_broker.submit_order.call_args.kwargs
+    assert kw["symbol"] == "SPY"
+    assert kw["qty"] == 10
+    assert kw["side"] == "buy"
+    assert kw["limit_price"] is None
+    assert kw["stop_loss_price"] == 90.0
     mock_broker.get_latest_price.assert_called_once_with("SPY")
 
 
@@ -530,13 +535,19 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
     assert mock_broker.cancel_open_entry_orders.call_count == 1
     mock_broker.cancel_open_orders.assert_not_called()
     assert mock_broker.wait_for_order_terminal.call_count == 1
-    assert mock_broker.submit_order.call_args_list[0].kwargs == {
-        "symbol": "SPY", "qty": 30.0, "side": "sell", "limit_price": 99.5,
-    }
-    assert mock_broker.submit_order.call_args_list[1].kwargs == {
-        "symbol": "QQQ",
-        "qty": 30,
-        "side": "buy",
-        "limit_price": 100.0,
-        "stop_loss_price": 95.0,
-    }
+    sell_kw = mock_broker.submit_order.call_args_list[0].kwargs
+    assert sell_kw["symbol"] == "SPY"
+    assert sell_kw["qty"] == 30.0
+    assert sell_kw["side"] == "sell"
+    assert sell_kw["limit_price"] == 99.5
+    # reference_price is plumbed through for fat-finger guard; value will be
+    # the position's current price at sell time.
+    assert sell_kw.get("reference_price") is not None
+
+    buy_kw = mock_broker.submit_order.call_args_list[1].kwargs
+    assert buy_kw["symbol"] == "QQQ"
+    assert buy_kw["qty"] == 30
+    assert buy_kw["side"] == "buy"
+    assert buy_kw["limit_price"] == 100.0
+    assert buy_kw["stop_loss_price"] == 95.0
+    assert buy_kw.get("reference_price") is not None

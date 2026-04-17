@@ -337,7 +337,8 @@ class AlpacaBroker:
     def submit_order(self, symbol: str, qty: float, side: str,
                      limit_price: float | None = None,
                      stop_loss_price: float | None = None,
-                     take_profit_price: float | None = None) -> dict:
+                     take_profit_price: float | None = None,
+                     reference_price: float | None = None) -> dict:
         order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
         # Normalize to Alpaca's tick size — sub-penny values from quote-midpoint
@@ -345,6 +346,31 @@ class AlpacaBroker:
         limit_price = _quantize_price(limit_price)
         stop_loss_price = _quantize_price(stop_loss_price)
         take_profit_price = _quantize_price(take_profit_price)
+
+        # Fat-finger / outlier price guardrail. If the caller passed a
+        # reference_price (typically today's quote or last bar close) and any
+        # of our prices is more than 20% away from it, the number is almost
+        # certainly garbage — a data-source glitch ($0.01 quote on a $300
+        # stock, or an LLM hallucinated entry). Submitting would turn qty
+        # sizing into nonsense (5% alloc / $0.01 = 500× expected shares) and
+        # blow through every risk check. Refuse the order.
+        OUTLIER_MAX_DEVIATION = 0.20
+        if reference_price and reference_price > 0:
+            for label, candidate in (
+                ("limit_price", limit_price),
+                ("stop_loss_price", stop_loss_price),
+                ("take_profit_price", take_profit_price),
+            ):
+                if candidate is None or candidate <= 0:
+                    continue
+                deviation = abs(candidate - reference_price) / reference_price
+                if deviation > OUTLIER_MAX_DEVIATION:
+                    logger.error(
+                        "Fat-finger guard: %s %s — %s=$%.4f deviates %.1f%% from reference $%.2f. "
+                        "Order REJECTED (likely data glitch or LLM hallucination).",
+                        side.upper(), symbol, label, candidate, deviation * 100, reference_price,
+                    )
+                    return {"id": None, "status": "rejected_outlier", "symbol": symbol}
 
         # Attach stop-loss as OTO (one-triggers-other) leg — no hard take-profit,
         # profit management is handled by midday reviewer's trailing stop logic

@@ -259,3 +259,74 @@ def test_wait_for_order_terminal_polls_until_filled(mock_tc_cls):
 
     assert status == "filled"
     assert mock_client.get_order_by_id.call_count == 2
+
+
+@patch("src.execution.broker.TradingClient")
+def test_submit_order_rejects_outlier_limit_price(mock_tc_cls):
+    """A limit_price >20% away from reference_price must be refused before submit."""
+    mock_client = MagicMock()
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    # Reference says $300 but LLM or data glitch produced a $50 limit — 83% deviation
+    result = broker.submit_order(
+        symbol="NVDA", qty=10, side="buy",
+        limit_price=50.0, reference_price=300.0,
+    )
+    assert result["status"] == "rejected_outlier"
+    assert result["id"] is None
+    mock_client.submit_order.assert_not_called()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_submit_order_rejects_outlier_stop_price(mock_tc_cls):
+    mock_client = MagicMock()
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    # Stop at $0.01 (data glitch) against $300 reference — should reject
+    result = broker.submit_order(
+        symbol="NVDA", qty=10, side="buy",
+        limit_price=300.0, stop_loss_price=0.01,
+        reference_price=300.0,
+    )
+    assert result["status"] == "rejected_outlier"
+    mock_client.submit_order.assert_not_called()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_submit_order_allows_prices_within_20pct(mock_tc_cls):
+    """Normal 3-4% variation around reference must pass through."""
+    mock_client = MagicMock()
+    submitted = MagicMock()
+    submitted.id = "ord-1"
+    submitted.status = "accepted"
+    submitted.symbol = "NVDA"
+    mock_client.submit_order.return_value = submitted
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.submit_order(
+        symbol="NVDA", qty=10, side="buy",
+        limit_price=310.0, stop_loss_price=285.0,
+        reference_price=300.0,  # 3.3% / 5% deviations — well within 20% guard
+    )
+    assert result["status"] == "accepted"
+    mock_client.submit_order.assert_called_once()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_submit_order_without_reference_price_skips_outlier_check(mock_tc_cls):
+    """Backwards compat — callers that don't pass reference_price get old behavior."""
+    mock_client = MagicMock()
+    submitted = MagicMock()
+    submitted.id = "ord-1"
+    submitted.status = "accepted"
+    submitted.symbol = "NVDA"
+    mock_client.submit_order.return_value = submitted
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    # Even a weird limit price gets through if reference is absent
+    result = broker.submit_order(symbol="NVDA", qty=10, side="buy", limit_price=0.01)
+    assert result["status"] == "accepted"
