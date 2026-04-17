@@ -308,6 +308,44 @@ class TradingPipeline:
 
         return updated_decisions
 
+    @staticmethod
+    def _clamp_queued_earnings_buys(
+        decisions: list[TradeDecision],
+        earnings_results: list[dict],
+        max_pct: float = 5.0,
+    ) -> list[TradeDecision]:
+        """Hard-cap BUY allocation on symbols with queued (just-filed) earnings.
+
+        A 10-Q filed today but not yet analyzed by the LLM can move the stock
+        ±10% overnight. PM shouldn't size up before the analyst has read it.
+        Prompt rule asks PM to self-comply; this is the belt that keeps things
+        safe even if the LLM ignores the rule.
+        """
+        queued_symbols = {
+            (ea.get("symbol") or "").strip().upper()
+            for ea in earnings_results
+            if ea.get("queued") and not ea.get("analysis")
+        }
+        queued_symbols.discard("")
+        if not queued_symbols:
+            return decisions
+        clamped: list[TradeDecision] = []
+        for d in decisions:
+            if d.action == "BUY" and d.symbol.upper() in queued_symbols and d.allocation_pct > max_pct:
+                try:
+                    reduced = d.model_copy(update={"allocation_pct": max_pct})
+                    logger.warning(
+                        "Earnings-queued cap: %s BUY %.2f%% → %.2f%% (fresh filing not yet analyzed)",
+                        d.symbol, d.allocation_pct, max_pct,
+                    )
+                    clamped.append(reduced)
+                except Exception as e:
+                    logger.warning("Earnings-queued cap copy failed for %s: %s — keeping original", d.symbol, e)
+                    clamped.append(d)
+            else:
+                clamped.append(d)
+        return clamped
+
     def _is_trading_day(self) -> bool:
         try:
             return self.broker.is_trading_day()
@@ -1099,6 +1137,14 @@ class TradingPipeline:
                 "Allowing %d supported orders through after symbol guard filter",
                 len(portfolio_decision.decisions),
             )
+
+        # Hard-cap BUYs on symbols whose latest 10-Q/10-K filed TODAY hasn't been
+        # LLM-analyzed yet. Placeholder entries are flagged queued=True in the
+        # earnings_results pipeline builds. Prevents blind sizing into event risk.
+        portfolio_decision.decisions = self._clamp_queued_earnings_buys(
+            portfolio_decision.decisions,
+            earnings_results,
+        )
 
         # Include realized P&L: (equity - last_equity) captures both unrealized
         # marks and any fills (including broker-triggered OTO stop-losses we never

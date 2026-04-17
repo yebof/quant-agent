@@ -49,9 +49,17 @@ class PortfolioManagerAgent(BaseAgent):
         position_history: dict = kwargs.get("position_history") or {}
 
         def _fmt_position(p: Position) -> str:
+            weight_pct = (p.market_value / total_value * 100) if total_value > 0 else 0.0
+            # Flag drift candidates directly in the line so PM can't miss them.
+            # P&L% tells PM whether the weight came from price appreciation (drift)
+            # or a large entry.
+            cost_basis = p.avg_entry * p.qty if p.avg_entry and p.qty else 0
+            pnl_pct = (p.unrealized_pnl / cost_basis * 100) if cost_basis > 0 else 0.0
+            drift_flag = " ⚠️DRIFT" if weight_pct > 12 and pnl_pct > 10 else ""
             core = (
                 f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | "
-                f"Current: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} | Sector: {p.sector}"
+                f"Current: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} ({pnl_pct:+.1f}%) | "
+                f"Weight: {weight_pct:.1f}% | Sector: {p.sector}{drift_flag}"
             )
             hist = position_history.get(p.symbol) or {}
             lines = [core]
