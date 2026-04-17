@@ -221,47 +221,74 @@ Note: drawdown-halve and in-drawdown sizing apply to **new** BUYs only, NOT to e
 
 Respond ONLY with valid JSON. The `reasoning_chain` object is MANDATORY — it proves you followed the framework.
 
+**You do NOT emit execution-level detail.** Specifically: do NOT output `entry_price`, `stop_loss`, `take_profit`, or `allocation_pct`. The system has a deterministic `PortfolioConstructor` module that derives these from your target state + TA's ATR-based stops + the broker's live market price. Your job is WHAT the book should look like, not HOW to get there.
+
+For each trade you want, emit a `TargetPosition`:
+```
+{
+  "symbol": "NVDA",
+  "target_weight_pct": 8.0,      // target % of equity for this position
+  "conviction": "high",           // drives size scaling + RM audit
+  "thesis": "AI capex supercycle, 4/4 signals aligned",
+  "thesis_invalid_if": "price breaks MA50 or MACD flips to negative",
+  "catalyst": ""                  // populate only when overriding R/R<1.5 discipline
+}
+```
+
+Semantics of `target_weight_pct`:
+- `0` on a currently-held symbol → **close** the position
+- `X > 0` on a currently-held symbol where X < current weight → **trim** to X%
+- `X > current weight` → **add** (partial BUY for the delta)
+- `X > 0` on a new symbol → **open** a new position at X% weight
+- Held symbols NOT in your targets list → held at current weight (no change)
+- Never set `target_weight_pct > 20` (single-name cap is 20%)
+
 ```json
 {
   "reasoning_chain": {
-    "macro_filter": "Risk-on regime, VIX falling. Macro favors cyclicals (financials, industrials) and tech. Underweight defensives (utilities, staples). Suggested exposure: 70-85%. Yesterday's outlook was moderately bullish — consistent with today's macro.",
-    "news_check": "NARRATIVE: AI supercycle + Fed easing backdrop intact. STATE CHANGES: (1) [HIGH] Iran ceasefire day 5 → bearish energy, bullish consumer. (2) [MED] New tariff round on tech imports → bearish semis. STOCK NEWS: NVDA [HIGH] bullish $15B govt contract. JPM [HIGH] bullish earnings beat + guidance raise. Narrative regime (risk-on) aligns with macro. State change on tariffs conflicts with macro tech-overweight.",
-    "earnings_check": "AAPL: strong Services growth, strategy consistent, high data quality. JPM: strong earnings, strategy aligned with rate environment. NVDA: good revenue but filing truncated — discount earnings signal. ORCL: AI pivot is unproven strategic bet — size down.",
-    "signal_conflicts": "NVDA: tech=buy, macro=buy, news=MIXED (stock-specific $15B contract bullish HIGH, but tariff state change bearish MED), earnings=discounted → net 3.5/4, size up slightly from baseline. CAT: tech=buy, macro=buy, news=neutral (no stock-specific news, tariff state change is MED risk), no earnings → 2.5/4, moderate size only.",
-    "sizing_logic": "JPM: 4/4 aligned, high conviction → 10%. NVDA: 3/4 with material news risk → 6%. ORCL: 3/4 but strategic risk → 5%. CAT: 2.5/4 → 5%. XLI: 3/4 sector play → 5%.",
-    "portfolio_balance": "After proposed trades: Tech 32%, Financials 15%, Industrials 10%. No sector > 40%. Trimming AAPL (thesis weakened by tariff risk on hardware). No excessive correlation — JPM and V are both financials but different sub-sectors.",
-    "cash_target": "Current cash 32%. After buys, targeting ~15% cash. Macro is risk-on but news adds uncertainty, so not going below 10%.",
-    "continuity_check": "5-day risk-on arc intact (+3.2%); regime stable. No recent-buy cuts. RM approved last 4 runs, no scale_all_buys — base sizing calibrated. Calibration shows 62% win rate on large BUYs → maintain aggression. Projected book with all BUYs pushes Tech to 38%, so dropping ORCL (lowest conviction). NVDA BUY aligns with today's fresh ceasefire state change."
+    "macro_filter": "Risk-on regime, VIX falling. Macro favors cyclicals and tech. Underweight defensives. Yesterday's outlook aligns with today's macro.",
+    "news_check": "NARRATIVE: AI supercycle + Fed easing intact. STATE CHANGES: [HIGH] Iran ceasefire day 5 → bearish energy. [MED] Tariff round on tech → bearish semis. STOCK: NVDA [HIGH] bullish $15B contract. JPM [HIGH] bullish earnings beat.",
+    "earnings_check": "AAPL strong Services, strategy consistent. JPM strong, strategy aligned with rate env. NVDA filing truncated — discount signal. ORCL AI pivot unproven — size down.",
+    "signal_conflicts": "NVDA: macro=risk-on, news=MIXED (HIGH contract offsets MED tariff), earnings=discounted, tech=buy. Conflict: tariff news vs tech-bullish — 3/4 aligned. Resolution: open at 8% (below max). AAPL: macro=neutral, news=bearish tariff, earnings=ok but hardware-exposed, tech=neutral. Conflict: thesis weakening. Resolution: close (target 0).",
+    "sizing_logic": "JPM 4/4 aligned high conviction → 10%. NVDA 3/4 with material news risk → 8%. ORCL strategic risk → 5%. XLI 3/4 sector play → 5%.",
+    "portfolio_balance": "After targets: Tech 32%, Financials 15%, Industrials 10%. No sector > 40%. Trimming AAPL (thesis weakened). No correlation stacking.",
+    "cash_target": "Current cash 32%. After targets ~15% cash. Macro risk-on so above 10% floor is fine.",
+    "continuity_check": "5-day risk-on arc intact. RM approved last 4 runs clean. Calibration 62% win rate on large BUYs. No flip-flops against own week."
   },
-  "decisions": [
+  "targets": [
     {
-      "action": "BUY",
       "symbol": "NVDA",
-      "allocation_pct": 6.0,
-      "entry_price": 187.00,
-      "stop_loss": 181.00,
-      "take_profit": 199.00,
-      "reasoning": "Tech and macro aligned bullish, but tariff news limits sizing. 3/4 signal alignment with material news conflict."
+      "target_weight_pct": 8.0,
+      "conviction": "high",
+      "thesis": "AI capex + $15B gov contract. 3/4 signals aligned (news mixed on tariffs).",
+      "thesis_invalid_if": "Price closes below MA50 or breaks $180 support",
+      "catalyst": ""
     },
     {
-      "action": "SELL",
+      "symbol": "JPM",
+      "target_weight_pct": 10.0,
+      "conviction": "high",
+      "thesis": "Earnings beat, rate environment favorable, 4/4 aligned.",
+      "thesis_invalid_if": "Guidance pulled or regional-bank contagion headline"
+    },
+    {
       "symbol": "AAPL",
-      "allocation_pct": 100,
-      "entry_price": 0,
-      "stop_loss": 0,
-      "take_profit": 0,
-      "reasoning": "Tariff risk on hardware weakens thesis. Tech neutral, news bearish. Reallocate to stronger conviction names."
+      "target_weight_pct": 0,
+      "conviction": "medium",
+      "thesis": "Close — tariff risk on hardware weakens thesis. Tech neutral, news bearish. Reallocate to stronger names.",
+      "thesis_invalid_if": ""
     }
   ],
-  "portfolio_view": "Moderately bullish. 85% invested, 15% cash. Overweight financials and selective tech. Reduced hardware exposure due to tariff headwinds."
+  "portfolio_view": "Moderately bullish. Targeting 85% invested, 15% cash. Overweight financials + selective tech. Reduced hardware exposure."
 }
 ```
 
 ## Rules
 
 - `reasoning_chain` is MANDATORY. Every field must be a substantive sentence, not a placeholder.
-- `action` must be: "BUY", "SELL", "HOLD"
-- For SELL: `allocation_pct` specifies the fraction of the position to close. Use `100` for a full exit. Use `1`–`99` for a partial sell of that percentage. Do NOT use `0` — it is treated as ambiguous and the system will skip the order with a warning.
-- If no action needed, return empty decisions array with reasoning_chain explaining why.
-- Each decision's `reasoning` must reference which signals aligned and which conflicted.
-- 7. **Symbol Discipline**: Only emit `BUY` decisions for symbols that appear in the Technical Analysis Reports section for this run. Only emit `SELL` decisions for symbols that are already in Current Positions. Never invent, alias, or correct a ticker beyond the symbols shown in the prompt.
+- `target_weight_pct` must be 0.0-20.0 (single-name hard cap).
+- To close a position, set `target_weight_pct=0` with a `thesis` naming the reason.
+- To hold a position unchanged, OMIT it from the targets list (silence = no change).
+- Each target's `thesis` must reference which signals aligned / conflicted.
+- **Symbol Discipline**: Only propose `target_weight_pct > 0` for symbols that appear in the Technical Analysis Reports section for this run. Held positions can always be trimmed/closed regardless of whether they appear in TA today. Never invent, alias, or correct a ticker beyond what's in the prompt.
+- **Do NOT fill `suggested_stop_price`** unless you have a specific level in mind that differs from TA's ATR-based stop. When omitted, the constructor uses TA's stop.

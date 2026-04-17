@@ -5,7 +5,7 @@ from src.pipeline import TradingPipeline
 from src.agents.base import AgentResult
 from src.models import (
     TechAnalysisResult, PortfolioDecision, TradeDecision, RiskVerdict, Position,
-    NewsAnalysisResult,
+    NewsAnalysisResult, TargetPosition,
 )
 
 def _mock_agent_result(raw_text="{}"):
@@ -69,14 +69,14 @@ def test_pipeline_morning_run_buy(
     mock_ta.analyze_batch.return_value = ({"SPY": spy_analysis}, _mock_agent_result())
     mock_ta_cls.return_value = mock_ta
 
-    # Portfolio Manager returns BUY decision
+    # Portfolio Manager emits a target (not a TradeDecision) — Phase 2:
+    # the constructor derives the actual order from target + TA + live price.
     mock_pm = MagicMock()
     mock_pm.decide.return_value = (PortfolioDecision(
-        decisions=[
-            TradeDecision(
-                action="BUY", symbol="SPY", allocation_pct=10.0,
-                entry_price=507.0, stop_loss=490.0, take_profit=530.0,
-                reasoning="Buy",
+        targets=[
+            TargetPosition(
+                symbol="SPY", target_weight_pct=10.0, conviction="high",
+                thesis="Buy", thesis_invalid_if="",
             )
         ],
         portfolio_view="Bullish",
@@ -181,11 +181,10 @@ def test_pipeline_market_order_sizes_from_live_market_price(
 
     mock_pm = MagicMock()
     mock_pm.decide.return_value = (PortfolioDecision(
-        decisions=[
-            TradeDecision(
-                action="BUY", symbol="SPY", allocation_pct=10.0,
-                entry_price=80.0, stop_loss=90.0, take_profit=130.0,
-                reasoning="Buy",
+        targets=[
+            TargetPosition(
+                symbol="SPY", target_weight_pct=10.0, conviction="high",
+                thesis="Buy", thesis_invalid_if="",
             )
         ],
         portfolio_view="Bullish",
@@ -253,14 +252,13 @@ def test_pipeline_market_order_sizes_from_live_market_price(
     mock_broker.submit_order.assert_called_once()
     kw = mock_broker.submit_order.call_args.kwargs
     assert kw["symbol"] == "SPY"
-    # Vol-adjusted sizing: $10k equity × 0.5% risk budget = $50 dollar-at-risk.
-    # With sizing_price=100 (market override) and stop=90, risk_per_share = 10 →
-    # qty_by_risk = 5, which caps below the qty_by_alloc of 10.
-    assert kw["qty"] == 5
+    # Phase 2 sizing: PortfolioConstructor uses TA's stop (72) vs broker's
+    # live market (100) → risk_per_share = $28. 0.5% risk budget of $10k
+    # = $50 at-risk → qty_by_risk = 1 share. Target's 10% weight ($1000 at
+    # $100 = 10 shares) is capped by the risk budget.
+    assert kw["qty"] == 1
     assert kw["side"] == "buy"
-    assert kw["limit_price"] is None
-    assert kw["stop_loss_price"] == 90.0
-    mock_broker.get_latest_price.assert_called_once_with("SPY")
+    assert kw["stop_loss_price"] == 72.0
 
 
 @patch("src.pipeline.AlpacaBroker")
@@ -293,11 +291,10 @@ def test_pipeline_risk_rejected(
 
     mock_pm = MagicMock()
     mock_pm.decide.return_value = (PortfolioDecision(
-        decisions=[
-            TradeDecision(
-                action="BUY", symbol="SPY", allocation_pct=10.0,
-                entry_price=507.0, stop_loss=490.0, take_profit=530.0,
-                reasoning="Buy",
+        targets=[
+            TargetPosition(
+                symbol="SPY", target_weight_pct=10.0, conviction="high",
+                thesis="Buy", thesis_invalid_if="",
             )
         ],
         portfolio_view="Bullish",
@@ -445,17 +442,17 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
     mock_ta_cls.return_value = mock_ta
 
     mock_pm = MagicMock()
+    # Rotation: close SPY (target=0) + open QQQ at 30% weight. Constructor
+    # turns target_weight_pct=0 on a held symbol into a full-exit SELL.
     mock_pm.decide.return_value = (PortfolioDecision(
-        decisions=[
-            TradeDecision(
-                action="SELL", symbol="SPY", allocation_pct=100.0,
-                entry_price=0.0, stop_loss=0.0, take_profit=0.0,
-                reasoning="Rotate out",
+        targets=[
+            TargetPosition(
+                symbol="SPY", target_weight_pct=0.0, conviction="medium",
+                thesis="Rotate out",
             ),
-            TradeDecision(
-                action="BUY", symbol="QQQ", allocation_pct=30.0,
-                entry_price=100.0, stop_loss=95.0, take_profit=110.0,
-                reasoning="Rotate in",
+            TargetPosition(
+                symbol="QQQ", target_weight_pct=15.0, conviction="high",
+                thesis="Rotate in",
             ),
         ],
         portfolio_view="Rotate from SPY to QQQ",

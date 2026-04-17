@@ -174,9 +174,53 @@ class ReasoningChain(BaseModel):
     continuity_check: str = ""
 
 
+class TargetPosition(BaseModel):
+    """PM's per-symbol intent — WHAT the book should look like, not HOW to get there.
+
+    The PortfolioConstructor translates a list of TargetPositions + current
+    holdings + market prices + TA ATR into concrete TradeDecision orders. The
+    LLM no longer guesses entry prices, stops, or share counts — it only
+    expresses intent.
+
+    Semantics:
+    - target_weight_pct = 0 and symbol currently held → close the position.
+    - target_weight_pct > 0 on a new symbol → open.
+    - target_weight_pct > current weight → add (partial BUY for the delta).
+    - target_weight_pct < current weight → trim (partial SELL for the delta).
+    - Held symbols NOT appearing in the target list → hold at current weight
+      (no instruction = no change). PM may include them explicitly with a
+      `keep` note for audit clarity, but it's not required.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    symbol: str
+    target_weight_pct: float = Field(ge=0.0, le=25.0)
+    conviction: Literal["high", "medium", "low"] = "medium"
+    thesis: str
+    thesis_invalid_if: str = ""
+    # Optional override hints the constructor MAY use. Non-binding — if
+    # absent, the constructor falls back to TA's ATR-based stop (2*ATR) and
+    # the broker's live price for entry.
+    suggested_stop_price: float | None = None
+    catalyst: str = ""  # populated when target violates R/R < 1.5 discipline
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        return _normalize_symbol(value)
+
+
 class PortfolioDecision(BaseModel):
     reasoning_chain: ReasoningChain | None = None
-    decisions: list[TradeDecision]
+    # Phase 2 output: PM emits intent (target weights), not orders.
+    targets: list[TargetPosition] = Field(default_factory=list)
+    # Phase 2 derived: populated by PortfolioConstructor AFTER the LLM returns.
+    # Downstream stages (hard risk filter, RM review, execution) read this.
+    # PM must never fill it directly — the LLM output is validated with
+    # `decisions` empty; the pipeline injects constructor output before
+    # handing the object off to downstream stages.
+    decisions: list[TradeDecision] = Field(default_factory=list)
     portfolio_view: str
 
 

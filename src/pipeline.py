@@ -28,11 +28,13 @@ from src.data.earnings import EarningsDataProvider
 from src.risk.rules import RiskRuleEngine
 from src.execution.broker import AlpacaBroker, _get_sector
 from src.pipeline_context import RunContext, SessionType
+from src.portfolio_constructor import PortfolioConstructor
 from src.storage.db import Database
 from src.models import (
     NewsIntelligenceReport,
     PortfolioDecision,
     RiskVerdict,
+    TargetPosition,
     TechAnalysisResult,
     TechnicalIndicators,
     TradeDecision,
@@ -125,6 +127,10 @@ class TradingPipeline:
         self.market.set_fallback_bars(self.broker.get_bars)
         self.db = Database(config.storage.db_path)
         self.db.initialize()
+        # Deterministic Target → Orders translator. Phase 2 of the architecture:
+        # the LLM (PM) emits TargetPositions (intent); the constructor does the
+        # math that turns intent into concrete TradeDecision orders.
+        self.portfolio_constructor = PortfolioConstructor()
         # Stragglers from prior runs that exceeded _wait_bg_threads' timeout.
         # Per-run threads are tracked on RunContext.bg_threads; this list only
         # catches the rare thread that refused to join within the budget so we
@@ -777,18 +783,31 @@ class TradingPipeline:
                 data = json.loads(row.get("full_response") or "{}")
             except (json.JSONDecodeError, TypeError):
                 continue
+            # Phase 2: new schema emits `targets` (target weights + thesis);
+            # older logs in the DB carry `decisions` (legacy TradeDecision).
+            # Parse whichever is present so PM reads a unified history.
+            targets = data.get("targets") or []
             decisions = data.get("decisions") or []
-            if not decisions:
+            summary_parts: list[str] = []
+            if targets:
+                for t in targets[:8]:
+                    if not isinstance(t, dict):
+                        continue
+                    sym = t.get("symbol", "?")
+                    w = t.get("target_weight_pct", "?")
+                    conv = (t.get("conviction") or "?")[0]
+                    summary_parts.append(f"{sym}→{w}%({conv})")
+            elif decisions:
+                for d in decisions[:8]:
+                    if not isinstance(d, dict):
+                        continue
+                    act = d.get("action", "?")
+                    sym = d.get("symbol", "?")
+                    alloc = d.get("allocation_pct", "?")
+                    summary_parts.append(f"{act} {sym} {alloc}%")
+            if not summary_parts:
                 lines.append(f"- {ts}: (no trades that day)")
                 continue
-            summary_parts: list[str] = []
-            for d in decisions[:8]:
-                if not isinstance(d, dict):
-                    continue
-                act = d.get("action", "?")
-                sym = d.get("symbol", "?")
-                alloc = d.get("allocation_pct", "?")
-                summary_parts.append(f"{act} {sym} {alloc}%")
             rc = data.get("reasoning_chain") or {}
             sizing = (rc.get("sizing_logic") or "")[:160].strip().replace("\n", " ")
             continuity = (rc.get("continuity_check") or "")[:160].strip().replace("\n", " ")
@@ -1570,8 +1589,47 @@ class TradingPipeline:
             tokens_used=pm_result.tokens_used,
         )
 
-        if not portfolio_decision or not portfolio_decision.decisions:
-            logger.info("Portfolio manager: no trades suggested")
+        if not portfolio_decision:
+            logger.info("Portfolio manager: parse failed, no decision object")
+            return {"status": "no_trades", "orders": []}
+
+        # Phase 2: translate target state → concrete orders.
+        # Broker live prices (price_map) feed the constructor so it can
+        # validate TA's entry prices. TA's ATR-based stops flow through as
+        # the default; PM can override via suggested_stop_price on a target.
+        price_map = {p.symbol: p.current_price for p in positions}
+        # Populate live prices for target BUY symbols not already covered by
+        # existing positions. Without this the constructor would fall back to
+        # TA's possibly-stale entry_price for any new opening.
+        for target in portfolio_decision.targets:
+            sym = target.symbol.strip().upper()
+            if sym in price_map:
+                continue
+            try:
+                live = self.broker.get_latest_price(sym)
+            except Exception as e:
+                logger.warning("Constructor price lookup failed for %s: %s", sym, e)
+                continue
+            if live and live > 0:
+                price_map[sym] = live
+        portfolio_decision.decisions = self.portfolio_constructor.construct_orders(
+            targets=portfolio_decision.targets,
+            positions=positions,
+            analyses=analyses,
+            total_value=total_value,
+            price_map=price_map,
+        )
+        logger.info(
+            "Constructor: %d targets → %d decisions (%d BUY, %d SELL, %d HOLD)",
+            len(portfolio_decision.targets),
+            len(portfolio_decision.decisions),
+            sum(1 for d in portfolio_decision.decisions if d.action == "BUY"),
+            sum(1 for d in portfolio_decision.decisions if d.action == "SELL"),
+            sum(1 for d in portfolio_decision.decisions if d.action == "HOLD"),
+        )
+
+        if not portfolio_decision.decisions:
+            logger.info("Portfolio manager + Constructor: no trades suggested")
             return {"status": "no_trades", "orders": []}
 
         portfolio_decision.decisions, symbol_blocked_reasons = self._filter_supported_symbols(
