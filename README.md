@@ -61,7 +61,7 @@ Evening (post-market)
 
 | Agent | Role | Key Feature |
 |-------|------|-------------|
-| **Tech Analyst** | Batch technical analysis | 5-step CoT (trend / momentum / volatility / volume / S&R). ATR-based default stop (`entry − 2*ATR`). Output rating + `conviction` (high/medium/low) + `reference_target` + `thesis_invalid_if` (soft exit condition). **Auto-computed `risk_reward`** (Python-calculated, not LLM-trusted) flows into PM sizing and RM veto logic. Pre-filter thresholds normalized by ATR. Auto-chunks batch > 30 symbols. Cross-field validator: BUY stop must be below entry, SELL above. |
+| **Tech Analyst** | Batch technical analysis | 5-step CoT (trend / momentum / volatility / volume / S&R). ATR-based default stop (`entry − 2*ATR`). Output rating + `conviction` (high/medium/low) + `reference_target` + `thesis_invalid_if` (soft exit condition). **Auto-computed `risk_reward`** (Python-calculated, not LLM-trusted) flows into PM sizing and RM veto logic. **Signal-age memory** (`data/tech/last_ratings.json`): prior rating surfaced to LLM as context; `signal_age_days` counted to spot stale setups — PM cuts allocation on 8+ day stale BUYs. Pre-filter thresholds normalized by ATR. Auto-chunks batch > 30 symbols. Cross-field validator: BUY stop must be below entry, SELL above. |
 | **News Intelligence** | 3-layer news analysis | Layer 1: Persistent macro narrative. Layer 2: State change detection. Layer 3: Per-symbol alerts with conviction. Daily storage in `data/news/` |
 | **Macro Analyst** | Regime assessment & sector guidance | 6-step CoT (vol / curve / monetary / inflation+labor+credit / cross-signal / sector). Inputs: VIX, 2Y/10Y yields, **DFF** (daily fed funds), **core & headline CPI**, **UNRATE**, **HY OAS**. Persists yesterday's regime → detects `regime_shift`. Cross-references News narrative via `alignment_with_news`. Emits bull/bear view-change triggers. |
 | **Earnings Analyst** | SEC 10-Q/10-K analysis | Revenue, margins, cash flow, strategic direction, competitive positioning, strategic vs operational risks, strategy consistency across filings. `investment_implications` carries a 5-step `reasoning_chain` (fundamental_quality / growth_trajectory / strategic_risks / management_execution / valuation_context) — sentiment call is derivable from the numbers, not a vibe check. |
@@ -176,14 +176,15 @@ quant-agent/
 │   │   ├── news_store.py          # Dated news storage + narrative persistence
 │   │   ├── earnings.py            # SEC EDGAR provider
 │   │   ├── technical.py           # TA indicators (MA, RSI, MACD, BB, ATR)
-│   │   └── correlation.py         # 120d pairwise return correlations + cluster detection
+│   │   ├── correlation.py         # 120d pairwise return correlations + cluster detection
+│   │   └── tech_store.py          # Per-symbol rating memory + signal-age computation
 │   ├── execution/
 │   │   └── broker.py              # Alpaca (OTO brackets, calendar, live prices)
 │   ├── risk/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 180 tests
+├── tests/                         # 189 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -194,7 +195,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 180 tests
+pytest tests/ -v    # 189 tests
 ```
 
 ## Data Sources
@@ -224,6 +225,9 @@ pytest tests/ -v    # 180 tests
 
 **File-based** (`data/macro/`):
 - `last_state.json` — yesterday's regime/confidence/outlook snapshot for shift detection
+
+**File-based** (`data/tech/`):
+- `last_ratings.json` — per-symbol prior rating + first_seen_date for signal-age tracking; TechAnalyst reads on next morning, PM uses age to cut allocations on stale setups
 
 **File-based** (`data/earnings/`):
 - `{SYMBOL}/analysis_{10-Q}_{date}.md` — cached SEC filing analyses

@@ -83,6 +83,8 @@ Then **adjust by Risk/Reward** (shown as `R/R x.xx:1` in each Technical Analysis
 
 Scale DOWN additionally when: strategic risks are high, data quality is poor, signal conflict exists, or the macro advisory (`macro_exposure_deviation`) is flagged.
 
+**Stale-signal discipline**: Each Tech report carries a `conviction` value and may carry an `age Nd` tag (days since that rating was first issued). An age of 8+ days on a BUY that hasn't reached its target is a **fatigued setup** — the LLM has had a week to be right and wasn't. Cut allocation by 50% vs base, or skip and redeploy elsewhere. Fresh signals (age 1-3 days) get base allocation; stale ones don't.
+
 **System-drawdown discipline** (independent of market regime): Look at the "Recent System Performance" section.
 - If `in_drawdown` is flagged (5d return < −3% OR 20d < −8%): **halve every new BUY's allocation** and state this in `sizing_logic`. This is NOT panic — it's acknowledging that the system's edge has temporarily degraded and preserving capital to re-engage when the tape cooperates.
 - If only 5d is negative but modest (−1% to −3%): no change needed; normal variance.

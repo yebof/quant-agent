@@ -45,6 +45,17 @@ The system will auto-compute `risk_reward = (target − entry) / (entry − stop
 - Set `reference_target` to a defensible level you actually expect price to reach within the 5-15 day swing horizon (not wishful). Nearest meaningful resistance (recent high, upper band, round number) usually qualifies. Going further out inflates R/R dishonestly.
 - If you cannot find a target ≥ 2× the stop distance, the setup is weak — downgrade `conviction` to `low` or emit `neutral`. An R/R < 1.5 BUY is a negative-expectancy trade; do not emit it as `buy` or `strong_buy` without a concrete catalyst called out in the reasoning.
 
+## Signal Freshness (if prior context attached)
+
+Some symbols will carry a `Prior rating (context)` line above the indicators — your own rating from the last run and how many days it has stood unchanged. Use it:
+
+- **Same rating, age 1-3 days** — fresh continuation. Keep conviction if the setup still looks clean; say why the thesis is still active.
+- **Same rating, age 4-7 days** — maturing. Check whether price has moved toward target. If yes, keep; if not, be honest — momentum may be fading, consider downgrading conviction one notch.
+- **Same rating, age 8+ days without progress to target** — STALE. The call has had time to work and hasn't. Downgrade to `conviction: low` OR flip to `neutral`. Old setups underperform fresh ones; don't sit on a dead call.
+- **Different rating from prior** (flip) — be explicit in `reasoning_chain.trend` or `.momentum` about WHAT CHANGED. A flip without named cause is noise.
+
+Freshness is independent of the directional rating. A 10-day-old `BUY (high)` is MORE suspicious than a 1-day-old `BUY (medium)` — age erodes confidence.
+
 ## Thesis Invalidation (soft exit)
 
 `thesis_invalid_if` is a single concrete observable condition that says "if this happens, my reasoning is wrong — exit early, don't wait for the stop."

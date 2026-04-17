@@ -64,6 +64,10 @@ class TechAnalysisResult(BaseModel):
     # exit BEFORE the broker stop fires, saving the 3-5% typically given up
     # between thesis-break and stop-trigger.
     thesis_invalid_if: str = ""
+    # Days since this rating was first issued (unchanged). Python-computed from
+    # TechStore after TechAnalystAgent returns; None on first run or when the
+    # symbol wasn't in yesterday's cache. Fresh=1 means "new today", 7+=stale.
+    signal_age_days: int | None = None
 
     @computed_field
     @property

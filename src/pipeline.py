@@ -14,6 +14,7 @@ from src.data.macro import MacroDataProvider
 from src.data.news import NewsDataProvider
 from src.data.news_store import NewsStore
 from src.data.macro_store import MacroStore
+from src.data.tech_store import TechStore
 from src.data.technical import compute_indicators
 from src.agents.tech_analyst import TechAnalystAgent
 from src.agents.portfolio_manager import PortfolioManagerAgent
@@ -105,6 +106,7 @@ class TradingPipeline:
         self.news_provider = NewsDataProvider()
         self.news_store = NewsStore()
         self.macro_store = MacroStore()
+        self.tech_store = TechStore()
         self.earnings_analyst = EarningsAnalystAgent(
             api_key=_key_for(config.llm.earnings_analyst_model),
             model=config.llm.earnings_analyst_model,
@@ -602,9 +604,25 @@ class TradingPipeline:
             ]
             logger.info("Tech pre-filter: %d/%d symbols have actionable signals",
                         len(symbols_data), len(all_symbols_data))
-            if symbols_data:
-                return self.tech_analyst.analyze_batch(symbols_data)
-            return {}, None
+            if not symbols_data:
+                return {}, None
+            # Feed yesterday's ratings so the LLM can judge continuation vs flip vs staleness.
+            prior_ratings = self.tech_store.load()
+            analyses_map, ta_res = self.tech_analyst.analyze_batch(
+                symbols_data, prior_ratings=prior_ratings,
+            )
+            # Persist today's ratings so tomorrow's run inherits this memory.
+            if analyses_map:
+                try:
+                    self.tech_store.update(list(analyses_map.values()))
+                except Exception as e:
+                    logger.warning("TechStore.update failed: %s", e)
+                # Compute signal age AFTER update and stamp it onto each result.
+                ages = self.tech_store.compute_ages(list(analyses_map.keys()))
+                for sym, analysis in analyses_map.items():
+                    if sym in ages:
+                        analysis.signal_age_days = ages[sym]
+            return analyses_map, ta_res
 
         def _run_earnings():
             return self._run_earnings_check(run_id, session="morning")

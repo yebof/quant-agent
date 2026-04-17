@@ -106,6 +106,46 @@ def test_build_user_message_includes_indicators_and_current_close(sample_indicat
         assert "58.0" in msg       # rsi_14
         assert "ATR=8.5" in msg    # ATR is surfaced for ATR-based stops
         assert "Current close: 507.0" in msg
+        # With no prior_ratings passed, no prior line should appear
+        assert "Prior rating" not in msg
+
+
+def test_build_user_message_surfaces_prior_rating_with_age(sample_indicators, sample_bars):
+    """When prior_ratings is supplied, the LLM sees a 'Prior rating' context line."""
+    from datetime import timedelta
+    from src.util.time import et_today
+
+    prior = {
+        "SPY": {
+            "rating": "buy",
+            "conviction": "high",
+            "first_seen_date": (et_today() - timedelta(days=4)).isoformat(),
+            "last_rating_date": et_today().isoformat(),
+            "entry_price": 500.0,
+            "stop_loss": 490.0,
+            "reference_target": 525.0,
+        }
+    }
+    with patch("anthropic.Anthropic"):
+        agent = TechAnalystAgent(api_key="test", model="claude-sonnet-4-6-20250514")
+        msg = agent.build_user_message(
+            symbols_data=_sym_data("SPY", sample_bars, sample_indicators),
+            prior_ratings=prior,
+        )
+        assert "Prior rating (context): buy" in msg
+        assert "4d ago" in msg
+        assert "entry 500.0" in msg  # prior price surfaced
+
+
+def test_build_user_message_omits_prior_for_new_symbol(sample_indicators, sample_bars):
+    """A symbol with no prior entry should not have a Prior rating line."""
+    with patch("anthropic.Anthropic"):
+        agent = TechAnalystAgent(api_key="test", model="claude-sonnet-4-6-20250514")
+        msg = agent.build_user_message(
+            symbols_data=_sym_data("NEWSYMBOL", sample_bars, sample_indicators),
+            prior_ratings={"OTHER_SYMBOL": {"rating": "buy"}},
+        )
+        assert "Prior rating" not in msg
 
 
 @patch("anthropic.Anthropic")

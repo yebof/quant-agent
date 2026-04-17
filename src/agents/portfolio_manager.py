@@ -34,8 +34,10 @@ class PortfolioManagerAgent(BaseAgent):
             rr = a.risk_reward
             rr_str = f"R/R {rr:.2f}:1" if rr is not None else "R/R n/a"
             invalid = a.thesis_invalid_if or "(not specified)"
+            age = getattr(a, "signal_age_days", None)
+            age_str = f", age {age}d" if age is not None and age > 0 else ""
             return (
-                f"- {a.symbol}: {a.rating} ({a.conviction}) | {rr_str} | "
+                f"- {a.symbol}: {a.rating} ({a.conviction}{age_str}) | {rr_str} | "
                 f"Entry: {a.entry_price} | Stop: {a.stop_loss} | Target: {a.reference_target}\n"
                 f"  Invalid if: {invalid}\n"
                 f"  Reasoning: {a.reasoning}"

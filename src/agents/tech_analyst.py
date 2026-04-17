@@ -32,6 +32,31 @@ class TechAnalystAgent(BaseAgent):
 
     def build_user_message(self, **kwargs) -> str:
         symbols_data: list[dict] = kwargs.get("symbols_data", []) or []
+        prior_ratings: dict[str, dict] = kwargs.get("prior_ratings") or {}
+
+        # How many days ago did the cached rating first appear?
+        from datetime import date as _date
+        from src.util.time import et_today
+        today = et_today()
+
+        def _prior_line(symbol: str) -> str:
+            p = prior_ratings.get(symbol)
+            if not p:
+                return ""
+            try:
+                first = _date.fromisoformat(p.get("first_seen_date", ""))
+                age = max(0, (today - first).days)
+                age_str = f"{age}d ago" if age > 0 else "today (new)"
+            except (ValueError, TypeError):
+                age_str = "unknown age"
+            entry = p.get("entry_price")
+            stop = p.get("stop_loss")
+            target = p.get("reference_target")
+            prices = f"entry {entry} / stop {stop} / target {target}" if entry else "no prior prices"
+            return (
+                f"\nPrior rating (context): {p.get('rating', '?')} "
+                f"({p.get('conviction', '?')}) | first seen {age_str} | {prices}"
+            )
 
         sections = []
         for item in symbols_data:
@@ -44,7 +69,7 @@ class TechAnalystAgent(BaseAgent):
                 for b in recent_bars
             )
             current_price = recent_bars[-1].close if recent_bars else "N/A"
-            sections.append(f"""### {symbol}
+            sections.append(f"""### {symbol}{_prior_line(symbol)}
 Price (last {len(recent_bars)} daily bars):
 {bars_text}
 Indicators: MA20={indicators.ma_20} MA50={indicators.ma_50} MA200={indicators.ma_200} | RSI={indicators.rsi_14} | MACD={indicators.macd}/{indicators.macd_signal}/{indicators.macd_hist} | BB={indicators.bb_lower}/{indicators.bb_middle}/{indicators.bb_upper} | ATR={indicators.atr_14} | Vol%={indicators.volume_change_pct}
@@ -58,16 +83,23 @@ Current close: {current_price}""")
         )
 
     def analyze_batch(
-        self, symbols_data: list[dict]
+        self,
+        symbols_data: list[dict],
+        prior_ratings: dict[str, dict] | None = None,
     ) -> tuple[dict[str, TechAnalysisResult], "AgentResult | None"]:
         """Batch analyze multiple symbols. Auto-chunks when > 30 symbols to avoid
         context overflow on the LLM call. Returns ({symbol: result}, merged AgentResult).
+
+        prior_ratings: optional {symbol: {rating, conviction, first_seen_date, ...}}
+        from TechStore. When supplied, each symbol's user-message section prefaces
+        today's data with a 'Prior rating' line so the LLM can judge continuation
+        vs flip vs staleness.
         """
         if not symbols_data:
             return {}, None
 
         if len(symbols_data) <= _MAX_SYMBOLS_PER_CALL:
-            return self._analyze_chunk(symbols_data)
+            return self._analyze_chunk(symbols_data, prior_ratings)
 
         # Chunk and stitch.
         chunks = [
@@ -85,7 +117,7 @@ Current close: {current_price}""")
         total_tokens = 0
         last_model = self.model
         for i, chunk in enumerate(chunks, 1):
-            chunk_analyses, chunk_result = self._analyze_chunk(chunk)
+            chunk_analyses, chunk_result = self._analyze_chunk(chunk, prior_ratings)
             merged.update(chunk_analyses)
             if chunk_result is not None:
                 combined_raw.append(f"--- chunk {i}/{len(chunks)} ---\n{chunk_result.raw_text}")
@@ -102,10 +134,12 @@ Current close: {current_price}""")
         return merged, merged_result
 
     def _analyze_chunk(
-        self, symbols_data: list[dict]
+        self,
+        symbols_data: list[dict],
+        prior_ratings: dict[str, dict] | None = None,
     ) -> tuple[dict[str, TechAnalysisResult], "AgentResult | None"]:
         """Single-call variant used inside the chunking loop."""
-        result = self.run(symbols_data=symbols_data)
+        result = self.run(symbols_data=symbols_data, prior_ratings=prior_ratings or {})
         parsed = result.parse_json()
 
         if parsed is None:
