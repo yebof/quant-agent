@@ -76,6 +76,7 @@ Evening (post-market)
 - Stop loss required
 - Inverse ETFs (SH, SDS, PSQ, SQQQ) carry signed multipliers for net exposure and gross magnitude for sizing/sector caps
 - **Advisory**: if projected net exposure deviates > 15pp from Macro's `target_invested_pct`, emits a non-blocking `macro_exposure_deviation` violation — RiskManager sees it and can respond with `scale_all_buys`
+- **Correlation cluster** (advisory): a proposed BUY plus already-held positions correlated > 0.7 with it (120-day daily returns) must not together exceed 50% of book. Catches AI / mega-cap-growth concentration that sector caps miss when yfinance tags NVDA (Technology) and GOOGL (Communication Services) separately.
 
 ### Execution Safety
 - Stale orders cancelled before each session
@@ -174,7 +175,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 163 tests
+├── tests/                         # 175 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -185,7 +186,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 163 tests
+pytest tests/ -v    # 175 tests
 ```
 
 ## Data Sources

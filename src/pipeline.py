@@ -186,6 +186,7 @@ class TradingPipeline:
         daily_pnl: float,
         baseline: float | None = None,
         macro_target_invested_pct: float | None = None,
+        correlation_matrix: dict[str, dict[str, float]] | None = None,
     ) -> tuple[list[TradeDecision], list, list[str]]:
         allowed_decisions: list[TradeDecision] = []
         remaining_violations = []
@@ -208,6 +209,7 @@ class TradingPipeline:
                 pending_sector_investment=pending_sector_investment,
                 pending_symbol_investment=pending_symbol_investment,
                 baseline=baseline,
+                correlation_matrix=correlation_matrix,
             )
             hard_violations = [v for v in violations if v.rule in HARD_BLOCK_RULES]
             if hard_violations:
@@ -333,6 +335,49 @@ class TradingPipeline:
                 len(alive), len(bg), timeout_s,
             )
         self._bg_threads = alive
+
+    def _compute_recent_performance(self, current_equity: float) -> dict:
+        """Rolling 5-day and 20-day returns from db.daily_pnl, + drawdown flag.
+
+        Used to tell PM 'we've been losing — size down' regardless of what the market
+        is doing. Independent of VIX / macro regime (which reflect market, not us).
+
+        Returns e.g. {'rolling_5d_pct': -2.3, 'rolling_20d_pct': -6.1,
+                      'in_drawdown': True, 'trailing_days': 18}
+        """
+        try:
+            rows = self.db.get_daily_pnl(limit=25)
+        except Exception as e:
+            logger.warning("Failed to read daily_pnl for drawdown context: %s", e)
+            return {}
+        if not rows:
+            return {"rolling_5d_pct": None, "rolling_20d_pct": None,
+                    "in_drawdown": False, "trailing_days": 0}
+
+        def _pct_change(start_idx: int) -> float | None:
+            if start_idx >= len(rows):
+                return None
+            start_value = rows[start_idx].get("total_value") or 0
+            if start_value <= 0:
+                return None
+            return round((current_equity - start_value) / start_value * 100, 2)
+
+        # rows are ordered newest-first (DESC)
+        rolling_5d = _pct_change(4)   # compare to 5 trading days ago
+        rolling_20d = _pct_change(19)  # compare to 20 trading days ago
+
+        in_drawdown = False
+        if rolling_5d is not None and rolling_5d < -3.0:
+            in_drawdown = True
+        if rolling_20d is not None and rolling_20d < -8.0:
+            in_drawdown = True
+
+        return {
+            "rolling_5d_pct": rolling_5d,
+            "rolling_20d_pct": rolling_20d,
+            "in_drawdown": in_drawdown,
+            "trailing_days": len(rows),
+        }
 
     def _refresh_account_state(self):
         account = self.broker.get_account()
@@ -536,6 +581,7 @@ class TradingPipeline:
 
         def _run_tech():
             all_symbols_data = []
+            symbols_bars: dict[str, list] = {}
             for symbol in self.config.trading.universe:
                 bars = self.market.get_ohlcv(symbol, self.config.trading.lookback_days)
                 if not bars:
@@ -543,6 +589,11 @@ class TradingPipeline:
                     continue
                 indicators = compute_indicators(symbol, bars)
                 all_symbols_data.append({"symbol": symbol, "bars": bars, "indicators": indicators})
+                symbols_bars[symbol] = bars
+            # Stash on self so the risk filter below can reuse for correlation clustering
+            # without re-downloading. Bars are already in memory; only marginal cost is
+            # the correlation DataFrame (few KB).
+            self._last_symbols_bars = symbols_bars
             # Pre-filter: only send actionable symbols to the LLM
             symbols_data = [
                 s for s in all_symbols_data
@@ -639,6 +690,10 @@ class TradingPipeline:
 
         # 5. Portfolio Manager decision
         yesterday_insights = self.db.get_latest_insights(before_date=str(date.today()))
+
+        # Recent performance context — if the system is in drawdown, PM should size down
+        # until it recovers. Meta-cognitive risk management, independent of market regime.
+        recent_performance = self._compute_recent_performance(last_equity)
         if yesterday_insights:
             logger.info("Loaded yesterday's insights (risk=%s): %s",
                         yesterday_insights.get("risk_rating", "?"),
@@ -653,6 +708,7 @@ class TradingPipeline:
             news_intel=news_intel,
             earnings_analyses=earnings_results,
             yesterday_insights=yesterday_insights,
+            recent_performance=recent_performance,
         )
 
         if portfolio_decision and portfolio_decision.reasoning_chain:
@@ -699,6 +755,23 @@ class TradingPipeline:
         if macro_analysis:
             pg = macro_analysis.get("position_guidance", {}) or {}
             macro_target_pct = pg.get("target_invested_pct")
+
+        # Correlation matrix (held + analyzed) — surfaces factor/theme concentration
+        # that sector caps miss. Computed from the bars already in memory from _run_tech.
+        correlation_matrix = None
+        try:
+            from src.data.correlation import build_correlation_matrix
+            pool_bars = dict(getattr(self, "_last_symbols_bars", {}))
+            # Include held symbols that weren't in today's analyzed set (fetch their bars).
+            for p in positions:
+                if p.symbol not in pool_bars:
+                    pool_bars[p.symbol] = self.market.get_ohlcv(
+                        p.symbol, self.config.trading.lookback_days
+                    ) or []
+            correlation_matrix = build_correlation_matrix(pool_bars)
+        except Exception as e:
+            logger.warning("Failed to build correlation matrix: %s (continuing without)", e)
+
         portfolio_decision.decisions, rule_violations, blocked_reasons = self._filter_hard_risk_decisions(
             portfolio_decision.decisions,
             positions,
@@ -706,6 +779,7 @@ class TradingPipeline:
             daily_pnl,
             baseline=last_equity,
             macro_target_invested_pct=macro_target_pct,
+            correlation_matrix=correlation_matrix,
         )
         if blocked_reasons:
             reasons = "; ".join(dict.fromkeys(blocked_reasons))
@@ -798,6 +872,7 @@ class TradingPipeline:
                 daily_pnl,
                 baseline=last_equity,
                 macro_target_invested_pct=macro_target_pct,
+                correlation_matrix=correlation_matrix,
             )
             if blocked_reasons:
                 reasons = "; ".join(dict.fromkeys(blocked_reasons))
@@ -1210,6 +1285,10 @@ class TradingPipeline:
         # 3. LLM evening analysis — daily review and tomorrow outlook
         macro_summary = self.macro.get_macro_summary()
         today_trades = self.db.get_trades(limit=20, today_only=True)
+        # Feed yesterday's insights back so evening can grade its own prior outlook
+        # against today's reality — enables calibration over time.
+        prior_outlook = self.db.get_latest_insights(before_date=today_str)
+
         analysis, ev_result = self.evening_analyst.analyze(
             positions=positions,
             macro_summary=macro_summary,
@@ -1217,6 +1296,7 @@ class TradingPipeline:
             daily_pnl=daily_pnl,
             daily_return_pct=daily_return_pct,
             today_trades=today_trades,
+            prior_outlook=prior_outlook,
         )
 
         self.db.insert_agent_log(

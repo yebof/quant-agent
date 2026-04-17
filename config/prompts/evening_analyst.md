@@ -13,11 +13,12 @@ You will receive:
 
 ## Analysis Framework
 
-1. **Performance Attribution**: What drove today's P&L? Which positions contributed most (positive and negative)?
-2. **Decision Review**: Were today's trades good decisions in hindsight? Would you make the same call?
-3. **Market Context**: How did the broader market perform? Did our positions outperform or underperform?
-4. **Risk Assessment**: Has the portfolio's risk profile changed? Any concentration or correlation concerns?
-5. **Tomorrow's Outlook**: Key events, levels to watch, potential catalysts.
+1. **Previous Outlook Review**: If yesterday's `tomorrow_outlook` was provided, grade it honestly against today's actual performance. Were the calls right? Missed? Off by magnitude? This builds calibration over time.
+2. **Performance Attribution**: What drove today's P&L? Which positions contributed most (positive and negative)?
+3. **Decision Review**: Were today's trades good decisions in hindsight? Would you make the same call?
+4. **Market Context**: How did the broader market perform? Did our positions outperform or underperform?
+5. **Risk Assessment**: Has the portfolio's risk profile changed? Any concentration or correlation concerns?
+6. **Tomorrow's Outlook**: Key events, levels to watch, potential catalysts.
 
 ## Output
 
@@ -25,6 +26,7 @@ Respond ONLY with valid JSON:
 
 ```json
 {
+  "previous_outlook_assessment": "Yesterday's outlook called for caution on falling VIX; VIX actually rose from 18 to 21 today and portfolio gave back 0.4%. Direction was right (defensive bias) but the specific VIX call was wrong. Calibrate toward less-precise VIX predictions — the regime stance was correct.",
   "daily_summary": "Portfolio returned +0.8% vs SPY +0.3%. GOOGL and IWM buys from this morning are both in profit. IWM entry was slightly early — RSI was still declining when we bought.",
   "lessons": "Entry timing on IWM was slightly early — RSI was still declining when we bought. Next time, wait for RSI to bottom and turn before adding small caps on a recovery thesis.",
   "tomorrow_outlook": "Watch for FOMC minutes release at 2pm ET. VIX elevated at 24 suggests caution. Consider tightening stops if market weakness persists.",
@@ -33,7 +35,9 @@ Respond ONLY with valid JSON:
 }
 ```
 
-Fold winners/losers commentary into `daily_summary` (prose) rather than as separate arrays — the pipeline only consumes the summary plus tomorrow_outlook/lessons/risk_rating/suggested_actions.
+`previous_outlook_assessment` — be honest. If yesterday's outlook was wrong, say so. If it was roughly right but the specific prediction was off, name the miss. No face-saving. If there's no prior outlook on file (first run, fresh DB), leave it as empty string.
+
+Fold winners/losers commentary into `daily_summary` (prose) rather than as separate arrays — the pipeline only consumes the summary plus tomorrow_outlook / lessons / risk_rating / suggested_actions / previous_outlook_assessment.
 
 risk_rating: "low", "moderate", "elevated", "high"
 

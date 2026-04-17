@@ -1,8 +1,10 @@
 import logging
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from src.agents.base import BaseAgent
-from src.models import Position
+from src.models import EveningReport, Position
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +28,8 @@ class EveningAnalystAgent(BaseAgent):
         total_value: float = kwargs["total_value"]
         daily_pnl: float = kwargs["daily_pnl"]
         daily_return_pct: float = kwargs["daily_return_pct"]
-        today_trades: list[dict] = kwargs.get("today_trades", [])
+        today_trades: list[dict] = kwargs.get("today_trades", []) or []
+        prior_outlook: dict | None = kwargs.get("prior_outlook")
 
         positions_text = "\n".join(
             f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Close: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} | Sector: {p.sector}"
@@ -38,7 +41,21 @@ class EveningAnalystAgent(BaseAgent):
             for t in today_trades
         ) if today_trades else "No trades today."
 
-        vix = macro_summary.get("vix", {})
+        vix = macro_summary.get("vix", {}) or {}
+
+        # Retrospection input — yesterday's outlook and suggested_actions to evaluate honestly.
+        if prior_outlook:
+            prior_section = f"""## Yesterday's Outlook (evaluate honestly against today's reality)
+- Date written: {prior_outlook.get('date', 'unknown')}
+- Tomorrow outlook: {prior_outlook.get('tomorrow_outlook', 'N/A')}
+- Risk rating: {prior_outlook.get('risk_rating', 'N/A')}
+- Suggested actions: {prior_outlook.get('suggested_actions', 'N/A')}
+
+Grade whether yesterday's outlook matched today's reality. This goes into
+`previous_outlook_assessment` — be honest: if you called for caution and the
+market ripped, say so. Calibration matters more than looking smart."""
+        else:
+            prior_section = "## Yesterday's Outlook\nNone on file (first run or fresh table)."
 
         return f"""## End-of-Day Review
 
@@ -55,11 +72,14 @@ class EveningAnalystAgent(BaseAgent):
 ### Macro
 - VIX: {vix.get('current', 'N/A')} (trend: {vix.get('trend', 'N/A')})
 
+{prior_section}
+
 Provide your end-of-day analysis as JSON."""
 
     def analyze(self, positions: list[Position], macro_summary: dict,
                 total_value: float, daily_pnl: float, daily_return_pct: float,
-                today_trades: list[dict] | None = None) -> tuple[dict | None, "AgentResult"]:
+                today_trades: list[dict] | None = None,
+                prior_outlook: dict | None = None) -> tuple[dict | None, "AgentResult"]:
         result = self.run(
             positions=positions,
             macro_summary=macro_summary,
@@ -67,9 +87,18 @@ Provide your end-of-day analysis as JSON."""
             daily_pnl=daily_pnl,
             daily_return_pct=daily_return_pct,
             today_trades=today_trades or [],
+            prior_outlook=prior_outlook,
         )
         parsed = result.parse_json()
         if parsed is None:
             logger.error("Evening analyst returned non-JSON response")
             return None, result
-        return parsed, result
+        if not isinstance(parsed, dict):
+            logger.error("Evening analyst expected object, got %s", type(parsed).__name__)
+            return None, result
+        try:
+            report = EveningReport(**parsed)
+        except ValidationError as e:
+            logger.error("Evening report failed schema validation: %s", e)
+            return None, result
+        return report.model_dump(), result

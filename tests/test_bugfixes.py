@@ -15,6 +15,9 @@ from src.models import (
     RiskModification, TechAnalysisResult, TradeDecision, Position,
     MacroAnalysis, MacroReasoningChain, MacroPositionGuidance, MacroSectorGuidance,
     TechReasoningChain,
+    RiskVerdict, RiskReasoningChain,
+    MiddayReview, MiddayAction,
+    EveningReport,
 )
 
 
@@ -805,6 +808,82 @@ def test_tech_reasoning_chain_requires_all_five_fields():
         trend="a", momentum="b", volatility="c", volume="d", support_resistance="e",
     )
     assert rc.trend == "a"
+
+
+# === RM reasoning_chain + scale_all_buys + Midday/Evening Pydantic ===
+
+def test_risk_reasoning_chain_requires_all_six_fields():
+    with pytest.raises(ValidationError):
+        RiskReasoningChain(rr_audit="a")  # missing 5 others
+    rc = RiskReasoningChain(
+        rr_audit="a", signal_fidelity="b", correlation_check="c",
+        event_risk="d", sizing_sanity="e", overall="f",
+    )
+    assert rc.overall == "f"
+
+
+def test_risk_verdict_accepts_reasoning_chain():
+    v = RiskVerdict(
+        approved=True,
+        reasoning_chain=RiskReasoningChain(
+            rr_audit="all >= 2", signal_fidelity="aligned",
+            correlation_check="no cluster", event_risk="no event",
+            sizing_sanity="proportional", overall="clean",
+        ),
+        reasoning="OK",
+    )
+    assert v.reasoning_chain is not None
+    assert v.reasoning_chain.rr_audit == "all >= 2"
+
+
+def test_midday_action_trail_stop_requires_price():
+    with pytest.raises(ValidationError):
+        MiddayAction(action="TRAIL_STOP", symbol="SPY", reason="x")  # no new_stop_price
+    ok = MiddayAction(action="TRAIL_STOP", symbol="SPY", reason="x", new_stop_price=500.0)
+    assert ok.new_stop_price == 500.0
+
+
+def test_midday_review_rejects_unknown_action():
+    with pytest.raises(ValidationError):
+        MiddayReview(
+            actions=[{"action": "TRIAL_STOP", "symbol": "SPY", "reason": "typo"}],  # TRIAL vs TRAIL
+            overall_assessment="x",
+            risk_level="moderate",
+        )
+
+
+def test_midday_review_accepts_full_schema():
+    r = MiddayReview(
+        actions=[
+            MiddayAction(action="HOLD", symbol="SPY", reason="still green"),
+            MiddayAction(action="TRAIL_STOP", symbol="NVDA", reason="up 12%", new_stop_price=195.0),
+            MiddayAction(action="SELL", symbol="AAPL", reason="thesis broke"),
+        ],
+        overall_assessment="Mix of hold + one trail + one cut",
+        risk_level="moderate",
+    )
+    assert len(r.actions) == 3
+    assert r.actions[1].new_stop_price == 195.0
+
+
+def test_evening_report_requires_core_fields():
+    with pytest.raises(ValidationError):
+        EveningReport(daily_summary="x")  # missing lessons / tomorrow_outlook / risk_rating
+    ok = EveningReport(
+        daily_summary="up 0.8%", lessons="be patient",
+        tomorrow_outlook="watch FOMC", risk_rating="moderate",
+        suggested_actions=["tighten IWM stop"],
+        previous_outlook_assessment="yesterday's call was directionally right",
+    )
+    assert ok.risk_rating == "moderate"
+
+
+def test_evening_report_rejects_invalid_risk_rating():
+    with pytest.raises(ValidationError):
+        EveningReport(
+            daily_summary="x", lessons="y",
+            tomorrow_outlook="z", risk_rating="catastrophic",  # not in enum
+        )
 
 
 def test_data_degraded_violation_fires_at_two_failures():

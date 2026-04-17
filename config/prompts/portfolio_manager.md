@@ -83,6 +83,11 @@ Then **adjust by Risk/Reward** (shown as `R/R x.xx:1` in each Technical Analysis
 
 Scale DOWN additionally when: strategic risks are high, data quality is poor, signal conflict exists, or the macro advisory (`macro_exposure_deviation`) is flagged.
 
+**System-drawdown discipline** (independent of market regime): Look at the "Recent System Performance" section.
+- If `in_drawdown` is flagged (5d return < −3% OR 20d < −8%): **halve every new BUY's allocation** and state this in `sizing_logic`. This is NOT panic — it's acknowledging that the system's edge has temporarily degraded and preserving capital to re-engage when the tape cooperates.
+- If only 5d is negative but modest (−1% to −3%): no change needed; normal variance.
+- If both 5d and 20d are strongly positive (>+5% and >+10%): do NOT size up extra. Past performance does not justify current aggressiveness — R/R and conviction rule sizing as always.
+
 ### Step 6: Portfolio Balance
 Check the resulting portfolio against constraints:
 - Sector concentration: no sector > 40%

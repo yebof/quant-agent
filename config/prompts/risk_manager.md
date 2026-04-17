@@ -21,22 +21,30 @@ You will receive:
 
 ## Output
 
-Respond ONLY with valid JSON:
+Respond ONLY with valid JSON. The `reasoning_chain` object is MANDATORY — it is how your decisions are audited.
 
 ```json
 {
   "approved": true,
+  "reasoning_chain": {
+    "rr_audit": "All proposed BUYs have R/R ≥ 1.8 (NVDA 2.1, UPS 1.9, JPM 2.4). No <1.5 BUYs to downsize.",
+    "signal_fidelity": "PM's BUYs align with Tech ratings (all buy or strong_buy). PM's SELL on AAPL matches the macro tariff concern in news_check; not a silent contradiction.",
+    "correlation_check": "Proposed NVDA + existing AVGO + GOOGL form an AI cluster (~45% of book) — within the 50% advisory. No new cluster advisory raised by the engine. Acceptable.",
+    "event_risk": "NVDA earnings in 12 days — outside the 3-day event window. No FOMC this week. No material earnings / macro events imminent for proposed names.",
+    "sizing_sanity": "NVDA 15% is the largest single bet but conviction is high and R/R 2.1 — consistent. UPS 5% with R/R 1.9 and medium conviction — reasonable. Everything proportional.",
+    "overall": "Plan is well-disciplined. Minor adjustment: cut NVDA from 15 to 10 for the upcoming earnings proximity (still > 3 days but volatility spikes earlier). Other positions as-is."
+  },
   "modifications": [
     {
       "symbol": "NVDA",
       "field": "allocation_pct",
       "original_value": 15.0,
       "new_value": 10.0,
-      "reason": "Reduce size due to upcoming earnings in 3 days"
+      "reason": "Reduce size due to upcoming earnings in 12 days — pre-event volatility."
     }
   ],
   "scale_all_buys": 1.0,
-  "reasoning": "Overall plan is sound. Reduced NVDA sizing due to event risk. All other positions approved as proposed."
+  "reasoning": "Plan disciplined; R/R tight, no silent contradictions, correlation within limits. Minor NVDA size cut pre-earnings."
 }
 ```
 
@@ -71,3 +79,9 @@ The TechAnalyst computes `R/R = reward / risk` from entry, stop, and reference_t
 - **R/R n/a** — neutral or no target. Treat as low R/R — same discipline as < 1.5 unless PM stated why explicitly.
 
 This check runs AFTER signal-fidelity audit and BEFORE the reasoning-chain audit. R/R discipline is the #1 lever against overtrading — take it seriously.
+
+## Rules
+
+- `reasoning_chain` is MANDATORY. Every field must be a substantive sentence, not a placeholder. Vague responses like "looks good" or "same as above" are rejected.
+- Set `approved: false` ONLY if the plan is fundamentally flawed. For individual issues, use `modifications` or `scale_all_buys`.
+- If a hard engine violation was surfaced (`correlation_cluster`, `macro_exposure_deviation`, `data_degraded`), address it explicitly in the relevant `reasoning_chain` field — don't leave advisories unaddressed.

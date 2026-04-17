@@ -230,6 +230,24 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
         invested = total_value - cash_balance
         invested_pct = (invested / total_value * 100) if total_value else 0
 
+        # Recent system performance (drawdown awareness).
+        recent_perf = kwargs.get("recent_performance") or {}
+        if recent_perf:
+            r5 = recent_perf.get("rolling_5d_pct")
+            r20 = recent_perf.get("rolling_20d_pct")
+            dd = recent_perf.get("in_drawdown")
+            trailing = recent_perf.get("trailing_days") or 0
+            dd_marker = " ⚠️ SYSTEM IN DRAWDOWN" if dd else ""
+            perf_section = (
+                f"## Recent System Performance (drawdown check){dd_marker}\n"
+                f"- Trailing 5-day return: {r5}%\n"
+                f"- Trailing 20-day return: {r20}%\n"
+                f"- Drawdown threshold: 5d < −3% OR 20d < −8% flags in_drawdown\n"
+                f"- History length: {trailing} days recorded\n"
+            )
+        else:
+            perf_section = "## Recent System Performance\nNo history yet."
+
         # Yesterday's insights section
         yesterday_insights: dict | None = kwargs.get("yesterday_insights")
         if yesterday_insights and yesterday_insights.get("tomorrow_outlook"):
@@ -264,6 +282,8 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
 ## Current Positions
 {positions_text}
 
+{perf_section}
+
 {insights_section}
 
 {macro_section}
@@ -282,7 +302,8 @@ Based on all the above (yesterday's insights, macro analysis, news, earnings, an
                total_value: float = 0,
                news_intel: NewsIntelligenceReport | None = None,
                earnings_analyses: list[dict] | None = None,
-               yesterday_insights: dict | None = None) -> tuple[PortfolioDecision | None, "AgentResult"]:
+               yesterday_insights: dict | None = None,
+               recent_performance: dict | None = None) -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
             analyses=analyses,
             positions=positions,
@@ -292,6 +313,7 @@ Based on all the above (yesterday's insights, macro analysis, news, earnings, an
             news_intel=news_intel,
             earnings_analyses=earnings_analyses or [],
             yesterday_insights=yesterday_insights,
+            recent_performance=recent_performance or {},
         )
         parsed = result.parse_json()
         if parsed is None:

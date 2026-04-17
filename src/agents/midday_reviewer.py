@@ -1,8 +1,10 @@
 import logging
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from src.agents.base import BaseAgent
-from src.models import Position
+from src.models import MiddayReview, Position
 
 logger = logging.getLogger(__name__)
 
@@ -90,4 +92,13 @@ Review each position against its stop loss and target. Recommend actions. Respon
         if parsed is None:
             logger.error("Midday reviewer returned non-JSON response")
             return None, result
-        return parsed, result
+        if not isinstance(parsed, dict):
+            logger.error("Midday reviewer expected object, got %s", type(parsed).__name__)
+            return None, result
+        try:
+            review = MiddayReview(**parsed)
+        except ValidationError as e:
+            logger.error("Midday review failed schema validation: %s", e)
+            return None, result
+        # Return dict form so pipeline's existing .get() accessors keep working.
+        return review.model_dump(), result

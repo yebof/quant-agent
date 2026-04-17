@@ -23,12 +23,17 @@ LLM multi-agent 美股量化交易系统，通过 Alpaca 执行交易（默认 p
 - **责任边界**：Macro 拥有 regime 枚举的权威；News 的 `current_regime` 只描述新闻/地缘背景，不复述枚举
 - **TechAnalyst**：5 步 `reasoning_chain` (trend/momentum/volatility/volume/support_resistance) + `conviction`；`reference_target`（非硬止盈）；`thesis_invalid_if`（软退出条件）；**自动计算 `risk_reward`（Python 计算，不信 LLM）**；rating↔价格 cross-field validator（BUY stop 必须 < entry）；ATR 默认 stop = entry − 2*ATR；batch > 30 自动 chunk；预过滤阈值按 ATR 归一化
 - **R/R 纪律全链路**：TA 自动算 R/R → PM 按 R/R 分档加减仓（≥3 加、<1.5 要 catalyst 或减半）→ RM 在 prompt 里独立执行否决纪律（R/R<1.5 必须 modification 或 scale_all_buys）
+- **相关性集群风控**：`src/data/correlation.py` 算 120 日 pairwise 相关度，新 advisory `correlation_cluster`：BUY + 已持且 corr>0.7 的仓位合计 > 50% 簿本就触发；catchAI 主题假分散
+- **回撤感知 sizing**：pipeline 每 morning 算 5d/20d 滚动 return，传 `recent_performance` 给 PM；若 5d<-3% 或 20d<-8% 标 `in_drawdown=True` → PM prompt 要求所有新 BUY 减半
+- **RM reasoning_chain**：6 字段 (rr_audit / signal_fidelity / correlation_check / event_risk / sizing_sanity / overall) 强制，最后一道关有审计痕迹
+- **Evening 自省**：EveningAnalyst 读昨日 `insights.tomorrow_outlook` → 今日输出 `previous_outlook_assessment` 老实打分，做长期 calibration
+- **Midday/Evening Pydantic**：从裸 dict 升级到 `MiddayReview` + `EveningReport`；`MiddayAction.TRAIL_STOP` 强制 `new_stop_price > 0`；typo (TRIAL_STOP) 直接 ValidationError 拦下
 - **生产调度**：macOS launchd，Mon-Fri SGT 22:00/04:00/08:30 → morning/midday/evening（对应美东 10:00/16:00/20:30）
 
 ## 开发规范
 
 - Python 3.11+，依赖管理用 pyproject.toml
-- 测试：`pytest tests/ -v`（163 tests）
+- 测试：`pytest tests/ -v`（175 tests）
 - 配置：`config/settings.yaml`，API key 通过 `${ENV_VAR}` 引用 `.env`
 - Agent prompts 在 `config/prompts/*.md`
 - 入口：`python main.py --mode morning|midday|evening|live`

@@ -94,6 +94,13 @@ Respond ONLY with valid JSON:
   "investment_implications": {
     "sentiment": "bullish",
     "conviction": "medium",
+    "reasoning_chain": {
+      "fundamental_quality": "Revenue $94.9B (+5.2% YoY) with Services accelerating to +14%; gross margin 46.9% holding; net income $24.8B. Core metrics healthy, mix shift improving margins over time.",
+      "growth_trajectory": "Services YoY acceleration from +11% to +14% is the standout; iPhone flat (+2%); total revenue growth stable not expanding. Growth is narrowing to Services — durable but limits upside magnitude.",
+      "strategic_risks": "Vision Pro ($billions R&D, unclear consumer adoption timeline); AI feature parity against Google/Samsung; EU regulatory pressure on App Store that directly hits the margin-expansion story.",
+      "management_execution": "Services narrative consistent with prior 4 quarters; buyback pace maintained ($20B authorized); no strategic pivots signaled. Execution credible.",
+      "valuation_context": "At ~28x forward earnings this requires Services to keep accelerating. Current setup supports that; any Services deceleration below +10% would compress the multiple."
+    },
     "key_thesis": "Services growth is the margin expansion story; iPhone flat but cash cow. Watch China trajectory.",
     "bull_case": "Services re-acceleration + AI features drive upgrade cycle",
     "bear_case": "China deterioration + regulatory risk to App Store margins"

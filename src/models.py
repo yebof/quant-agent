@@ -181,8 +181,19 @@ class RiskModification(BaseModel):
     reason: str
 
 
+class RiskReasoningChain(BaseModel):
+    """6-step CoT for the risk manager — forces audit trail on the last gate."""
+    rr_audit: str             # did every BUY respect R/R >= 1.5 without catalyst override?
+    signal_fidelity: str      # does PM's action align with Tech/Macro/News? silent contradictions?
+    correlation_check: str    # any hidden cluster / factor concentration across decisions?
+    event_risk: str           # earnings / FOMC / macro events in the coming 3 days affecting these names?
+    sizing_sanity: str        # is size proportional to conviction and R/R? any outsized bet?
+    overall: str              # final synthesis and why approved/rejected/modified
+
+
 class RiskVerdict(BaseModel):
     approved: bool
+    reasoning_chain: RiskReasoningChain | None = None
     modifications: list[RiskModification] = []
     # Portfolio-level size control. Multiplies every BUY decision's allocation_pct after
     # per-symbol modifications are applied. 1.0 = no change; 0.5 = half all buys; 0.0
@@ -437,9 +448,19 @@ class EarningsRiskFlags(BaseModel):
     operational_risks: list[str] = []
 
 
+class EarningsReasoningChain(BaseModel):
+    """5-step CoT for fundamental analysis — why sentiment is what it is."""
+    fundamental_quality: str       # revenue, margin, cash flow trajectory
+    growth_trajectory: str         # YoY / QoQ direction, momentum, inflection
+    strategic_risks: str           # biggest strategic bets and their execution risk
+    management_execution: str      # is management doing what they said? any pivots?
+    valuation_context: str         # is the market pricing this fairly given the above?
+
+
 class EarningsInvestmentImplications(BaseModel):
     sentiment: Literal["bullish", "bearish", "neutral"]
     conviction: Literal["high", "medium", "low"]
+    reasoning_chain: EarningsReasoningChain | None = None
     key_thesis: str
     bull_case: str = "not disclosed"
     bear_case: str = "not disclosed"
@@ -479,6 +500,40 @@ class EarningsAnalysis(BaseModel):
         if not text:
             raise ValueError("field cannot be empty")
         return text
+
+
+class MiddayAction(BaseModel):
+    action: Literal["SELL", "REDUCE", "TRAIL_STOP", "HOLD"]
+    symbol: str
+    reason: str
+    new_stop_price: float | None = None  # required when action == TRAIL_STOP
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        return _normalize_symbol(value)
+
+    @model_validator(mode="after")
+    def _trail_stop_requires_new_price(self):
+        if self.action == "TRAIL_STOP" and (self.new_stop_price is None or self.new_stop_price <= 0):
+            raise ValueError("TRAIL_STOP requires new_stop_price > 0")
+        return self
+
+
+class MiddayReview(BaseModel):
+    actions: list[MiddayAction] = []
+    overall_assessment: str
+    risk_level: Literal["low", "moderate", "elevated", "high"]
+
+
+class EveningReport(BaseModel):
+    daily_summary: str
+    lessons: str
+    tomorrow_outlook: str
+    risk_rating: Literal["low", "moderate", "elevated", "high"]
+    suggested_actions: list[str] = []
+    # Outlook-vs-reality retrospection — was yesterday's tomorrow_outlook right?
+    previous_outlook_assessment: str = ""
 
 
 class AgentLog(BaseModel):

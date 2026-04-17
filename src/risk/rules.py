@@ -48,7 +48,9 @@ class RiskRuleEngine:
               pending_investment: float = 0.0,
               pending_sector_investment: dict[str, float] | None = None,
               pending_symbol_investment: dict[str, float] | None = None,
-              baseline: float | None = None) -> list[RiskViolation]:
+              baseline: float | None = None,
+              correlation_matrix: dict[str, dict[str, float]] | None = None,
+              max_correlated_cluster_pct: float = 50.0) -> list[RiskViolation]:
         if decision.action == "SELL":
             return []
         if total_value <= 0:
@@ -107,6 +109,29 @@ class RiskRuleEngine:
                 value=decision.stop_loss,
                 limit=0,
             ))
+
+        # 4b. Correlation cluster (advisory) — catches the "all-AI" concentration problem
+        # that sector caps miss. If the proposed BUY plus the held positions highly correlated
+        # with it (|corr| >= 0.7) together exceed max_correlated_cluster_pct, flag.
+        if correlation_matrix:
+            from src.data.correlation import highly_correlated_peers, CLUSTER_CORRELATION_THRESHOLD
+            held_symbols = [p.symbol for p in positions]
+            peers = highly_correlated_peers(decision.symbol, held_symbols, correlation_matrix)
+            if peers:
+                peer_value = sum(p.market_value for p in positions if p.symbol in peers)
+                cluster_pct = (peer_value + new_investment) / total_value * 100
+                if cluster_pct > max_correlated_cluster_pct:
+                    violations.append(RiskViolation(
+                        rule="correlation_cluster",
+                        message=(
+                            f"{decision.symbol} + correlated holdings [{', '.join(peers)}] "
+                            f"would total {cluster_pct:.0f}% of book, exceeding "
+                            f"{max_correlated_cluster_pct:.0f}% cluster cap (advisory). "
+                            f"Pairwise corr > {CLUSTER_CORRELATION_THRESHOLD}."
+                        ),
+                        value=cluster_pct,
+                        limit=max_correlated_cluster_pct,
+                    ))
 
         # 5. Sector concentration — gross (existing, pending, and new all use unsigned magnitude)
         from src.execution.broker import _get_sector
