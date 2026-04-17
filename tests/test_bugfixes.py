@@ -397,7 +397,7 @@ def test_evening_return_pct_handles_zero_last_equity():
     pipeline.db.get_trades.return_value = []
     pipeline.macro.get_macro_summary.return_value = {}
     pipeline.evening_analyst.analyze.return_value = (
-        {"daily_summary": "Flat", "tomorrow_outlook": "Watch", "risk_rating": "low"},
+        EveningReport(daily_summary="Flat", lessons="", tomorrow_outlook="Watch", risk_rating="low"),
         AgentResult(raw_text="{}", tokens_used=10, model="test", user_message="test"),
     )
 
@@ -424,7 +424,7 @@ def test_evening_daily_pnl_uses_last_equity():
     pipeline.db.get_trades.return_value = []
     pipeline.macro.get_macro_summary.return_value = {}
     pipeline.evening_analyst.analyze.return_value = (
-        {"daily_summary": "Up", "tomorrow_outlook": "Watch", "risk_rating": "low"},
+        EveningReport(daily_summary="Up", lessons="", tomorrow_outlook="Watch", risk_rating="low"),
         AgentResult(raw_text="{}", tokens_used=10, model="test", user_message="test"),
     )
 

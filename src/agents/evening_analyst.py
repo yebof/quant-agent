@@ -150,7 +150,7 @@ Provide your end-of-day analysis as JSON."""
                 prior_outlook: dict | None = None,
                 recent_sells: list[dict] | None = None,
                 news_intel: NewsIntelligenceReport | None = None,
-                earnings_analyses: list[dict] | None = None) -> tuple[dict | None, "AgentResult"]:
+                earnings_analyses: list[dict] | None = None) -> tuple[EveningReport | None, "AgentResult"]:
         result = self.run(
             positions=positions,
             macro_summary=macro_summary,
@@ -175,4 +175,5 @@ Provide your end-of-day analysis as JSON."""
         except ValidationError as e:
             logger.error("Evening report failed schema validation: %s", e)
             return None, result
-        return report.model_dump(), result
+        # Phase 4 #7: return the Pydantic object; pipeline reads attributes.
+        return report, result

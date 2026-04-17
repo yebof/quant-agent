@@ -6,7 +6,34 @@ from src.agents.base import AgentResult
 from src.models import (
     TechAnalysisResult, PortfolioDecision, TradeDecision, RiskVerdict, Position,
     NewsAnalysisResult, TargetPosition,
+    MacroAnalysis, MacroReasoningChain, MacroPositionGuidance,
 )
+
+
+def _macro_stub(regime="risk-on", outlook="bullish", confidence="medium",
+                target_invested_pct=75.0, cash_rec_pct=25.0):
+    """Build a valid MacroAnalysis Pydantic object for pipeline tests.
+
+    Phase 4 #7 made MacroAnalystAgent.analyze() return MacroAnalysis
+    (Pydantic) instead of dict. Tests that mock the agent must return
+    the typed object so downstream consumers' attribute access works.
+    """
+    return MacroAnalysis(
+        reasoning_chain=MacroReasoningChain(
+            volatility_analysis="a", yield_curve_analysis="b",
+            monetary_policy_analysis="c", inflation_labor_credit="d",
+            cross_signal_synthesis="e", sector_implications="f",
+        ),
+        regime=regime,
+        confidence=confidence,
+        equity_outlook=outlook,
+        position_guidance=MacroPositionGuidance(
+            target_invested_pct=target_invested_pct,
+            cash_recommendation_pct=cash_rec_pct,
+            reasoning="stub",
+        ),
+        summary="stub macro analysis",
+    )
 
 def _mock_agent_result(raw_text="{}"):
     return AgentResult(raw_text=raw_text, tokens_used=100, model="test", user_message="test input")
@@ -117,8 +144,7 @@ def test_pipeline_morning_run_buy(
 
     # Macro analyst
     mock_maa = MagicMock()
-    mock_maa.analyze.return_value = ({"regime": "risk-on", "equity_outlook": "bullish",
-        "confidence": "medium", "summary": "Bullish macro"}, _mock_agent_result())
+    mock_maa.analyze.return_value = (_macro_stub(regime="risk-on", outlook="bullish"), _mock_agent_result())
     mock_maa_cls.return_value = mock_maa
 
     # News
@@ -220,8 +246,7 @@ def test_pipeline_market_order_sizes_from_live_market_price(
     mock_broker_cls.return_value = mock_broker
 
     mock_maa = MagicMock()
-    mock_maa.analyze.return_value = ({"regime": "risk-on", "equity_outlook": "bullish",
-        "confidence": "medium", "summary": "Bullish macro"}, _mock_agent_result())
+    mock_maa.analyze.return_value = (_macro_stub(regime="risk-on", outlook="bullish"), _mock_agent_result())
     mock_maa_cls.return_value = mock_maa
 
     mock_na = MagicMock()
@@ -325,8 +350,7 @@ def test_pipeline_risk_rejected(
 
     # Macro analyst
     mock_maa = MagicMock()
-    mock_maa.analyze.return_value = ({"regime": "risk-off", "equity_outlook": "bearish",
-        "confidence": "high", "summary": "Bearish macro"}, _mock_agent_result())
+    mock_maa.analyze.return_value = (_macro_stub(regime="risk-off", outlook="bearish", confidence="high"), _mock_agent_result())
     mock_maa_cls.return_value = mock_maa
 
     # News
@@ -505,8 +529,7 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
     mock_broker_cls.return_value = mock_broker
 
     mock_maa = MagicMock()
-    mock_maa.analyze.return_value = ({"regime": "risk-on", "equity_outlook": "bullish",
-        "confidence": "medium", "summary": "Bullish macro"}, _mock_agent_result())
+    mock_maa.analyze.return_value = (_macro_stub(regime="risk-on", outlook="bullish"), _mock_agent_result())
     mock_maa_cls.return_value = mock_maa
 
     mock_na = MagicMock()

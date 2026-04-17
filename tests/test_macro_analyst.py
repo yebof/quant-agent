@@ -56,10 +56,11 @@ def test_macro_analyze_parses_valid_response(mock_cls):
     analysis, result = agent.analyze(macro_summary=MACRO_SUMMARY, universe=["SPY"])
 
     assert analysis is not None
-    assert analysis["regime"] == "risk-on"
-    assert analysis["position_guidance"]["target_invested_pct"] == 75.0
-    assert analysis["bull_triggers"] == ["Core CPI MoM < 0.2% for 2m"]
-    assert analysis["reasoning_chain"]["cross_signal_synthesis"].startswith("Aligned")
+    # Phase 4 #7: analyze() returns a Pydantic MacroAnalysis object.
+    assert analysis.regime == "risk-on"
+    assert analysis.position_guidance.target_invested_pct == 75.0
+    assert analysis.bull_triggers == ["Core CPI MoM < 0.2% for 2m"]
+    assert analysis.reasoning_chain.cross_signal_synthesis.startswith("Aligned")
 
 
 @patch("anthropic.Anthropic")
@@ -93,7 +94,7 @@ def test_macro_analyze_heals_alias_sector(mock_cls):
     analysis, _ = agent.analyze(macro_summary=MACRO_SUMMARY)
 
     assert analysis is not None
-    assert analysis["sector_guidance"][0]["sector"] == "Financial Services"
+    assert analysis.sector_guidance[0].sector == "Financial Services"
 
 
 @patch("anthropic.Anthropic")

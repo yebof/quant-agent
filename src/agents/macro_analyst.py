@@ -107,8 +107,13 @@ Walk through the 6-step reasoning chain, then emit the full JSON schema (includi
         universe: list[str] | None = None,
         last_state: dict | None = None,
         news_narrative: dict | None = None,
-    ) -> tuple[dict | None, AgentResult]:
-        """Run LLM, validate via Pydantic, return dict (model_dump) for PM's .get() access."""
+    ) -> tuple[MacroAnalysis | None, AgentResult]:
+        """Run LLM, validate via Pydantic, return the typed object.
+
+        Phase 4 #7: returns MacroAnalysis instead of dict. Consumers that
+        need dict form (PM's rendering, macro_store serialization) call
+        .model_dump() at their boundary.
+        """
         result = self.run(
             macro_summary=macro_summary,
             universe=universe or [],
@@ -127,4 +132,4 @@ Walk through the 6-step reasoning chain, then emit the full JSON schema (includi
         except ValidationError as e:
             logger.error("Macro analysis failed validation: %s", e)
             return None, result
-        return analysis.model_dump(), result
+        return analysis, result

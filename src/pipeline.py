@@ -1054,7 +1054,12 @@ class TradingPipeline:
         """
         if not macro_analysis or not analyses:
             return ""
-        outlook = (macro_analysis.get("equity_outlook") or "").lower()
+        # macro_analysis is MacroAnalysis (Pydantic) post-Phase-4-#7; dict path
+        # still supported for defensive compatibility with legacy callers.
+        if hasattr(macro_analysis, "equity_outlook"):
+            outlook = (macro_analysis.equity_outlook or "").lower()
+        else:
+            outlook = (macro_analysis.get("equity_outlook") or "").lower()
         if outlook not in ("bullish", "bearish"):
             return ""
         bullish = sum(1 for a in analyses if a.rating in ("buy", "strong_buy"))
@@ -1371,7 +1376,9 @@ class TradingPipeline:
             )
             if analysis:
                 try:
-                    self.macro_store.save_last_state(analysis)
+                    # macro_store persists dict form; Pydantic analysis is the
+                    # canonical in-memory shape.
+                    self.macro_store.save_last_state(analysis.model_dump())
                 except Exception as e:
                     logger.warning("Failed to persist macro last state: %s", e)
             return macro_summary, analysis, result
@@ -1514,15 +1521,18 @@ class TradingPipeline:
                 agent_name="macro_analyst", run_id=run_id,
                 input_summary=f"VIX={macro_summary.get('vix', {}).get('current')}",
                 input_message=ma_result.user_message,
-                output_summary=f"regime={macro_analysis.get('regime')}, outlook={macro_analysis.get('equity_outlook')}" if macro_analysis else "parse_error",
+                output_summary=(
+                    f"regime={macro_analysis.regime}, outlook={macro_analysis.equity_outlook}"
+                    if macro_analysis else "parse_error"
+                ),
                 full_response=ma_result.raw_text,
                 model=self.config.llm.macro_analyst_model,
                 tokens_used=ma_result.tokens_used,
             )
             if macro_analysis:
-                logger.info("Macro analysis: regime=%s, outlook=%s, exposure=%s",
-                             macro_analysis.get("regime"), macro_analysis.get("equity_outlook"),
-                             macro_analysis.get("position_guidance", {}).get("overall_exposure"))
+                logger.info("Macro analysis: regime=%s, outlook=%s, target_invested=%s%%",
+                             macro_analysis.regime, macro_analysis.equity_outlook,
+                             macro_analysis.position_guidance.target_invested_pct)
                 data_status["macro"] = "ok"
             else:
                 data_status["macro"] = "parse_error"
@@ -1613,7 +1623,9 @@ class TradingPipeline:
         portfolio_decision, pm_result = self.portfolio_manager.decide(
             analyses=analyses,
             positions=positions,
-            macro_analysis=macro_analysis,
+            # PM's template is dict-shaped; serialize at the boundary so
+            # build_user_message stays prose-oriented.
+            macro_analysis=(macro_analysis.model_dump() if macro_analysis else None),
             cash_balance=cash,
             total_value=total_value,
             news_intel=news_intel,
@@ -1720,8 +1732,9 @@ class TradingPipeline:
         daily_pnl = total_value - last_equity
         macro_target_pct = None
         if macro_analysis:
-            pg = macro_analysis.get("position_guidance", {}) or {}
-            macro_target_pct = pg.get("target_invested_pct")
+            # MacroAnalysis is a Pydantic object; position_guidance is a
+            # required sub-model on it.
+            macro_target_pct = macro_analysis.position_guidance.target_invested_pct
 
         # Correlation matrix (held + analyzed) — surfaces factor/theme concentration
         # that sector caps miss. Computed from the bars already in memory from _run_tech.
@@ -2188,7 +2201,7 @@ class TradingPipeline:
                 agent_name="midday_reviewer", run_id=run_id,
                 input_summary=f"{len(positions)} positions, ${total_value:.0f} total",
                 input_message=md_result.user_message,
-                output_summary=review.get("overall_assessment", "N/A") if review else "parse_error",
+                output_summary=review.overall_assessment if review else "parse_error",
                 full_response=md_result.raw_text,
                 model=self.config.llm.midday_reviewer_model,
                 tokens_used=md_result.tokens_used,
@@ -2240,15 +2253,20 @@ class TradingPipeline:
                 # mismatches post-REDUCE position). Keep the highest-priority action.
                 _priority = {"SELL": 0, "REDUCE": 1, "TRAIL_STOP": 2, "HOLD": 3}
                 best_by_symbol: dict[str, dict] = {}
-                for ai in (review or {}).get("actions") or []:
+                # Phase 4 #7: review is now MiddayReview (Pydantic); actions
+                # are MiddayAction objects. Convert each to dict here so the
+                # downstream loop (which is dict-oriented) stays unchanged.
+                actions_raw = review.actions if review else []
+                actions_list = [a.model_dump() for a in actions_raw]
+                for ai in actions_list:
                     sym = (ai.get("symbol") or "").strip().upper()
                     if not sym:
                         continue
                     curr = best_by_symbol.get(sym)
                     if curr is None or _priority.get(ai.get("action"), 99) < _priority.get(curr.get("action"), 99):
                         best_by_symbol[sym] = ai
-                if len(best_by_symbol) < len((review or {}).get("actions") or []):
-                    dropped = len((review or {}).get("actions") or []) - len(best_by_symbol)
+                if len(best_by_symbol) < len(actions_list):
+                    dropped = len(actions_list) - len(best_by_symbol)
                     logger.info("Midday: collapsed %d duplicate same-symbol actions (priority SELL>REDUCE>TRAIL_STOP>HOLD)", dropped)
 
                 if best_by_symbol:
@@ -2340,7 +2358,7 @@ class TradingPipeline:
 
         logger.info("Midday: %d positions, risk=%s, %d orders",
                      len(positions),
-                     review.get("risk_level", "N/A") if review else "no_positions",
+                     review.risk_level if review else "no_positions",
                      len(orders))
         self._wait_bg_threads(ctx)
         # Reconcile BOTH today's midday submissions AND any lingering
@@ -2349,7 +2367,8 @@ class TradingPipeline:
         # sweeps all unreconciled orders regardless of run.
         self._reconcile_fills()
         return {"status": "reviewed", "positions": len(positions),
-                "review": review, "orders": orders, "run_id": run_id}
+                "review": review.model_dump() if review else None,
+                "orders": orders, "run_id": run_id}
 
     def run_intra_check(self) -> dict:
         """Lightweight intra-session circuit-breaker check (no LLM calls).
@@ -2518,7 +2537,7 @@ class TradingPipeline:
             agent_name="evening_analyst", run_id=run_id,
             input_summary=f"${total_value:.0f} total, PnL ${daily_pnl:.2f}",
             input_message=ev_result.user_message,
-            output_summary=analysis.get("daily_summary", "N/A") if analysis else "parse_error",
+            output_summary=analysis.daily_summary if analysis else "parse_error",
             full_response=ev_result.raw_text,
             model=self.config.llm.evening_analyst_model,
             tokens_used=ev_result.tokens_used,
@@ -2528,14 +2547,14 @@ class TradingPipeline:
         if analysis:
             self.db.save_insights(
                 date=today_str,
-                tomorrow_outlook=analysis.get("tomorrow_outlook", ""),
-                lessons=analysis.get("lessons", ""),
-                suggested_actions=analysis.get("suggested_actions", []),
-                risk_rating=analysis.get("risk_rating", ""),
-                tomorrow_bias=analysis.get("tomorrow_bias", "neutral"),
-                tomorrow_conviction=analysis.get("tomorrow_conviction", "medium"),
-                tomorrow_key_risks=analysis.get("tomorrow_key_risks", []),
-                sell_decisions_assessment=analysis.get("sell_decisions_assessment", ""),
+                tomorrow_outlook=analysis.tomorrow_outlook,
+                lessons=analysis.lessons,
+                suggested_actions=analysis.suggested_actions,
+                risk_rating=analysis.risk_rating,
+                tomorrow_bias=analysis.tomorrow_bias,
+                tomorrow_conviction=analysis.tomorrow_conviction,
+                tomorrow_key_risks=analysis.tomorrow_key_risks,
+                sell_decisions_assessment=analysis.sell_decisions_assessment,
             )
 
         # Housekeeping: drop agent_logs older than 2 years (full_response bloats the DB
@@ -2556,10 +2575,10 @@ class TradingPipeline:
 
         logger.info("Evening: value=$%.2f, PnL=$%.2f (%.2f%%), risk=%s",
                      total_value, daily_pnl, daily_return_pct,
-                     analysis.get("risk_rating", "N/A") if analysis else "error")
+                     analysis.risk_rating if analysis else "error")
         if analysis:
-            logger.info("Summary: %s", analysis.get("daily_summary", ""))
-            logger.info("Tomorrow: %s", analysis.get("tomorrow_outlook", ""))
+            logger.info("Summary: %s", analysis.daily_summary)
+            logger.info("Tomorrow: %s", analysis.tomorrow_outlook)
         self._wait_bg_threads(ctx)
         # Evening is the last chance to reconcile today's orders before the
         # next trading day. Sweep everything still marked submitted.
@@ -2569,6 +2588,6 @@ class TradingPipeline:
             "total_value": total_value,
             "daily_pnl": daily_pnl,
             "daily_return_pct": daily_return_pct,
-            "analysis": analysis,
+            "analysis": analysis.model_dump() if analysis else None,
             "run_id": run_id,
         }
