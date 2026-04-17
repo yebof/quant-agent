@@ -102,3 +102,19 @@ def test_parse_json_falls_back_to_largest_when_no_shape_match():
     parsed = result.parse_json()
     # Second object has more keys/larger
     assert parsed == {"b": 2, "c": 3, "d": 4}
+
+
+def test_parse_json_prefers_later_agent_shaped_correction_over_larger_draft():
+    """Earlier drafts should not beat later corrections once both look valid."""
+    from src.agents.base import AgentResult
+
+    raw = (
+        'Draft:\n'
+        '{"approved": true, "reasoning": "this is a much longer draft explanation that should not outrank the corrected answer just because it is larger"}\n'
+        'Final:\n'
+        '{"approved": false}'
+    )
+    result = AgentResult(raw_text=raw, tokens_used=0, model="test")
+    parsed = result.parse_json()
+
+    assert parsed == {"approved": False}
