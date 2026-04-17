@@ -377,6 +377,21 @@ class AlpacaBroker:
         use_stop = (stop_loss_price is not None and stop_loss_price > 0
                     and order_side == OrderSide.BUY)
 
+        # Stop-limit instead of stop-market for BUY OTO brackets:
+        # On a gap-down (overnight earnings blowup, geopolitical shock),
+        # a plain stop_price is a market order — it fills at whatever price
+        # the book has, which can be 10%+ worse than the stop. A stop-limit
+        # caps the worst-case fill at `stop_limit_price`. We set the limit
+        # 3% below stop — user preference "prioritize fill over price" means
+        # this buffer needs to be generous enough that routine volatility
+        # clears it. Trade-off: on extreme gaps beyond −3% from stop, the
+        # stop-limit won't fill and the position stays open until the next
+        # midday review can act. Accepted for the upside of bounded exits.
+        STOP_LIMIT_BUFFER_PCT = 0.03
+        stop_limit_price = None
+        if stop_loss_price is not None and stop_loss_price > 0:
+            stop_limit_price = _quantize_price(stop_loss_price * (1 - STOP_LIMIT_BUFFER_PCT))
+
         if limit_price is not None:
             kwargs = dict(
                 symbol=symbol, qty=qty, side=order_side,
@@ -384,7 +399,9 @@ class AlpacaBroker:
             )
             if use_stop:
                 kwargs["order_class"] = OrderClass.OTO
-                kwargs["stop_loss"] = StopLossRequest(stop_price=stop_loss_price)
+                kwargs["stop_loss"] = StopLossRequest(
+                    stop_price=stop_loss_price, limit_price=stop_limit_price,
+                )
             request = LimitOrderRequest(**kwargs)
         else:
             kwargs = dict(
@@ -393,11 +410,16 @@ class AlpacaBroker:
             )
             if use_stop:
                 kwargs["order_class"] = OrderClass.OTO
-                kwargs["stop_loss"] = StopLossRequest(stop_price=stop_loss_price)
+                kwargs["stop_loss"] = StopLossRequest(
+                    stop_price=stop_loss_price, limit_price=stop_limit_price,
+                )
             request = MarketOrderRequest(**kwargs)
 
         order = self.client.submit_order(request)
-        bracket_info = f" [SL=${stop_loss_price}]" if use_stop else ""
+        bracket_info = (
+            f" [SL=${stop_loss_price}/limit=${stop_limit_price}]"
+            if use_stop else ""
+        )
         logger.info("Order submitted: %s %s %s @ %s%s — status: %s",
                      side, qty, symbol, limit_price or "market", bracket_info, order.status)
         return {
@@ -455,13 +477,19 @@ class AlpacaBroker:
             return None
         qty = positions[0].qty
 
+        # Trailing stop also runs as stop-limit (3% buffer) for the same
+        # gap-protection reason as the entry-bracket stop.
+        stop_price_q = _quantize_price(new_stop_price)
+        stop_limit_q = _quantize_price(new_stop_price * 0.97)
         try:
-            req = StopOrderRequest(
+            from alpaca.trading.requests import StopLimitOrderRequest
+            req = StopLimitOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.GTC,
-                stop_price=_quantize_price(new_stop_price),
+                stop_price=stop_price_q,
+                limit_price=stop_limit_q,
             )
             order = self.client.submit_order(req)
             logger.info(
