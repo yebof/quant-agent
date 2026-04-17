@@ -253,7 +253,10 @@ def test_pipeline_market_order_sizes_from_live_market_price(
     mock_broker.submit_order.assert_called_once()
     kw = mock_broker.submit_order.call_args.kwargs
     assert kw["symbol"] == "SPY"
-    assert kw["qty"] == 10
+    # Vol-adjusted sizing: $10k equity × 0.5% risk budget = $50 dollar-at-risk.
+    # With sizing_price=100 (market override) and stop=90, risk_per_share = 10 →
+    # qty_by_risk = 5, which caps below the qty_by_alloc of 10.
+    assert kw["qty"] == 5
     assert kw["side"] == "buy"
     assert kw["limit_price"] is None
     assert kw["stop_loss_price"] == 90.0
@@ -546,7 +549,9 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
 
     buy_kw = mock_broker.submit_order.call_args_list[1].kwargs
     assert buy_kw["symbol"] == "QQQ"
-    assert buy_kw["qty"] == 30
+    # Vol-adjusted: equity $10k × 0.5% = $50 risk budget, stop 95 vs entry 100
+    # gives $5 risk/share → qty_by_risk = 10 (caps under qty_by_alloc of 30).
+    assert buy_kw["qty"] == 10
     assert buy_kw["side"] == "buy"
     assert buy_kw["limit_price"] == 100.0
     assert buy_kw["stop_loss_price"] == 95.0
