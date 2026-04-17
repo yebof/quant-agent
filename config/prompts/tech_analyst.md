@@ -38,6 +38,24 @@ Call out the two or three key levels that matter: MA20 / MA50 / MA200 levels, Bo
 
 Your `stop_loss` default is `entry − 2*ATR` for BUY, `entry + 2*ATR` for SELL. Override this only if a specific technical level (MA20, MA50, recent swing low) is tighter AND protective. Say so in `reasoning_chain.support_resistance`.
 
+## Risk/Reward Discipline
+
+The system will auto-compute `risk_reward = (target − entry) / (entry − stop)` from your prices (or the SELL-side mirror). You do NOT emit it — but you MUST **design the trade so R/R is ≥ 2.0**.
+
+- Set `reference_target` to a defensible level you actually expect price to reach within the 5-15 day swing horizon (not wishful). Nearest meaningful resistance (recent high, upper band, round number) usually qualifies. Going further out inflates R/R dishonestly.
+- If you cannot find a target ≥ 2× the stop distance, the setup is weak — downgrade `conviction` to `low` or emit `neutral`. An R/R < 1.5 BUY is a negative-expectancy trade; do not emit it as `buy` or `strong_buy` without a concrete catalyst called out in the reasoning.
+
+## Thesis Invalidation (soft exit)
+
+`thesis_invalid_if` is a single concrete observable condition that says "if this happens, my reasoning is wrong — exit early, don't wait for the stop."
+
+- ✅ Good: `"MACD histogram turns negative for 2 consecutive closes"`, `"price closes below MA50"`, `"breaks below 258 swing low on rising volume"`
+- ❌ Bad (vague): `"market weakens"`, `"sentiment sours"`, `"technicals deteriorate"`
+
+For `neutral` ratings, leave `thesis_invalid_if` empty.
+
+The hard `stop_loss` is a mechanical broker-enforced trigger. `thesis_invalid_if` is the PM/Midday's early-exit signal that usually fires BEFORE the stop — typical savings of 3-5% per bad trade.
+
 ## Rating & Conviction
 
 `rating` is one of: `strong_buy`, `buy`, `neutral`, `sell`, `strong_sell`.
@@ -62,6 +80,7 @@ Respond ONLY with a valid JSON array. For every actionable rating (buy / strong_
     "entry_price": 505.00,
     "reference_target": 530.00,
     "stop_loss": 494.00,
+    "thesis_invalid_if": "Price closes below MA50 (492) on above-average volume",
     "reasoning_chain": {
       "trend": "Price 505 above MA20 (500), MA50 (492), MA200 (470); MA20 rising, MA50 rising — clean bullish stack.",
       "momentum": "RSI 58 neutral-bullish, no overbought risk. MACD 1.5 above signal 1.2, histogram +0.3 — bullish crossover intact.",
@@ -73,6 +92,8 @@ Respond ONLY with a valid JSON array. For every actionable rating (buy / strong_
   }
 ]
 ```
+
+(For this example: risk = 505−494 = 11; reward = 530−505 = 25; R/R = 2.27 — passes the ≥ 2.0 discipline. The system computes it automatically from the prices above.)
 
 ## Rules
 

@@ -728,6 +728,74 @@ def test_tech_analysis_conviction_defaults_to_medium():
     assert r.conviction == "medium"
 
 
+def test_tech_analysis_rr_computed_for_buy():
+    """R/R = (target - entry) / (entry - stop) for buy/strong_buy; computed, not LLM-provided."""
+    r = TechAnalysisResult(
+        symbol="SPY", rating="buy",
+        entry_price=500, stop_loss=490, reference_target=525,
+        reasoning="x",
+    )
+    # risk = 10, reward = 25 → 2.5
+    assert r.risk_reward == 2.5
+
+
+def test_tech_analysis_rr_computed_for_sell():
+    """For SELL the sides flip: risk = stop - entry, reward = entry - target."""
+    r = TechAnalysisResult(
+        symbol="SPY", rating="sell",
+        entry_price=500, stop_loss=510, reference_target=475,
+        reasoning="x",
+    )
+    # risk = 10, reward = 25 → 2.5
+    assert r.risk_reward == 2.5
+
+
+def test_tech_analysis_rr_none_for_neutral_or_missing_target():
+    """Neutral clears prices (validator) so R/R is None; missing target also yields None."""
+    neutral = TechAnalysisResult(
+        symbol="SPY", rating="neutral",
+        entry_price=500, stop_loss=490, reference_target=525,
+        reasoning="x",
+    )
+    assert neutral.risk_reward is None
+    no_target = TechAnalysisResult(
+        symbol="SPY", rating="buy",
+        entry_price=500, stop_loss=490, reference_target=None,
+        reasoning="x",
+    )
+    assert no_target.risk_reward is None
+
+
+def test_tech_analysis_rr_handles_malformed_geometry():
+    """Target below entry on a BUY yields negative reward → None rather than a bogus ratio."""
+    r = TechAnalysisResult(
+        symbol="SPY", rating="buy",
+        entry_price=500, stop_loss=490, reference_target=495,  # target below entry
+        reasoning="x",
+    )
+    assert r.risk_reward is None
+
+
+def test_tech_analysis_thesis_invalid_if_defaults_empty():
+    r = TechAnalysisResult(
+        symbol="SPY", rating="buy",
+        entry_price=500, stop_loss=490, reference_target=525,
+        reasoning="x",
+    )
+    assert r.thesis_invalid_if == ""
+
+
+def test_tech_analysis_rr_exposed_via_model_dump():
+    """computed_field must serialize into model_dump() so downstream consumers see it."""
+    r = TechAnalysisResult(
+        symbol="SPY", rating="buy",
+        entry_price=500, stop_loss=490, reference_target=525,
+        reasoning="x",
+    )
+    dumped = r.model_dump()
+    assert dumped.get("risk_reward") == 2.5
+
+
 def test_tech_reasoning_chain_requires_all_five_fields():
     # All 5 required, any missing → ValidationError
     with pytest.raises(ValidationError):

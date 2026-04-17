@@ -67,15 +67,17 @@ class RiskManagerAgent(BaseAgent):
         else:
             reasoning_section = ""
 
-        # Tech Analyst Signals — lets RM audit PM's fidelity to the underlying ratings.
+        # Tech Analyst Signals — lets RM audit PM's fidelity AND enforce R/R discipline.
         if tech_analyses:
-            tech_lines = [
-                f"- {a.symbol}: {a.rating}"
-                + (f" | entry ${a.entry_price}, stop ${a.stop_loss}" if a.entry_price else "")
-                + f" — {a.reasoning[:120]}"
-                for a in tech_analyses
-            ]
-            tech_section = "## Tech Analyst Signals (cross-check PM's decisions)\n" + "\n".join(tech_lines)
+            tech_lines = []
+            for a in tech_analyses:
+                rr = getattr(a, "risk_reward", None)
+                rr_str = f"R/R {rr:.2f}:1" if rr is not None else "R/R n/a"
+                price_str = f"entry ${a.entry_price}, stop ${a.stop_loss}" if a.entry_price else "no prices"
+                tech_lines.append(
+                    f"- {a.symbol}: {a.rating} ({a.conviction}) | {rr_str} | {price_str} — {a.reasoning[:120]}"
+                )
+            tech_section = "## Tech Analyst Signals (cross-check PM's decisions + R/R discipline)\n" + "\n".join(tech_lines)
         else:
             tech_section = "## Tech Analyst Signals\n(not provided)"
 

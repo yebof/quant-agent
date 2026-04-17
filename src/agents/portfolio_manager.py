@@ -30,10 +30,17 @@ class PortfolioManagerAgent(BaseAgent):
         news_intel: NewsIntelligenceReport | None = kwargs.get("news_intel")
         earnings_analyses: list[dict] = kwargs.get("earnings_analyses", [])
 
-        analyses_text = "\n".join(
-            f"- {a.symbol}: {a.rating} ({a.conviction}) | Entry: {a.entry_price} | Stop: {a.stop_loss} | Target: {a.reference_target}\n  Reasoning: {a.reasoning}"
-            for a in analyses
-        )
+        def _fmt_tech(a):
+            rr = a.risk_reward
+            rr_str = f"R/R {rr:.2f}:1" if rr is not None else "R/R n/a"
+            invalid = a.thesis_invalid_if or "(not specified)"
+            return (
+                f"- {a.symbol}: {a.rating} ({a.conviction}) | {rr_str} | "
+                f"Entry: {a.entry_price} | Stop: {a.stop_loss} | Target: {a.reference_target}\n"
+                f"  Invalid if: {invalid}\n"
+                f"  Reasoning: {a.reasoning}"
+            )
+        analyses_text = "\n".join(_fmt_tech(a) for a in analyses)
 
         positions_text = "\n".join(
             f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Current: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} | Sector: {p.sector}"

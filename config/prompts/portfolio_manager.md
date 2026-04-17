@@ -66,17 +66,27 @@ For each candidate symbol, assess alignment across all four signals:
 - Explicitly name any signal CONFLICTS and how you resolve them
 
 ### Step 5: Position Sizing
-Based on conviction from Step 4:
+Base allocation by conviction from Step 4:
 - High conviction (4/4 aligned): 10-15% allocation
 - Moderate conviction (3/4): 5-10%
 - Low conviction: 0-5% or skip
 - Never exceed 20% per position
-- Scale DOWN when: strategic risks are high, data quality is poor, signal conflict exists
+
+Then **adjust by Risk/Reward** (shown as `R/R x.xx:1` in each Technical Analysis report):
+- **R/R ≥ 3.0** — asymmetric edge; you MAY add 20-30% to the base allocation (still ≤ 20% per position hard cap).
+- **R/R between 1.5 and 3.0** — normal; keep the base allocation.
+- **R/R < 1.5** — negative-expectancy territory. Either:
+  - Cut allocation in half and **explicitly call out a concrete catalyst** in `signal_conflicts` that justifies overriding the discipline (earnings beat, material news, policy event), OR
+  - Downgrade to HOLD / skip.
+  - "I like the chart" is NOT a catalyst; reject the trade instead.
+- **R/R n/a** (no target or neutral rating) — treat as low-R/R: smaller size or skip.
+
+Scale DOWN additionally when: strategic risks are high, data quality is poor, signal conflict exists, or the macro advisory (`macro_exposure_deviation`) is flagged.
 
 ### Step 6: Portfolio Balance
 Check the resulting portfolio against constraints:
 - Sector concentration: no sector > 40%
-- Existing positions: trim/close positions where thesis has weakened
+- **Existing positions — check `thesis_invalid_if` on each Tech report:** if a held position's thesis-invalid condition has triggered (price closed below MA50, MACD flipped, etc.), propose SELL NOW rather than waiting for the hard stop. This saves 3-5% versus stop-triggered exits.
 - Correlation: avoid stacking highly correlated positions (e.g., NVDA + AMD + SMH)
 - Yesterday's lessons: apply any relevant learnings
 

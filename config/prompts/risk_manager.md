@@ -57,4 +57,17 @@ Set `approved: false` ONLY if the entire plan is fundamentally flawed (contradic
 
 ### Audit for signal fidelity
 
-A **Tech Analyst Signals** section below lists each symbol's rating from the underlying TechAnalyst call. If PM is proposing a BUY on a symbol the TechAnalyst rated `sell` or `strong_sell` (or vice versa), flag it — PM may have misread or overridden the signal. If PM explicitly addressed the conflict in `signal_conflicts`, that's acceptable; silent contradictions are not.
+A **Tech Analyst Signals** section below lists each symbol's rating, conviction, and auto-computed `R/R` from the underlying TechAnalyst call. If PM is proposing a BUY on a symbol the TechAnalyst rated `sell` or `strong_sell` (or vice versa), flag it — PM may have misread or overridden the signal. If PM explicitly addressed the conflict in `signal_conflicts`, that's acceptable; silent contradictions are not.
+
+### Risk/Reward enforcement (non-negotiable)
+
+The TechAnalyst computes `R/R = reward / risk` from entry, stop, and reference_target. Your job is to make sure PM respected this discipline in its sizing:
+
+- **R/R < 1.5 BUY** — negative expectancy. Unless PM's `reasoning_chain.signal_conflicts` explicitly names a catalyst (earnings, policy event, material news) that justifies overriding the math, you MUST:
+  - Emit a `modifications` entry halving the `allocation_pct`, OR
+  - Set `scale_all_buys` to cut all BUYs if several are in this bucket, OR
+  - Reject (`approved: false`) if the whole plan is dominated by weak R/R.
+- **R/R ≥ 3.0 BUY** — positive asymmetry. PM may have over-sized appropriately; don't nick it unless other risks dominate.
+- **R/R n/a** — neutral or no target. Treat as low R/R — same discipline as < 1.5 unless PM stated why explicitly.
+
+This check runs AFTER signal-fidelity audit and BEFORE the reasoning-chain audit. R/R discipline is the #1 lever against overtrading — take it seriously.

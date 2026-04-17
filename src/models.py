@@ -1,7 +1,7 @@
 from datetime import datetime, date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 
 def _normalize_symbol(value: str) -> str:
@@ -59,6 +59,34 @@ class TechAnalysisResult(BaseModel):
     stop_loss: float | None = None
     reasoning_chain: TechReasoningChain | None = None
     reasoning: str  # 1-sentence summary; reasoning_chain carries the full analysis
+    # Soft exit signal separate from the hard stop_loss. Example:
+    # "MACD histogram turns negative for 2 consecutive closes" — lets PM / midday
+    # exit BEFORE the broker stop fires, saving the 3-5% typically given up
+    # between thesis-break and stop-trigger.
+    thesis_invalid_if: str = ""
+
+    @computed_field
+    @property
+    def risk_reward(self) -> float | None:
+        """Reward/risk ratio from entry, stop, and reference_target.
+
+        Computed in Python (not trusted to the LLM). For BUY we expect (target > entry > stop);
+        for SELL the inequalities flip. Returns None when any price is missing, the rating
+        is neutral, or the geometry is malformed (so PM / RM won't render a fake ratio).
+        """
+        if self.entry_price is None or self.stop_loss is None or self.reference_target is None:
+            return None
+        if self.rating in ("buy", "strong_buy"):
+            risk = self.entry_price - self.stop_loss
+            reward = self.reference_target - self.entry_price
+        elif self.rating in ("sell", "strong_sell"):
+            risk = self.stop_loss - self.entry_price
+            reward = self.entry_price - self.reference_target
+        else:
+            return None
+        if risk <= 0 or reward <= 0:
+            return None
+        return round(reward / risk, 2)
 
     @field_validator("symbol")
     @classmethod

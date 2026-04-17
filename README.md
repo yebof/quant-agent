@@ -57,12 +57,12 @@ Evening (post-market)
 
 | Agent | Role | Key Feature |
 |-------|------|-------------|
-| **Tech Analyst** | Batch technical analysis | 5-step CoT (trend / momentum / volatility / volume / S&R). ATR-based default stop (`entry − 2*ATR`). Output rating + `conviction` (high/medium/low) + `reference_target` (soft, not hard TP). Pre-filter thresholds normalized by ATR so leveraged ETFs use proportional bars. Auto-chunks batch > 30 symbols to stay under LLM context. Cross-field validator: BUY stop must be below entry, SELL above. |
+| **Tech Analyst** | Batch technical analysis | 5-step CoT (trend / momentum / volatility / volume / S&R). ATR-based default stop (`entry − 2*ATR`). Output rating + `conviction` (high/medium/low) + `reference_target` + `thesis_invalid_if` (soft exit condition). **Auto-computed `risk_reward`** (Python-calculated, not LLM-trusted) flows into PM sizing and RM veto logic. Pre-filter thresholds normalized by ATR. Auto-chunks batch > 30 symbols. Cross-field validator: BUY stop must be below entry, SELL above. |
 | **News Intelligence** | 3-layer news analysis | Layer 1: Persistent macro narrative. Layer 2: State change detection. Layer 3: Per-symbol alerts with conviction. Daily storage in `data/news/` |
 | **Macro Analyst** | Regime assessment & sector guidance | 6-step CoT (vol / curve / monetary / inflation+labor+credit / cross-signal / sector). Inputs: VIX, 2Y/10Y yields, **DFF** (daily fed funds), **core & headline CPI**, **UNRATE**, **HY OAS**. Persists yesterday's regime → detects `regime_shift`. Cross-references News narrative via `alignment_with_news`. Emits bull/bear view-change triggers. |
 | **Earnings Analyst** | SEC 10-Q/10-K analysis | Revenue, margins, strategic direction, competitive positioning, strategic vs operational risks, strategy consistency across filings |
-| **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain (macro → news → earnings → signal conflicts → sizing → balance → cash). Each decision traces which signals aligned/conflicted |
-| **Risk Manager** | Trade review with veto power | Audits PM's reasoning chain for logic errors. Also receives the **raw Tech Analyst ratings** to audit PM's fidelity to underlying signals. Sees full macro context (VIX + yields + spread + fed funds). Can modify per-symbol fields OR apply portfolio-wide `scale_all_buys` (0.0-1.0) to pull all BUY sizes down uniformly. |
+| **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain (macro → news → earnings → signal conflicts → sizing → balance → cash). Sizing explicitly scales by the TechAnalyst's `risk_reward`: R/R ≥ 3 boost, R/R < 1.5 requires an explicit catalyst or shrinks. Step 6 checks `thesis_invalid_if` on each held position for early exits before stop triggers. |
+| **Risk Manager** | Trade review with veto power | Audits PM's reasoning chain + enforces R/R discipline: BUYs with R/R < 1.5 must be downsized via modifications or rejected unless PM named a catalyst. Sees raw Tech ratings + R/R + full macro context. Can modify per-symbol fields OR apply portfolio-wide `scale_all_buys` (0.0-1.0). |
 | **Midday Reviewer** | Profit management & trailing-stop execution | Trailing-stop logic is **real**, not cosmetic — `TRAIL_STOP` action actually cancels the broker's old stop and submits a new one at the specified price via `AlpacaBroker.replace_stop_loss`. Sees VIX + HY OAS + core CPI to gauge whether to tighten stops broadly. |
 | **Evening Analyst** | Daily P&L review & learning | Outputs feed into next morning's PM prompt (cross-session memory) |
 
@@ -174,7 +174,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 157 tests
+├── tests/                         # 163 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -185,7 +185,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 157 tests
+pytest tests/ -v    # 163 tests
 ```
 
 ## Data Sources
