@@ -79,6 +79,184 @@ def test_pm_gracefully_handles_missing_memory_layers():
         assert "No prior narrative yet" in msg
         assert "No prior snapshots yet" in msg
         assert "none surfaced" in msg
+        # New self-calibration sections also have fallbacks
+        assert "no prior RM verdicts on record" in msg
+        assert "no prior PM decisions on record" in msg
+        assert "no projection available" in msg
+
+
+def test_pm_renders_rm_verdicts_and_own_history():
+    """PM sees RM's recent scale_all_buys + its own prior decisions."""
+    with patch("anthropic.Anthropic"):
+        agent = PortfolioManagerAgent(api_key="test", model="claude-opus-4-6")
+        msg = agent.build_user_message(
+            analyses=[], positions=[], macro_analysis=None,
+            cash_balance=5000.0, total_value=10000.0,
+            rm_recent_verdicts=(
+                "- 2026-04-16: APPROVED [scale_all_buys=0.50] — trimmed exposure: macro uncertain\n"
+                "- 2026-04-17: APPROVED [scale_all_buys=0.50; mods on NVDA] — still oversized"
+            ),
+            pm_recent_decisions=(
+                "- 2026-04-16: BUY NVDA 12%; BUY AMD 10%\n"
+                "    sizing: high conviction stacked on AI thesis\n"
+                "- 2026-04-17: BUY GOOGL 12%; SELL AAPL 100%"
+            ),
+        )
+        # RM verdicts surfaced
+        assert "## Risk Manager Verdicts" in msg
+        assert "scale_all_buys=0.50" in msg
+        assert "mods on NVDA" in msg
+        # PM's own decisions surfaced
+        assert "## Your Recent Decisions" in msg
+        assert "BUY NVDA 12%" in msg
+        assert "high conviction stacked on AI thesis" in msg
+
+
+def test_pm_renders_projected_book_preview():
+    """PM sees sector concentration preview before writing decisions."""
+    with patch("anthropic.Anthropic"):
+        agent = PortfolioManagerAgent(api_key="test", model="claude-opus-4-6")
+        msg = agent.build_user_message(
+            analyses=[], positions=[], macro_analysis=None,
+            cash_balance=5000.0, total_value=10000.0,
+            projected_portfolio=(
+                "- Current: 60% net invested · sectors: Technology 30%, Financial Services 20%\n"
+                "- If you allocate 5% to each of 3 BUY-rated candidate(s) (NVDA, AMD, JPM):\n"
+                "    → 75% net invested · sectors: Technology 40%, Financial Services 25%\n"
+                "    ⚠ Sectors near/over 35% cap: Technology"
+            ),
+        )
+        assert "## Projected Book Preview" in msg
+        assert "Current: 60% net invested" in msg
+        assert "Technology 40%" in msg
+        assert "Sectors near/over 35% cap" in msg
+
+
+# === Pipeline builder smoke tests ===
+
+def test_rm_verdicts_builder_parses_agent_logs(tmp_path):
+    """_build_rm_recent_verdicts parses stored full_response JSON correctly."""
+    import json
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    # Insert 2 RM logs with backdated timestamps so today's PM sees them
+    db.insert_agent_log(
+        agent_name="risk_manager", run_id="r1",
+        input_summary="", input_message="",
+        output_summary="Approved: True",
+        full_response=json.dumps({
+            "approved": True,
+            "scale_all_buys": 0.5,
+            "modifications": [{"symbol": "NVDA", "field": "allocation_pct",
+                                "original_value": 12, "new_value": 6, "reason": "R/R low"}],
+            "reasoning": "Oversized tech bets; cut in half.",
+        }),
+        model="gpt-5.4", tokens_used=100,
+    )
+    db.conn.execute(
+        "UPDATE agent_logs SET timestamp = datetime('now', '-2 days') "
+        "WHERE agent_name = 'risk_manager'"
+    )
+    db.conn.commit()
+    db.insert_agent_log(
+        agent_name="risk_manager", run_id="r2",
+        input_summary="", input_message="",
+        output_summary="Approved: True",
+        full_response=json.dumps({
+            "approved": True,
+            "scale_all_buys": 1.0,
+            "modifications": [],
+            "reasoning": "All trades pass.",
+        }),
+        model="gpt-5.4", tokens_used=100,
+    )
+    db.conn.execute(
+        "UPDATE agent_logs SET timestamp = datetime('now', '-1 day') "
+        "WHERE run_id = 'r2'"
+    )
+    db.conn.commit()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    out = pipeline._build_rm_recent_verdicts(limit=5)
+    # Oldest→newest ordering preserved
+    assert "scale_all_buys=0.50" in out
+    assert "mods on NVDA" in out
+    assert "All trades pass." in out
+    # Lines should be in oldest-first order
+    lines = out.split("\n")
+    assert "Oversized" in lines[0]
+    assert "All trades pass" in lines[1]
+
+
+def test_pm_decisions_builder_parses_own_history(tmp_path):
+    import json
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    db.insert_agent_log(
+        agent_name="portfolio_manager", run_id="p1",
+        input_summary="", input_message="",
+        output_summary="1 trade",
+        full_response=json.dumps({
+            "reasoning_chain": {
+                "sizing_logic": "high conviction on AI capex",
+                "continuity_check": "consistent with 5-day risk-on narrative",
+            },
+            "decisions": [
+                {"action": "BUY", "symbol": "NVDA", "allocation_pct": 8.0,
+                 "entry_price": 195, "stop_loss": 186, "take_profit": 215,
+                 "reasoning": "..."},
+            ],
+        }),
+        model="gpt-5.4", tokens_used=100,
+    )
+    db.conn.execute(
+        "UPDATE agent_logs SET timestamp = datetime('now', '-1 day') "
+        "WHERE agent_name = 'portfolio_manager'"
+    )
+    db.conn.commit()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    out = pipeline._build_pm_recent_decisions(limit=3)
+    assert "BUY NVDA 8.0%" in out
+    assert "high conviction on AI capex" in out
+    assert "consistent with 5-day risk-on narrative" in out
+
+
+def test_projected_portfolio_flags_sector_overweight(tmp_path):
+    """With 3 Tech BUYs at 5% each on top of 30% held Tech, projection → 45%."""
+    from src.pipeline import TradingPipeline
+    from src.models import TechAnalysisResult
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    # Existing 30% Tech position
+    positions = [
+        Position(symbol="MSFT", qty=10, avg_entry=400, current_price=400,
+                 market_value=3000, unrealized_pnl=0, sector="Technology"),
+    ]
+    # Three Tech BUY candidates
+    analyses = [
+        TechAnalysisResult(
+            symbol=sym, rating="buy", conviction="high",
+            entry_price=100, stop_loss=95, reference_target=110,
+            reasoning="test",
+        )
+        for sym in ("NVDA", "AMD", "AAPL")
+    ]
+    out = pipeline._build_projected_portfolio(
+        positions, analyses, total_value=10000, default_buy_pct=5.0,
+    )
+    assert "Current: 30% net invested" in out
+    # 30 + 3*5 = 45% Tech
+    assert "Technology 45%" in out
+    assert "Sectors near/over 35% cap: Technology" in out
 
 
 # === MacroStore history ===

@@ -282,6 +282,29 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_recent_agent_outputs(self, agent_name: str, limit: int = 5,
+                                 before_date: str | None = None) -> list[dict]:
+        """Last N agent_logs rows for agent_name, newest first.
+
+        Used by PM for self-calibration: reading its own recent decisions and
+        reading RM's recent verdicts on those decisions. `before_date` (ISO
+        'YYYY-MM-DD') skips the in-progress run so PM doesn't accidentally
+        read a log it just wrote in the same pipeline tick.
+        """
+        conditions = ["agent_name = ?"]
+        params: list = [agent_name]
+        if before_date:
+            conditions.append("date(timestamp) < ?")
+            params.append(before_date)
+        where = "WHERE " + " AND ".join(conditions)
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT agent_name, timestamp, full_response, output_summary "
+                f"FROM agent_logs {where} ORDER BY timestamp DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_latest_insights(self, before_date: str | None = None) -> dict | None:
         if before_date:
             sql = "SELECT * FROM insights WHERE date < ? ORDER BY date DESC LIMIT 1"

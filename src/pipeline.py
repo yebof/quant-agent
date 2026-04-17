@@ -448,6 +448,166 @@ class TradingPipeline:
             lines.append(f"- [{d}] {event} → {syms}")
         return "\n".join(lines)
 
+    def _build_rm_recent_verdicts(self, limit: int = 5) -> str:
+        """How RM has been judging PM's output over the last N sessions.
+
+        PM reading this lets it self-calibrate: if RM has been scaling BUYs
+        down for several runs in a row, PM has been oversizing — pull base
+        allocations down before RM has to do it again.
+        """
+        import json
+        try:
+            rows = self.db.get_recent_agent_outputs(
+                agent_name="risk_manager", limit=limit,
+                before_date=str(et_today()),
+            )
+        except Exception as e:
+            logger.warning("rm_recent_verdicts: DB fetch failed: %s", e)
+            return ""
+        if not rows:
+            return ""
+        lines = []
+        for row in reversed(rows):  # oldest→newest
+            ts = (row.get("timestamp") or "")[:10]
+            try:
+                data = json.loads(row.get("full_response") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            approved = data.get("approved")
+            mods = data.get("modifications") or []
+            scale = data.get("scale_all_buys", 1.0)
+            try:
+                scale = float(scale) if scale is not None else 1.0
+            except (TypeError, ValueError):
+                scale = 1.0
+            verdict = "APPROVED" if approved else "REJECTED"
+            extras: list[str] = []
+            if scale < 1.0:
+                extras.append(f"scale_all_buys={scale:.2f}")
+            if mods:
+                mod_syms = sorted({m.get("symbol", "?") for m in mods if isinstance(m, dict)})
+                if mod_syms:
+                    extras.append(f"mods on {', '.join(mod_syms)}")
+            tag = f" [{'; '.join(extras)}]" if extras else ""
+            reason = (data.get("reasoning") or "")[:140].strip().replace("\n", " ")
+            lines.append(f"- {ts}: {verdict}{tag} — {reason}")
+        return "\n".join(lines)
+
+    def _build_pm_recent_decisions(self, limit: int = 3) -> str:
+        """PM's own last N decision sets — used to spot flip-flopping against itself."""
+        import json
+        try:
+            rows = self.db.get_recent_agent_outputs(
+                agent_name="portfolio_manager", limit=limit,
+                before_date=str(et_today()),
+            )
+        except Exception as e:
+            logger.warning("pm_recent_decisions: DB fetch failed: %s", e)
+            return ""
+        if not rows:
+            return ""
+        lines = []
+        for row in reversed(rows):  # oldest→newest
+            ts = (row.get("timestamp") or "")[:10]
+            try:
+                data = json.loads(row.get("full_response") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            decisions = data.get("decisions") or []
+            if not decisions:
+                lines.append(f"- {ts}: (no trades that day)")
+                continue
+            summary_parts: list[str] = []
+            for d in decisions[:8]:
+                if not isinstance(d, dict):
+                    continue
+                act = d.get("action", "?")
+                sym = d.get("symbol", "?")
+                alloc = d.get("allocation_pct", "?")
+                summary_parts.append(f"{act} {sym} {alloc}%")
+            rc = data.get("reasoning_chain") or {}
+            sizing = (rc.get("sizing_logic") or "")[:160].strip().replace("\n", " ")
+            continuity = (rc.get("continuity_check") or "")[:160].strip().replace("\n", " ")
+            line = f"- {ts}: {'; '.join(summary_parts)}"
+            if sizing:
+                line += f"\n    sizing: {sizing}"
+            if continuity:
+                line += f"\n    continuity: {continuity}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _build_projected_portfolio(
+        self,
+        positions,
+        analyses: list[TechAnalysisResult],
+        total_value: float,
+        default_buy_pct: float = 5.0,
+    ) -> str:
+        """Preview of the book if PM rubber-stamped every BUY-rated TA candidate.
+
+        Surfaces sector concentration BEFORE PM writes decisions, so it can
+        self-correct instead of waiting for RM or the hard sector cap to flag
+        it. Kept simple on purpose: no correlation math here (that's RM's
+        correlation_cluster advisory). Just current vs projected sector mix.
+        """
+        from src.execution.broker import _get_sector
+        from src.risk.rules import _effective_multiplier, _gross_multiplier
+        if total_value <= 0:
+            return ""
+        buy_candidates = [
+            a for a in analyses
+            if a.rating in ("buy", "strong_buy") and a.entry_price
+        ]
+        if not positions and not buy_candidates:
+            return ""
+
+        current_net = sum(p.market_value * _effective_multiplier(p.symbol) for p in positions)
+        current_invested_pct = abs(current_net) / total_value * 100
+        sector_gross: dict[str, float] = {}
+        for p in positions:
+            sec = p.sector or _get_sector(p.symbol) or "Unknown"
+            gross = p.market_value * _gross_multiplier(p.symbol)
+            sector_gross[sec] = sector_gross.get(sec, 0.0) + gross
+
+        proj_net = current_net
+        proj_sector = dict(sector_gross)
+        for a in buy_candidates:
+            raw = total_value * (default_buy_pct / 100)
+            proj_net += raw * _effective_multiplier(a.symbol)
+            sec = _get_sector(a.symbol) or "Unknown"
+            proj_sector[sec] = proj_sector.get(sec, 0.0) + raw * _gross_multiplier(a.symbol)
+        proj_invested_pct = abs(proj_net) / total_value * 100
+
+        def _sector_line(sector_dict: dict[str, float]) -> str:
+            if not sector_dict:
+                return "(empty)"
+            sorted_secs = sorted(sector_dict.items(), key=lambda kv: -kv[1])[:5]
+            return ", ".join(f"{s} {v / total_value * 100:.0f}%" for s, v in sorted_secs)
+
+        lines = [
+            f"- Current: {current_invested_pct:.0f}% net invested · sectors: {_sector_line(sector_gross)}",
+        ]
+        if buy_candidates:
+            n = len(buy_candidates)
+            shown = [a.symbol for a in buy_candidates[:8]]
+            tail = f" +{n - 8} more" if n > 8 else ""
+            lines.append(
+                f"- If you allocate {default_buy_pct:.0f}% to each of {n} BUY-rated candidate(s) "
+                f"({', '.join(shown)}{tail}):"
+            )
+            lines.append(
+                f"    → {proj_invested_pct:.0f}% net invested · sectors: {_sector_line(proj_sector)}"
+            )
+            overweight = [
+                s for s, v in proj_sector.items()
+                if v / total_value * 100 > 35 and s != "Unknown"
+            ]
+            if overweight:
+                lines.append(
+                    f"    ⚠ Sectors near/over 35% cap: {', '.join(sorted(overweight))}"
+                )
+        return "\n".join(lines)
+
     def _compute_recent_performance(self, current_equity: float) -> dict:
         """Rolling 5-day and 20-day returns from db.daily_pnl, + drawdown flag.
 
@@ -874,6 +1034,16 @@ class TradingPipeline:
         weekly_narrative = self._build_weekly_narrative()
         macro_trajectory = self._build_macro_trajectory()
         active_state_changes = self._build_active_state_changes()
+        # Self-calibration layers: PM sees its own recent decisions + how RM
+        # has been judging them. Lets PM down-size on its own before RM has to
+        # repeatedly scale_all_buys.
+        rm_recent_verdicts = self._build_rm_recent_verdicts()
+        pm_recent_decisions = self._build_pm_recent_decisions()
+        # Projected book preview — what current + (TA BUYs @ default size) looks like
+        # by sector, so PM can see concentration risk before writing decisions.
+        projected_portfolio = self._build_projected_portfolio(
+            positions, analyses, total_value,
+        )
 
         portfolio_decision, pm_result = self.portfolio_manager.decide(
             analyses=analyses,
@@ -889,6 +1059,9 @@ class TradingPipeline:
             weekly_narrative=weekly_narrative,
             macro_trajectory=macro_trajectory,
             active_state_changes=active_state_changes,
+            rm_recent_verdicts=rm_recent_verdicts,
+            pm_recent_decisions=pm_recent_decisions,
+            projected_portfolio=projected_portfolio,
         )
 
         if portfolio_decision and portfolio_decision.reasoning_chain:

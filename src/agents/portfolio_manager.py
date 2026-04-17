@@ -324,6 +324,28 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
             "## Active News State Changes\n(none surfaced in the rolling 14-day window)"
         )
 
+        # Self-calibration layers: PM reads RM's recent verdicts on it + its own
+        # recent decisions, to avoid oversizing repeatedly and to spot flip-flops.
+        rm_recent_verdicts: str = kwargs.get("rm_recent_verdicts") or ""
+        pm_recent_decisions: str = kwargs.get("pm_recent_decisions") or ""
+        projected_portfolio: str = kwargs.get("projected_portfolio") or ""
+
+        rm_verdicts_section = (
+            f"## Risk Manager Verdicts (last 5 sessions — self-calibrate)\n{rm_recent_verdicts}"
+            if rm_recent_verdicts else
+            "## Risk Manager Verdicts\n(no prior RM verdicts on record)"
+        )
+        pm_decisions_section = (
+            f"## Your Recent Decisions (last 3 sessions — avoid flip-flops)\n{pm_recent_decisions}"
+            if pm_recent_decisions else
+            "## Your Recent Decisions\n(no prior PM decisions on record)"
+        )
+        projected_section = (
+            f"## Projected Book Preview (if you rubber-stamp TA's BUYs at 5% each)\n{projected_portfolio}"
+            if projected_portfolio else
+            "## Projected Book Preview\n(no projection available — empty book or no BUY candidates)"
+        )
+
         return f"""## Account Status
 - Total Value: ${total_value:,.2f}
 - Cash Balance: ${cash_balance:,.2f}
@@ -332,7 +354,13 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
 ## Current Positions (with entry context + signal trajectory)
 {positions_text}
 
+{projected_section}
+
 {perf_section}
+
+{pm_decisions_section}
+
+{rm_verdicts_section}
 
 {narrative_section}
 
@@ -363,7 +391,10 @@ Based on all the above (memory of past decisions + environment trajectory + toda
                position_history: dict | None = None,
                weekly_narrative: str = "",
                macro_trajectory: str = "",
-               active_state_changes: str = "") -> tuple[PortfolioDecision | None, "AgentResult"]:
+               active_state_changes: str = "",
+               rm_recent_verdicts: str = "",
+               pm_recent_decisions: str = "",
+               projected_portfolio: str = "") -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
             analyses=analyses,
             positions=positions,
@@ -378,6 +409,9 @@ Based on all the above (memory of past decisions + environment trajectory + toda
             weekly_narrative=weekly_narrative,
             macro_trajectory=macro_trajectory,
             active_state_changes=active_state_changes,
+            rm_recent_verdicts=rm_recent_verdicts,
+            pm_recent_decisions=pm_recent_decisions,
+            projected_portfolio=projected_portfolio,
         )
         parsed = result.parse_json()
         if parsed is None:
