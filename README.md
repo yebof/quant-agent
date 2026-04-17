@@ -65,7 +65,7 @@ Evening (post-market)
 | **News Intelligence** | 3-layer news analysis | Layer 1: Persistent macro narrative. Layer 2: State change detection. Layer 3: Per-symbol alerts with conviction. Daily storage in `data/news/` |
 | **Macro Analyst** | Regime assessment & sector guidance | 6-step CoT (vol / curve / monetary / inflation+labor+credit / cross-signal / sector). Inputs: VIX, 2Y/10Y yields, **DFF** (daily fed funds), **core & headline CPI**, **UNRATE**, **HY OAS**. Persists yesterday's regime → detects `regime_shift`. Cross-references News narrative via `alignment_with_news`. Emits bull/bear view-change triggers. |
 | **Earnings Analyst** | SEC 10-Q/10-K analysis | Revenue, margins, cash flow, strategic direction, competitive positioning, strategic vs operational risks, strategy consistency across filings. `investment_implications` carries a 5-step `reasoning_chain` (fundamental_quality / growth_trajectory / strategic_risks / management_execution / valuation_context) — sentiment call is derivable from the numbers, not a vibe check. |
-| **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain (+ continuity check) across 4 memory layers: L1 today's signals, L2 per-position entry context + Tech rating 7-day trajectory, L3a rolling Portfolio Narrative (last 7 evenings), L3b Macro Regime Trajectory (7 days), L3c Active HIGH-conviction state_changes (14 days). Sizing scales by TechAnalyst's `risk_reward`: R/R ≥ 3 boost, R/R < 1.5 requires catalyst or shrinks. **Drawdown-aware**: halves new BUYs when `in_drawdown` flagged. **Holding discipline** (tiered by days_held): <5d → default HOLD unless thesis_invalid_if or today's macro flip; 5-15d → standard; >15d profitable + trend intact → let it run. Early exits via `thesis_invalid_if` save 3-5% vs stop-triggered. |
+| **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain + continuity check across **8 memory layers**: L1 today's signals, L2 per-position entry context + Tech rating 7-day trajectory with `Weight:%` and `⚠️DRIFT` flag on concentrated winners, L3a rolling Portfolio Narrative (7 evenings), L3b Macro Regime Trajectory (7 days), L3c Active HIGH-conviction state_changes (14 days), **L4 Trade Calibration** — actual realized win rate + avg return on closed BUYs (45d), bucketed by size, **L5 RM Verdicts** (last 5 sessions — PM shrinks sizing when RM keeps scaling it down), **L6 Own Recent Decisions** (last 3 sessions — spot flip-flops), **L7 Projected Book Preview** — if you rubber-stamp all TA BUYs @ 5%, flags sectors nearing 35% cap. Sizing scales by TechAnalyst's `risk_reward` (R/R ≥ 3 boost, < 1.5 requires catalyst). **Regime-adaptive cash floor**: risk-off 25% / transitional 15% / risk-on 5%. **Drawdown-aware**: halves new BUYs when `in_drawdown` flagged. **Drift trim**: Weight > 12% + P&L > 10% → must trim or justify; Weight > 18% → hard trim. **Earnings-queued hard cap**: just-filed 10-Q with no analysis yet → BUY capped at 5% (enforced in pipeline). **Holding discipline** (tiered by days_held): <5d → default HOLD unless thesis_invalid_if or macro regime flipped today; 5-15d → standard; >15d profitable + trend intact → let it run. 11-row **Rule Priority** cheat sheet resolves conflicts (thesis_invalid > holding > earnings-cap > drift > cash-floor > R/R > ...). |
 | **Risk Manager** | Trade review with veto power | Mandatory 6-step `reasoning_chain` (rr_audit / signal_fidelity / correlation_check / event_risk / sizing_sanity / overall) — vague approvals rejected. Enforces R/R discipline: BUYs with R/R < 1.5 must be downsized via modifications or rejected unless PM named a catalyst. Sees raw Tech ratings + R/R + full macro context. Can modify per-symbol fields OR apply portfolio-wide `scale_all_buys` (0.0-1.0). |
 | **Midday Reviewer** | Profit management & trailing-stop execution | Trailing-stop logic is **real**, not cosmetic — `TRAIL_STOP` action actually cancels the broker's old stop and submits a new one at the specified price via `AlpacaBroker.replace_stop_loss`. Sees VIX + HY OAS + core CPI to gauge whether to tighten stops broadly. Output is Pydantic `MiddayReview` — action enum enforced (typos like `TRIAL_STOP` rejected); `TRAIL_STOP` requires `new_stop_price > 0`. |
 | **Evening Analyst** | Daily P&L review & learning | Pydantic `EveningReport` with enum `risk_rating`. **Outlook retrospective**: reads yesterday's `tomorrow_outlook` and grades it honestly against today's reality via `previous_outlook_assessment` — builds calibration over time. Outputs feed into next morning's PM prompt (cross-session memory). |
@@ -81,6 +81,7 @@ Evening (post-market)
 - Inverse ETFs (SH, SDS, PSQ, SQQQ) carry signed multipliers for net exposure and gross magnitude for sizing/sector caps
 - **Advisory**: if projected net exposure deviates > 15pp from Macro's `target_invested_pct`, emits a non-blocking `macro_exposure_deviation` violation — RiskManager sees it and can respond with `scale_all_buys`
 - **Correlation cluster** (advisory): a proposed BUY plus already-held positions correlated > 0.7 with it (120-day daily returns) must not together exceed 50% of book. Catches AI / mega-cap-growth concentration that sector caps miss when yfinance tags NVDA (Technology) and GOOGL (Communication Services) separately.
+- **Correlation coverage gap** (advisory): when yfinance data is too sparse to build the matrix but the book has ≥ 2 positions, RM sees a `correlation_coverage_gap` advisory and can respond with `scale_all_buys < 1.0`. Prevents the cluster check from silently disabling when upstream data degrades.
 
 ### Execution Safety
 - Stale orders cancelled before each session
@@ -90,6 +91,9 @@ Evening (post-market)
 - BUY attaches OTO stop-loss via Alpaca (broker-enforced)
 - No hard take-profit — profit managed by midday reviewer's trailing stop logic
 - Partial sell via `allocation_pct` (1–99 = partial, 100 = full exit; 0 is treated as a no-op)
+- **Order-status gating**: every broker submission runs through `_order_accepted()` before the audit log is written — Alpaca error payloads (missing id, status rejected/expired/canceled) are refused so the trades table never records a phantom fill
+- **No-price BUY skip**: if neither the broker nor in-memory OHLCV bars can sanity-check the LLM's `entry_price`, the BUY is skipped rather than submitted as a stale limit
+- **Earnings-queued BUY cap**: pipeline hard-clamps any BUY on a symbol whose latest 10-Q/10-K is `queued` (fresh filing, LLM analysis still running) to ≤ 5% allocation, regardless of PM's conviction
 
 ### LLM Risk Manager
 - Mandatory 6-step `reasoning_chain`: rr_audit → signal_fidelity → correlation_check → event_risk → sizing_sanity → overall
@@ -184,7 +188,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 204 tests
+├── tests/                         # 219 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -195,7 +199,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 204 tests
+pytest tests/ -v    # 219 tests
 ```
 
 ## Data Sources
@@ -231,3 +235,4 @@ pytest tests/ -v    # 204 tests
 
 **File-based** (`data/earnings/`):
 - `{SYMBOL}/analysis_{10-Q}_{date}.md` — cached SEC filing analyses
+- `manifest.json` — tracks processed filings; `failed_attempts` counter bounds bg-analysis retries (abandon + mark `abandoned=True` after 3 failures so a consistently-unparseable 10-Q doesn't burn tokens every session forever)

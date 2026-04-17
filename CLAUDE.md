@@ -2,50 +2,50 @@
 
 LLM multi-agent 美股量化交易系统，通过 Alpaca 执行交易（默认 paper trading）。
 
-## 架构要点
+## 入口 + 测试
 
-- **8 个 LLM agent**：tech_analyst, news_analyst, macro_analyst, earnings_analyst, portfolio_manager, risk_manager, midday_reviewer, evening_analyst
-- **双层风控**：硬规则引擎（仓位/暴露/日损/板块集中度）+ LLM Risk Manager 审核
-- **三个时段**：morning（分析+交易）、midday（持仓检查）、evening（日报）
-- **数据源**：yfinance（行情）、FRED（VIX / 收益率 / DFF / CPI / UNRATE / HY OAS）、RSS（新闻）、SEC EDGAR（财报）
-- 支持 OpenAI 和 Anthropic 模型，按 agent 独立配置
+```bash
+pytest tests/ -v                                    # 全量测试
+python main.py --mode morning|midday|evening|live   # 手动跑
+```
 
-## 关键约定（2026-04-17 重构后，见 `project_trading_design_decisions.md` 记忆）
+生产路径走 launchd（`~/Library/LaunchAgents/com.quant-agent.*.plist`），不走 `--mode live`。
 
-- **反向 ETF**（SH/SDS/PSQ/SQQQ）用签名乘数算**净敞口**（对冲相消），abs 算单仓和行业上限
-- **日 P&L** = `broker.equity - broker.last_equity`（含已实现 fill，包括 broker 触发的 OTO 止损）；熔断基准为 `last_equity`
-- **SELL `allocation_pct`**：100=全卖、1-99=部分、0=跳过（不要再用 0 表示全卖）
-- **DB**：SQLite WAL；midday `sync_positions` 整体替换仓位快照；evening `prune_agent_logs(730天)` + `prune_trades(5年)`；**所有 8 agent**（含 earnings）LLM 调用完整 prompt+raw_text 入 agent_logs 表
-- **MacroAnalyst**：6 步 reasoning_chain (vol / curve / monetary / inflation+labor+credit / cross-signal / sector)；持久化到 `data/macro/last_state.json` 做 regime-shift 检测；读昨日 News narrative 做 `alignment_with_news` 交叉验证；输出含 `bull_triggers` / `bear_triggers`；`sector_guidance.sector` 限定为 yfinance 枚举
-- **Midday trailing stop 是真实订单**：`TRAIL_STOP` 动作走 `broker.replace_stop_loss()`——取消旧 stop + 下新 stop。HOLD 是不动、REDUCE 是真卖半仓、SELL 是真全平
-- **RiskManager 可以 `scale_all_buys: 0.0-1.0`** 对所有 BUY 做组合级缩放；看到 `tech_analyses` 可以审计 PM 对底层信号的忠实度
-- **硬风控 + macro_exposure_deviation 软违规**：实际净敞口偏离 Macro 的 `target_invested_pct` > 15pp 时给 RM 一个 advisory（不拦单）
-- **责任边界**：Macro 拥有 regime 枚举的权威；News 的 `current_regime` 只描述新闻/地缘背景，不复述枚举
-- **TechAnalyst**：5 步 `reasoning_chain` (trend/momentum/volatility/volume/support_resistance) + `conviction`；`reference_target`（非硬止盈）；`thesis_invalid_if`（软退出条件）；**自动计算 `risk_reward`（Python 计算，不信 LLM）**；rating↔价格 cross-field validator（BUY stop 必须 < entry）；ATR 默认 stop = entry − 2*ATR；batch > 30 自动 chunk；预过滤阈值按 ATR 归一化；**signal-age 记忆**（`data/tech/last_ratings.json`）——prompt 里塞昨日 rating context，8+ 天未兑现的 stale 信号 PM 自动减半仓；**估值上下文**（yfinance trailing PE / forward PE / P/S）——LLM 见到 forward PE >40x 或 P/S >15 就在 `reasoning_chain.support_resistance` 里标 stretched，避免高位追价
-- **R/R 纪律全链路**：TA 自动算 R/R → PM 按 R/R 分档加减仓（≥3 加、<1.5 要 catalyst 或减半）→ RM 在 prompt 里独立执行否决纪律（R/R<1.5 必须 modification 或 scale_all_buys）
-- **相关性集群风控**：`src/data/correlation.py` 算 120 日 pairwise 相关度，新 advisory `correlation_cluster`：BUY + 已持且 corr>0.7 的仓位合计 > 50% 簿本就触发；catchAI 主题假分散
-- **回撤感知 sizing**：pipeline 每 morning 算 5d/20d 滚动 return，传 `recent_performance` 给 PM；若 5d<-3% 或 20d<-8% 标 `in_drawdown=True` → PM prompt 要求所有新 BUY 减半
-- **PM 多层记忆**：
-  - **L2 持仓血统**：每只持仓附带 entry_date / days_held / entry_reasoning（从 `db.trades` 查）+ Tech rating 7 天轨迹（TechStore.history per-symbol）
-  - **L3a Portfolio Narrative**：过去 7 天 `db.insights` 的 daily_summary+lessons 串起来
-  - **L3b Macro Regime Trajectory**：MacroStore.history 存 14 天 regime/confidence/target
-  - **L3c Active State Changes**：NewsStore 扫过去 14 天 `full_report.json`，HIGH-conviction 事件按 event 去重 + 记 first_seen_date
-  - **Holding Discipline**：持仓 <5 天默认 HOLD 除非 thesis_invalid_if 或 regime 今日 flip；5-15 天标准；>15 天盈利+趋势完好默认让跑
-  - **Step 6.5 Continuity Check**：决策前自省"我的 decisions 和过去 7 天方向一致吗？不一致说得出具体原因吗？"
-- **RM reasoning_chain**：6 字段 (rr_audit / signal_fidelity / correlation_check / event_risk / sizing_sanity / overall) 强制，最后一道关有审计痕迹
-- **Evening 自省**：EveningAnalyst 读昨日 `insights.tomorrow_outlook` → 今日输出 `previous_outlook_assessment` 老实打分，做长期 calibration
-- **Midday/Evening Pydantic**：从裸 dict 升级到 `MiddayReview` + `EveningReport`；`MiddayAction.TRAIL_STOP` 强制 `new_stop_price > 0`；typo (TRIAL_STOP) 直接 ValidationError 拦下
-- **EarningsAnalyst**：`investment_implications` 必含 5 步 `reasoning_chain` (fundamental_quality / growth_trajectory / strategic_risks / management_execution / valuation_context) —— sentiment 必须可从这 5 字段推导
-- **生产侧防挂死**：所有 Alpaca SDK 调用注入 30s HTTP timeout（`_install_http_timeout`），且 launchd plist 外层用 `/opt/homebrew/bin/timeout --kill-after=30 600 ...` 10 分钟兜底——双层防护，防再次出现 13 小时 hang
-- **价格 quantize**：`broker.submit_order` 提交前 `_quantize_price(price)` 按 Alpaca tick 规则归整（≥$1 用 2 位小数、<$1 用 4 位）——防 sub-penny reject
-- **生产调度（时区弹性）**：launchd 每 30 分钟触发 wrapper（`scripts/run_if_et_window.sh`），wrapper 看 **ET 时间**判断是否在 session 窗口 + 看 last-run 文件去重。morning 09:30-12:00 ET、midday 15:00-16:30 ET、evening 20:00-22:00 ET、Mon-Fri ET。用户出差到任何时区都能正确时刻触发
-- **ET 时间统一**：`src/util/time.py` 提供 `et_today()` / `et_now()`；daily_pnl key、insights 查询、broker.is_trading_day、news/macro 快照目录、earnings cutoff、market OHLCV 全部走 ET——跨时区 host 上数据一致
+## 架构速览
+
+- 8 个 LLM agent：tech / news / macro / earnings / portfolio_manager / risk_manager / midday_reviewer / evening_analyst
+- 双层风控：硬规则引擎（仓位/暴露/日损/板块/相关性/earnings-queued） + LLM RiskManager 审核
+- 三时段：morning（分析+交易）、midday（持仓检查+真 trailing stop）、evening（日报 + 次日 insights）
+- 数据源：yfinance、FRED、RSS、SEC EDGAR
+- 配置：`config/settings.yaml` + `.env`；按 agent 独立选 OpenAI / Anthropic 模型
+
+详细设计见 `README.md`，agent 行为规则见 `config/prompts/*.md`。
+
+## 不要违反的约定（这些不看代码就看不出，违反会出事）
+
+这一节是 CLAUDE.md 的主要价值——约定背后的"为什么"在代码里不写死，所以必须记在这里。
+
+### 金额 / 仓位语义
+- **反向 ETF**（SH/SDS/PSQ/SQQQ）用**签名乘数**算净敞口（对冲相消），**abs 乘数**算单仓/板块上限。`src/risk/rules.py:_effective_multiplier` vs `_gross_multiplier`
+- **日 P&L** = `broker.equity - broker.last_equity`（含已实现 fill，包括 broker 触发的 OTO 止损）；熔断基准永远是 `last_equity`，**不是**昨晚 DB 里的快照
+- **SELL `allocation_pct`** 约定：`100` = 全卖，`1-99` = 部分，`0` = 跳过（**不要再用 0 表示全卖**）；pipeline 会 warning 然后 skip
+
+### 责任边界
+- Macro 拥有 regime 枚举（risk-on / risk-off / transitional / neutral）的权威；News 的 `current_regime` 只描述新闻/地缘背景，不重复 Macro 的枚举
+- 所有 SELL 面单 path（morning SELL、midday SELL/REDUCE、emergency sell）提交后都走 `_order_accepted()` 校验，broker 返 error/rejected 不写 trades 表，别再绕开这层
+
+### 时区
+- ET 统一走 `src/util/time.py` 的 `et_today()` / `et_now()`。`daily_pnl` 主键、`insights` 查询、`broker.is_trading_day`、news/macro 快照目录、earnings cutoff、market OHLCV 全部 ET——任何 host TZ 都要出同样数据
+- launchd 每 30 分钟触发 `scripts/run_if_et_window.sh`，wrapper 看 **ET 时间**判断窗口 + last-run 文件去重。窗口：morning 09:30-12:00、midday 15:00-16:30、evening 20:00-22:00（Mon-Fri ET）。用户经常出差，不同时区必须都正确
+
+### 生产侧防挂死 / 防拒单（都有血泪）
+- 所有 Alpaca SDK 调用通过 `_install_http_timeout()` 注入 30s HTTP timeout；launchd plist 外层 `/opt/homebrew/bin/timeout --kill-after=30 600 ...` 10 分钟兜底——**双层**，防再次出现 13 小时 hang（2026-04-17 事故）
+- `broker.submit_order` 提交前 `_quantize_price()` 按 Alpaca tick 归整（≥$1 → 0.01、<$1 → 0.0001）——防 sub-penny reject
+- `_bg_analyze` earnings 分析失败调 `record_failure()`；连 3 次失败就 abandon + 标 `abandoned=True`，不再重分析——防 LLM 失败循环烧 token
 
 ## 开发规范
 
-- Python 3.11+，依赖管理用 pyproject.toml
-- 测试：`pytest tests/ -v`（204 tests）
-- 配置：`config/settings.yaml`，API key 通过 `${ENV_VAR}` 引用 `.env`
-- Agent prompts 在 `config/prompts/*.md`
-- 入口：`python main.py --mode morning|midday|evening|live`
-- Scheduler (`--mode live`) 时区已 pin 到 US/Eastern；生产路径走 launchd（非此 scheduler）
+- Python 3.11+、依赖在 pyproject.toml
+- LLM agent 改动后：改 `config/prompts/*.md` 的 rule + 对应 `src/agents/*.py` 的 build_user_message，然后加 test（在 `tests/test_*.py`）
+- 任何进 trades / positions 表的写入必须先过 `_order_accepted()`
+- **记忆**：我的长期偏好 / 决策背景见 `~/.claude/projects/-Users-yebof-Documents-Claude-workspace-quant-agent/memory/`
