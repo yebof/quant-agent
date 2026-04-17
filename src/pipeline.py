@@ -1472,6 +1472,24 @@ class TradingPipeline:
                     stop_loss_price=decision.stop_loss if decision.stop_loss > 0 else None,
                     # No hard take-profit — profit managed by midday trailing stop logic
                 )
+                # Symmetric with SELL phase: if Alpaca returns an error-shaped
+                # dict (missing id, or status not in the accepted set), treat
+                # the submission as failed. Don't decrement available_cash and
+                # don't record the trade — otherwise risk math thinks we spent
+                # money we didn't spend, and the audit log shows a phantom BUY.
+                if not order or not order.get("id"):
+                    logger.error(
+                        "BUY %s: broker returned no order id (payload=%s) — skipping, "
+                        "cash untouched", decision.symbol, order,
+                    )
+                    continue
+                status = (order.get("status") or "").lower()
+                if status in ("rejected", "canceled", "cancelled", "expired", "error"):
+                    logger.error(
+                        "BUY %s: broker rejected order (status=%s) — skipping, cash untouched",
+                        decision.symbol, status,
+                    )
+                    continue
                 orders.append(order)
                 available_cash -= estimated_cost
                 # Record the actual submitted price, not the LLM's original entry_price
