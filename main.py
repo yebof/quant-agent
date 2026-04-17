@@ -30,7 +30,10 @@ def main():
     parser.add_argument("--config", default="config/settings.yaml", help="Path to config file")
     parser.add_argument(
         "--mode",
-        choices=["live", "once", "morning", "midday", "evening", "intra_check"],
+        choices=[
+            "live", "once", "morning", "midday", "evening",
+            "intra_check", "earnings_preprocess",
+        ],
         default="once", help="Run mode",
     )
     args = parser.parse_args()
@@ -59,6 +62,8 @@ def main():
             result = pipeline.run_evening()
         elif args.mode == "intra_check":
             result = pipeline.run_intra_check()
+        elif args.mode == "earnings_preprocess":
+            result = pipeline.run_earnings_preprocess()
         logger.info("Result: %s", result)
 
 

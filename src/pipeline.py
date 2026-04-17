@@ -2488,6 +2488,114 @@ class TradingPipeline:
                 "review": review.model_dump() if review else None,
                 "orders": orders, "run_id": run_id}
 
+    def run_earnings_preprocess(self) -> dict:
+        """Pre-market earnings analysis — fires at 08:00 ET before morning trading.
+
+        Phase 4 #6 of the architecture work. Previously morning's
+        `_run_earnings_check` fired a background thread AT THE SAME TIME as
+        PM was making decisions — PM saw a placeholder for any just-filed
+        10-Q/10-K and had to work without the analysis. Half-sync /
+        half-async, data-freshness uncertain, and the bg thread made
+        pipeline shutdown coupling ugly.
+
+        Running preprocessing ahead of market open decouples the two
+        concerns:
+          - 08:00 ET: download pending filings, run the LLM analysis to
+            completion, save + confirm. No time pressure.
+          - 09:30 ET: morning trading sees ONLY cached, confirmed analyses
+            (is_new=False). No placeholders, no bg threads, PM always has
+            the full earnings signal.
+
+        This method is synchronous by design — preprocessing runs with a
+        30-minute budget before market open, so waiting for the LLM
+        serially is fine. No need for daemon threads.
+        """
+        ctx = RunContext.start("earnings_preprocess")
+        run_id = ctx.run_id
+        logger.info("=== Earnings preprocessing: %s ===", run_id)
+
+        if not self._is_trading_day():
+            logger.info("Earnings preprocess skipped: market closed for non-trading day")
+            return {"status": "market_holiday", "run_id": run_id}
+
+        try:
+            reports = self.earnings_provider.check_and_fetch(
+                self.config.trading.universe,
+            )
+        except Exception as e:
+            logger.error("Earnings preprocess: fetch failed: %s", e)
+            return {"status": "fetch_error", "run_id": run_id, "error": str(e)}
+
+        new_reports = [r for r in reports if r.is_new]
+        if not new_reports:
+            logger.info("Earnings preprocess: no new filings, nothing to analyze.")
+            return {"status": "nothing_new", "run_id": run_id, "count": 0}
+
+        logger.info(
+            "Earnings preprocess: analyzing %d new filings: %s",
+            len(new_reports),
+            ", ".join(r.symbol for r in new_reports),
+        )
+        try:
+            results = self.earnings_analyst.analyze_reports(new_reports)
+        except Exception as e:
+            logger.error("Earnings preprocess: LLM analysis failed: %s", e, exc_info=True)
+            # Record failures so the retry bounds kick in for each filing.
+            for r in new_reports:
+                try:
+                    self.earnings_provider.record_failure(r)
+                except Exception as re:
+                    logger.error("record_failure failed for %s: %s", r.symbol, re)
+            return {"status": "analysis_error", "run_id": run_id, "error": str(e)}
+
+        # Log each LLM call (parity with the inline bg-thread path).
+        analyzed_count = 0
+        for res in results:
+            agent_result = res.get("agent_result")
+            if agent_result is None:
+                continue
+            sym = res.get("symbol", "?")
+            analysis = res.get("analysis") or {}
+            sentiment = (analysis.get("investment_implications") or {}).get("sentiment", "?")
+            try:
+                self.db.insert_agent_log(
+                    agent_name="earnings_analyst_preprocess",
+                    run_id=run_id,
+                    input_summary=f"{sym} {res.get('form_type','?')} filed {res.get('filing_date','?')}",
+                    input_message=agent_result.user_message,
+                    output_summary=(
+                        f"sentiment={sentiment}" if res.get("analysis") else "parse_error"
+                    ),
+                    full_response=agent_result.raw_text,
+                    model=self.config.llm.earnings_analyst_model,
+                    tokens_used=agent_result.tokens_used,
+                )
+            except Exception as e:
+                logger.error("Earnings preprocess: log insert failed for %s: %s", sym, e)
+            analyzed_count += 1
+
+        # Confirm filings. Do this AFTER logging so a crash between the two
+        # leaves the filing still "new" for the next preprocess run.
+        confirmed = 0
+        for r in new_reports:
+            if any(res["symbol"] == r.symbol and res["is_new"] for res in results):
+                try:
+                    self.earnings_provider.confirm_filing(r)
+                    confirmed += 1
+                except Exception as e:
+                    logger.warning("confirm_filing failed for %s: %s", r.symbol, e)
+
+        logger.info(
+            "Earnings preprocess complete: %d analyzed, %d confirmed",
+            analyzed_count, confirmed,
+        )
+        return {
+            "status": "preprocessed",
+            "run_id": run_id,
+            "analyzed": analyzed_count,
+            "confirmed": confirmed,
+        }
+
     def run_intra_check(self) -> dict:
         """Lightweight intra-session circuit-breaker check (no LLM calls).
 
