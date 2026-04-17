@@ -29,11 +29,39 @@ SECTOR_ETFS = {
 
 
 class MarketDataProvider:
+    def __init__(self, fallback_bars=None):
+        """
+        fallback_bars: optional callable `(symbol, lookback_days) -> list[OHLCV]`
+        Used when yfinance returns empty (rate limit, outage, transient gap).
+        Pipeline typically wires this to `broker.get_bars` so Alpaca data
+        keeps TA alive when yfinance flakes.
+        """
+        self._fallback_bars = fallback_bars
+
+    def set_fallback_bars(self, fn) -> None:
+        self._fallback_bars = fn
+
     def get_ohlcv(self, symbol: str, lookback_days: int = 120) -> list[OHLCV]:
         end = et_today()  # yfinance end (exclusive) — use ET to match US-market sessions
         start = end - timedelta(days=lookback_days)
-        df = yf.download(symbol, start=str(start), end=str(end), progress=False)
-        if df.empty:
+        try:
+            df = yf.download(symbol, start=str(start), end=str(end), progress=False)
+        except Exception as e:
+            logger.warning("yfinance download crashed for %s: %s", symbol, e)
+            df = None
+        if df is None or df.empty:
+            # yfinance returned nothing — try fallback before giving up.
+            if self._fallback_bars is not None:
+                try:
+                    bars = self._fallback_bars(symbol, lookback_days) or []
+                    if bars:
+                        logger.info(
+                            "yfinance empty for %s, fallback source returned %d bars",
+                            symbol, len(bars),
+                        )
+                        return bars
+                except Exception as e:
+                    logger.warning("fallback_bars failed for %s: %s", symbol, e)
             return []
         # yfinance may return MultiIndex columns for single ticker
         if isinstance(df.columns, pd.MultiIndex):

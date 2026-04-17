@@ -33,6 +33,74 @@ def test_get_ohlcv(mock_download, mock_yf_data):
 
 
 @patch("src.data.market.yf.download")
+def test_get_ohlcv_falls_back_when_yfinance_empty(mock_download):
+    """yfinance returning empty must trigger the Alpaca fallback."""
+    from src.models import OHLCV
+
+    mock_download.return_value = pd.DataFrame()  # yfinance empty
+    fallback_calls = []
+
+    def _fake_fallback(symbol, lookback_days):
+        fallback_calls.append((symbol, lookback_days))
+        return [OHLCV(
+            date=date(2026, 4, 15), open=100, high=105, low=99, close=104,
+            volume=1000,
+        )]
+
+    provider = MarketDataProvider(fallback_bars=_fake_fallback)
+    bars = provider.get_ohlcv("NVDA", lookback_days=60)
+    assert len(bars) == 1
+    assert bars[0].close == 104
+    assert fallback_calls == [("NVDA", 60)]
+
+
+@patch("src.data.market.yf.download")
+def test_get_ohlcv_falls_back_when_yfinance_raises(mock_download):
+    """A yfinance exception also routes to fallback."""
+    from src.models import OHLCV
+
+    mock_download.side_effect = RuntimeError("yfinance rate limited")
+
+    def _fake_fallback(symbol, lookback_days):
+        return [OHLCV(
+            date=date(2026, 4, 15), open=50, high=52, low=49, close=51,
+            volume=500,
+        )]
+
+    provider = MarketDataProvider(fallback_bars=_fake_fallback)
+    bars = provider.get_ohlcv("AAPL", lookback_days=30)
+    assert len(bars) == 1
+    assert bars[0].close == 51
+
+
+@patch("src.data.market.yf.download")
+def test_get_ohlcv_returns_empty_when_both_sources_fail(mock_download):
+    mock_download.return_value = pd.DataFrame()
+
+    def _fallback_raising(symbol, lookback_days):
+        raise RuntimeError("alpaca also down")
+
+    provider = MarketDataProvider(fallback_bars=_fallback_raising)
+    assert provider.get_ohlcv("SPY", 30) == []
+
+
+def test_set_fallback_bars_post_construction():
+    """Pipeline wires fallback after both market + broker exist."""
+    from src.models import OHLCV
+
+    provider = MarketDataProvider()
+    # No fallback yet → empty yfinance → empty list
+    with patch("src.data.market.yf.download", return_value=pd.DataFrame()):
+        assert provider.get_ohlcv("X", 10) == []
+    # Install fallback after construction
+    provider.set_fallback_bars(lambda s, d: [OHLCV(
+        date=date(2026, 4, 15), open=1, high=1, low=1, close=1, volume=1,
+    )])
+    with patch("src.data.market.yf.download", return_value=pd.DataFrame()):
+        assert len(provider.get_ohlcv("X", 10)) == 1
+
+
+@patch("src.data.market.yf.download")
 def test_get_ohlcv_empty(mock_download):
     mock_download.return_value = pd.DataFrame()
     provider = MarketDataProvider()

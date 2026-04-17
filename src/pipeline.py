@@ -118,6 +118,10 @@ class TradingPipeline:
             secret_key=config.api_keys.alpaca_secret,
             paper=config.alpaca.paper,
         )
+        # Wire the broker as yfinance's fallback so a yfinance outage doesn't
+        # blackout the technical analyst. Alpaca's daily bars cover the same
+        # universe we trade on, so fallback coverage is effectively 100%.
+        self.market.set_fallback_bars(self.broker.get_bars)
         self.db = Database(config.storage.db_path)
         self.db.initialize()
         # Background earnings-analysis threads. We join them before each run_* exits

@@ -158,6 +158,65 @@ class AlpacaBroker:
             )
             return False
 
+    def get_bars(self, symbol: str, lookback_days: int = 120) -> list:
+        """Fetch daily OHLCV bars from Alpaca as a list[OHLCV].
+
+        Used by MarketDataProvider as a fallback when yfinance returns empty.
+        Same shape as MarketDataProvider.get_ohlcv so the caller is oblivious
+        to which source answered. Returns [] on any error.
+        """
+        from datetime import timedelta as _td
+        from src.models import OHLCV
+        from src.util.time import et_today
+
+        try:
+            if self._data_client is None:
+                from alpaca.data.historical.stock import StockHistoricalDataClient
+                self._data_client = StockHistoricalDataClient(self.api_key, self.secret_key)
+                _install_http_timeout(self._data_client)
+
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+
+            end = et_today()
+            start = end - _td(days=lookback_days)
+            req = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Day,
+                start=start,
+                end=end,
+            )
+            raw = self._data_client.get_stock_bars(req)
+            # SDK returns a BarSet-like object with .data = {symbol: [Bar, ...]}
+            bars_list = None
+            if hasattr(raw, "data") and isinstance(raw.data, dict):
+                bars_list = raw.data.get(symbol)
+            elif isinstance(raw, dict):
+                bars_list = raw.get(symbol)
+            if not bars_list:
+                return []
+            out: list[OHLCV] = []
+            for b in bars_list:
+                ts = getattr(b, "timestamp", None)
+                d = ts.date() if ts is not None else None
+                if d is None:
+                    continue
+                try:
+                    out.append(OHLCV(
+                        date=d,
+                        open=float(getattr(b, "open", 0) or 0),
+                        high=float(getattr(b, "high", 0) or 0),
+                        low=float(getattr(b, "low", 0) or 0),
+                        close=float(getattr(b, "close", 0) or 0),
+                        volume=int(getattr(b, "volume", 0) or 0),
+                    ))
+                except (TypeError, ValueError):
+                    continue
+            return out
+        except Exception as e:
+            logger.warning("broker.get_bars failed for %s: %s", symbol, e)
+            return []
+
     def get_latest_price(self, symbol: str) -> float | None:
         try:
             if self._data_client is None:
