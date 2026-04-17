@@ -263,6 +263,25 @@ class Database:
             )
             self.conn.commit()
 
+    def get_symbol_last_buy(self, symbol: str) -> dict | None:
+        """Most recent BUY row for a symbol — used by PM to anchor 'when bought / why'."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM trades WHERE symbol = ? AND action = 'BUY' "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_recent_insights(self, limit: int = 7) -> list[dict]:
+        """Last N evening insights, newest first. PM reads to build 7-day narrative."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM insights ORDER BY date DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_latest_insights(self, before_date: str | None = None) -> dict | None:
         if before_date:
             sql = "SELECT * FROM insights WHERE date < ? ORDER BY date DESC LIMIT 1"

@@ -339,6 +339,115 @@ class TradingPipeline:
             )
         self._bg_threads = alive
 
+    def _build_position_history(self, positions) -> dict[str, dict]:
+        """L2 memory: for each held symbol, entry context + Tech rating trajectory.
+
+        PM uses this to anchor 'when did I buy + why' and recognize when a fresh
+        setup has been maturing vs stuck vs invalidated.
+        """
+        from datetime import date as _date
+        out: dict[str, dict] = {}
+        today = et_today()
+        for p in positions:
+            sym = p.symbol
+            entry = None
+            try:
+                entry = self.db.get_symbol_last_buy(sym)
+            except Exception as e:
+                logger.warning("position_history: last_buy lookup failed for %s: %s", sym, e)
+
+            entry_date_str = None
+            days_held: int | None = None
+            if entry and entry.get("timestamp"):
+                try:
+                    ts = entry["timestamp"]
+                    entry_date = _date.fromisoformat(ts[:10]) if isinstance(ts, str) else None
+                    if entry_date is not None:
+                        entry_date_str = str(entry_date)
+                        days_held = max(0, (today - entry_date).days)
+                except (ValueError, TypeError):
+                    pass
+
+            try:
+                tech_history = self.tech_store.get_history(sym, days=7)
+            except Exception as e:
+                logger.warning("position_history: tech history failed for %s: %s", sym, e)
+                tech_history = []
+
+            out[sym] = {
+                "entry_date": entry_date_str,
+                "entry_price": entry.get("price") if entry else None,
+                "entry_reasoning": (entry.get("reasoning") or "")[:280] if entry else "",
+                "days_held": days_held,
+                "tech_history": tech_history,
+            }
+        return out
+
+    def _build_weekly_narrative(self) -> str:
+        """L3a memory: last 7 evenings' daily_summary + daily_pnl, compact."""
+        try:
+            insights = self.db.get_recent_insights(limit=7)
+        except Exception as e:
+            logger.warning("weekly_narrative: insights fetch failed: %s", e)
+            insights = []
+        if not insights:
+            return ""
+        try:
+            pnl_rows = self.db.get_daily_pnl(limit=14)
+        except Exception:
+            pnl_rows = []
+        pnl_by_date = {r["date"]: r for r in pnl_rows}
+        lines = []
+        # insights come newest-first; display oldest→newest so the "arc" reads naturally
+        for row in reversed(insights):
+            d = row.get("date", "?")
+            summary = (row.get("tomorrow_outlook") or row.get("lessons") or "").strip()
+            if len(summary) > 220:
+                summary = summary[:217] + "..."
+            pnl = pnl_by_date.get(d) or {}
+            ret = pnl.get("daily_return_pct")
+            ret_str = f"{ret:+.2f}%" if isinstance(ret, (int, float)) else "n/a"
+            risk = row.get("risk_rating", "?")
+            lines.append(f"- {d}: {ret_str} ({risk}) — {summary}")
+        return "\n".join(lines)
+
+    def _build_macro_trajectory(self) -> str:
+        """L3b memory: last 7 days of macro regime / confidence / target_invested_pct."""
+        try:
+            history = self.macro_store.load_history(days=7)
+        except Exception as e:
+            logger.warning("macro_trajectory: load_history failed: %s", e)
+            history = []
+        if not history:
+            return ""
+        lines = []
+        for snap in history:
+            d = snap.get("date", "?")
+            regime = snap.get("regime", "?")
+            conf = snap.get("confidence", "?")
+            pg = snap.get("position_guidance") or {}
+            target = pg.get("target_invested_pct", "?")
+            lines.append(f"- {d}: {regime} ({conf}) → target {target}%")
+        return "\n".join(lines)
+
+    def _build_active_state_changes(self) -> str:
+        """L3c memory: HIGH-conviction state_changes from the last 14 days, deduped."""
+        try:
+            changes = self.news_store.recent_state_changes(lookback_days=14, limit=8)
+        except Exception as e:
+            logger.warning("active_state_changes: news_store failed: %s", e)
+            changes = []
+        if not changes:
+            return ""
+        lines = []
+        for ch in changes:
+            d = ch.get("first_seen_date", "?")
+            event = (ch.get("event") or "")[:160]
+            symbols = ch.get("affected_symbols") or []
+            syms = ", ".join(symbols[:6]) if symbols else "—"
+            lines.append(f"- [{d}] {event} → {syms}")
+        return "\n".join(lines)
+
     def _compute_recent_performance(self, current_equity: float) -> dict:
         """Rolling 5-day and 20-day returns from db.daily_pnl, + drawdown flag.
 
@@ -759,6 +868,13 @@ class TradingPipeline:
                         yesterday_insights.get("risk_rating", "?"),
                         yesterday_insights.get("tomorrow_outlook", "")[:100])
 
+        # Multi-layer memory for PM — gives it investment continuity awareness
+        # so it stops treating each morning as fresh reasoning against single-day signals.
+        position_history = self._build_position_history(positions)
+        weekly_narrative = self._build_weekly_narrative()
+        macro_trajectory = self._build_macro_trajectory()
+        active_state_changes = self._build_active_state_changes()
+
         portfolio_decision, pm_result = self.portfolio_manager.decide(
             analyses=analyses,
             positions=positions,
@@ -769,6 +885,10 @@ class TradingPipeline:
             earnings_analyses=earnings_results,
             yesterday_insights=yesterday_insights,
             recent_performance=recent_performance,
+            position_history=position_history,
+            weekly_narrative=weekly_narrative,
+            macro_trajectory=macro_trajectory,
+            active_state_changes=active_state_changes,
         )
 
         if portfolio_decision and portfolio_decision.reasoning_chain:

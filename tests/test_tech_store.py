@@ -96,6 +96,46 @@ def test_compute_ages_returns_days_since_first_seen(tmp_path):
     assert "UNKNOWN" not in ages  # cached data absent → no key
 
 
+def test_update_appends_to_per_symbol_history(tmp_path):
+    """Each day's rating is appended to history[]. Dedup on same-day re-run."""
+    store = TechStore(data_dir=str(tmp_path / "tech"))
+    # First run
+    a1 = _analysis("NVDA", rating="buy", conviction="medium")
+    a1.risk_reward = 2.1
+    store.update([a1])
+    # Same-day re-run (pipeline re-executed) should replace, not duplicate
+    a1b = _analysis("NVDA", rating="buy", conviction="high")
+    a1b.risk_reward = 2.3
+    store.update([a1b])
+    hist = store.get_history("NVDA", days=7)
+    assert len(hist) == 1
+    assert hist[0]["conviction"] == "high"
+    assert hist[0]["risk_reward"] == 2.3
+
+
+def test_get_history_returns_recent_N_days(tmp_path):
+    """history keeps up to 14 days; get_history(days=7) returns the last 7."""
+    store = TechStore(data_dir=str(tmp_path / "tech"))
+    # Seed a cache directly with 10 days of history
+    seed = {"NVDA": {
+        "rating": "buy",
+        "conviction": "medium",
+        "first_seen_date": str(et_today()),
+        "last_rating_date": str(et_today()),
+        "entry_price": 190, "stop_loss": 184, "reference_target": 210,
+        "history": [
+            {"date": (et_today() - timedelta(days=d)).isoformat(),
+             "rating": "buy", "conviction": "medium", "risk_reward": 2.0}
+            for d in range(9, -1, -1)
+        ],
+    }}
+    store.save(seed)
+    seven = store.get_history("NVDA", days=7)
+    assert len(seven) == 7
+    # Oldest first among the returned slice
+    assert seven[0]["date"] <= seven[-1]["date"]
+
+
 def test_compute_ages_returns_zero_for_today(tmp_path):
     store = TechStore(data_dir=str(tmp_path / "tech"))
     store.update([_analysis("NVDA", rating="buy")])  # first_seen = today

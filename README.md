@@ -65,7 +65,7 @@ Evening (post-market)
 | **News Intelligence** | 3-layer news analysis | Layer 1: Persistent macro narrative. Layer 2: State change detection. Layer 3: Per-symbol alerts with conviction. Daily storage in `data/news/` |
 | **Macro Analyst** | Regime assessment & sector guidance | 6-step CoT (vol / curve / monetary / inflation+labor+credit / cross-signal / sector). Inputs: VIX, 2Y/10Y yields, **DFF** (daily fed funds), **core & headline CPI**, **UNRATE**, **HY OAS**. Persists yesterday's regime → detects `regime_shift`. Cross-references News narrative via `alignment_with_news`. Emits bull/bear view-change triggers. |
 | **Earnings Analyst** | SEC 10-Q/10-K analysis | Revenue, margins, cash flow, strategic direction, competitive positioning, strategic vs operational risks, strategy consistency across filings. `investment_implications` carries a 5-step `reasoning_chain` (fundamental_quality / growth_trajectory / strategic_risks / management_execution / valuation_context) — sentiment call is derivable from the numbers, not a vibe check. |
-| **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain (macro → news → earnings → signal conflicts → sizing → balance → cash). Sizing scales by the TechAnalyst's `risk_reward`: R/R ≥ 3 boost, R/R < 1.5 requires an explicit catalyst or shrinks. **Drawdown-aware**: receives rolling 5d/20d returns; when `in_drawdown` (5d < −3% OR 20d < −8%), halves all new BUY sizes until recovery. Step 6 checks `thesis_invalid_if` on held positions for early exits before stop triggers. |
+| **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain (+ continuity check) across 4 memory layers: L1 today's signals, L2 per-position entry context + Tech rating 7-day trajectory, L3a rolling Portfolio Narrative (last 7 evenings), L3b Macro Regime Trajectory (7 days), L3c Active HIGH-conviction state_changes (14 days). Sizing scales by TechAnalyst's `risk_reward`: R/R ≥ 3 boost, R/R < 1.5 requires catalyst or shrinks. **Drawdown-aware**: halves new BUYs when `in_drawdown` flagged. **Holding discipline** (tiered by days_held): <5d → default HOLD unless thesis_invalid_if or today's macro flip; 5-15d → standard; >15d profitable + trend intact → let it run. Early exits via `thesis_invalid_if` save 3-5% vs stop-triggered. |
 | **Risk Manager** | Trade review with veto power | Mandatory 6-step `reasoning_chain` (rr_audit / signal_fidelity / correlation_check / event_risk / sizing_sanity / overall) — vague approvals rejected. Enforces R/R discipline: BUYs with R/R < 1.5 must be downsized via modifications or rejected unless PM named a catalyst. Sees raw Tech ratings + R/R + full macro context. Can modify per-symbol fields OR apply portfolio-wide `scale_all_buys` (0.0-1.0). |
 | **Midday Reviewer** | Profit management & trailing-stop execution | Trailing-stop logic is **real**, not cosmetic — `TRAIL_STOP` action actually cancels the broker's old stop and submits a new one at the specified price via `AlpacaBroker.replace_stop_loss`. Sees VIX + HY OAS + core CPI to gauge whether to tighten stops broadly. Output is Pydantic `MiddayReview` — action enum enforced (typos like `TRIAL_STOP` rejected); `TRAIL_STOP` requires `new_stop_price > 0`. |
 | **Evening Analyst** | Daily P&L review & learning | Pydantic `EveningReport` with enum `risk_rating`. **Outlook retrospective**: reads yesterday's `tomorrow_outlook` and grades it honestly against today's reality via `previous_outlook_assessment` — builds calibration over time. Outputs feed into next morning's PM prompt (cross-session memory). |
@@ -184,7 +184,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 194 tests
+├── tests/                         # 204 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -195,7 +195,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 194 tests
+pytest tests/ -v    # 204 tests
 ```
 
 ## Data Sources

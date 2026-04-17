@@ -44,10 +44,37 @@ class PortfolioManagerAgent(BaseAgent):
             )
         analyses_text = "\n".join(_fmt_tech(a) for a in analyses)
 
-        positions_text = "\n".join(
-            f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Current: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} | Sector: {p.sector}"
-            for p in positions
-        ) if positions else "No current positions."
+        # L2 memory: each position line also gets entry context + Tech rating trajectory
+        # so PM can anchor "when bought / for what reason / how signal has evolved".
+        position_history: dict = kwargs.get("position_history") or {}
+
+        def _fmt_position(p: Position) -> str:
+            core = (
+                f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | "
+                f"Current: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} | Sector: {p.sector}"
+            )
+            hist = position_history.get(p.symbol) or {}
+            lines = [core]
+            entry_date = hist.get("entry_date")
+            days_held = hist.get("days_held")
+            if entry_date or days_held is not None:
+                label = f"entry {entry_date or 'unknown'}"
+                if days_held is not None:
+                    label += f", held {days_held}d"
+                reasoning = (hist.get("entry_reasoning") or "").strip()
+                if reasoning:
+                    label += f' — "{reasoning}"'
+                lines.append(f"  Bought: {label}")
+            tech_hist = hist.get("tech_history") or []
+            if tech_hist:
+                trail = " → ".join(
+                    f"{h.get('rating', '?')}({h.get('conviction', '?')[0]})"
+                    for h in tech_hist
+                )
+                lines.append(f"  Tech history (last {len(tech_hist)}d): {trail}")
+            return "\n".join(lines)
+
+        positions_text = "\n".join(_fmt_position(p) for p in positions) if positions else "No current positions."
 
         # Format macro analysis section
         if macro_analysis:
@@ -276,15 +303,42 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
         else:
             insights_section = "## Yesterday's Evening Insights\nNo prior session insights available."
 
+        # L3 memory layers — past environment trajectory
+        weekly_narrative: str = kwargs.get("weekly_narrative") or ""
+        macro_trajectory: str = kwargs.get("macro_trajectory") or ""
+        active_state_changes: str = kwargs.get("active_state_changes") or ""
+
+        narrative_section = (
+            f"## Portfolio Narrative (last 7 trading days)\n{weekly_narrative}"
+            if weekly_narrative else
+            "## Portfolio Narrative\nNo prior narrative yet (fresh table)."
+        )
+        trajectory_section = (
+            f"## Macro Regime Trajectory (last 7 days)\n{macro_trajectory}"
+            if macro_trajectory else
+            "## Macro Regime Trajectory\nNo prior snapshots yet."
+        )
+        active_changes_section = (
+            f"## Active News State Changes (HIGH conviction, last 14d)\n{active_state_changes}"
+            if active_state_changes else
+            "## Active News State Changes\n(none surfaced in the rolling 14-day window)"
+        )
+
         return f"""## Account Status
 - Total Value: ${total_value:,.2f}
 - Cash Balance: ${cash_balance:,.2f}
 - Invested: ${invested:,.2f} ({invested_pct:.1f}%)
 
-## Current Positions
+## Current Positions (with entry context + signal trajectory)
 {positions_text}
 
 {perf_section}
+
+{narrative_section}
+
+{trajectory_section}
+
+{active_changes_section}
 
 {insights_section}
 
@@ -297,7 +351,7 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
 ## Technical Analysis Reports
 {analyses_text}
 
-Based on all the above (yesterday's insights, macro analysis, news, earnings, and technical signals), what trades should we execute? Respond as JSON."""
+Based on all the above (memory of past decisions + environment trajectory + today's signals), what trades should we execute? Respond as JSON."""
 
     def decide(self, analyses: list[TechAnalysisResult], positions: list[Position],
                macro_analysis: dict | None = None, cash_balance: float = 0,
@@ -305,7 +359,11 @@ Based on all the above (yesterday's insights, macro analysis, news, earnings, an
                news_intel: NewsIntelligenceReport | None = None,
                earnings_analyses: list[dict] | None = None,
                yesterday_insights: dict | None = None,
-               recent_performance: dict | None = None) -> tuple[PortfolioDecision | None, "AgentResult"]:
+               recent_performance: dict | None = None,
+               position_history: dict | None = None,
+               weekly_narrative: str = "",
+               macro_trajectory: str = "",
+               active_state_changes: str = "") -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
             analyses=analyses,
             positions=positions,
@@ -316,6 +374,10 @@ Based on all the above (yesterday's insights, macro analysis, news, earnings, an
             earnings_analyses=earnings_analyses or [],
             yesterday_insights=yesterday_insights,
             recent_performance=recent_performance or {},
+            position_history=position_history or {},
+            weekly_narrative=weekly_narrative,
+            macro_trajectory=macro_trajectory,
+            active_state_changes=active_state_changes,
         )
         parsed = result.parse_json()
         if parsed is None:

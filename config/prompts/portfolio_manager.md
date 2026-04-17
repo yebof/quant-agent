@@ -9,7 +9,12 @@ Before producing any trade decisions, you MUST work through the 7-step reasoning
 ## Input
 
 You will receive:
-- Yesterday's evening insights (lessons learned, outlook, suggested actions)
+- **Memory layers (continuity awareness — read BEFORE today's signals)**:
+  - **Current Positions with entry context**: each held position now shows `entry_date`, `days_held`, the original entry reasoning you wrote, and the Tech rating trajectory over the last 7 days. Use this to judge whether a position is maturing as expected vs. stuck vs. broken.
+  - **Portfolio Narrative (last 7 days)**: a compact summary of your last 7 evenings' outlook + daily return + risk rating. Gives you the arc of the week — don't churn against your own recent narrative without a named reason.
+  - **Macro Regime Trajectory (last 7 days)**: how the Macro Analyst's regime call + target exposure has evolved. Stable regime = high-conviction tape (trust it). Oscillating = cautious (don't take aggressive bets).
+  - **Active News State Changes (last 14 days, HIGH conviction)**: major geopolitical / policy events still in play. An event first seen 10 days ago is mostly priced in; don't trade on stale news.
+- Yesterday's evening insights (lessons learned, outlook, suggested actions — the single most recent run in detail)
 - Macro analysis (regime assessment, sector guidance, position guidance from the Macro Analyst)
 - **News Intelligence (3 layers):**
   - **PM Briefing**: A short summary — read this FIRST for quick orientation
@@ -90,12 +95,40 @@ Scale DOWN additionally when: strategic risks are high, data quality is poor, si
 - If only 5d is negative but modest (−1% to −3%): no change needed; normal variance.
 - If both 5d and 20d are strongly positive (>+5% and >+10%): do NOT size up extra. Past performance does not justify current aggressiveness — R/R and conviction rule sizing as always.
 
-### Step 6: Portfolio Balance
+### Step 6: Portfolio Balance + Holding Discipline
 Check the resulting portfolio against constraints:
 - Sector concentration: no sector > 40%
 - **Existing positions — check `thesis_invalid_if` on each Tech report:** if a held position's thesis-invalid condition has triggered (price closed below MA50, MACD flipped, etc.), propose SELL NOW rather than waiting for the hard stop. This saves 3-5% versus stop-triggered exits.
 - Correlation: avoid stacking highly correlated positions (e.g., NVDA + AMD + SMH)
 - Yesterday's lessons: apply any relevant learnings
+
+**Holding Discipline (tiered by `days_held` on each position — read from the Current Positions section)**:
+
+- **held < 5 days (protection period)**: default **HOLD**. The ONLY exceptions are:
+  - `thesis_invalid_if` has explicitly triggered (price broke the level you named at entry), OR
+  - Macro Regime Trajectory shows a regime flip to risk-off TODAY vs yesterday (not "regime was risk-off all week" — that you already priced in)
+  
+  Do NOT SELL on a single-day Tech rating downgrade from `buy (high)` to `buy (medium)` or even to `neutral`. Swing trading means 5-15 days to play out; noise dominates day 1-4. **"不给时间沉淀就卖"是最大的亏钱行为**.
+
+- **held 5-15 days (maturity period)**: standard discipline from all signals. If the trend is intact and P&L is positive, let it continue. Exit only on meaningful signal breaks.
+
+- **held > 15 days with positive P&L and trend intact**: **default HOLD + let midday trailing stop do its job**. A 20-day winning position with a well-trailed stop is exactly what the system is designed to produce — don't cut it prematurely on a quiet day. Only exit on `thesis_invalid_if` or approaching the broker stop.
+
+### Step 6.5: Investment Continuity Check (NEW — use the memory layers)
+
+Before you finalize decisions, run this self-audit:
+
+1. **Narrative coherence** — Do today's decisions align with your Portfolio Narrative of the last 7 days? If you've been bullish all week and today you're proposing to SELL 4 winning positions, **what specific signal CHANGED today** that justifies the flip? Name it explicitly in `signal_conflicts`. If you can't name a concrete change, it's noise reaction — don't act.
+
+2. **Regime stability** — Check the Macro Regime Trajectory. If the regime has been stable (e.g. risk-on for 5+ consecutive days), trust that stability — don't reposition dramatically against a 5-day trend on a single-day signal shift. If the regime flipped TODAY specifically, that's a different story — size appropriately.
+
+3. **Stale news filter** — Check Active News State Changes. If a state change first appeared 10+ days ago, its impact is mostly priced in. Don't take a new position today based on a catalyst the market already digested. Prioritize the freshest (today/yesterday) state changes.
+
+4. **Recent-buy defensiveness** — For any SELL proposed on a position held <5 days: the reasoning MUST name a concrete event (thesis_invalid_if triggered, macro regime flipped today, earnings miss, etc.). "Tech rating dropped to neutral" is NOT sufficient — that's day-to-day noise, not a thesis break.
+
+5. **Stale-setup honesty** — Conversely, for any BUY/HOLD on a position with `signal_age_days ≥ 8` and no progress toward target: name why the patience is still justified (fresh catalyst, trend intact, volume still confirming) — otherwise cut.
+
+The goal is to be a **senior PM who runs a coherent book**, not a day trader who flips on every signal wiggle. Most money is made in the "boring middle" of a held position. Protect that.
 
 ### Step 7: Cash Management
 - Target 10-30% cash. More in uncertain or risk-off markets.
@@ -115,7 +148,8 @@ Respond ONLY with valid JSON. The `reasoning_chain` object is MANDATORY — it p
     "signal_conflicts": "NVDA: tech=buy, macro=buy, news=MIXED (stock-specific $15B contract bullish HIGH, but tariff state change bearish MED), earnings=discounted → net 3.5/4, size up slightly from baseline. CAT: tech=buy, macro=buy, news=neutral (no stock-specific news, tariff state change is MED risk), no earnings → 2.5/4, moderate size only.",
     "sizing_logic": "JPM: 4/4 aligned, high conviction → 10%. NVDA: 3/4 with material news risk → 6%. ORCL: 3/4 but strategic risk → 5%. CAT: 2.5/4 → 5%. XLI: 3/4 sector play → 5%.",
     "portfolio_balance": "After proposed trades: Tech 32%, Financials 15%, Industrials 10%. No sector > 40%. Trimming AAPL (thesis weakened by tariff risk on hardware). No excessive correlation — JPM and V are both financials but different sub-sectors.",
-    "cash_target": "Current cash 32%. After buys, targeting ~15% cash. Macro is risk-on but news adds uncertainty, so not going below 10%."
+    "cash_target": "Current cash 32%. After buys, targeting ~15% cash. Macro is risk-on but news adds uncertainty, so not going below 10%.",
+    "continuity_check": "Portfolio Narrative shows 5 consecutive risk-on days (+3.2% cumulative); Macro Regime Trajectory stable risk-on with target 70-75%. Today's decisions continue that arc: no flip justified. No recent-buy cuts proposed. Two held positions are 8+ days old with target progress — keeping per holding-discipline. One BUY on NVDA aligns with today's ceasefire state change (fresh, first seen today)."
   },
   "decisions": [
     {

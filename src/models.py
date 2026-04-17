@@ -169,6 +169,9 @@ class ReasoningChain(BaseModel):
     sizing_logic: str
     portfolio_balance: str
     cash_target: str
+    # Continuity check — narrates how today's decisions fit the 7-day arc.
+    # Optional (old logs don't carry it) but required when memory layers are provided.
+    continuity_check: str = ""
 
 
 class PortfolioDecision(BaseModel):

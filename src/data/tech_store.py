@@ -55,6 +55,8 @@ class TechStore:
         For each symbol in new_analyses:
         - Same rating as the cached entry → keep `first_seen_date` (age grows).
         - Different rating or new symbol → reset `first_seen_date` to today ET.
+        - history[] list accumulates (date, rating, conviction, risk_reward)
+          per day, trimmed to last 14. Enables PM to see signal trajectory.
         Symbols absent from today's batch are left untouched (they may reappear
         on a later day when they re-enter the pre-filter).
         """
@@ -62,11 +64,22 @@ class TechStore:
         prior = self.load()
         for a in new_analyses:
             sym = a.symbol
-            prior_entry = prior.get(sym)
-            if prior_entry and prior_entry.get("rating") == a.rating:
+            prior_entry = prior.get(sym, {}) or {}
+            if prior_entry.get("rating") == a.rating:
                 first_seen = prior_entry.get("first_seen_date", today)
             else:
                 first_seen = today
+
+            # Maintain per-symbol history — dedupe by date so re-runs in one day don't double.
+            history = [h for h in (prior_entry.get("history") or []) if h.get("date") != today]
+            history.append({
+                "date": today,
+                "rating": a.rating,
+                "conviction": a.conviction,
+                "risk_reward": getattr(a, "risk_reward", None),
+            })
+            history = history[-14:]  # keep last 2 trading weeks
+
             prior[sym] = {
                 "rating": a.rating,
                 "conviction": a.conviction,
@@ -75,9 +88,15 @@ class TechStore:
                 "entry_price": a.entry_price,
                 "stop_loss": a.stop_loss,
                 "reference_target": a.reference_target,
+                "history": history,
             }
         self.save(prior)
         return prior
+
+    def get_history(self, symbol: str, days: int = 7) -> list[dict]:
+        """Recent per-day rating trajectory for a symbol (oldest first)."""
+        entry = self.load().get(symbol, {}) or {}
+        return (entry.get("history") or [])[-days:]
 
     def compute_ages(self, symbols: list[str]) -> dict[str, int]:
         """Days elapsed since `first_seen_date` for each symbol in the current cache."""

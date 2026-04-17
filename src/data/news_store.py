@@ -71,3 +71,35 @@ class NewsStore:
 
     def get_report_path(self) -> str:
         return str(self._today_dir())
+
+    def recent_state_changes(self, lookback_days: int = 14, limit: int = 8) -> list[dict]:
+        """Scan the last N dated reports for HIGH-conviction state_changes.
+
+        Dedupes by `event` string — same event appearing across multiple days is
+        kept as one entry with `first_seen_date` = oldest occurrence. Sorted
+        newest-first so PM's prompt shows the most actionable items first.
+        """
+        from datetime import timedelta
+        today = et_today()
+        seen: dict[str, dict] = {}
+        for days_ago in range(lookback_days):
+            d = today - timedelta(days=days_ago)
+            report_path = self.data_dir / str(d) / "full_report.json"
+            if not report_path.exists():
+                continue
+            try:
+                report = json.loads(report_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            for ch in report.get("state_changes", []) or []:
+                if ch.get("conviction") != "high":
+                    continue
+                event = (ch.get("event") or "").strip()
+                if not event:
+                    continue
+                # Oldest first-seen wins (so we know "how long has this been active")
+                if event not in seen or seen[event]["first_seen_date"] > str(d):
+                    seen[event] = {**ch, "first_seen_date": str(d)}
+        return sorted(seen.values(),
+                      key=lambda x: x.get("first_seen_date", ""),
+                      reverse=True)[:limit]
