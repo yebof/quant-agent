@@ -206,6 +206,22 @@ class RiskVerdict(BaseModel):
     # per-symbol modifications are applied. 1.0 = no change; 0.5 = half all buys; 0.0
     # effectively kills BUY side while leaving SELL/HOLD/TRAIL intact.
     scale_all_buys: float = Field(default=1.0, ge=0.0, le=1.0)
+    # Categorized reason for any modification / scaling. PM reads the recent
+    # history of this field to self-calibrate in a targeted way: repeated
+    # `oversized` means cut base allocations; repeated `rr_fail` means trust
+    # TA's R/R math more literally; etc. One label per verdict.
+    reason_category: Literal[
+        "clean",             # approved untouched, no mods
+        "oversized",         # sizing too aggressive vs conviction
+        "rr_fail",           # R/R < 1.5 without catalyst on one or more BUYs
+        "concentration",     # sector / single-name too heavy
+        "correlation_risk",  # theme/factor clustering flagged
+        "event_risk",        # pre-earnings / FOMC / macro event volatility
+        "macro_misalign",    # PM's net exposure deviates from Macro target
+        "data_degraded",     # multiple upstream sources failed
+        "signal_fidelity",   # PM contradicts TechAnalyst without explanation
+        "other",             # doesn't fit the above
+    ] = "clean"
     reasoning: str
 
 

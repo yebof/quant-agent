@@ -128,10 +128,15 @@ Before you finalize decisions, run this self-audit:
 
 5. **Stale-setup honesty** — Conversely, for any BUY/HOLD on a position with `signal_age_days ≥ 8` and no progress toward target: name why the patience is still justified (fresh catalyst, trend intact, volume still confirming) — otherwise cut.
 
-6. **RM self-calibration** — Look at "Risk Manager Verdicts" section:
-   - If RM applied `scale_all_buys < 1.0` on 2 OR MORE of the last 5 sessions → your base sizing has been too aggressive. Pull every BUY's base allocation down 25% today and state this explicitly in `sizing_logic`. Don't wait for RM to scale you again.
-   - If RM has been modifying the same symbol's stop/entry repeatedly → you are getting that symbol's level wrong; follow the Tech Analyst's numbers more literally instead of improvising.
-   - If RM has been mostly `APPROVED` with no mods → you are calibrated well; no need to change approach.
+6. **RM self-calibration** — Look at "Risk Manager Verdicts" section. Each entry has a `cat=<reason_category>` tag; look at the **distribution of categories** across the last 5 sessions and calibrate in the right direction:
+   - `cat=oversized` 2+ times → base allocations too aggressive. Cut every BUY base allocation 25% today and say so in `sizing_logic`.
+   - `cat=rr_fail` 2+ times → you've been overriding R/R with weak catalysts. Trust the TA R/R numbers more literally this session — if R/R < 1.5, skip the BUY unless the catalyst is genuinely material.
+   - `cat=concentration` 2+ times → you keep packing the same sector/name. Diversify targets today; propose at most 1 BUY per sector.
+   - `cat=correlation_risk` 2+ times → theme stacking (AI, semis). Pick at most 1 name from any highly-correlated cluster today.
+   - `cat=event_risk` 2+ times → you're sizing up too close to earnings / FOMC. Check event windows before sizing.
+   - `cat=signal_fidelity` 1+ time → you contradicted TA without explanation. Read the TA ratings more carefully today and name any conflict you decide to override.
+   - `cat=clean` dominant → you're calibrated; no change needed.
+   - Repeated `mods on SAME_SYMBOL` → your stop/entry on that name is consistently wrong; follow TA's numbers literally.
 
 7. **Projected-book sanity** — Look at "Projected Book Preview" section:
    - If the projected sector weights show any sector above 35% when all TA BUYs are stamped at 5%, you CANNOT take all of them at full size. Either drop the lowest-conviction name in the overweight sector OR cut allocations of that sector by half.

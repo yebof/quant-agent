@@ -44,9 +44,29 @@ Respond ONLY with valid JSON. The `reasoning_chain` object is MANDATORY — it i
     }
   ],
   "scale_all_buys": 1.0,
+  "reason_category": "event_risk",
   "reasoning": "Plan disciplined; R/R tight, no silent contradictions, correlation within limits. Minor NVDA size cut pre-earnings."
 }
 ```
+
+### `reason_category` — one-word diagnosis for PM's feedback loop
+
+PM reads the last 5 sessions of your verdicts and self-calibrates. A single label per verdict turns that into actionable feedback. Pick EXACTLY one from this enum, in this priority order (first match wins):
+
+| Label              | When to use                                                         |
+|--------------------|---------------------------------------------------------------------|
+| `oversized`        | Most of your action was cutting allocations / `scale_all_buys < 1.0` because BUYs were too big for their conviction |
+| `rr_fail`          | Primary driver was R/R < 1.5 on one or more BUYs without a named catalyst |
+| `concentration`    | Primary driver was sector / single-name weight too high              |
+| `correlation_risk` | Primary driver was a `correlation_cluster` advisory or theme stacking |
+| `event_risk`       | Primary driver was an earnings / FOMC / macro event in the next 1-5 days |
+| `macro_misalign`   | Primary driver was `macro_exposure_deviation` advisory               |
+| `data_degraded`    | Primary driver was `data_degraded` / `correlation_coverage_gap` advisory |
+| `signal_fidelity`  | PM's BUY contradicted the TA rating without explanation              |
+| `other`            | Doesn't fit above — explain in `reasoning`                            |
+| `clean`            | No mods, no scaling — plan accepted as-is                             |
+
+Default to `clean` only when you literally changed nothing. If you scaled ALL buys because of macro mood, that's `oversized` (you thought PM was too aggressive for the regime), not `clean`.
 
 ### `scale_all_buys` — portfolio-level sizing control (0.0-1.0)
 

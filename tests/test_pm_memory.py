@@ -150,6 +150,7 @@ def test_rm_verdicts_builder_parses_agent_logs(tmp_path):
         full_response=json.dumps({
             "approved": True,
             "scale_all_buys": 0.5,
+            "reason_category": "oversized",
             "modifications": [{"symbol": "NVDA", "field": "allocation_pct",
                                 "original_value": 12, "new_value": 6, "reason": "R/R low"}],
             "reasoning": "Oversized tech bets; cut in half.",
@@ -168,6 +169,7 @@ def test_rm_verdicts_builder_parses_agent_logs(tmp_path):
         full_response=json.dumps({
             "approved": True,
             "scale_all_buys": 1.0,
+            "reason_category": "clean",
             "modifications": [],
             "reasoning": "All trades pass.",
         }),
@@ -182,7 +184,9 @@ def test_rm_verdicts_builder_parses_agent_logs(tmp_path):
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.db = db
     out = pipeline._build_rm_recent_verdicts(limit=5)
-    # Oldest→newest ordering preserved
+    # Category surfaced for both verdicts
+    assert "cat=oversized" in out
+    assert "cat=clean" in out
     assert "scale_all_buys=0.50" in out
     assert "mods on NVDA" in out
     assert "All trades pass." in out
@@ -190,6 +194,27 @@ def test_rm_verdicts_builder_parses_agent_logs(tmp_path):
     lines = out.split("\n")
     assert "Oversized" in lines[0]
     assert "All trades pass" in lines[1]
+
+
+def test_risk_verdict_accepts_reason_category():
+    """RiskVerdict parses the new reason_category enum; default is 'clean'."""
+    from src.models import RiskVerdict
+
+    # Default when field omitted
+    v1 = RiskVerdict(approved=True, reasoning="fine")
+    assert v1.reason_category == "clean"
+
+    # All enum values parse
+    for cat in ("oversized", "rr_fail", "concentration", "correlation_risk",
+                "event_risk", "macro_misalign", "data_degraded",
+                "signal_fidelity", "other", "clean"):
+        v = RiskVerdict(approved=True, reasoning="x", reason_category=cat)
+        assert v.reason_category == cat
+
+    # Unknown category rejected
+    import pytest
+    with pytest.raises(Exception):  # pydantic ValidationError
+        RiskVerdict(approved=True, reasoning="x", reason_category="weird")
 
 
 def test_pm_decisions_builder_parses_own_history(tmp_path):

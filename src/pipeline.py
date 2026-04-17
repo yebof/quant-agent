@@ -543,14 +543,15 @@ class TradingPipeline:
             except (TypeError, ValueError):
                 scale = 1.0
             verdict = "APPROVED" if approved else "REJECTED"
-            extras: list[str] = []
+            category = (data.get("reason_category") or "clean").strip()
+            extras: list[str] = [f"cat={category}"]
             if scale < 1.0:
                 extras.append(f"scale_all_buys={scale:.2f}")
             if mods:
                 mod_syms = sorted({m.get("symbol", "?") for m in mods if isinstance(m, dict)})
                 if mod_syms:
                     extras.append(f"mods on {', '.join(mod_syms)}")
-            tag = f" [{'; '.join(extras)}]" if extras else ""
+            tag = f" [{'; '.join(extras)}]"
             reason = (data.get("reasoning") or "")[:140].strip().replace("\n", " ")
             lines.append(f"- {ts}: {verdict}{tag} — {reason}")
         return "\n".join(lines)
