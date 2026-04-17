@@ -205,28 +205,152 @@ class EarningsDataProvider:
             logger.warning("Failed to download %s %s: %s", filing.symbol, filing.form_type, e)
             return None
 
-    def _extract_text(self, html_path: str, max_chars: int = 150000) -> str:
-        """Extract clean text from SEC HTML filing."""
+    def _extract_text(self, html_path: str, max_chars: int = 30000) -> str:
+        """Extract high-signal sections from a SEC 10-Q / 10-K filing.
+
+        A raw 10-K can be 200K+ chars; 70-80% is boilerplate the LLM doesn't
+        need (properties listings, mine safety disclosures, legal notes,
+        signatures, exhibit indices, XBRL footers). Dumping that to the
+        earnings_analyst wastes ~30% of our total token budget and dilutes
+        its attention away from what drives the investment call.
+
+        This returns a compressed document with just:
+        - Financial statements  (revenue / margins / EPS numbers)
+        - MD&A                  (narrative on growth, segments, outlook)
+        - Risk factors          (top risks management flagged)
+
+        Falls back to truncated full-text when structured extraction
+        can't locate any sections (non-standard filing layout).
+        """
         raw = Path(html_path).read_bytes()
         soup = BeautifulSoup(raw, "html.parser")
 
-        # Remove script, style, and hidden elements
         for tag in soup(["script", "style", "meta", "link"]):
             tag.decompose()
 
         text = soup.get_text(separator="\n")
-
-        # Clean up whitespace
         lines = [line.strip() for line in text.splitlines()]
         text = "\n".join(line for line in lines if line)
-
-        # Collapse multiple newlines
         text = re.sub(r"\n{3,}", "\n\n", text)
 
-        if len(text) > max_chars:
-            text = text[:max_chars] + "\n\n[... truncated ...]"
+        # Structured path
+        sections = self._extract_key_sections(text)
+        structured_output = ""
+        if sections:
+            parts: list[str] = []
+            total = 0
+            # Order: financials (hard numbers) → MD&A (narrative) → risks (tail)
+            order = ("financial_statements", "mdna", "risk_factors")
+            for label in order:
+                body = sections.get(label)
+                if not body:
+                    continue
+                # Per-section cap — MD&A on a 10-K can run 40K+ on its own.
+                if len(body) > 12000:
+                    body = body[:12000] + "\n[... section truncated ...]"
+                header = label.replace("_", " ").upper()
+                section_text = f"=== {header} ===\n{body}"
+                if total + len(section_text) + 2 > max_chars:
+                    remaining = max_chars - total - 30  # 30 chars for tail marker
+                    if remaining > 2000:
+                        parts.append(section_text[:remaining] + "\n[... truncated ...]")
+                    break
+                parts.append(section_text)
+                total += len(section_text) + 2
+            if parts:
+                structured_output = "\n\n".join(parts)
 
+        # If structured extraction produced meaningful content (≥3K chars),
+        # use it. Below that the sections are either sparse ('see 10-K')
+        # stubs or our patterns missed the real headers — fall back to the
+        # truncated full text so the LLM still has something to work with.
+        MIN_STRUCTURED_SIZE = 3000
+        if structured_output and len(structured_output) >= MIN_STRUCTURED_SIZE:
+            logger.info(
+                "Extracted %d section(s) from filing → %d chars (down from %d)",
+                len(sections), len(structured_output), len(text),
+            )
+            return structured_output
+
+        # Fallback: truncated full text
+        if len(text) > max_chars:
+            logger.info(
+                "Structured extraction too sparse (%d chars); falling back to truncated full text "
+                "(%d → %d chars)",
+                len(structured_output), len(text), max_chars,
+            )
+            text = text[:max_chars] + "\n\n[... truncated ...]"
         return text
+
+    def _extract_key_sections(self, text: str) -> dict[str, str]:
+        """Locate financial / MD&A / risk-factor section bodies via regex.
+
+        Filings typically carry a table of contents listing 'Item 1. ...',
+        'Item 2. ...' near the top — those are pointers, not the section
+        bodies themselves. We prefer matches beyond the first ~15K chars
+        (past the TOC) when multiple matches exist. Body extends from the
+        header to the next detected section/stop marker.
+        """
+        # Each entry: (label, pattern, strategy)
+        # - "first":    the pattern matches a distinctive heading, not a TOC
+        #               line — the first occurrence is the real one. Financial
+        #               statements use this because 'CONSOLIDATED STATEMENTS
+        #               OF OPERATIONS' isn't something a TOC typically says.
+        # - "skip_toc": the pattern matches 'Item X. Section Name', which DOES
+        #               appear in a TOC — prefer the first occurrence past
+        #               ~15K chars (where the TOC ends).
+        patterns = [
+            ("financial_statements", re.compile(
+                r"(?im)(?:condensed\s+)?consolidated\s+statements?\s+of\s+(?:operations?|income)\b"
+            ), "first"),
+            ("mdna", re.compile(
+                # [\u2019'] accepts both ASCII apostrophe and the curly
+                # quote U+2019 that SEC HTML filings commonly use.
+                r"(?im)^\s*(?:item\s*[27]\.?)\s*management[\u2019']?s?\s+discussion"
+            ), "skip_toc"),
+            ("risk_factors", re.compile(
+                r"(?im)^\s*(?:item\s*1a\.?)\s*risk\s+factors"
+            ), "skip_toc"),
+        ]
+        stop_pattern = re.compile(
+            r"(?im)^\s*(?:item\s*\d+[a-z]?\.?\s|"
+            r"signatures?\s*$|"
+            r"exhibit\s+index|"
+            r"part\s+(?:i|ii|iii|iv)\b)"
+        )
+        all_stops = sorted(m.start() for m in stop_pattern.finditer(text))
+
+        found: dict[str, str] = {}
+        for label, pat, strategy in patterns:
+            matches = list(pat.finditer(text))
+            if not matches:
+                continue
+            if strategy == "first":
+                chosen = matches[0]
+            else:  # skip_toc
+                chosen = next(
+                    (m for m in matches if m.start() >= 15000),
+                    matches[-1],
+                )
+            body_start = chosen.end()
+            # Next stop after (body_start + 200) — don't let the header's
+            # own "Item X" mention terminate its own body.
+            next_stop = None
+            for stop in all_stops:
+                if stop > body_start + 200:
+                    next_stop = stop
+                    break
+            body = (
+                text[body_start:next_stop].strip()
+                if next_stop else text[body_start:].strip()
+            )
+            # Low threshold — 10-Q Risk Factors sections often read "No
+            # material changes from 10-K" in ~200-400 chars, which is still
+            # useful information (confirms no new risks flagged). Below 150
+            # is almost certainly a false-positive match.
+            if len(body) >= 150:
+                found[label] = body
+        return found
 
     def _get_analysis_path(self, symbol: str, form_type: str, filing_date: str) -> str:
         """Return path for the analysis markdown file."""

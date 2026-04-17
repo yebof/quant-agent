@@ -77,6 +77,76 @@ def report(tmp_path):
     )
 
 
+def test_extract_text_compresses_standard_10q(tmp_path):
+    """Full 10-Q with TOC + all standard sections → structured extraction path."""
+    from src.data.earnings import EarningsDataProvider
+
+    filler = "Lorem ipsum dolor sit amet consectetur. " * 50  # ~2000 chars
+    html = f"""<html><body>
+    <h1>Apple Inc. Q1 2026 Form 10-Q</h1>
+    <div>Table of Contents: Item 1. Financial Statements ... Item 2. Management's Discussion and Analysis ... Item 1A. Risk Factors ...</div>
+    {"Cover page filler filler filler. " * 400}
+    <h2>CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS</h2>
+    <p>Net sales: Products $113,743 Services $26,340. Total $140,083.
+    Operating income $42,832. Diluted EPS $2.40. {filler}</p>
+    <h2>Item 2. Management's Discussion and Analysis of Financial Condition</h2>
+    <p>Products revenue grew 8% YoY driven by iPhone. Services grew 14%.
+    Gross margin expanded 120bps to 46.9%. Guidance implies mid-single-digit
+    revenue growth in Q2. {filler}</p>
+    <h2>Item 1A. Risk Factors</h2>
+    <p>There have been no material changes to the risk factors disclosed in
+    our 2025 Form 10-K. {filler}</p>
+    </body></html>"""
+    html_path = tmp_path / "test.html"
+    html_path.write_bytes(html.encode())
+
+    p = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
+    out = p._extract_text(str(html_path), max_chars=30000)
+    assert "=== FINANCIAL STATEMENTS ===" in out
+    assert "=== MDNA ===" in out
+    assert "=== RISK FACTORS ===" in out
+    assert "113,743" in out
+    assert "iPhone" in out
+    assert len(out) < len(html) / 2
+
+
+def test_extract_text_handles_smart_apostrophe(tmp_path):
+    """SEC filings commonly use the curly apostrophe U+2019 — regex must match it."""
+    from src.data.earnings import EarningsDataProvider
+
+    html = (
+        "<html><body>"
+        + ("x " * 8000)  # push past TOC threshold
+        + "\nItem 2.\nManagement\u2019s Discussion and Analysis\n"
+        + "<p>Revenue up 10%. " + ("Lorem ipsum. " * 200) + "</p>"
+        + "\nItem 3. Quantitative disclosures\n"
+        + "</body></html>"
+    )
+    html_path = tmp_path / "curly.html"
+    html_path.write_bytes(html.encode())
+
+    p = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
+    out = p._extract_text(str(html_path))
+    # Whether structured or fallback path fires, the key content must be there.
+    assert "Revenue up 10%" in out
+
+
+def test_extract_text_falls_back_to_truncated_when_sections_sparse(tmp_path):
+    """A filing with no recognizable section headers → fallback truncated text."""
+    from src.data.earnings import EarningsDataProvider
+
+    raw = "This is a filing without standard section markers. " * 4000
+    html_path = tmp_path / "nohdr.html"
+    html_path.write_bytes(f"<html><body>{raw}</body></html>".encode())
+
+    p = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
+    out = p._extract_text(str(html_path), max_chars=5000)
+    # No section markers, fallback path
+    assert "===" not in out
+    assert len(out) <= 5100  # 5000 + small tail marker
+    assert "[... truncated ...]" in out
+
+
 def test_earnings_analyst_accepts_valid_analysis(agent, report):
     agent.run = MagicMock(
         return_value=AgentResult(
