@@ -86,8 +86,47 @@ class EarningsDataProvider:
                 "form_type": report.form_type,
                 "local_path": report.filing_path,
                 "analysis_path": report.analysis_path,
+                "failed_attempts": 0,
             }
         self.save_manifest()
+
+    def record_failure(self, report: "EarningsReport", max_attempts: int = 3) -> bool:
+        """Track a failed LLM analysis attempt. Abandon after `max_attempts`.
+
+        Without bounded retries, a filing whose analysis consistently fails
+        (parse error, rate limit, model overloaded) would be re-queued every
+        session forever — wasting tokens indefinitely. After max_attempts we
+        mark the filing abandoned so _check_symbol skips it and falls back to
+        any prior analysis.
+
+        Returns True when the filing has just been abandoned (caller should
+        stop queueing it).
+        """
+        abandoned = False
+        with self._manifest_lock:
+            key = f"{report.symbol}_{report.form_type}"
+            entry = dict(self.manifest.get(key, {}))
+            attempts = int(entry.get("failed_attempts", 0)) + 1
+            entry["filing_date"] = report.filing_date
+            entry["form_type"] = report.form_type
+            entry["local_path"] = report.filing_path
+            entry["failed_attempts"] = attempts
+            if attempts >= max_attempts:
+                entry["abandoned"] = True
+                entry["abandoned_at"] = datetime.utcnow().isoformat()
+                abandoned = True
+                logger.error(
+                    "Abandoning earnings analysis for %s %s (%s) after %d attempts",
+                    report.symbol, report.form_type, report.filing_date, attempts,
+                )
+            else:
+                logger.warning(
+                    "Earnings analysis for %s %s failed (attempt %d/%d); will retry next session",
+                    report.symbol, report.form_type, attempts, max_attempts,
+                )
+            self.manifest[key] = entry
+        self.save_manifest()
+        return abandoned
 
     def _sec_get(self, url: str) -> bytes:
         """GET with SEC-required headers and rate limiting."""
@@ -231,7 +270,17 @@ class EarningsDataProvider:
         # Take the most recent filing
         latest = filings[0]
         manifest_key = f"{symbol}_{latest.form_type}"
-        last_known = self.manifest.get(manifest_key, {}).get("filing_date")
+        entry = self.manifest.get(manifest_key, {})
+        last_known = entry.get("filing_date")
+
+        # Honor the abandoned flag: after N failed analysis attempts we stop
+        # re-queueing this specific filing. Fall back to prior analysis if any.
+        if entry.get("abandoned") and last_known == latest.filing_date:
+            logger.info(
+                "Skipping %s %s (%s) — previously abandoned after repeated LLM failures",
+                symbol, latest.form_type, latest.filing_date,
+            )
+            return self._get_existing_analysis(symbol, form_type=latest.form_type)
 
         if last_known == latest.filing_date:
             # Already processed this filing — return existing analysis matching this form_type

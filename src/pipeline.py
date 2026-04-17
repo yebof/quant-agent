@@ -857,6 +857,18 @@ class TradingPipeline:
                                 self.earnings_provider.confirm_filing(r)
                     except Exception as e:
                         logger.error("[%s] Background earnings analysis failed: %s", session, e, exc_info=True)
+                        # Track failed attempts per filing so we eventually
+                        # abandon the ones that keep failing — prevents an
+                        # unparseable 10-Q from burning tokens every session
+                        # forever.
+                        for r in bg_reports:
+                            try:
+                                self.earnings_provider.record_failure(r)
+                            except Exception as re:
+                                logger.error(
+                                    "[%s] record_failure failed for %s: %s",
+                                    session, r.symbol, re,
+                                )
 
                 bg = threading.Thread(
                     target=_bg_analyze,

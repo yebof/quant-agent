@@ -386,6 +386,43 @@ def test_pm_renders_calibration_section():
         assert "avg return +3.20%" in msg
 
 
+def test_earnings_record_failure_abandons_after_max_attempts(tmp_path):
+    """Third failure flips `abandoned=True` and returns True from record_failure."""
+    from src.data.earnings import EarningsDataProvider, EarningsReport
+
+    provider = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
+    report = EarningsReport(
+        symbol="NVDA", form_type="10-Q", filing_date="2026-04-15",
+        filing_path="", analysis_path=None, text_excerpt="",
+        is_new=True,
+    )
+
+    # Attempt 1 + 2: not abandoned yet
+    assert provider.record_failure(report, max_attempts=3) is False
+    assert provider.record_failure(report, max_attempts=3) is False
+    entry_before = provider.manifest["NVDA_10-Q"]
+    assert entry_before["failed_attempts"] == 2
+    assert entry_before.get("abandoned") is not True
+
+    # Attempt 3 triggers abandonment
+    assert provider.record_failure(report, max_attempts=3) is True
+    entry_after = provider.manifest["NVDA_10-Q"]
+    assert entry_after["failed_attempts"] == 3
+    assert entry_after["abandoned"] is True
+
+    # confirm_filing resets the counter (so a successful retry wipes the state)
+    report2 = EarningsReport(
+        symbol="NVDA", form_type="10-Q", filing_date="2026-04-15",
+        filing_path="/path/to/10q.html",
+        analysis_path="/path/to/analysis.md",
+        text_excerpt="...", is_new=True,
+    )
+    provider.confirm_filing(report2)
+    assert provider.manifest["NVDA_10-Q"]["failed_attempts"] == 0
+    assert "abandoned" not in provider.manifest["NVDA_10-Q"] or \
+           provider.manifest["NVDA_10-Q"].get("abandoned") is not True
+
+
 def test_clamp_queued_earnings_noop_when_nothing_queued():
     from src.models import TradeDecision
     from src.pipeline import TradingPipeline
