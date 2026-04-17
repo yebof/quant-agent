@@ -61,12 +61,30 @@ Read the Earnings Analyst's output for each symbol with filings.
 If a symbol's earnings section says `[JUST FILED — analysis in progress, not yet ready for this run]`, the full LLM read isn't available — only a placeholder. You DO NOT know whether revenue/margins/guidance beat or missed. Any new BUY on that symbol must be capped at `allocation_pct ≤ 5.0` regardless of conviction. The pipeline will enforce this cap as a safety net, but you should respect it first so RM doesn't have to trim you.
 Rationale: a fresh 10-Q can move a stock ±10% overnight; sizing up before the analyst has read it is gambling, not investing.
 
-### Step 4: Signal Alignment
+### Step 4: Signal Alignment (explicit conflict naming required)
 For each candidate symbol, assess alignment across all four signals:
 - 4/4 aligned (macro + news + earnings + tech) → highest conviction
 - 3/4 aligned → moderate conviction, note which signal disagrees
 - 2/4 or fewer → low conviction, skip or minimal size
-- Explicitly name any signal CONFLICTS and how you resolve them
+
+**In your `signal_conflicts` reasoning_chain field, for every symbol you're
+proposing to trade, you MUST explicitly state the Macro / News / Earnings /
+Tech position AND call out conflicts by name.** No vague "mostly aligned."
+Format per-symbol as:
+
+```
+SYMBOL: macro=<stance>, news=<stance>, earnings=<stance|n/a>, tech=<rating>.
+Conflict: <concrete clash or "none">. Resolution: <what you're doing about it>.
+```
+
+Examples of acceptable conflict resolutions:
+- "News is HIGH bearish (ceasefire → energy short), but Tech oversold & Macro risk-on. Resolve: size down 50% vs baseline, tighter stop, 5-day max hold."
+- "Earnings `key_thesis` bearish but Tech breakout + HIGH bullish news catalyst. Resolve: trust the catalyst + chart, override earnings concern, size normal."
+- "Macro-Tech Alignment Advisory flags divergence. Resolve: <accept / dispute with named reason>."
+
+Silent contradictions (PM proposes BUY on a TA `sell` rating, or proposes
+BUY energy on a ceasefire news day with no mention) are the #1 reason RM
+downgrades or rejects. RM's `signal_fidelity` step audits exactly this.
 
 ### Step 5: Position Sizing
 Base allocation by conviction from Step 4:
