@@ -1511,6 +1511,169 @@ class TradingPipeline:
     # and calling the method directly.
     # ---------------------------------------------------------------
 
+    def _midday_emergency_liquidate(
+        self, positions, loss_violation, run_id: str,
+    ) -> list[dict]:
+        """Force-close every position when daily loss breaches the cap.
+
+        Isolated from run_midday so the midday execution flow stays
+        readable. Uses a 1% slippage cushion on the limit (vs the 0.5%
+        used for ordinary sells) because the tape is usually ugly when
+        this fires.
+        """
+        logger.warning(
+            "MIDDAY RISK ALERT: %s — force-closing all positions",
+            loss_violation.message,
+        )
+        orders: list[dict] = []
+        for p in positions:
+            try:
+                qty = self._full_sell_qty(p.qty)
+                if qty is None:
+                    continue
+                emergency_limit = round(p.current_price * 0.99, 2)
+                order = self.broker.submit_order(
+                    symbol=p.symbol, qty=qty, side="sell",
+                    limit_price=emergency_limit,
+                    reference_price=p.current_price,
+                )
+                if not self._order_accepted(order, p.symbol, "sell"):
+                    continue
+                orders.append(order)
+                self.db.insert_trade(
+                    symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,
+                    price=emergency_limit,
+                    reasoning=f"Daily loss limit breached: {loss_violation.message}",
+                    run_id=run_id,
+                    broker_order_id=order.get("id"),
+                    fill_status="submitted",
+                )
+                logger.info(
+                    "Emergency sell: %s %s @ limit $%.2f",
+                    self._format_qty(qty), p.symbol, emergency_limit,
+                )
+            except Exception as e:
+                logger.error("Emergency sell failed for %s: %s", p.symbol, e)
+        return orders
+
+    def _midday_execute_llm_actions(
+        self, positions, review, run_id: str,
+    ) -> list[dict]:
+        """Dispatch LLM-recommended SELL / REDUCE / TRAIL_STOP actions to broker.
+
+        Dedups same-symbol conflicting actions by priority (SELL > REDUCE >
+        TRAIL_STOP > HOLD) to avoid the broker seeing two orders fighting
+        each other on one position.
+        """
+        orders: list[dict] = []
+        _priority = {"SELL": 0, "REDUCE": 1, "TRAIL_STOP": 2, "HOLD": 3}
+        best_by_symbol: dict[str, dict] = {}
+        actions_raw = review.actions if review else []
+        actions_list = [a.model_dump() for a in actions_raw]
+        for ai in actions_list:
+            sym = (ai.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            curr = best_by_symbol.get(sym)
+            if curr is None or _priority.get(ai.get("action"), 99) < _priority.get(curr.get("action"), 99):
+                best_by_symbol[sym] = ai
+        if len(best_by_symbol) < len(actions_list):
+            dropped = len(actions_list) - len(best_by_symbol)
+            logger.info(
+                "Midday: collapsed %d duplicate same-symbol actions "
+                "(priority SELL>REDUCE>TRAIL_STOP>HOLD)", dropped,
+            )
+
+        if not best_by_symbol:
+            return orders
+
+        for action_item in best_by_symbol.values():
+            act = action_item.get("action")
+            if act not in ("SELL", "REDUCE", "TRAIL_STOP"):
+                continue
+            symbol = action_item.get("symbol", "")
+            existing = [p for p in positions if p.symbol == symbol]
+            if not existing or existing[0].qty <= 0:
+                logger.warning("Midday: skipping %s %s — no matching position",
+                               act, symbol)
+                continue
+            try:
+                if act == "TRAIL_STOP":
+                    try:
+                        new_stop = float(action_item.get("new_stop_price") or 0)
+                    except (TypeError, ValueError):
+                        new_stop = 0.0
+                    if new_stop <= 0:
+                        logger.warning(
+                            "Midday: TRAIL_STOP %s skipped — missing/invalid new_stop_price",
+                            symbol,
+                        )
+                        continue
+                    if new_stop >= existing[0].current_price:
+                        logger.warning(
+                            "Midday: TRAIL_STOP %s skipped — new_stop $%.2f >= current $%.2f",
+                            symbol, new_stop, existing[0].current_price,
+                        )
+                        continue
+                    # Sanity: stop < 50% of current price is almost certainly
+                    # an LLM typo. Leaving the old stop is safer than
+                    # replacing it with a non-protective one.
+                    if new_stop < existing[0].current_price * 0.5:
+                        logger.warning(
+                            "Midday: TRAIL_STOP %s skipped — new_stop $%.2f is <50%% of current $%.2f (likely LLM error)",
+                            symbol, new_stop, existing[0].current_price,
+                        )
+                        continue
+                    order = self.broker.replace_stop_loss(symbol, new_stop)
+                    if order:
+                        orders.append(order)
+                        self.db.insert_trade(
+                            symbol=symbol, action="TRAIL_STOP",
+                            qty=existing[0].qty, price=new_stop,
+                            reasoning=action_item.get("reason", "midday trailing stop"),
+                            run_id=run_id,
+                            stop_loss=new_stop,
+                            broker_order_id=order.get("id"),
+                            fill_status="submitted",
+                        )
+                        logger.info(
+                            "Midday action: TRAIL_STOP %s → $%.2f — %s",
+                            symbol, new_stop, action_item.get("reason"),
+                        )
+                    continue
+
+                if act == "REDUCE":
+                    qty = self._reduce_sell_qty(existing[0].qty)
+                else:
+                    qty = self._full_sell_qty(existing[0].qty)
+                if qty is None:
+                    continue
+                sell_limit = round(existing[0].current_price * 0.995, 2)
+                order = self.broker.submit_order(
+                    symbol=symbol, qty=qty, side="sell",
+                    limit_price=sell_limit,
+                    reference_price=existing[0].current_price,
+                )
+                if not self._order_accepted(order, symbol, "sell"):
+                    continue
+                orders.append(order)
+                self.db.insert_trade(
+                    symbol=symbol, action=act, qty=qty,
+                    price=existing[0].current_price,
+                    reasoning=action_item.get("reason", "midday review"),
+                    run_id=run_id,
+                    broker_order_id=order.get("id"),
+                    fill_status="submitted",
+                )
+                logger.info(
+                    "Midday action: %s %s %s — %s",
+                    act, self._format_qty(qty),
+                    symbol, action_item.get("reason"),
+                )
+            except Exception as e:
+                logger.error("Midday order failed for %s: %s", symbol, e)
+        return orders
+
     def _execution_stage(self, ctx: RunContext) -> list[dict]:
         """Execute HOLD logging → SELLs → wait fills → refresh → BUYs.
 
@@ -2218,154 +2381,18 @@ class TradingPipeline:
                 tokens_used=md_result.tokens_used,
             )
 
-            # 3. Risk check: if daily loss limit breached, force-sell all positions.
-            # Use (equity - last_equity) so realized losses from morning fills
-            # and broker-triggered stops are counted — not just mark-to-market.
+            # Risk check: if daily loss limit breached, force-sell all
+            # positions. Else: dispatch the LLM's per-position action list.
             daily_pnl = total_value - last_equity
             loss_violation = self.risk_engine.check_daily_loss(last_equity, daily_pnl)
             if loss_violation:
-                logger.warning("MIDDAY RISK ALERT: %s — force-closing all positions", loss_violation.message)
-                for p in positions:
-                    try:
-                        qty = self._full_sell_qty(p.qty)
-                        if qty is None:
-                            continue
-                        # Use a wider 1% limit buffer for emergency exits — prevents
-                        # catastrophic slippage in a fast selloff while still crossing
-                        # bid/ask in most cases.
-                        emergency_limit = round(p.current_price * 0.99, 2)
-                        order = self.broker.submit_order(
-                            symbol=p.symbol, qty=qty, side="sell",
-                            limit_price=emergency_limit,
-                            reference_price=p.current_price,
-                        )
-                        if not self._order_accepted(order, p.symbol, "sell"):
-                            continue
-                        orders.append(order)
-                        self.db.insert_trade(
-                            symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,
-                            price=emergency_limit,
-                            reasoning=f"Daily loss limit breached: {loss_violation.message}",
-                            run_id=run_id,
-                            broker_order_id=order.get("id"),
-                            fill_status="submitted",
-                        )
-                        logger.info(
-                            "Emergency sell: %s %s @ limit $%.2f",
-                            self._format_qty(qty), p.symbol, emergency_limit,
-                        )
-                    except Exception as e:
-                        logger.error("Emergency sell failed for %s: %s", p.symbol, e)
+                orders.extend(self._midday_emergency_liquidate(
+                    positions, loss_violation, run_id,
+                ))
             else:
-                # 4. Execute LLM-recommended actions (SELL / REDUCE / TRAIL_STOP).
-                # HOLD is intentionally a no-op (position stays, broker stop unchanged).
-                # Dedup by symbol first — if the LLM emits both TRAIL_STOP and REDUCE
-                # for the same name, the two broker orders fight each other (stop qty
-                # mismatches post-REDUCE position). Keep the highest-priority action.
-                _priority = {"SELL": 0, "REDUCE": 1, "TRAIL_STOP": 2, "HOLD": 3}
-                best_by_symbol: dict[str, dict] = {}
-                # Phase 4 #7: review is now MiddayReview (Pydantic); actions
-                # are MiddayAction objects. Convert each to dict here so the
-                # downstream loop (which is dict-oriented) stays unchanged.
-                actions_raw = review.actions if review else []
-                actions_list = [a.model_dump() for a in actions_raw]
-                for ai in actions_list:
-                    sym = (ai.get("symbol") or "").strip().upper()
-                    if not sym:
-                        continue
-                    curr = best_by_symbol.get(sym)
-                    if curr is None or _priority.get(ai.get("action"), 99) < _priority.get(curr.get("action"), 99):
-                        best_by_symbol[sym] = ai
-                if len(best_by_symbol) < len(actions_list):
-                    dropped = len(actions_list) - len(best_by_symbol)
-                    logger.info("Midday: collapsed %d duplicate same-symbol actions (priority SELL>REDUCE>TRAIL_STOP>HOLD)", dropped)
-
-                if best_by_symbol:
-                    for action_item in best_by_symbol.values():
-                        act = action_item.get("action")
-                        if act not in ("SELL", "REDUCE", "TRAIL_STOP"):
-                            continue
-                        symbol = action_item.get("symbol", "")
-                        existing = [p for p in positions if p.symbol == symbol]
-                        if not existing or existing[0].qty <= 0:
-                            logger.warning("Midday: skipping %s %s — no matching position",
-                                           act, symbol)
-                            continue
-                        try:
-                            if act == "TRAIL_STOP":
-                                # Actual broker stop replacement — cancel old, submit new.
-                                try:
-                                    new_stop = float(action_item.get("new_stop_price") or 0)
-                                except (TypeError, ValueError):
-                                    new_stop = 0.0
-                                if new_stop <= 0:
-                                    logger.warning(
-                                        "Midday: TRAIL_STOP %s skipped — missing/invalid new_stop_price",
-                                        symbol,
-                                    )
-                                    continue
-                                if new_stop >= existing[0].current_price:
-                                    logger.warning(
-                                        "Midday: TRAIL_STOP %s skipped — new_stop $%.2f >= current $%.2f",
-                                        symbol, new_stop, existing[0].current_price,
-                                    )
-                                    continue
-                                # Sanity bound: a stop more than 50% below current price is
-                                # almost certainly an LLM typo (e.g., '20' on a $200 stock).
-                                # A non-protective stop is worse than leaving the old one.
-                                if new_stop < existing[0].current_price * 0.5:
-                                    logger.warning(
-                                        "Midday: TRAIL_STOP %s skipped — new_stop $%.2f is <50%% of current $%.2f (likely LLM error)",
-                                        symbol, new_stop, existing[0].current_price,
-                                    )
-                                    continue
-                                order = self.broker.replace_stop_loss(symbol, new_stop)
-                                if order:
-                                    orders.append(order)
-                                    self.db.insert_trade(
-                                        symbol=symbol, action="TRAIL_STOP",
-                                        qty=existing[0].qty, price=new_stop,
-                                        reasoning=action_item.get("reason", "midday trailing stop"),
-                                        run_id=run_id,
-                                        stop_loss=new_stop,
-                                        broker_order_id=order.get("id"),
-                                        fill_status="submitted",
-                                    )
-                                    logger.info(
-                                        "Midday action: TRAIL_STOP %s → $%.2f — %s",
-                                        symbol, new_stop, action_item.get("reason"),
-                                    )
-                                continue
-
-                            if act == "REDUCE":
-                                qty = self._reduce_sell_qty(existing[0].qty)
-                            else:
-                                qty = self._full_sell_qty(existing[0].qty)
-                            if qty is None:
-                                continue
-                            sell_limit = round(existing[0].current_price * 0.995, 2)
-                            order = self.broker.submit_order(
-                                symbol=symbol, qty=qty, side="sell",
-                                limit_price=sell_limit,
-                                reference_price=existing[0].current_price)
-                            if not self._order_accepted(order, symbol, "sell"):
-                                continue
-                            orders.append(order)
-                            self.db.insert_trade(
-                                symbol=symbol, action=act, qty=qty,
-                                price=existing[0].current_price,
-                                reasoning=action_item.get("reason", "midday review"),
-                                run_id=run_id,
-                                broker_order_id=order.get("id"),
-                                fill_status="submitted",
-                            )
-                            logger.info(
-                                "Midday action: %s %s %s — %s",
-                                act, self._format_qty(qty),
-                                symbol, action_item.get("reason"),
-                            )
-                        except Exception as e:
-                            logger.error("Midday order failed for %s: %s", symbol, e)
+                orders.extend(self._midday_execute_llm_actions(
+                    positions, review, run_id,
+                ))
 
         logger.info("Midday: %d positions, risk=%s, %d orders",
                      len(positions),
