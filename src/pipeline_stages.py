@@ -34,6 +34,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
+from src.data.technical import compute_indicators
 from src.models import NewsIntelligenceReport, TechAnalysisResult, TechnicalIndicators
 from src.pipeline_context import RunContext
 
@@ -106,8 +107,6 @@ class MorningResearchStage:
         self._has_actionable_signal = has_actionable_signal_fn
         self._run_news_update = run_news_update_fn
         self._run_earnings_check = run_earnings_check_fn
-        from src.data.technical import compute_indicators
-        self._compute_indicators = compute_indicators
 
     def run(self, ctx: RunContext) -> RunContext:
         logger.info("=== Stage: MorningResearch ===")
@@ -148,7 +147,7 @@ class MorningResearchStage:
                 if not bars:
                     logger.warning("No data for %s, skipping", symbol)
                     continue
-                indicators = self._compute_indicators(symbol, bars)
+                indicators = compute_indicators(symbol, bars)
                 all_symbols_data.append({"symbol": symbol, "bars": bars, "indicators": indicators})
                 symbols_bars[symbol] = bars
             ctx.symbols_bars = symbols_bars
