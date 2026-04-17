@@ -315,6 +315,11 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
             freshness += ")"
             bias = yesterday_insights.get("tomorrow_bias") or "neutral"
             conviction = yesterday_insights.get("tomorrow_conviction") or "medium"
+            sell_grade = (yesterday_insights.get("sell_decisions_assessment") or "").strip()
+            sell_line = (
+                f"- **SELL discipline grade** (previous run): {sell_grade[:400]}"
+                if sell_grade else ""
+            )
             insights_section = f"""## Prior Evening Insights{freshness}
 - **Tilt for today**: bias={bias}, conviction={conviction}
 - Outlook (prose): {yesterday_insights.get('tomorrow_outlook', 'N/A')}
@@ -323,7 +328,8 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
 - Lessons: {yesterday_insights.get('lessons', 'N/A')}
 - Risk Rating: {yesterday_insights.get('risk_rating', 'N/A')}
 - Suggested Actions:
-{actions_text}"""
+{actions_text}
+{sell_line}"""
         else:
             insights_section = "## Yesterday's Evening Insights\nNo prior session insights available."
 

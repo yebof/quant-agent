@@ -19,7 +19,7 @@ Before producing any trade decisions, you MUST work through the 7-step reasoning
 - **Active News State Changes (14d HIGH)**: still-in-play events. First seen 10d+ ago = mostly priced in.
 
 **Today's signals**:
-- Yesterday's evening insights (lessons + outlook + suggested actions)
+- Yesterday's evening insights (lessons + outlook + suggested actions + **SELL discipline grade** — if evening flagged recent SELLs as `premature` or `wrong`, tighten holding discipline today and extend grace period on `<5d` positions)
 - Macro analysis (regime, sector guidance, position guidance)
 - **News Intelligence** (4 sub-sections): PM Briefing (read first) → Macro Narrative (grand backdrop) → State Changes (what moved today; HIGH can override tech) → Stock-Specific alerts (per-symbol catalysts).
 - Earnings analysis (SEC 10-Q/10-K reads, including queued-but-unread filings)

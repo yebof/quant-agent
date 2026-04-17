@@ -75,6 +75,7 @@ class Database:
                 tomorrow_bias TEXT DEFAULT 'neutral',
                 tomorrow_conviction TEXT DEFAULT 'medium',
                 tomorrow_key_risks TEXT DEFAULT '[]',
+                sell_decisions_assessment TEXT DEFAULT '',
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
         """)
@@ -114,6 +115,7 @@ class Database:
         _ensure_column("insights", "tomorrow_bias", "tomorrow_bias TEXT DEFAULT 'neutral'")
         _ensure_column("insights", "tomorrow_conviction", "tomorrow_conviction TEXT DEFAULT 'medium'")
         _ensure_column("insights", "tomorrow_key_risks", "tomorrow_key_risks TEXT DEFAULT '[]'")
+        _ensure_column("insights", "sell_decisions_assessment", "sell_decisions_assessment TEXT DEFAULT ''")
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
@@ -284,7 +286,8 @@ class Database:
                       suggested_actions: str, risk_rating: str,
                       tomorrow_bias: str = "neutral",
                       tomorrow_conviction: str = "medium",
-                      tomorrow_key_risks: list | str = ()):
+                      tomorrow_key_risks: list | str = (),
+                      sell_decisions_assessment: str = ""):
         import json
         actions_json = json.dumps(suggested_actions) if isinstance(suggested_actions, list) else suggested_actions
         risks_json = (
@@ -295,10 +298,12 @@ class Database:
             self.conn.execute(
                 """INSERT OR REPLACE INTO insights
                    (date, tomorrow_outlook, lessons, suggested_actions, risk_rating,
-                    tomorrow_bias, tomorrow_conviction, tomorrow_key_risks)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    tomorrow_bias, tomorrow_conviction, tomorrow_key_risks,
+                    sell_decisions_assessment)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (date, tomorrow_outlook, lessons, actions_json, risk_rating,
-                 tomorrow_bias, tomorrow_conviction, risks_json),
+                 tomorrow_bias, tomorrow_conviction, risks_json,
+                 sell_decisions_assessment or ""),
             )
             self.conn.commit()
 
