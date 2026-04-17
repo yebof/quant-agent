@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.scheduler import TradingScheduler
@@ -26,3 +27,28 @@ def test_scheduler_runs_on_trading_day(mock_pipeline_cls):
     scheduler._run_safe(pipeline.run_morning, "morning")
 
     pipeline.run_morning.assert_called_once()
+
+
+@patch("src.scheduler.TradingPipeline")
+def test_scheduler_setup_registers_preprocess_and_intra_jobs(mock_pipeline_cls):
+    cfg = MagicMock()
+    cfg.trading.schedule = SimpleNamespace(
+        earnings_preprocess="05:00",
+        morning="06:00",
+        intra_check="10:30",
+        midday="12:00",
+        evening="16:30",
+    )
+    mock_pipeline_cls.return_value = MagicMock()
+
+    scheduler = TradingScheduler(cfg)
+    scheduler.setup()
+
+    job_ids = {job.id for job in scheduler.scheduler.get_jobs()}
+    assert job_ids == {
+        "earnings_preprocess",
+        "morning_run",
+        "intra_check",
+        "midday_check",
+        "evening_report",
+    }

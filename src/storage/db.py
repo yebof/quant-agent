@@ -32,7 +32,7 @@ class Database:
                 reasoning TEXT,
                 run_id TEXT,
                 broker_order_id TEXT,
-                fill_status TEXT,                      -- submitted | filled | canceled | rejected | expired | NULL(legacy)
+                fill_status TEXT,                      -- submitted | filled | canceled | rejected | expired | done_for_day | NULL(legacy)
                 fill_qty REAL,                         -- actual qty filled (may differ from requested)
                 fill_price REAL,                       -- actual avg fill price
                 fill_reconciled_at TEXT,               -- when we confirmed the terminal status
@@ -206,7 +206,8 @@ class Database:
         `fill_status` semantics:
           - 'submitted'  — sent to broker, terminal status pending
           - 'filled'     — broker confirmed execution (full or partial)
-          - 'canceled' / 'rejected' / 'expired' — did not execute
+          - 'canceled' / 'rejected' / 'expired' / 'done_for_day' — terminal broker
+                           status; may still carry fill_qty/fill_price for partial fills
           - None         — pre-reconciliation / system row (HOLD, TRAIL_STOP, TAKE_PROFIT).
                            Legacy rows also carry None and are treated as filled by memory readers.
         """
@@ -258,8 +259,17 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    @staticmethod
+    def _executed_trade_predicate() -> str:
+        """SQL predicate for trades that executed at least some quantity."""
+        return (
+            "(fill_status IS NULL OR fill_status = 'filled' "
+            "OR COALESCE(fill_qty, 0) > 0)"
+        )
+
     def get_trades(self, symbol: str | None = None, limit: int = 100,
-                    today_only: bool = False) -> list[dict]:
+                    today_only: bool = False,
+                    executed_only: bool = False) -> list[dict]:
         conditions = []
         params: list = []
         if symbol:
@@ -267,6 +277,8 @@ class Database:
             params.append(symbol)
         if today_only:
             conditions.append("date(timestamp) = date('now')")
+        if executed_only:
+            conditions.append(self._executed_trade_predicate())
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._lock:
             # Secondary order-by on id ensures tie-break ordering is
@@ -435,18 +447,17 @@ class Database:
             self.conn.commit()
 
     def get_symbol_last_buy(self, symbol: str) -> dict | None:
-        """Most recent FILLED BUY row for a symbol.
+        """Most recent executed BUY row for a symbol.
 
-        Phase 3: filter on fill_status so a BUY that was submitted but never
-        filled doesn't show up in PM's position_history memory as if we
-        opened a position. Legacy NULL rows pre-date reconciliation and are
-        treated as filled for backward compatibility.
+        Submitted-but-never-filled BUYs must not show up in PM memory, but a
+        partial fill that later ended canceled or expired still created real
+        exposure and should be surfaced.
         """
         with self._lock:
             row = self.conn.execute(
                 "SELECT * FROM trades WHERE symbol = ? AND action = 'BUY' "
-                "AND (fill_status IS NULL OR fill_status = 'filled') "
-                "ORDER BY timestamp DESC LIMIT 1",
+                f"AND {self._executed_trade_predicate()} "
+                "ORDER BY timestamp DESC, id DESC LIMIT 1",
                 (symbol,),
             ).fetchone()
         return dict(row) if row else None
@@ -483,13 +494,13 @@ class Database:
             or {} when there are too few closed trades to be meaningful.
         """
         with self._lock:
-            # Phase 3: skip non-filled orders (submitted-but-canceled, rejected,
-            # expired). Legacy rows with NULL fill_status pre-date reconciliation
-            # and are treated as filled for backward compatibility.
+            # Skip orders that never executed. Legacy rows with NULL fill_status
+            # pre-date reconciliation and are treated as filled for backward
+            # compatibility.
             rows = self.conn.execute(
                 "SELECT symbol, action, qty, price, timestamp, fill_qty, fill_price "
                 "FROM trades WHERE timestamp > datetime('now', ?) "
-                "AND (fill_status IS NULL OR fill_status = 'filled') "
+                f"AND {self._executed_trade_predicate()} "
                 "ORDER BY timestamp",
                 (f"-{lookback_days} days",),
             ).fetchall()

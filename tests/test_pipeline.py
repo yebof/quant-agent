@@ -399,6 +399,30 @@ def test_pipeline_morning_skips_non_trading_day():
     pipeline.broker.cancel_open_entry_orders.assert_not_called()
 
 
+def test_pipeline_morning_early_return_still_cleans_up_background_work():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.cancel_open_entry_orders.return_value = None
+    pipeline.broker.get_account.return_value = {"cash": 1000.0, "portfolio_value": 5000.0}
+    pipeline.broker.get_positions.return_value = []
+    pipeline.morning_research_stage = MagicMock()
+    pipeline._wait_bg_threads = MagicMock()
+    pipeline._reconcile_fills = MagicMock()
+
+    def _populate_empty_research(ctx):
+        ctx.analyses = []
+        ctx.bg_threads.append(MagicMock())
+
+    pipeline.morning_research_stage.run.side_effect = _populate_empty_research
+
+    result = pipeline.run_morning()
+
+    assert result["status"] == "no_data"
+    pipeline._wait_bg_threads.assert_called_once()
+    pipeline._reconcile_fills.assert_called_once()
+
+
 def test_pipeline_midday_skips_non_trading_day():
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.broker = MagicMock()
