@@ -114,6 +114,49 @@ def test_cancel_open_entry_orders_preserves_sell_protection(mock_tc_cls):
 
 
 @patch("src.execution.broker.TradingClient")
+def test_submit_order_quantizes_sub_penny_limit_price(mock_tc_cls):
+    """Quote midpoint can yield $106.515; Alpaca requires $0.01 ticks for ≥$1.
+    submit_order must round BEFORE building the request. Observed 2026-04-17:
+    UPS BUY @ $106.515 rejected (code 42210000)."""
+    from alpaca.trading.requests import LimitOrderRequest
+
+    mock_client = MagicMock()
+    mock_order = MagicMock()
+    mock_order.id = "ord-q"
+    mock_order.status = "accepted"
+    mock_order.symbol = "UPS"
+    mock_client.submit_order.return_value = mock_order
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    broker.submit_order(
+        symbol="UPS", qty=5, side="buy",
+        limit_price=106.515,
+        stop_loss_price=98.127,  # stop too — same tick rule applies
+    )
+    req = mock_client.submit_order.call_args[0][0]
+    assert isinstance(req, LimitOrderRequest)
+    assert float(req.limit_price) == 106.52  # quantized to nearest cent
+    # The OTO stop_loss leg carries the stop_price on its own sub-object.
+    assert float(req.stop_loss.stop_price) == 98.13
+
+
+@patch("src.execution.broker.TradingClient")
+def test_submit_order_keeps_four_decimals_for_sub_dollar_stocks(mock_tc_cls):
+    """Penny stocks under $1 use $0.0001 ticks — quantize must not over-round."""
+    from alpaca.trading.requests import LimitOrderRequest
+
+    mock_client = MagicMock()
+    mock_client.submit_order.return_value = MagicMock(id="x", status="accepted", symbol="PENNY")
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    broker.submit_order(symbol="PENNY", qty=100, side="buy", limit_price=0.123456)
+    req = mock_client.submit_order.call_args[0][0]
+    assert float(req.limit_price) == 0.1235
+
+
+@patch("src.execution.broker.TradingClient")
 def test_broker_injects_http_timeout_on_session(mock_tc_cls):
     """Every Alpaca SDK call must carry a default HTTP timeout so a hung TCP
     connection can't freeze the whole process (observed 13h hang on 2026-04-17)."""

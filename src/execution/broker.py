@@ -25,6 +25,18 @@ _INDEX_ETFS = {"SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "IVV"}
 _BROKER_HTTP_TIMEOUT = 30.0
 
 
+def _quantize_price(price: float | None) -> float | None:
+    """Round to Alpaca's minimum tick size: $0.01 for stocks ≥ $1, $0.0001 below.
+
+    The quote-midpoint in `get_latest_price` can produce sub-penny values like
+    $106.515; submitting that raw triggers Alpaca error 42210000 and the order
+    is rejected. Observed 2026-04-17 morning: UPS BUY @ $106.515 rejected.
+    """
+    if price is None or price <= 0:
+        return price
+    return round(price, 2 if price >= 1.0 else 4)
+
+
 def _install_http_timeout(client, timeout: float = _BROKER_HTTP_TIMEOUT) -> None:
     """Inject a default timeout on an Alpaca SDK client's underlying requests.Session.
 
@@ -268,6 +280,12 @@ class AlpacaBroker:
                      take_profit_price: float | None = None) -> dict:
         order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
+        # Normalize to Alpaca's tick size — sub-penny values from quote-midpoint
+        # math or LLM outputs get Alpaca error 42210000 and a rejected order.
+        limit_price = _quantize_price(limit_price)
+        stop_loss_price = _quantize_price(stop_loss_price)
+        take_profit_price = _quantize_price(take_profit_price)
+
         # Attach stop-loss as OTO (one-triggers-other) leg — no hard take-profit,
         # profit management is handled by midday reviewer's trailing stop logic
         use_stop = (stop_loss_price is not None and stop_loss_price > 0
@@ -357,7 +375,7 @@ class AlpacaBroker:
                 qty=qty,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.GTC,
-                stop_price=round(new_stop_price, 2),
+                stop_price=_quantize_price(new_stop_price),
             )
             order = self.client.submit_order(req)
             logger.info(
