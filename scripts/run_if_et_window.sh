@@ -71,4 +71,16 @@ fi
 echo "$NOW_UNIX" > "$LAST_FILE"
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Firing ${MODE} (ET ${ET_DATE} ${ET_HOUR}:${ET_MIN}, weekday ${ET_DOW})"
 cd "$PROJECT_ROOT"
+
+# Load API keys from .env — single source of truth for secrets.
+# Keeps the plist files free of keys (they're world-readable in
+# ~/Library/LaunchAgents; .env is chmod 600). Key rotation then means
+# editing one file, not five.
+if [[ -f "${PROJECT_ROOT}/.env" ]]; then
+    # shellcheck disable=SC1091
+    set -a
+    source "${PROJECT_ROOT}/.env"
+    set +a
+fi
+
 exec "$TIMEOUT" --kill-after=30 600 "$PYTHON" main.py --mode "$MODE"
