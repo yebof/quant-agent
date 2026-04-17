@@ -282,6 +282,105 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def compute_trade_calibration(self, lookback_days: int = 45) -> dict:
+        """Win rate + avg realized return on BUYs that closed in the window.
+
+        Matches each BUY to the next SELL-family action (SELL, PARTIAL_SELL%,
+        EMERGENCY_SELL) for the same symbol, FIFO. Open positions are excluded
+        because their outcome isn't known yet.
+
+        Bucketed by allocation size (proxy for conviction): a larger dollar
+        commitment implies higher conviction when PM sized it. Lets PM see
+        "my high-conviction bets have been winning / losing" without an
+        explicit conviction column in trades.
+
+        Returns:
+            {"n_closed": int, "win_rate_pct": float, "avg_return_pct": float,
+             "avg_hold_days": float,
+             "by_size": {
+                "large": {...},  # $ entry >= 10k
+                "medium": {...}, # 5-10k
+                "small": {...},  # <5k
+             }}
+            or {} when there are too few closed trades to be meaningful.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT symbol, action, qty, price, timestamp FROM trades "
+                "WHERE timestamp > datetime('now', ?) ORDER BY timestamp",
+                (f"-{lookback_days} days",),
+            ).fetchall()
+        # FIFO queue of open BUY lots per symbol
+        from collections import defaultdict
+        open_lots: dict[str, list[dict]] = defaultdict(list)
+        closed: list[dict] = []
+        for row in rows:
+            sym = row["symbol"]
+            act = row["action"] or ""
+            qty = float(row["qty"] or 0)
+            price = float(row["price"] or 0)
+            ts = row["timestamp"]
+            if qty <= 0 or price <= 0:
+                continue
+            if act == "BUY":
+                open_lots[sym].append({"qty": qty, "price": price, "ts": ts})
+            elif act.startswith("SELL") or act.startswith("PARTIAL_SELL") or act == "EMERGENCY_SELL":
+                # Close from oldest lot first
+                remaining = qty
+                lots = open_lots[sym]
+                while remaining > 0 and lots:
+                    lot = lots[0]
+                    closed_qty = min(lot["qty"], remaining)
+                    try:
+                        buy_dt = datetime.fromisoformat(lot["ts"].replace(" ", "T"))
+                        sell_dt = datetime.fromisoformat(ts.replace(" ", "T"))
+                        hold_days = max(0, (sell_dt - buy_dt).days)
+                    except (ValueError, TypeError):
+                        hold_days = 0
+                    ret_pct = (price / lot["price"] - 1) * 100 if lot["price"] > 0 else 0
+                    entry_usd = closed_qty * lot["price"]
+                    closed.append({
+                        "symbol": sym,
+                        "return_pct": ret_pct,
+                        "hold_days": hold_days,
+                        "entry_usd": entry_usd,
+                    })
+                    lot["qty"] -= closed_qty
+                    if lot["qty"] <= 1e-9:
+                        lots.pop(0)
+                    remaining -= closed_qty
+        if len(closed) < 3:
+            return {}
+
+        def _bucket_stats(bucket: list[dict]) -> dict:
+            if not bucket:
+                return {"n": 0}
+            n = len(bucket)
+            wins = sum(1 for c in bucket if c["return_pct"] > 0)
+            avg_ret = sum(c["return_pct"] for c in bucket) / n
+            avg_hold = sum(c["hold_days"] for c in bucket) / n
+            return {
+                "n": n,
+                "win_rate_pct": round(wins / n * 100, 1),
+                "avg_return_pct": round(avg_ret, 2),
+                "avg_hold_days": round(avg_hold, 1),
+            }
+
+        large = [c for c in closed if c["entry_usd"] >= 10_000]
+        medium = [c for c in closed if 5_000 <= c["entry_usd"] < 10_000]
+        small = [c for c in closed if c["entry_usd"] < 5_000]
+
+        overall = _bucket_stats(closed)
+        return {
+            **overall,
+            "by_size": {
+                "large (≥$10k)": _bucket_stats(large),
+                "medium ($5-10k)": _bucket_stats(medium),
+                "small (<$5k)": _bucket_stats(small),
+            },
+            "lookback_days": lookback_days,
+        }
+
     def get_recent_agent_outputs(self, agent_name: str, limit: int = 5,
                                  before_date: str | None = None) -> list[dict]:
         """Last N agent_logs rows for agent_name, newest first.

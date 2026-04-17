@@ -646,6 +646,35 @@ class TradingPipeline:
                 )
         return "\n".join(lines)
 
+    def _build_calibration_note(self, lookback_days: int = 45) -> str:
+        """Render PM's own hit rate + avg return on closed BUYs in the window.
+
+        L4 calibration memory — the answer to 'has my conviction actually paid
+        off recently?'. Without this PM keeps sizing confidence on today's
+        alignment score alone, even if that score has been losing lately.
+        """
+        try:
+            stats = self.db.compute_trade_calibration(lookback_days=lookback_days)
+        except Exception as e:
+            logger.warning("calibration_note: stats failed: %s", e)
+            return ""
+        if not stats or stats.get("n", 0) < 3:
+            return ""
+        lines = [
+            f"- Overall (last {stats.get('lookback_days', lookback_days)}d): "
+            f"{stats['n']} closed BUYs, win rate {stats['win_rate_pct']:.0f}%, "
+            f"avg return {stats['avg_return_pct']:+.2f}%, avg hold {stats['avg_hold_days']:.1f}d"
+        ]
+        by_size = stats.get("by_size") or {}
+        for label, s in by_size.items():
+            if not s or s.get("n", 0) == 0:
+                continue
+            lines.append(
+                f"  - {label}: {s['n']} trades, win {s['win_rate_pct']:.0f}%, "
+                f"avg {s['avg_return_pct']:+.2f}%, hold {s['avg_hold_days']:.1f}d"
+            )
+        return "\n".join(lines)
+
     def _compute_recent_performance(self, current_equity: float) -> dict:
         """Rolling 5-day and 20-day returns from db.daily_pnl, + drawdown flag.
 
@@ -1082,6 +1111,10 @@ class TradingPipeline:
         projected_portfolio = self._build_projected_portfolio(
             positions, analyses, total_value,
         )
+        # L4 calibration — actual realized win rate + avg return on recent
+        # closed trades. Grounds conviction sizing in outcomes, not just
+        # today's alignment score.
+        calibration_note = self._build_calibration_note()
 
         portfolio_decision, pm_result = self.portfolio_manager.decide(
             analyses=analyses,
@@ -1100,6 +1133,7 @@ class TradingPipeline:
             rm_recent_verdicts=rm_recent_verdicts,
             pm_recent_decisions=pm_recent_decisions,
             projected_portfolio=projected_portfolio,
+            calibration_note=calibration_note,
         )
 
         if portfolio_decision and portfolio_decision.reasoning_chain:

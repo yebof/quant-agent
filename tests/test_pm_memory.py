@@ -294,6 +294,98 @@ def test_clamp_queued_earnings_buys_caps_allocation():
     assert aapl.allocation_pct == 100   # SELL untouched
 
 
+def test_trade_calibration_matches_fifo_and_buckets(tmp_path):
+    """BUYs → SELLs are FIFO matched; win rate + avg return + buckets reported."""
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    # Large winner: buy 100 @ 100 (entry = $10k), sell 100 @ 115 → +15%
+    db.insert_trade("NVDA", "BUY", 100, 100, "large", "r1")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-15 days') "
+        "WHERE symbol='NVDA' AND action='BUY'"
+    )
+    db.conn.commit()
+    db.insert_trade("NVDA", "SELL", 100, 115, "exit", "r2")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-5 days') "
+        "WHERE symbol='NVDA' AND action='SELL'"
+    )
+    db.conn.commit()
+
+    # Medium loser: buy 100 @ 60 (entry = $6k), sell 100 @ 54 → -10%
+    db.insert_trade("XOM", "BUY", 100, 60, "medium", "r3")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-20 days') "
+        "WHERE symbol='XOM' AND action='BUY'"
+    )
+    db.conn.commit()
+    db.insert_trade("XOM", "SELL", 100, 54, "stop", "r4")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-10 days') "
+        "WHERE symbol='XOM' AND action='SELL'"
+    )
+    db.conn.commit()
+
+    # Small winner: buy 10 @ 200 (entry = $2k), sell 10 @ 220 → +10%
+    db.insert_trade("JPM", "BUY", 10, 200, "small", "r5")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-8 days') "
+        "WHERE symbol='JPM' AND action='BUY'"
+    )
+    db.conn.commit()
+    db.insert_trade("JPM", "SELL", 10, 220, "target", "r6")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-1 day') "
+        "WHERE symbol='JPM' AND action='SELL'"
+    )
+    db.conn.commit()
+
+    stats = db.compute_trade_calibration(lookback_days=45)
+    # 3 closed trades, 2 winners → 66.7% win rate
+    assert stats["n"] == 3
+    assert stats["win_rate_pct"] == 66.7
+    # Avg return = (15 + -10 + 10) / 3 = 5.0
+    assert abs(stats["avg_return_pct"] - 5.0) < 0.01
+    # Buckets
+    by_size = stats["by_size"]
+    assert by_size["large (≥$10k)"]["n"] == 1
+    assert by_size["large (≥$10k)"]["avg_return_pct"] == 15.0
+    assert by_size["medium ($5-10k)"]["n"] == 1
+    assert by_size["small (<$5k)"]["n"] == 1
+
+
+def test_trade_calibration_returns_empty_below_threshold(tmp_path):
+    """With <3 closed trades, stats are {} to avoid misleading PM on noise."""
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    db.insert_trade("NVDA", "BUY", 10, 100, "x", "r1")
+    db.insert_trade("NVDA", "SELL", 10, 105, "x", "r2")
+    stats = db.compute_trade_calibration(lookback_days=45)
+    assert stats == {}
+
+
+def test_pm_renders_calibration_section():
+    """PM prompt shows the calibration note when provided."""
+    with patch("anthropic.Anthropic"):
+        agent = PortfolioManagerAgent(api_key="test", model="claude-opus-4-6")
+        msg = agent.build_user_message(
+            analyses=[], positions=[], macro_analysis=None,
+            cash_balance=5000.0, total_value=10000.0,
+            calibration_note=(
+                "- Overall (last 45d): 12 closed BUYs, win rate 58%, "
+                "avg return +3.20%, avg hold 6.4d"
+            ),
+        )
+        assert "## Trade Calibration" in msg
+        assert "win rate 58%" in msg
+        assert "avg return +3.20%" in msg
+
+
 def test_clamp_queued_earnings_noop_when_nothing_queued():
     from src.models import TradeDecision
     from src.pipeline import TradingPipeline

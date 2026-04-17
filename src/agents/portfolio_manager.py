@@ -337,6 +337,7 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
         rm_recent_verdicts: str = kwargs.get("rm_recent_verdicts") or ""
         pm_recent_decisions: str = kwargs.get("pm_recent_decisions") or ""
         projected_portfolio: str = kwargs.get("projected_portfolio") or ""
+        calibration_note: str = kwargs.get("calibration_note") or ""
 
         rm_verdicts_section = (
             f"## Risk Manager Verdicts (last 5 sessions — self-calibrate)\n{rm_recent_verdicts}"
@@ -353,6 +354,11 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
             if projected_portfolio else
             "## Projected Book Preview\n(no projection available — empty book or no BUY candidates)"
         )
+        calibration_section = (
+            f"## Trade Calibration (your actual realized outcomes)\n{calibration_note}"
+            if calibration_note else
+            "## Trade Calibration\n(not enough closed trades yet for calibration — <3 in window)"
+        )
 
         return f"""## Account Status
 - Total Value: ${total_value:,.2f}
@@ -365,6 +371,8 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
 {projected_section}
 
 {perf_section}
+
+{calibration_section}
 
 {pm_decisions_section}
 
@@ -402,7 +410,8 @@ Based on all the above (memory of past decisions + environment trajectory + toda
                active_state_changes: str = "",
                rm_recent_verdicts: str = "",
                pm_recent_decisions: str = "",
-               projected_portfolio: str = "") -> tuple[PortfolioDecision | None, "AgentResult"]:
+               projected_portfolio: str = "",
+               calibration_note: str = "") -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
             analyses=analyses,
             positions=positions,
@@ -420,6 +429,7 @@ Based on all the above (memory of past decisions + environment trajectory + toda
             rm_recent_verdicts=rm_recent_verdicts,
             pm_recent_decisions=pm_recent_decisions,
             projected_portfolio=projected_portfolio,
+            calibration_note=calibration_note,
         )
         parsed = result.parse_json()
         if parsed is None:
