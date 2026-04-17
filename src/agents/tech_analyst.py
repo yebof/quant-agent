@@ -34,6 +34,12 @@ class TechAnalystAgent(BaseAgent):
         symbols_data: list[dict] = kwargs.get("symbols_data", []) or []
         prior_ratings: dict[str, dict] = kwargs.get("prior_ratings") or {}
         valuations: dict[str, dict] = kwargs.get("valuations") or {}
+        # Yesterday's macro regime — used as a sanity checker, NOT to
+        # override TA's technical call. Pipeline passes macro_store's
+        # last_state (1-day stale typically). Regime very rarely flips
+        # overnight, so this is a cheap additional context.
+        prior_macro_regime: str | None = kwargs.get("prior_macro_regime")
+        prior_macro_outlook: str | None = kwargs.get("prior_macro_outlook")
 
         # How many days ago did the cached rating first appear?
         from datetime import date as _date
@@ -90,9 +96,24 @@ Price (last {len(recent_bars)} daily bars):
 Indicators: MA20={indicators.ma_20} MA50={indicators.ma_50} MA200={indicators.ma_200} | RSI={indicators.rsi_14} | MACD={indicators.macd}/{indicators.macd_signal}/{indicators.macd_hist} | BB={indicators.bb_lower}/{indicators.bb_middle}/{indicators.bb_upper} | ATR={indicators.atr_14} | Vol%={indicators.volume_change_pct}
 Current close: {current_price}""")
 
+        macro_context = ""
+        if prior_macro_regime:
+            macro_context = (
+                f"\n## Macro Context (as of previous session — sanity-check only)\n"
+                f"Regime: {prior_macro_regime}"
+                + (f" | Equity outlook: {prior_macro_outlook}" if prior_macro_outlook else "")
+                + "\n\nThis is NOT an override of your technical call. Use it to flag "
+                "divergence in support_resistance step: e.g., 'macro is risk-off but "
+                "price broke out — watch for a short-squeeze then fade back to trend'. "
+                "Your rating stays driven by the chart; the macro flag is a cross-check "
+                "surfaced to PM and RM.\n"
+            )
+
         return (
             "Analyze the following symbols. For EACH symbol, walk through the 5-step "
-            "reasoning_chain and respect the ATR-based stop discipline in the prompt.\n\n"
+            "reasoning_chain and respect the ATR-based stop discipline in the prompt."
+            + macro_context
+            + "\n\n"
             + "\n\n".join(sections)
             + "\n\nRespond with a JSON array — one object per symbol, in any order."
         )
@@ -102,6 +123,8 @@ Current close: {current_price}""")
         symbols_data: list[dict],
         prior_ratings: dict[str, dict] | None = None,
         valuations: dict[str, dict] | None = None,
+        prior_macro_regime: str | None = None,
+        prior_macro_outlook: str | None = None,
     ) -> tuple[dict[str, TechAnalysisResult], "AgentResult | None"]:
         """Batch analyze multiple symbols. Auto-chunks when > 30 symbols to avoid
         context overflow on the LLM call. Returns ({symbol: result}, merged AgentResult).
@@ -113,12 +136,19 @@ Current close: {current_price}""")
         valuations: optional {symbol: {trailing_pe, forward_pe, ps_ratio}} from
           MarketDataProvider.get_valuation_metrics. Surfaced as a Valuation line
           in the prompt so the LLM can flag overvaluation in its reasoning_chain.
+        prior_macro_regime / prior_macro_outlook: yesterday's regime (from
+          MacroStore.last_state). Surfaced as a sanity-check input so TA can
+          flag divergence in reasoning_chain.support_resistance — does NOT
+          override the technical call.
         """
         if not symbols_data:
             return {}, None
 
         if len(symbols_data) <= _MAX_SYMBOLS_PER_CALL:
-            return self._analyze_chunk(symbols_data, prior_ratings, valuations)
+            return self._analyze_chunk(
+                symbols_data, prior_ratings, valuations,
+                prior_macro_regime, prior_macro_outlook,
+            )
 
         # Chunk and stitch.
         chunks = [
@@ -136,7 +166,10 @@ Current close: {current_price}""")
         total_tokens = 0
         last_model = self.model
         for i, chunk in enumerate(chunks, 1):
-            chunk_analyses, chunk_result = self._analyze_chunk(chunk, prior_ratings, valuations)
+            chunk_analyses, chunk_result = self._analyze_chunk(
+                chunk, prior_ratings, valuations,
+                prior_macro_regime, prior_macro_outlook,
+            )
             merged.update(chunk_analyses)
             if chunk_result is not None:
                 combined_raw.append(f"--- chunk {i}/{len(chunks)} ---\n{chunk_result.raw_text}")
@@ -157,12 +190,16 @@ Current close: {current_price}""")
         symbols_data: list[dict],
         prior_ratings: dict[str, dict] | None = None,
         valuations: dict[str, dict] | None = None,
+        prior_macro_regime: str | None = None,
+        prior_macro_outlook: str | None = None,
     ) -> tuple[dict[str, TechAnalysisResult], "AgentResult | None"]:
         """Single-call variant used inside the chunking loop."""
         result = self.run(
             symbols_data=symbols_data,
             prior_ratings=prior_ratings or {},
             valuations=valuations or {},
+            prior_macro_regime=prior_macro_regime,
+            prior_macro_outlook=prior_macro_outlook,
         )
         parsed = result.parse_json()
 

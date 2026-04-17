@@ -360,6 +360,7 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
         pm_recent_decisions: str = kwargs.get("pm_recent_decisions") or ""
         projected_portfolio: str = kwargs.get("projected_portfolio") or ""
         calibration_note: str = kwargs.get("calibration_note") or ""
+        macro_tech_alignment: str = kwargs.get("macro_tech_alignment") or ""
 
         rm_verdicts_section = (
             f"## Risk Manager Verdicts (last 5 sessions — self-calibrate)\n{rm_recent_verdicts}"
@@ -381,6 +382,10 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
             if calibration_note else
             "## Trade Calibration\n(not enough closed trades yet for calibration — <3 in window)"
         )
+        alignment_section = (
+            f"## Macro-Tech Alignment Advisory\n{macro_tech_alignment}"
+            if macro_tech_alignment else ""
+        )
 
         return f"""## Account Status
 - Total Value: ${total_value:,.2f}
@@ -395,6 +400,8 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
 {perf_section}
 
 {calibration_section}
+
+{alignment_section}
 
 {pm_decisions_section}
 
@@ -433,7 +440,8 @@ Based on all the above (memory of past decisions + environment trajectory + toda
                rm_recent_verdicts: str = "",
                pm_recent_decisions: str = "",
                projected_portfolio: str = "",
-               calibration_note: str = "") -> tuple[PortfolioDecision | None, "AgentResult"]:
+               calibration_note: str = "",
+               macro_tech_alignment: str = "") -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
             analyses=analyses,
             positions=positions,
@@ -452,6 +460,7 @@ Based on all the above (memory of past decisions + environment trajectory + toda
             pm_recent_decisions=pm_recent_decisions,
             projected_portfolio=projected_portfolio,
             calibration_note=calibration_note,
+            macro_tech_alignment=macro_tech_alignment,
         )
         parsed = result.parse_json()
         if parsed is None:

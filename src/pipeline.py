@@ -918,6 +918,46 @@ class TradingPipeline:
         out.sort(key=lambda r: r["sell_date"], reverse=True)
         return out[:10]
 
+    @staticmethod
+    def _build_macro_tech_alignment(
+        macro_analysis: dict | None,
+        analyses: list,
+    ) -> str:
+        """Advisory: does Macro's equity outlook match TA's rating distribution?
+
+        Macro says 'bullish' but TA's ratings are majority bearish → market
+        action is diverging from the macro call. That's a signal for PM to
+        weight today's TA signals more carefully (market is often right
+        about regime flips before FRED data catches up).
+
+        Returns empty string when no divergence, or there's not enough data.
+        """
+        if not macro_analysis or not analyses:
+            return ""
+        outlook = (macro_analysis.get("equity_outlook") or "").lower()
+        if outlook not in ("bullish", "bearish"):
+            return ""
+        bullish = sum(1 for a in analyses if a.rating in ("buy", "strong_buy"))
+        bearish = sum(1 for a in analyses if a.rating in ("sell", "strong_sell"))
+        total = len(analyses)
+        if total < 5:
+            return ""  # too small a sample to read a tape
+        if outlook == "bullish" and bearish > bullish:
+            return (
+                f"DIVERGENCE: Macro `equity_outlook=bullish` but TA has more bearish "
+                f"ratings ({bearish}) than bullish ({bullish}) across {total} symbols. "
+                f"Market action may be leading the data — tread carefully on new BUYs "
+                f"and respect TA's cautious signals."
+            )
+        if outlook == "bearish" and bullish > bearish:
+            return (
+                f"DIVERGENCE: Macro `equity_outlook=bearish` but TA has more bullish "
+                f"ratings ({bullish}) than bearish ({bearish}) across {total} symbols. "
+                f"Market may be pricing a turnaround before Macro data confirms — "
+                f"don't ignore high-R/R long setups just because Macro is cautious."
+            )
+        return ""
+
     def _build_calibration_note(self, lookback_days: int = 45) -> str:
         """Render PM's own hit rate + avg return on closed BUYs in the window.
 
@@ -1290,8 +1330,17 @@ class TradingPipeline:
                         valuations[sym] = self.market.get_valuation_metrics(sym)
                     except Exception as e:
                         logger.warning("valuation fetch crashed for %s: %s", sym, e)
+            # Pass yesterday's macro regime as a TA sanity-check input. TA
+            # won't override its technical call based on this — just surfaces
+            # divergence (e.g. "macro risk-off but NVDA broke out"). ~1-day
+            # stale is acceptable; regime rarely flips overnight.
+            prior_macro_state = self.macro_store.load_last_state() or {}
             analyses_map, ta_res = self.tech_analyst.analyze_batch(
-                symbols_data, prior_ratings=prior_ratings, valuations=valuations,
+                symbols_data,
+                prior_ratings=prior_ratings,
+                valuations=valuations,
+                prior_macro_regime=prior_macro_state.get("regime"),
+                prior_macro_outlook=prior_macro_state.get("equity_outlook"),
             )
             # Persist today's ratings so tomorrow's run inherits this memory.
             if analyses_map:
@@ -1420,6 +1469,10 @@ class TradingPipeline:
         # closed trades. Grounds conviction sizing in outcomes, not just
         # today's alignment score.
         calibration_note = self._build_calibration_note()
+        # Macro-Tech cross-check — if Macro outlook and TA rating distribution
+        # disagree, surface it as an advisory (non-blocking). Captures the
+        # "market is leading the data" signal that either alone can miss.
+        macro_tech_alignment = self._build_macro_tech_alignment(macro_analysis, analyses)
 
         portfolio_decision, pm_result = self.portfolio_manager.decide(
             analyses=analyses,
@@ -1439,6 +1492,7 @@ class TradingPipeline:
             pm_recent_decisions=pm_recent_decisions,
             projected_portfolio=projected_portfolio,
             calibration_note=calibration_note,
+            macro_tech_alignment=macro_tech_alignment,
         )
 
         if portfolio_decision and portfolio_decision.reasoning_chain:
