@@ -813,22 +813,43 @@ class TradingPipeline:
         if not positions and not buy_candidates:
             return ""
 
+        cached_sectors = dict(getattr(self, "_last_symbol_sectors", {}))
+
+        def _resolve_sector(symbol: str, fallback: str | None = None) -> str:
+            sector = (fallback or "").strip() if fallback else ""
+            if sector and sector != "Unknown":
+                cached_sectors[symbol] = sector
+                return sector
+
+            sector = cached_sectors.get(symbol, "")
+            if sector and sector != "Unknown":
+                return sector
+
+            sector = _get_sector(symbol) or "Unknown"
+            if sector != "Unknown":
+                cached_sectors[symbol] = sector
+            return sector
+
         current_net = sum(p.market_value * _effective_multiplier(p.symbol) for p in positions)
         current_invested_pct = abs(current_net) / total_value * 100
         sector_gross: dict[str, float] = {}
         for p in positions:
-            sec = p.sector or _get_sector(p.symbol) or "Unknown"
+            sec = _resolve_sector(p.symbol, p.sector)
             gross = p.market_value * _gross_multiplier(p.symbol)
             sector_gross[sec] = sector_gross.get(sec, 0.0) + gross
 
         proj_net = current_net
         proj_sector = dict(sector_gross)
+        unresolved_symbols: list[str] = []
         for a in buy_candidates:
             raw = total_value * (default_buy_pct / 100)
             proj_net += raw * _effective_multiplier(a.symbol)
-            sec = _get_sector(a.symbol) or "Unknown"
+            sec = _resolve_sector(a.symbol)
+            if sec == "Unknown":
+                unresolved_symbols.append(a.symbol)
             proj_sector[sec] = proj_sector.get(sec, 0.0) + raw * _gross_multiplier(a.symbol)
         proj_invested_pct = abs(proj_net) / total_value * 100
+        self._last_symbol_sectors = cached_sectors
 
         def _sector_line(sector_dict: dict[str, float]) -> str:
             if not sector_dict:
@@ -857,6 +878,12 @@ class TradingPipeline:
             if overweight:
                 lines.append(
                     f"    ⚠ Sectors near/over 35% cap: {', '.join(sorted(overweight))}"
+                )
+            if unresolved_symbols:
+                unique = list(dict.fromkeys(unresolved_symbols))
+                lines.append(
+                    "    ⚠ Sector unresolved for: "
+                    f"{', '.join(unique)} — projected mix may understate concentration."
                 )
         return "\n".join(lines)
 

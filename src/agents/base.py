@@ -25,20 +25,21 @@ class AgentResult:
     # When the LLM prose includes an extra JSON fragment (self-correction,
     # partial thinking-out-loud, or a tool-like object), these anchors let us
     # pick the actual output instead of the largest stray fragment.
-    _EXPECTED_AGENT_KEYS = frozenset({
-        "decisions",           # PortfolioDecision
-        "approved",            # RiskVerdict
-        "actions",             # MiddayReview
-        "daily_summary",       # EveningReport
-        "tomorrow_outlook",    # EveningReport alt anchor
-        "regime",              # MacroAnalysis
-        "reasoning_chain",     # any analyst with CoT
-        "investment_implications",  # EarningsAnalysis
-        "macro_narrative",     # NewsIntelligenceReport
-        "analyses",            # TechAnalyst batch wrapper
-        "symbol",              # TechAnalysisResult single
-        "rating",              # TechAnalysisResult single
-    })
+    _EXPECTED_AGENT_KEY_WEIGHTS = {
+        "decisions": 50,           # PortfolioDecision
+        "approved": 50,            # RiskVerdict
+        "actions": 50,             # MiddayReview
+        "daily_summary": 40,       # EveningReport
+        "tomorrow_outlook": 40,    # EveningReport alt anchor
+        "regime": 40,              # MacroAnalysis
+        "investment_implications": 40,  # EarningsAnalysis
+        "macro_narrative": 40,     # NewsIntelligenceReport
+        "analyses": 40,            # TechAnalyst batch wrapper
+        "portfolio_view": 20,      # PortfolioDecision summary
+        "reasoning_chain": 20,     # nested rationale wrapper
+        "symbol": 5,               # TechAnalysisResult single
+        "rating": 5,               # TechAnalysisResult single
+    }
 
     @staticmethod
     def _shape_score(parsed) -> int:
@@ -46,7 +47,11 @@ class AgentResult:
         if not isinstance(parsed, dict):
             return 0
         keys = set(parsed.keys())
-        return len(keys & AgentResult._EXPECTED_AGENT_KEYS)
+        return sum(
+            weight
+            for key, weight in AgentResult._EXPECTED_AGENT_KEY_WEIGHTS.items()
+            if key in keys
+        )
 
     def parse_json(self) -> dict | list | None:
         text = self.raw_text.strip()
@@ -81,11 +86,16 @@ class AgentResult:
             candidates.append((self._shape_score(parsed), len(json.dumps(parsed)), idx, parsed))
             idx += 1
         if candidates:
-            # Sort priority: (1) shape-score (has expected keys), (2) size,
-            # (3) source order as tiebreaker. The old behavior of pure "pick
-            # largest" would pick a 500-char helper object over a 200-char
-            # correct one. Shape-score first fixes that.
-            return max(candidates, key=lambda item: (item[0], item[1], item[2]))[3]
+            max_shape = max(item[0] for item in candidates)
+            if max_shape > 0:
+                # Once something looks like a real agent output, prefer the
+                # latest correction over an earlier larger draft.
+                shaped = [item for item in candidates if item[0] == max_shape]
+                return max(shaped, key=lambda item: (item[2], item[1]))[3]
+
+            # If nothing has recognizable agent keys, fall back to the largest
+            # valid JSON fragment and use recency only as a tiebreaker.
+            return max(candidates, key=lambda item: (item[1], item[2]))[3]
 
         logger.warning("Failed to parse agent response as JSON: %s", self.raw_text[:200])
         return None

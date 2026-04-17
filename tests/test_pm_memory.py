@@ -813,6 +813,11 @@ def test_projected_portfolio_flags_sector_overweight(tmp_path):
     from src.models import TechAnalysisResult
 
     pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline._last_symbol_sectors = {
+        "NVDA": "Technology",
+        "AMD": "Technology",
+        "AAPL": "Technology",
+    }
     # Existing 30% Tech position
     positions = [
         Position(symbol="MSFT", qty=10, avg_entry=400, current_price=400,
@@ -827,13 +832,15 @@ def test_projected_portfolio_flags_sector_overweight(tmp_path):
         )
         for sym in ("NVDA", "AMD", "AAPL")
     ]
-    out = pipeline._build_projected_portfolio(
-        positions, analyses, total_value=10000, default_buy_pct=5.0,
-    )
+    with patch("src.execution.broker._get_sector") as mock_get_sector:
+        out = pipeline._build_projected_portfolio(
+            positions, analyses, total_value=10000, default_buy_pct=5.0,
+        )
     assert "Current: 30% net invested" in out
     # 30 + 3*5 = 45% Tech
     assert "Technology 45%" in out
     assert "Sectors near/over 35% cap: Technology" in out
+    mock_get_sector.assert_not_called()
 
 
 # === MacroStore history ===
