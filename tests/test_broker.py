@@ -114,6 +114,35 @@ def test_cancel_open_entry_orders_preserves_sell_protection(mock_tc_cls):
 
 
 @patch("src.execution.broker.TradingClient")
+def test_broker_injects_http_timeout_on_session(mock_tc_cls):
+    """Every Alpaca SDK call must carry a default HTTP timeout so a hung TCP
+    connection can't freeze the whole process (observed 13h hang on 2026-04-17)."""
+    # Simulate the SDK's internal session; the patched broker will wrap its
+    # .request method to set a default timeout.
+    import requests
+    mock_session = MagicMock(spec=requests.Session)
+    original_request = MagicMock(return_value=MagicMock(status_code=200))
+    mock_session.request = original_request
+    # attribute access: broker's patch sets _quant_timeout_patched
+    mock_session._quant_timeout_patched = False
+
+    mock_client = MagicMock()
+    mock_client._session = mock_session
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+
+    # The session.request method must be wrapped (not the original MagicMock)
+    assert mock_client._session.request is not original_request
+    assert getattr(mock_client._session, "_quant_timeout_patched", False) is True
+
+    # Invoke the wrapped request with no explicit timeout — it should inject one.
+    mock_client._session.request("GET", "https://example.com/api")
+    args, kwargs = original_request.call_args
+    assert kwargs.get("timeout") == 30.0
+
+
+@patch("src.execution.broker.TradingClient")
 def test_replace_stop_loss_cancels_old_and_submits_new(mock_tc_cls):
     """Trailing-stop path: cancel any open sell-stop for symbol, submit new stop at new price."""
     old_stop = MagicMock()

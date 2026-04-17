@@ -18,6 +18,32 @@ logger = logging.getLogger(__name__)
 # Index ETFs that have no single sector — bucket them as "Broad".
 _INDEX_ETFS = {"SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "IVV"}
 
+# Default HTTP timeout for ALL Alpaca SDK calls (connect, read).
+# Without this, a stalled TCP connection to the broker can hang the process
+# for hours under launchd — observed 2026-04-17 when the evening job sat for
+# 13+ hours at the very first broker call.
+_BROKER_HTTP_TIMEOUT = 30.0
+
+
+def _install_http_timeout(client, timeout: float = _BROKER_HTTP_TIMEOUT) -> None:
+    """Inject a default timeout on an Alpaca SDK client's underlying requests.Session.
+
+    The SDK (alpaca-py 0.43.2) uses a requests.Session with no default timeout; each
+    call goes through RESTClient._one_request which just forwards opts. This patches
+    session.request to set timeout=30s if the caller didn't specify one.
+    """
+    session = getattr(client, "_session", None)
+    if session is None or getattr(session, "_quant_timeout_patched", False):
+        return
+    original_request = session.request
+
+    def _request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", timeout)
+        return original_request(method, url, **kwargs)
+
+    session.request = _request_with_timeout
+    session._quant_timeout_patched = True
+
 # Cache sector lookups to avoid repeated API calls
 _sector_cache: dict[str, str] = {}
 _sector_lock = threading.Lock()
@@ -68,6 +94,7 @@ class AlpacaBroker:
         self.api_key = api_key
         self.secret_key = secret_key
         self.client = TradingClient(api_key, secret_key, paper=paper)
+        _install_http_timeout(self.client)
         self._data_client = None
 
     def get_account(self) -> dict:
@@ -124,6 +151,7 @@ class AlpacaBroker:
                 from alpaca.data.historical.stock import StockHistoricalDataClient
 
                 self._data_client = StockHistoricalDataClient(self.api_key, self.secret_key)
+                _install_http_timeout(self._data_client)
 
             from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
 
