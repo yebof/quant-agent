@@ -57,7 +57,7 @@ Evening (post-market)
 
 | Agent | Role | Key Feature |
 |-------|------|-------------|
-| **Tech Analyst** | Batch technical analysis | Pre-filtered: only actionable signals sent to LLM (RSI extremes, BB proximity, MACD crossover, volume spike) |
+| **Tech Analyst** | Batch technical analysis | 5-step CoT (trend / momentum / volatility / volume / S&R). ATR-based default stop (`entry − 2*ATR`). Output rating + `conviction` (high/medium/low) + `reference_target` (soft, not hard TP). Pre-filter thresholds normalized by ATR so leveraged ETFs use proportional bars. Auto-chunks batch > 30 symbols to stay under LLM context. Cross-field validator: BUY stop must be below entry, SELL above. |
 | **News Intelligence** | 3-layer news analysis | Layer 1: Persistent macro narrative. Layer 2: State change detection. Layer 3: Per-symbol alerts with conviction. Daily storage in `data/news/` |
 | **Macro Analyst** | Regime assessment & sector guidance | 6-step CoT (vol / curve / monetary / inflation+labor+credit / cross-signal / sector). Inputs: VIX, 2Y/10Y yields, **DFF** (daily fed funds), **core & headline CPI**, **UNRATE**, **HY OAS**. Persists yesterday's regime → detects `regime_shift`. Cross-references News narrative via `alignment_with_news`. Emits bull/bear view-change triggers. |
 | **Earnings Analyst** | SEC 10-Q/10-K analysis | Revenue, margins, strategic direction, competitive positioning, strategic vs operational risks, strategy consistency across filings |
@@ -174,7 +174,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 139 tests
+├── tests/                         # 157 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -185,7 +185,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 139 tests
+pytest tests/ -v    # 157 tests
 ```
 
 ## Data Sources

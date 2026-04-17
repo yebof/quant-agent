@@ -1,13 +1,22 @@
-import json
 import logging
 from pathlib import Path
 
-from src.agents.base import BaseAgent
-from src.models import OHLCV, TechnicalIndicators, TechAnalysisResult
+from src.agents.base import BaseAgent, AgentResult
+from src.models import TechAnalysisResult
 
 logger = logging.getLogger(__name__)
 
 PROMPT_PATH = Path(__file__).parent.parent.parent / "config" / "prompts" / "tech_analyst.md"
+
+# OHLCV bars attached per symbol in the user message. Enough for swing pivots
+# and micro-structure, not so many that context balloons on a 30-symbol batch.
+_BARS_PER_SYMBOL = 20
+
+# Auto-chunk the batch when a single LLM call would carry too many symbols.
+# 25 picked so chunks stay comfortably within typical LLM context, assuming
+# ~300 input tokens per symbol (20 bars + indicators).
+_MAX_SYMBOLS_PER_CALL = 30
+_CHUNK_SIZE = 25
 
 
 class TechAnalystAgent(BaseAgent):
@@ -22,44 +31,80 @@ class TechAnalystAgent(BaseAgent):
         return "You are a technical analyst. Respond with JSON."
 
     def build_user_message(self, **kwargs) -> str:
-        # Support both single and batch analysis
-        symbols_data: list[dict] = kwargs.get("symbols_data", [])
-        if not symbols_data and "symbol" in kwargs:
-            # Single symbol fallback
-            symbols_data = [{
-                "symbol": kwargs["symbol"],
-                "bars": kwargs["bars"],
-                "indicators": kwargs["indicators"],
-            }]
+        symbols_data: list[dict] = kwargs.get("symbols_data", []) or []
 
         sections = []
         for item in symbols_data:
             symbol = item["symbol"]
             bars = item["bars"]
             indicators = item["indicators"]
-            recent_bars = bars[-5:] if len(bars) > 5 else bars
+            recent_bars = bars[-_BARS_PER_SYMBOL:] if len(bars) > _BARS_PER_SYMBOL else bars
             bars_text = "\n".join(
                 f"  {b.date}: O={b.open} H={b.high} L={b.low} C={b.close} V={b.volume}"
                 for b in recent_bars
             )
+            current_price = recent_bars[-1].close if recent_bars else "N/A"
             sections.append(f"""### {symbol}
-Price (last {len(recent_bars)}d):
+Price (last {len(recent_bars)} daily bars):
 {bars_text}
 Indicators: MA20={indicators.ma_20} MA50={indicators.ma_50} MA200={indicators.ma_200} | RSI={indicators.rsi_14} | MACD={indicators.macd}/{indicators.macd_signal}/{indicators.macd_hist} | BB={indicators.bb_lower}/{indicators.bb_middle}/{indicators.bb_upper} | ATR={indicators.atr_14} | Vol%={indicators.volume_change_pct}
-Current: {recent_bars[-1].close if recent_bars else 'N/A'}""")
+Current close: {current_price}""")
 
-        return "Analyze these symbols:\n\n" + "\n\n".join(sections) + "\n\nRespond with a JSON array of analyses."
+        return (
+            "Analyze the following symbols. For EACH symbol, walk through the 5-step "
+            "reasoning_chain and respect the ATR-based stop discipline in the prompt.\n\n"
+            + "\n\n".join(sections)
+            + "\n\nRespond with a JSON array — one object per symbol, in any order."
+        )
 
-    def analyze(self, symbol: str, bars: list[OHLCV], indicators: TechnicalIndicators) -> TechAnalysisResult | None:
-        """Single symbol analysis (legacy, still works)."""
-        results, _ = self.analyze_batch([{"symbol": symbol, "bars": bars, "indicators": indicators}])
-        return results.get(symbol)
-
-    def analyze_batch(self, symbols_data: list[dict]) -> tuple[dict[str, TechAnalysisResult], "AgentResult | None"]:
-        """Batch analyze multiple symbols in ONE LLM call. Returns ({symbol: result}, agent_result)."""
+    def analyze_batch(
+        self, symbols_data: list[dict]
+    ) -> tuple[dict[str, TechAnalysisResult], "AgentResult | None"]:
+        """Batch analyze multiple symbols. Auto-chunks when > 30 symbols to avoid
+        context overflow on the LLM call. Returns ({symbol: result}, merged AgentResult).
+        """
         if not symbols_data:
             return {}, None
 
+        if len(symbols_data) <= _MAX_SYMBOLS_PER_CALL:
+            return self._analyze_chunk(symbols_data)
+
+        # Chunk and stitch.
+        chunks = [
+            symbols_data[i : i + _CHUNK_SIZE]
+            for i in range(0, len(symbols_data), _CHUNK_SIZE)
+        ]
+        logger.info(
+            "Tech batch too large (%d symbols); splitting into %d chunks of up to %d.",
+            len(symbols_data), len(chunks), _CHUNK_SIZE,
+        )
+
+        merged: dict[str, TechAnalysisResult] = {}
+        combined_raw: list[str] = []
+        combined_msg: list[str] = []
+        total_tokens = 0
+        last_model = self.model
+        for i, chunk in enumerate(chunks, 1):
+            chunk_analyses, chunk_result = self._analyze_chunk(chunk)
+            merged.update(chunk_analyses)
+            if chunk_result is not None:
+                combined_raw.append(f"--- chunk {i}/{len(chunks)} ---\n{chunk_result.raw_text}")
+                combined_msg.append(f"--- chunk {i}/{len(chunks)} ---\n{chunk_result.user_message}")
+                total_tokens += chunk_result.tokens_used
+                last_model = chunk_result.model
+
+        merged_result = AgentResult(
+            raw_text="\n\n".join(combined_raw),
+            tokens_used=total_tokens,
+            model=last_model,
+            user_message="\n\n".join(combined_msg),
+        )
+        return merged, merged_result
+
+    def _analyze_chunk(
+        self, symbols_data: list[dict]
+    ) -> tuple[dict[str, TechAnalysisResult], "AgentResult | None"]:
+        """Single-call variant used inside the chunking loop."""
         result = self.run(symbols_data=symbols_data)
         parsed = result.parse_json()
 
@@ -67,17 +112,14 @@ Current: {recent_bars[-1].close if recent_bars else 'N/A'}""")
             logger.error("Tech analyst returned non-JSON for batch analysis")
             return {}, result
 
-        # Handle both array response and single object
         items = parsed if isinstance(parsed, list) else [parsed]
-        analyses = {}
+        analyses: dict[str, TechAnalysisResult] = {}
         failed_symbols: list[str] = []
         for item in items:
             try:
                 analysis = TechAnalysisResult(**item)
                 analyses[analysis.symbol] = analysis
             except Exception as e:
-                # Preserve which symbol we lost — PM's input_summary shouldn't pretend
-                # the batch was complete if schema validation dropped items.
                 bad_symbol = str((item or {}).get("symbol", "?")) if isinstance(item, dict) else "?"
                 failed_symbols.append(bad_symbol)
                 logger.error("Failed to parse tech analysis item for %s: %s", bad_symbol, e)

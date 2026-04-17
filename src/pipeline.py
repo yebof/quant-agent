@@ -486,7 +486,12 @@ class TradingPipeline:
             return intel
 
         def _has_actionable_signal(indicators, symbol: str, bars) -> bool:
-            """Pre-filter: only send symbols with interesting signals to the LLM."""
+            """Pre-filter: only send symbols with interesting signals to the LLM.
+
+            Thresholds are ATR-normalized where appropriate so a highly-volatile 3x
+            ETF (SQQQ) isn't held to the same near-zero MACD bar as a low-vol
+            defensive (PG). Falls back to a percentage of MA20 when ATR is absent.
+            """
             # Always analyze held positions
             held_symbols = {p.symbol for p in positions}
             if symbol in held_symbols:
@@ -497,8 +502,6 @@ class TradingPipeline:
             if indicators.rsi_14 is not None and (indicators.rsi_14 < 35 or indicators.rsi_14 > 65):
                 return True
             # Price near Bollinger Bands (within 10% of band_width from upper/lower).
-            # Use the latest close (not ma_20 — ma_20 IS the middle band, so the old
-            # check was always ~50% away from both extremes and never fired).
             if indicators.bb_upper and indicators.bb_lower and bars:
                 last_close = bars[-1].close
                 band_width = indicators.bb_upper - indicators.bb_lower
@@ -507,19 +510,28 @@ class TradingPipeline:
                         return True
                     if abs(last_close - indicators.bb_lower) / band_width < 0.1:
                         return True
-            # MACD crossover (histogram near zero relative to price — within 0.3% of price)
-            if indicators.macd_hist is not None and indicators.ma_20 and indicators.ma_20 > 0:
-                macd_pct = abs(indicators.macd_hist) / indicators.ma_20
-                if macd_pct < 0.003:
-                    return True
+            # MACD near zero — "potential crossover" signal. Scale by ATR so a
+            # quiet low-vol name and a whippy leveraged ETF use comparable thresholds.
+            if indicators.macd_hist is not None:
+                if indicators.atr_14 and indicators.atr_14 > 0:
+                    if abs(indicators.macd_hist) < 0.2 * indicators.atr_14:
+                        return True
+                elif indicators.ma_20 and indicators.ma_20 > 0:
+                    if abs(indicators.macd_hist) / indicators.ma_20 < 0.003:
+                        return True
             # Significant volume change (> 50%)
             if indicators.volume_change_pct is not None and abs(indicators.volume_change_pct) > 50:
                 return True
-            # Golden/Death cross signals (MA20 near MA50)
+            # Golden/Death cross — MA20 and MA50 close enough that a cross is near.
+            # ATR-scaled: 0.5*ATR ≈ half a typical day's move.
             if indicators.ma_20 and indicators.ma_50:
-                spread = abs(indicators.ma_20 - indicators.ma_50) / indicators.ma_50
-                if spread < 0.02:
-                    return True
+                spread = abs(indicators.ma_20 - indicators.ma_50)
+                if indicators.atr_14 and indicators.atr_14 > 0:
+                    if spread < 0.5 * indicators.atr_14:
+                        return True
+                else:
+                    if spread / indicators.ma_50 < 0.02:
+                        return True
             return False
 
         def _run_tech():

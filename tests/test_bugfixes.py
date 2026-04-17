@@ -14,6 +14,7 @@ from src.config import RiskConfig
 from src.models import (
     RiskModification, TechAnalysisResult, TradeDecision, Position,
     MacroAnalysis, MacroReasoningChain, MacroPositionGuidance, MacroSectorGuidance,
+    TechReasoningChain,
 )
 
 
@@ -335,7 +336,7 @@ def test_pipeline_symbol_guard_blocks_off_universe_and_unanalyzed_buys():
             symbol="SPY",
             rating="buy",
             entry_price=500,
-            exit_price=530,
+            reference_target=530,
             stop_loss=480,
             reasoning="supported",
         )
@@ -676,6 +677,66 @@ def test_macro_exposure_deviation_skipped_when_within_tolerance():
             macro_target_invested_pct=20,  # 25% vs 20% = 5pp deviation, under 15pp tolerance
         )
     assert not any(v.rule == "macro_exposure_deviation" for v in violations)
+
+
+# === TechAnalysisResult v2 (reasoning_chain + cross-field validator + conviction) ===
+
+def test_tech_analysis_neutral_clears_price_fields():
+    """Neutral rating must null-out price fields even if the LLM emitted stale ones."""
+    r = TechAnalysisResult(
+        symbol="SPY",
+        rating="neutral",
+        entry_price=500, reference_target=530, stop_loss=480,
+        reasoning="Mixed signals",
+    )
+    assert r.entry_price is None
+    assert r.reference_target is None
+    assert r.stop_loss is None
+
+
+def test_tech_analysis_buy_without_prices_rejected():
+    """BUY/SELL/strong_* must carry entry + stop — validator blocks orphan actionable ratings."""
+    with pytest.raises(ValidationError):
+        TechAnalysisResult(symbol="SPY", rating="buy", reasoning="x")
+    with pytest.raises(ValidationError):
+        TechAnalysisResult(symbol="SPY", rating="strong_sell", entry_price=500, reasoning="x")
+
+
+def test_tech_analysis_buy_stop_must_be_below_entry():
+    """For BUY the protective stop must be below entry; reversed = validator error."""
+    with pytest.raises(ValidationError):
+        TechAnalysisResult(
+            symbol="SPY", rating="buy",
+            entry_price=500, stop_loss=520,  # stop ABOVE entry — wrong
+            reasoning="x",
+        )
+    # Reversed direction is correct for SELL
+    ok = TechAnalysisResult(
+        symbol="SPY", rating="sell",
+        entry_price=500, stop_loss=520,  # stop ABOVE entry — correct for SELL
+        reasoning="x",
+    )
+    assert ok.stop_loss == 520
+
+
+def test_tech_analysis_conviction_defaults_to_medium():
+    r = TechAnalysisResult(
+        symbol="SPY", rating="buy",
+        entry_price=500, stop_loss=490,
+        reasoning="x",
+    )
+    assert r.conviction == "medium"
+
+
+def test_tech_reasoning_chain_requires_all_five_fields():
+    # All 5 required, any missing → ValidationError
+    with pytest.raises(ValidationError):
+        TechReasoningChain(trend="a", momentum="b")  # missing volatility/volume/support_resistance
+    # All present → ok
+    rc = TechReasoningChain(
+        trend="a", momentum="b", volatility="c", volume="d", support_resistance="e",
+    )
+    assert rc.trend == "a"
 
 
 def test_data_degraded_violation_fires_at_two_failures():

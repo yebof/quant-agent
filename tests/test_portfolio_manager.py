@@ -10,12 +10,12 @@ def sample_analyses():
     return [
         TechAnalysisResult(
             symbol="SPY", rating="buy", entry_price=507.0,
-            exit_price=530.0, stop_loss=490.0,
+            reference_target=530.0, stop_loss=490.0,
             reasoning="Strong uptrend",
         ),
         TechAnalysisResult(
             symbol="QQQ", rating="neutral", entry_price=None,
-            exit_price=None, stop_loss=None,
+            reference_target=None, stop_loss=None,
             reasoning="Mixed signals",
         ),
     ]

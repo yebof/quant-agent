@@ -31,7 +31,7 @@ class PortfolioManagerAgent(BaseAgent):
         earnings_analyses: list[dict] = kwargs.get("earnings_analyses", [])
 
         analyses_text = "\n".join(
-            f"- {a.symbol}: {a.rating} | Entry: {a.entry_price} | Stop: {a.stop_loss} | Target: {a.exit_price}\n  Reasoning: {a.reasoning}"
+            f"- {a.symbol}: {a.rating} ({a.conviction}) | Entry: {a.entry_price} | Stop: {a.stop_loss} | Target: {a.reference_target}\n  Reasoning: {a.reasoning}"
             for a in analyses
         )
 
