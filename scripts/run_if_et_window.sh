@@ -7,7 +7,7 @@
 # share this script so the system fires at correct US market times regardless
 # of the host's timezone — survives the user flying across continents.
 #
-# Usage: run_if_et_window.sh <morning|midday|evening>
+# Usage: run_if_et_window.sh <earnings_preprocess|morning|intra_check|midday|evening>
 
 set -eu
 
@@ -17,20 +17,20 @@ if [[ -z "$MODE" ]]; then
     exit 2
 fi
 
-PROJECT_ROOT="/Users/yebof/Documents/Claude-workspace/quant-agent"
-PYTHON="${PROJECT_ROOT}/.venv/bin/python"
-TIMEOUT="/opt/homebrew/bin/timeout"
-LAST_RUN_DIR="${HOME}/.cache/quant-agent"
-MIN_GAP_SEC=3600  # don't fire same mode twice within an hour
+PROJECT_ROOT="${PROJECT_ROOT_OVERRIDE:-/Users/yebof/Documents/Claude-workspace/quant-agent}"
+PYTHON="${PYTHON_OVERRIDE:-${PROJECT_ROOT}/.venv/bin/python}"
+TIMEOUT="${TIMEOUT_OVERRIDE:-/opt/homebrew/bin/timeout}"
+LAST_RUN_DIR="${LAST_RUN_DIR_OVERRIDE:-${HOME}/.cache/quant-agent}"
+MIN_GAP_SEC="${MIN_GAP_SEC_OVERRIDE:-3600}"  # don't fire same mode twice within an hour
 
 mkdir -p "$LAST_RUN_DIR"
 
 # === ET weekday + hour (independent of host TZ) ===
-ET_DOW=$(TZ="America/New_York" date +%u)    # 1=Mon ... 7=Sun
-ET_HOUR=$(TZ="America/New_York" date +%H)
-ET_MIN=$(TZ="America/New_York" date +%M)
+ET_DOW="${ET_DOW_OVERRIDE:-$(TZ="America/New_York" date +%u)}"    # 1=Mon ... 7=Sun
+ET_HOUR="${ET_HOUR_OVERRIDE:-$(TZ="America/New_York" date +%H)}"
+ET_MIN="${ET_MIN_OVERRIDE:-$(TZ="America/New_York" date +%M)}"
 ET_TOTAL_MIN=$((10#$ET_HOUR * 60 + 10#$ET_MIN))  # 10# forces base-10 (leading zeros)
-ET_DATE=$(TZ="America/New_York" date +%Y-%m-%d)
+ET_DATE="${ET_DATE_OVERRIDE:-$(TZ="America/New_York" date +%Y-%m-%d)}"
 
 # Weekend short-circuit — US markets closed
 if [[ "$ET_DOW" -gt 5 ]]; then
@@ -58,7 +58,7 @@ fi
 
 # === Last-run guard — don't fire more than once per window ===
 LAST_FILE="${LAST_RUN_DIR}/last-${MODE}"
-NOW_UNIX=$(date +%s)
+NOW_UNIX="${NOW_UNIX_OVERRIDE:-$(date +%s)}"
 if [[ -f "$LAST_FILE" ]]; then
     LAST_UNIX=$(cat "$LAST_FILE" 2>/dev/null || echo 0)
     GAP=$((NOW_UNIX - LAST_UNIX))
@@ -68,7 +68,6 @@ if [[ -f "$LAST_FILE" ]]; then
 fi
 
 # === All checks passed — fire ===
-echo "$NOW_UNIX" > "$LAST_FILE"
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Firing ${MODE} (ET ${ET_DATE} ${ET_HOUR}:${ET_MIN}, weekday ${ET_DOW})"
 cd "$PROJECT_ROOT"
 
@@ -83,4 +82,12 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
     set +a
 fi
 
-exec "$TIMEOUT" --kill-after=30 600 "$PYTHON" main.py --mode "$MODE"
+if "$TIMEOUT" --kill-after=30 600 "$PYTHON" main.py --mode "$MODE"; then
+    echo "$NOW_UNIX" > "$LAST_FILE"
+    exit 0
+else
+    STATUS=$?
+fi
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ${MODE} failed with status ${STATUS}; not updating last-run guard" >&2
+exit "$STATUS"

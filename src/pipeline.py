@@ -2384,7 +2384,9 @@ class TradingPipeline:
         # the same return bucket so evening / caller see a complete action list.
         orders = list(auto_tp_orders) + list(exdiv_orders)
         if positions:
-            morning_trades = self.db.get_trades(limit=50, today_only=True)
+            morning_trades = self.db.get_trades(
+                limit=50, today_only=True, executed_only=True,
+            )
             review, md_result = self.midday_reviewer.review(
                 positions=positions,
                 macro_summary=macro_summary,

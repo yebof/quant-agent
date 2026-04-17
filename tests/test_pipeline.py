@@ -6,7 +6,7 @@ from src.agents.base import AgentResult
 from src.models import (
     TechAnalysisResult, PortfolioDecision, TradeDecision, RiskVerdict, Position,
     NewsAnalysisResult, TargetPosition,
-    MacroAnalysis, MacroReasoningChain, MacroPositionGuidance,
+    MacroAnalysis, MacroReasoningChain, MacroPositionGuidance, MiddayReview,
 )
 
 
@@ -449,6 +449,46 @@ def test_pipeline_midday_preserves_protective_orders():
     assert result["status"] == "reviewed"
     pipeline.broker.cancel_open_orders.assert_not_called()
     pipeline.broker.cancel_open_entry_orders.assert_not_called()
+
+
+def test_pipeline_midday_fetches_only_executed_morning_trades():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.get_account.return_value = {"cash": 1000.0, "portfolio_value": 5000.0}
+    pipeline.broker.get_positions.return_value = [
+        Position(
+            symbol="SPY", qty=10.0, avg_entry=500.0, current_price=505.0,
+            market_value=5050.0, unrealized_pnl=50.0, sector="ETF",
+        )
+    ]
+    pipeline.macro = MagicMock()
+    pipeline.macro.get_macro_summary.return_value = {}
+    pipeline.db = MagicMock()
+    pipeline.db.get_trades.return_value = []
+    pipeline.config = MagicMock()
+    pipeline.config.llm.midday_reviewer_model = "test-model"
+    pipeline._auto_take_profit = MagicMock(return_value=[])
+    pipeline._handle_ex_dividends = MagicMock(return_value=[])
+    pipeline._run_news_update = MagicMock(return_value=None)
+    pipeline._run_earnings_check = MagicMock(return_value=(None, []))
+    pipeline._midday_execute_llm_actions = MagicMock(return_value=[])
+    pipeline._wait_bg_threads = MagicMock()
+    pipeline._reconcile_fills = MagicMock()
+    pipeline.risk_engine = MagicMock()
+    pipeline.risk_engine.check_daily_loss.return_value = None
+    pipeline.midday_reviewer = MagicMock()
+    pipeline.midday_reviewer.review.return_value = (
+        MiddayReview(actions=[], overall_assessment="stable", risk_level="low"),
+        _mock_agent_result(),
+    )
+
+    result = pipeline.run_midday()
+
+    assert result["status"] == "reviewed"
+    pipeline.db.get_trades.assert_called_once_with(
+        limit=50, today_only=True, executed_only=True,
+    )
 
 
 def test_pipeline_evening_skips_non_trading_day():

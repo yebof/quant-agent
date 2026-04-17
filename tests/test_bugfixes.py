@@ -202,6 +202,42 @@ def test_midday_pnl_pct_zero_qty():
         assert "TEST" in msg
 
 
+def test_midday_reviewer_ignores_unfilled_buys_in_trade_context():
+    from src.agents.midday_reviewer import MiddayReviewerAgent
+
+    with patch("anthropic.Anthropic"):
+        agent = MiddayReviewerAgent(api_key="test", model="claude-sonnet-4-6")
+        msg = agent.build_user_message(
+            positions=[Position(
+                symbol="SPY", qty=10, avg_entry=500,
+                current_price=505, market_value=5050,
+                unrealized_pnl=50, sector="ETF",
+            )],
+            macro_summary={"vix": {"current": 20, "trend": "flat"}},
+            cash_balance=1000,
+            total_value=6000,
+            morning_trades=[
+                {
+                    "symbol": "SPY", "action": "BUY",
+                    "reasoning": "stale add-on that never filled",
+                    "fill_status": "canceled",
+                    "stop_loss": 490.0,
+                    "take_profit": 520.0,
+                },
+                {
+                    "symbol": "SPY", "action": "BUY",
+                    "reasoning": "core entry thesis that actually filled",
+                    "fill_status": "filled",
+                    "stop_loss": 480.0,
+                    "take_profit": 530.0,
+                },
+            ],
+        )
+
+        assert "core entry thesis that actually filled" in msg
+        assert "stale add-on that never filled" not in msg
+
+
 def test_pm_invested_pct_zero_total():
     """Portfolio manager should not crash when total_value is 0."""
     from src.agents.portfolio_manager import PortfolioManagerAgent

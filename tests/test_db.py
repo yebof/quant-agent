@@ -1,6 +1,7 @@
 import pytest
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time, timedelta
 from src.storage.db import Database
+from src.util.time import ET, UTC
 
 
 @pytest.fixture
@@ -34,6 +35,37 @@ def test_insert_and_query_trade(db):
     assert len(trades) == 1
     assert trades[0]["symbol"] == "SPY"
     assert trades[0]["qty"] == 10.0
+
+
+def test_get_trades_today_only_uses_et_trading_day(db, monkeypatch):
+    import src.storage.db as db_module
+
+    utc_today = datetime.now(UTC).date()
+    fake_et_day = utc_today - timedelta(days=1)
+    monkeypatch.setattr(db_module, "et_today", lambda: fake_et_day)
+
+    start_et = datetime.combine(fake_et_day, time.min, tzinfo=ET)
+    within_early = start_et + timedelta(hours=12)
+    within_late = start_et + timedelta(hours=23)
+    outside_next = start_et + timedelta(days=1, hours=2)
+
+    def _sqlite_ts(when: datetime) -> str:
+        return when.astimezone(UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+    rows = [
+        ("EARLY", _sqlite_ts(within_early)),
+        ("LATE", _sqlite_ts(within_late)),
+        ("NEXT", _sqlite_ts(outside_next)),
+    ]
+    db.conn.executemany(
+        "INSERT INTO trades (symbol, action, qty, price, reasoning, run_id, timestamp) "
+        "VALUES (?, 'BUY', 1, 100, 'x', 'r1', ?)",
+        rows,
+    )
+    db.conn.commit()
+
+    trades = db.get_trades(today_only=True)
+    assert [t["symbol"] for t in trades] == ["LATE", "EARLY"]
 
 
 def test_upsert_position(db):
