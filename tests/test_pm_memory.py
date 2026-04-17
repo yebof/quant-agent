@@ -196,6 +196,77 @@ def test_rm_verdicts_builder_parses_agent_logs(tmp_path):
     assert "All trades pass" in lines[1]
 
 
+def test_handle_ex_dividends_lowers_stop_day_before(tmp_path):
+    """Ex-div tomorrow → stop adjusted down by div amount. Idempotent same-day."""
+    from datetime import timedelta
+    from unittest.mock import MagicMock
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+    from src.util.time import et_today
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.market = MagicMock()
+    pipeline.broker = MagicMock()
+
+    # Position: held JPM, current price $200, existing stop at $185
+    jpm = Position(
+        symbol="JPM", qty=50, avg_entry=180, current_price=200,
+        market_value=10000, unrealized_pnl=1000, sector="Financial Services",
+    )
+    pipeline.market.get_upcoming_ex_dividend.return_value = {
+        "date": et_today() + timedelta(days=1),  # tomorrow → adjust
+        "amount": 1.20,
+    }
+    pipeline.broker.get_current_stop_price.return_value = 185.00
+    pipeline.broker.replace_stop_loss.return_value = {
+        "id": "stop-1", "status": "accepted", "symbol": "JPM",
+    }
+
+    orders = pipeline._handle_ex_dividends([jpm], run_id="r1")
+    assert len(orders) == 1
+    # Stop dropped from 185 → 183.80
+    args, kwargs = pipeline.broker.replace_stop_loss.call_args
+    assert args[0] == "JPM"
+    assert args[1] == round(185.00 - 1.20, 2)
+
+    # Running again same day → idempotent (no broker call repeat)
+    pipeline.broker.replace_stop_loss.reset_mock()
+    orders_2 = pipeline._handle_ex_dividends([jpm], run_id="r2")
+    assert orders_2 == []
+    pipeline.broker.replace_stop_loss.assert_not_called()
+
+
+def test_handle_ex_dividends_skips_when_ex_div_is_today(tmp_path):
+    """Ex-div TODAY means the gap already happened — too late to adjust."""
+    from unittest.mock import MagicMock
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+    from src.util.time import et_today
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.market = MagicMock()
+    pipeline.broker = MagicMock()
+
+    p = Position(
+        symbol="JPM", qty=50, avg_entry=180, current_price=200,
+        market_value=10000, unrealized_pnl=1000, sector="Financial Services",
+    )
+    pipeline.market.get_upcoming_ex_dividend.return_value = {
+        "date": et_today(),  # today → no action
+        "amount": 1.20,
+    }
+    orders = pipeline._handle_ex_dividends([p], run_id="r1")
+    assert orders == []
+    pipeline.broker.replace_stop_loss.assert_not_called()
+
+
 def test_run_intra_check_emergency_sells_on_breach(tmp_path):
     """Intra check at -4% daily: force-sells every position."""
     from unittest.mock import MagicMock

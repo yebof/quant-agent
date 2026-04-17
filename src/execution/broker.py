@@ -217,6 +217,35 @@ class AlpacaBroker:
             logger.warning("broker.get_bars failed for %s: %s", symbol, e)
             return []
 
+    def get_current_stop_price(self, symbol: str) -> float | None:
+        """Return the stop_price of the current open sell-stop for a symbol.
+
+        Used by ex-dividend / trailing-stop logic that needs to read the
+        existing stop before replacing it. Returns None if no sell-stop
+        exists or the query fails.
+        """
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            orders = self.client.get_orders(
+                filter=GetOrdersRequest(
+                    status=QueryOrderStatus.OPEN, symbols=[symbol], nested=True,
+                )
+            )
+        except Exception as exc:
+            logger.warning("get_current_stop_price failed for %s: %s", symbol, exc)
+            return None
+        for order in orders or []:
+            order_type = str(getattr(getattr(order, "order_type", None), "value",
+                                    getattr(order, "order_type", ""))).lower()
+            order_side = str(getattr(getattr(order, "side", None), "value",
+                                    getattr(order, "side", ""))).lower()
+            if "stop" in order_type and order_side == "sell":
+                try:
+                    return float(getattr(order, "stop_price", 0) or 0) or None
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     def get_latest_price(self, symbol: str) -> float | None:
         try:
             if self._data_client is None:

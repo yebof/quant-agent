@@ -80,6 +80,54 @@ class MarketDataProvider:
             )
         return bars
 
+    def get_upcoming_ex_dividend(self, symbol: str) -> dict:
+        """Return {date, amount} for a symbol's upcoming ex-dividend, or {}.
+
+        Used by midday ex-div adjustment to lower stops by dividend amount
+        before the ex-div gap triggers them for a non-thesis reason.
+        Bounded by a 10s timeout per symbol — same pattern as valuations.
+        """
+        from datetime import date as _date
+
+        def _fetch():
+            try:
+                return yf.Ticker(symbol).info or {}
+            except Exception as e:
+                logger.warning("ex-div fetch failed for %s: %s", symbol, e)
+                return {}
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                info = ex.submit(_fetch).result(timeout=_VALUATION_TIMEOUT_S)
+        except FuturesTimeout:
+            logger.warning("ex-div fetch timed out for %s", symbol)
+            return {}
+
+        ex_ts = info.get("exDividendDate")
+        amount = info.get("lastDividendValue")
+        if amount is None:
+            annual = info.get("trailingAnnualDividendRate")
+            # Most US large-caps pay quarterly; fall back to annual/4 if we
+            # don't have a concrete last-event value.
+            if annual:
+                try:
+                    amount = float(annual) / 4
+                except (TypeError, ValueError):
+                    amount = None
+        if ex_ts is None or amount is None:
+            return {}
+        try:
+            ex_date = _date.fromtimestamp(float(ex_ts))
+        except (TypeError, ValueError, OSError):
+            return {}
+        try:
+            amount = round(float(amount), 4)
+        except (TypeError, ValueError):
+            return {}
+        if amount <= 0:
+            return {}
+        return {"date": ex_date, "amount": amount}
+
     def get_valuation_metrics(self, symbol: str) -> dict:
         """Fetch trailing PE, forward PE, and price-to-sales from yfinance.
 
