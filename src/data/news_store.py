@@ -52,10 +52,39 @@ class NewsStore:
 
     # ── Daily Reports ──
 
-    def save_daily_report(self, report: dict):
-        path = self._today_dir() / "full_report.json"
-        _atomic_write(path, json.dumps(report, indent=2, ensure_ascii=False))
-        logger.info("Daily news report saved → %s", path)
+    def save_daily_report(self, report: dict, session: str | None = None):
+        """Save today's news intelligence report.
+
+        Writes full_report.json (latest session wins — consumers that only
+        want the latest snapshot read this). When `session` is provided,
+        ALSO writes full_report_<session>.json so morning/midday/evening
+        snapshots are individually recoverable. Session-tagged copies let
+        the next session load the previous one as a diff baseline.
+        """
+        today_dir = self._today_dir()
+        payload = json.dumps(report, indent=2, ensure_ascii=False)
+        _atomic_write(today_dir / "full_report.json", payload)
+        if session:
+            _atomic_write(today_dir / f"full_report_{session}.json", payload)
+        logger.info("Daily news report saved → %s (session=%s)", today_dir, session)
+
+    def load_daily_report(self, session: str | None = None) -> dict | None:
+        """Load today's news report.
+
+        When `session` is provided, loads full_report_<session>.json. Without
+        it, loads the latest (full_report.json). Returns None if the file
+        doesn't exist or is corrupt.
+        """
+        today_dir = self.data_dir / str(et_today())
+        name = f"full_report_{session}.json" if session else "full_report.json"
+        path = today_dir / name
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to load daily report %s: %s", path, e)
+            return None
 
     def save_stock_alerts(self, stock_news: dict):
         alerts_dir = self._today_dir() / "stock_alerts"

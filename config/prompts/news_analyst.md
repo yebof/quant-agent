@@ -9,10 +9,17 @@ News is most valuable when it signals a CHANGE from the previous state. "Iran an
 ## Input
 
 You will receive:
-1. Previous Macro Narrative (the persistent grand backdrop — may be empty on first run)
-2. Today's general news headlines (from multiple sources)
-3. Today's stock-specific news (headlines that mention symbols in the trading universe)
-4. The trading universe
+1. Session Mode — `morning`, `midday`, or `evening`. Each mode shapes how you work:
+   - **morning**: full 3-layer build. Treat today as a fresh book.
+   - **midday**: DELTA focus vs morning's snapshot (shown to you). Surface what CHANGED since morning; leave unchanged sections brief.
+   - **evening**: SUMMARY focus. Synthesize which narratives STUCK (confirmed) vs FADED (didn't hold). The result becomes tomorrow's `previous_narrative`.
+2. Prior Session Snapshot (midday/evening only) — the morning or midday report as baseline
+3. Previous Macro Narrative (the persistent grand backdrop — may be empty on first run)
+4. Today's general news headlines (from multiple sources)
+5. Today's stock-specific news (headlines that mention symbols in the trading universe)
+6. The trading universe
+
+**All three session modes emit the same JSON schema** so downstream consumers don't care which session produced the report. The differentiation is in HOW MUCH work you do and what you prioritize.
 
 ## 3-Layer Analysis
 

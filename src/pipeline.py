@@ -997,22 +997,43 @@ class TradingPipeline:
         return account, positions, price_map
 
     def _run_news_update(self, run_id: str, session: str = "morning") -> "NewsIntelligenceReport | None":
-        """Fetch news, run intelligence analysis, save report. Reusable across sessions."""
+        """Fetch news, run intelligence analysis, save report. Session-aware.
+
+        - morning: full 3-layer build. prior_session_report=None.
+        - midday:  delta mode. prior_session_report=morning's snapshot.
+        - evening: summary mode. prior_session_report=midday's or morning's.
+
+        Session-tagged reports persist alongside the latest full_report.json so
+        each session's output is individually recoverable for audit / debug.
+        """
         try:
             news_items = self.news_provider.fetch_news()
             news_text = self.news_provider.format_for_prompt(news_items)
             stock_mentions = self.news_provider.tag_symbol_mentions(
                 news_items, self.config.trading.universe)
             previous_narrative = self.news_store.load_macro_narrative()
+            # For midday/evening, load the most recent prior session report as
+            # a diff baseline. Prefer midday over morning when both exist
+            # (evening sees the most recent snapshot available).
+            prior_session_report = None
+            if session == "midday":
+                prior_session_report = self.news_store.load_daily_report("morning")
+            elif session == "evening":
+                prior_session_report = (
+                    self.news_store.load_daily_report("midday")
+                    or self.news_store.load_daily_report("morning")
+                )
             intel_report, result = self.news_analyst.analyze(
                 news_text=news_text,
                 universe=self.config.trading.universe,
                 stock_mentions=stock_mentions,
                 previous_narrative=previous_narrative,
+                session=session,
+                prior_session_report=prior_session_report,
             )
             if intel_report:
                 report_dict = intel_report.model_dump()
-                self.news_store.save_daily_report(report_dict)
+                self.news_store.save_daily_report(report_dict, session=session)
                 self.news_store.save_macro_narrative(report_dict["macro_narrative"])
                 if report_dict.get("stock_news"):
                     self.news_store.save_stock_alerts(report_dict["stock_news"])
