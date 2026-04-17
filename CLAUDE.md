@@ -28,6 +28,9 @@ LLM multi-agent 美股量化交易系统，通过 Alpaca 执行交易（默认 p
 - **RM reasoning_chain**：6 字段 (rr_audit / signal_fidelity / correlation_check / event_risk / sizing_sanity / overall) 强制，最后一道关有审计痕迹
 - **Evening 自省**：EveningAnalyst 读昨日 `insights.tomorrow_outlook` → 今日输出 `previous_outlook_assessment` 老实打分，做长期 calibration
 - **Midday/Evening Pydantic**：从裸 dict 升级到 `MiddayReview` + `EveningReport`；`MiddayAction.TRAIL_STOP` 强制 `new_stop_price > 0`；typo (TRIAL_STOP) 直接 ValidationError 拦下
+- **EarningsAnalyst**：`investment_implications` 必含 5 步 `reasoning_chain` (fundamental_quality / growth_trajectory / strategic_risks / management_execution / valuation_context) —— sentiment 必须可从这 5 字段推导
+- **生产侧防挂死**：所有 Alpaca SDK 调用注入 30s HTTP timeout（`_install_http_timeout`），且 launchd plist 外层用 `/opt/homebrew/bin/timeout --kill-after=30 600 ...` 10 分钟兜底——双层防护，防再次出现 13 小时 hang
+- **价格 quantize**：`broker.submit_order` 提交前 `_quantize_price(price)` 按 Alpaca tick 规则归整（≥$1 用 2 位小数、<$1 用 4 位）——防 sub-penny reject
 - **生产调度**：macOS launchd，Mon-Fri SGT 22:00/04:00/08:30 → morning/midday/evening（对应美东 10:00/16:00/20:30）
 
 ## 开发规范

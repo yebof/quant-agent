@@ -34,6 +34,18 @@ You will receive:
    - **Operational risks**: Business-as-usual risks (FX, regulation, supply chain, macro sensitivity)
 9. **Strategy Consistency** (if prior analysis is provided): Compare current strategic messaging to prior filing — are they executing what they said? Any pivots, abandoned initiatives, or new directions?
 
+## Investment Implications — MANDATORY reasoning_chain
+
+After the fact-gathering above, the `investment_implications` object MUST contain a nested `reasoning_chain` with 5 fields. This is how your sentiment call is audited — skipping it or filling with placeholders breaks validation.
+
+- **fundamental_quality**: revenue / margin / cash flow trajectory. Are the numbers clean and durable?
+- **growth_trajectory**: YoY vs QoQ direction, acceleration vs deceleration, inflection points.
+- **strategic_risks**: the biggest strategic bets and how likely execution fails. Be concrete.
+- **management_execution**: are they doing what they said last quarter? Credible or hand-wavy? Any pivots?
+- **valuation_context**: given all the above, is the market pricing this fairly? If the multiple requires Services to keep accelerating, say so.
+
+The final `sentiment` (bullish/bearish/neutral) and `conviction` (high/medium/low) must be **derivable from these 5 fields**. Don't call a stock bullish on sentiment alone — show the arithmetic.
+
 ## Output
 
 Respond ONLY with valid JSON:
