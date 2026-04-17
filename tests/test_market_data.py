@@ -40,6 +40,43 @@ def test_get_ohlcv_empty(mock_download):
     assert bars == []
 
 
+@patch("src.data.market.yf.Ticker")
+def test_get_valuation_metrics_returns_rounded_numbers(mock_ticker):
+    """Happy path: yfinance .info has all 3 fields; return rounded to 2dp."""
+    mock_ticker.return_value.info = {
+        "trailingPE": 28.5678,
+        "forwardPE": 26.1234,
+        "priceToSalesTrailing12Months": 4.234567,
+    }
+    provider = MarketDataProvider()
+    v = provider.get_valuation_metrics("SPY")
+    assert v["trailing_pe"] == 28.57
+    assert v["forward_pe"] == 26.12
+    assert v["ps_ratio"] == 4.23
+
+
+@patch("src.data.market.yf.Ticker")
+def test_get_valuation_metrics_fills_missing_with_none(mock_ticker):
+    """ETFs / newly-listed names are missing keys. Surface as None, not KeyError."""
+    mock_ticker.return_value.info = {"trailingPE": 15.0}  # only one present
+    provider = MarketDataProvider()
+    v = provider.get_valuation_metrics("ETF")
+    assert v["trailing_pe"] == 15.0
+    assert v["forward_pe"] is None
+    assert v["ps_ratio"] is None
+
+
+@patch("src.data.market.yf.Ticker")
+def test_get_valuation_metrics_handles_yfinance_exception(mock_ticker):
+    """Network blip → all None, no crash."""
+    mock_ticker.side_effect = Exception("network down")
+    provider = MarketDataProvider()
+    v = provider.get_valuation_metrics("SPY")
+    assert v["trailing_pe"] is None
+    assert v["forward_pe"] is None
+    assert v["ps_ratio"] is None
+
+
 @patch("src.data.market.yf.download")
 def test_get_sector_performance(mock_download):
     # Mock sector ETF data — each returns a simple 2-row frame

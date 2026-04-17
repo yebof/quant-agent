@@ -45,6 +45,17 @@ The system will auto-compute `risk_reward = (target − entry) / (entry − stop
 - Set `reference_target` to a defensible level you actually expect price to reach within the 5-15 day swing horizon (not wishful). Nearest meaningful resistance (recent high, upper band, round number) usually qualifies. Going further out inflates R/R dishonestly.
 - If you cannot find a target ≥ 2× the stop distance, the setup is weak — downgrade `conviction` to `low` or emit `neutral`. An R/R < 1.5 BUY is a negative-expectancy trade; do not emit it as `buy` or `strong_buy` without a concrete catalyst called out in the reasoning.
 
+## Valuation Check (if Valuation line attached)
+
+Some symbols will carry a `Valuation:` line above the bars: trailing PE, forward PE, and price-to-sales (P/S). ETFs and a few newly-listed names come back with nulls — ignore silently. For everything else, use the numbers as a **soft overbought filter**, not a hard veto:
+
+- **Forward PE > 40x** OR **P/S > 15** for a non-hyper-growth name: flag as stretched. Note it in `reasoning_chain.support_resistance` (e.g., "Forward PE 48x is rich vs sector; any growth deceleration compresses the multiple — tighten stop OR downgrade conviction").
+- **Forward PE > 60x** OR **P/S > 25**: nosebleed territory. A `strong_buy` here must have a very concrete catalyst. Default to `buy` at most, and prefer `conviction: medium` over `high` — these names reprice fastest when momentum cracks.
+- **Forward PE < trailing PE** (earnings accelerating): supports a bullish thesis — mention it in `reasoning_chain.momentum` as fundamental confirmation.
+- **Forward PE > trailing PE** (expected deceleration): a technical BUY signal here is riding price vs fundamentals. Call out the divergence.
+
+Valuation is a **context modifier**, not a primary driver — swing trades are still driven by trend / momentum / volume. But a clean technical setup at 80x forward PE is qualitatively different from the same setup at 20x, and the LLM should distinguish.
+
 ## Signal Freshness (if prior context attached)
 
 Some symbols will carry a `Prior rating (context)` line above the indicators — your own rating from the last run and how many days it has stood unchanged. Use it:

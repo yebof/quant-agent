@@ -137,6 +137,29 @@ def test_build_user_message_surfaces_prior_rating_with_age(sample_indicators, sa
         assert "entry 500.0" in msg  # prior price surfaced
 
 
+def test_build_user_message_surfaces_valuation_when_provided(sample_indicators, sample_bars):
+    valuations = {"SPY": {"trailing_pe": 28.5, "forward_pe": 26.1, "ps_ratio": 4.2}}
+    with patch("anthropic.Anthropic"):
+        agent = TechAnalystAgent(api_key="test", model="claude-sonnet-4-6-20250514")
+        msg = agent.build_user_message(
+            symbols_data=_sym_data("SPY", sample_bars, sample_indicators),
+            valuations=valuations,
+        )
+        assert "Valuation: trailing PE 28.5 | forward PE 26.1 | P/S 4.2" in msg
+
+
+def test_build_user_message_hides_valuation_when_all_none(sample_indicators, sample_bars):
+    """ETFs typically return all-None valuations — should not render the line at all."""
+    valuations = {"SPY": {"trailing_pe": None, "forward_pe": None, "ps_ratio": None}}
+    with patch("anthropic.Anthropic"):
+        agent = TechAnalystAgent(api_key="test", model="claude-sonnet-4-6-20250514")
+        msg = agent.build_user_message(
+            symbols_data=_sym_data("SPY", sample_bars, sample_indicators),
+            valuations=valuations,
+        )
+        assert "Valuation:" not in msg
+
+
 def test_build_user_message_omits_prior_for_new_symbol(sample_indicators, sample_bars):
     """A symbol with no prior entry should not have a Prior rating line."""
     with patch("anthropic.Anthropic"):

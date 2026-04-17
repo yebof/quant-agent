@@ -639,8 +639,18 @@ class TradingPipeline:
                 return {}, None
             # Feed yesterday's ratings so the LLM can judge continuation vs flip vs staleness.
             prior_ratings = self.tech_store.load()
+            # Fetch valuation snapshots only for post-pre-filter symbols (typically
+            # 10-20 of 77) to bound the yfinance cost. ETFs usually return empty.
+            valuations: dict[str, dict] = {}
+            for s in symbols_data:
+                sym = s.get("symbol")
+                if sym:
+                    try:
+                        valuations[sym] = self.market.get_valuation_metrics(sym)
+                    except Exception as e:
+                        logger.warning("valuation fetch crashed for %s: %s", sym, e)
             analyses_map, ta_res = self.tech_analyst.analyze_batch(
-                symbols_data, prior_ratings=prior_ratings,
+                symbols_data, prior_ratings=prior_ratings, valuations=valuations,
             )
             # Persist today's ratings so tomorrow's run inherits this memory.
             if analyses_map:

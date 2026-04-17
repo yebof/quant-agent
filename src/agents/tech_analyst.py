@@ -33,6 +33,7 @@ class TechAnalystAgent(BaseAgent):
     def build_user_message(self, **kwargs) -> str:
         symbols_data: list[dict] = kwargs.get("symbols_data", []) or []
         prior_ratings: dict[str, dict] = kwargs.get("prior_ratings") or {}
+        valuations: dict[str, dict] = kwargs.get("valuations") or {}
 
         # How many days ago did the cached rating first appear?
         from datetime import date as _date
@@ -58,6 +59,20 @@ class TechAnalystAgent(BaseAgent):
                 f"({p.get('conviction', '?')}) | first seen {age_str} | {prices}"
             )
 
+        def _valuation_line(symbol: str) -> str:
+            v = valuations.get(symbol)
+            if not v:
+                return ""
+            t = v.get("trailing_pe")
+            f = v.get("forward_pe")
+            ps = v.get("ps_ratio")
+            # All three missing (typical for ETFs) → skip the line entirely.
+            if t is None and f is None and ps is None:
+                return ""
+            return (
+                f"\nValuation: trailing PE {t} | forward PE {f} | P/S {ps}"
+            )
+
         sections = []
         for item in symbols_data:
             symbol = item["symbol"]
@@ -69,7 +84,7 @@ class TechAnalystAgent(BaseAgent):
                 for b in recent_bars
             )
             current_price = recent_bars[-1].close if recent_bars else "N/A"
-            sections.append(f"""### {symbol}{_prior_line(symbol)}
+            sections.append(f"""### {symbol}{_prior_line(symbol)}{_valuation_line(symbol)}
 Price (last {len(recent_bars)} daily bars):
 {bars_text}
 Indicators: MA20={indicators.ma_20} MA50={indicators.ma_50} MA200={indicators.ma_200} | RSI={indicators.rsi_14} | MACD={indicators.macd}/{indicators.macd_signal}/{indicators.macd_hist} | BB={indicators.bb_lower}/{indicators.bb_middle}/{indicators.bb_upper} | ATR={indicators.atr_14} | Vol%={indicators.volume_change_pct}
@@ -86,20 +101,24 @@ Current close: {current_price}""")
         self,
         symbols_data: list[dict],
         prior_ratings: dict[str, dict] | None = None,
+        valuations: dict[str, dict] | None = None,
     ) -> tuple[dict[str, TechAnalysisResult], "AgentResult | None"]:
         """Batch analyze multiple symbols. Auto-chunks when > 30 symbols to avoid
         context overflow on the LLM call. Returns ({symbol: result}, merged AgentResult).
 
         prior_ratings: optional {symbol: {rating, conviction, first_seen_date, ...}}
-        from TechStore. When supplied, each symbol's user-message section prefaces
-        today's data with a 'Prior rating' line so the LLM can judge continuation
-        vs flip vs staleness.
+          from TechStore. When supplied, each symbol's user-message section prefaces
+          today's data with a 'Prior rating' line so the LLM can judge continuation
+          vs flip vs staleness.
+        valuations: optional {symbol: {trailing_pe, forward_pe, ps_ratio}} from
+          MarketDataProvider.get_valuation_metrics. Surfaced as a Valuation line
+          in the prompt so the LLM can flag overvaluation in its reasoning_chain.
         """
         if not symbols_data:
             return {}, None
 
         if len(symbols_data) <= _MAX_SYMBOLS_PER_CALL:
-            return self._analyze_chunk(symbols_data, prior_ratings)
+            return self._analyze_chunk(symbols_data, prior_ratings, valuations)
 
         # Chunk and stitch.
         chunks = [
@@ -117,7 +136,7 @@ Current close: {current_price}""")
         total_tokens = 0
         last_model = self.model
         for i, chunk in enumerate(chunks, 1):
-            chunk_analyses, chunk_result = self._analyze_chunk(chunk, prior_ratings)
+            chunk_analyses, chunk_result = self._analyze_chunk(chunk, prior_ratings, valuations)
             merged.update(chunk_analyses)
             if chunk_result is not None:
                 combined_raw.append(f"--- chunk {i}/{len(chunks)} ---\n{chunk_result.raw_text}")
@@ -137,9 +156,14 @@ Current close: {current_price}""")
         self,
         symbols_data: list[dict],
         prior_ratings: dict[str, dict] | None = None,
+        valuations: dict[str, dict] | None = None,
     ) -> tuple[dict[str, TechAnalysisResult], "AgentResult | None"]:
         """Single-call variant used inside the chunking loop."""
-        result = self.run(symbols_data=symbols_data, prior_ratings=prior_ratings or {})
+        result = self.run(
+            symbols_data=symbols_data,
+            prior_ratings=prior_ratings or {},
+            valuations=valuations or {},
+        )
         parsed = result.parse_json()
 
         if parsed is None:
