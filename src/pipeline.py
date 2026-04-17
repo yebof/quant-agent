@@ -1242,6 +1242,36 @@ class TradingPipeline:
             ))
             logger.warning("Morning data degradation: %s", data_status)
 
+        # Correlation coverage check. build_correlation_matrix silently returns
+        # {} when fewer than 2 symbols have enough bars (e.g., yfinance rate-
+        # limited, holiday with stale cache). Downstream risk engine then
+        # evaluates `if correlation_matrix:` → False → skips the cluster check
+        # entirely. If we have any book to diversify, that silence is a real
+        # coverage gap — surface it as an advisory so RM can decide to scale
+        # down exposure until data returns.
+        has_book_to_check = len(positions) >= 2 or any(
+            d.action == "BUY" for d in portfolio_decision.decisions
+        )
+        if (not correlation_matrix) and has_book_to_check:
+            from src.risk.rules import RiskViolation as _RV
+            rule_violations.append(_RV(
+                rule="correlation_coverage_gap",
+                message=(
+                    "Correlation matrix is empty (insufficient bar data this run). "
+                    "The cluster-concentration advisory is DISABLED. Consider "
+                    "scale_all_buys < 1.0 until coverage returns, especially for "
+                    "thematic names (AI, semis, energy)."
+                ),
+                value=0.0,
+                limit=2.0,  # 2 = minimum symbols to matrix-ify
+            ))
+            logger.warning(
+                "Correlation matrix empty — cluster risk check disabled for this run "
+                "(positions=%d, buy_candidates=%d)",
+                len(positions),
+                sum(1 for d in portfolio_decision.decisions if d.action == "BUY"),
+            )
+
         # 6. Risk Manager LLM review (with remaining non-blocking violations as advisory).
         # Pass tech_analyses so RM can audit PM's fidelity to the underlying ratings.
         verdict, rm_result = self.risk_manager.review(
