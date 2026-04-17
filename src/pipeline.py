@@ -27,7 +27,7 @@ from src.agents.earnings_analyst import EarningsAnalystAgent
 from src.data.earnings import EarningsDataProvider
 from src.risk.rules import RiskRuleEngine
 from src.execution.broker import AlpacaBroker, _get_sector
-from src.pipeline_context import RunContext, SessionType
+from src.pipeline_context import PMFacts, RunContext, SessionType
 from src.portfolio_constructor import PortfolioConstructor
 from src.storage.db import Database
 from src.models import (
@@ -1083,6 +1083,120 @@ class TradingPipeline:
             )
         return ""
 
+    def _build_pm_facts(
+        self,
+        *,
+        positions: list,
+        analyses: list,
+        total_value: float,
+        cash: float,
+        recent_performance: dict,
+    ) -> PMFacts:
+        """Quantitative snapshot surfaced to PM as structured fields.
+
+        Phase 4 #4: reduces PM's reliance on LLM-summarized prose for the
+        things that are actually numbers (win rate, sector weights, age
+        buckets). Prose layers (weekly_narrative, rm_recent_verdicts)
+        stay for qualitative continuity.
+        """
+        import statistics
+        from src.execution.broker import _get_sector as _sector_of
+        from src.risk.rules import _gross_multiplier
+
+        f = PMFacts()
+
+        # Calibration
+        try:
+            calib = self.db.compute_trade_calibration(lookback_days=30)
+        except Exception as e:
+            logger.warning("pm_facts: calibration failed: %s", e)
+            calib = {}
+        if calib:
+            f.closed_trades_30d = int(calib.get("n") or 0)
+            f.win_rate_30d_pct = calib.get("win_rate_pct")
+            f.avg_return_30d_pct = calib.get("avg_return_pct")
+            f.avg_hold_days_30d = calib.get("avg_hold_days")
+
+        # RM discipline
+        try:
+            rm_rows = self.db.get_recent_agent_outputs(
+                agent_name="risk_manager", limit=5,
+                before_date=str(et_today()),
+            )
+        except Exception as e:
+            logger.warning("pm_facts: rm outputs failed: %s", e)
+            rm_rows = []
+        f.rm_verdicts_seen = len(rm_rows)
+        for row in rm_rows:
+            try:
+                import json as _json
+                data = _json.loads(row.get("full_response") or "{}")
+            except (ValueError, TypeError):
+                continue
+            scale = data.get("scale_all_buys", 1.0)
+            try:
+                if float(scale) < 1.0:
+                    f.rm_scale_downs_last5 += 1
+            except (TypeError, ValueError):
+                pass
+            if data.get("modifications"):
+                f.rm_mods_last5 += 1
+
+        # Book state
+        if total_value > 0:
+            invested = total_value - (cash or 0)
+            f.invested_pct = round(invested / total_value * 100, 1)
+            f.cash_pct = round((cash or 0) / total_value * 100, 1)
+        f.position_count = len(positions)
+
+        # Sector weights (gross multiplier for leveraged ETFs)
+        for p in positions:
+            if p.qty <= 0 or total_value <= 0:
+                continue
+            weight = p.market_value * _gross_multiplier(p.symbol) / total_value * 100
+            sector = p.sector or _sector_of(p.symbol) or "Unknown"
+            f.sector_weights[sector] = round(
+                f.sector_weights.get(sector, 0.0) + weight, 1,
+            )
+
+        # Age buckets + drift flag
+        try:
+            position_history = self._build_position_history(positions)
+        except Exception:
+            position_history = {}
+        for p in positions:
+            hist = position_history.get(p.symbol) or {}
+            days = hist.get("days_held")
+            if days is None:
+                continue
+            if days < 5:
+                f.positions_under_5d += 1
+            elif days <= 15:
+                f.positions_5_to_15d += 1
+            else:
+                f.positions_over_15d += 1
+            # Drift check
+            if p.avg_entry and p.qty and total_value > 0:
+                weight = p.market_value / total_value * 100
+                cost_basis = p.avg_entry * p.qty
+                pnl_pct = (p.unrealized_pnl / cost_basis * 100) if cost_basis > 0 else 0
+                if weight > 12 and pnl_pct > 10:
+                    f.positions_drift_flagged += 1
+
+        # Signal freshness
+        ages = [a.signal_age_days for a in analyses if a.signal_age_days is not None]
+        f.tech_signals_count = len(analyses)
+        if ages:
+            f.tech_signals_median_age_days = int(statistics.median(ages))
+            f.tech_signals_stale_count = sum(1 for a in ages if a >= 8)
+
+        # System perf
+        f.rolling_5d_pct = recent_performance.get("rolling_5d_pct")
+        f.rolling_20d_pct = recent_performance.get("rolling_20d_pct")
+        f.in_drawdown = bool(recent_performance.get("in_drawdown"))
+
+        return f
+
     def _build_calibration_note(self, lookback_days: int = 45) -> str:
         """Render PM's own hit rate + avg return on closed BUYs in the window.
 
@@ -1619,6 +1733,13 @@ class TradingPipeline:
         # disagree, surface it as an advisory (non-blocking). Captures the
         # "market is leading the data" signal that either alone can miss.
         macro_tech_alignment = self._build_macro_tech_alignment(macro_analysis, analyses)
+        # Phase 4 #4: structured facts snapshot for PM — pure numbers, not prose.
+        pm_facts = self._build_pm_facts(
+            positions=positions, analyses=analyses,
+            total_value=total_value, cash=cash,
+            recent_performance=recent_performance,
+        )
+        ctx.facts = pm_facts
 
         portfolio_decision, pm_result = self.portfolio_manager.decide(
             analyses=analyses,
@@ -1641,6 +1762,7 @@ class TradingPipeline:
             projected_portfolio=projected_portfolio,
             calibration_note=calibration_note,
             macro_tech_alignment=macro_tech_alignment,
+            facts=pm_facts,
         )
 
         if portfolio_decision and portfolio_decision.reasoning_chain:

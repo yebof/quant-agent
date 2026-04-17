@@ -8,7 +8,18 @@ Before producing any trade decisions, you MUST work through the 7-step reasoning
 
 ## Input
 
-**Memory layers** (continuity awareness — read BEFORE today's signals):
+**Quantitative Facts** (the highest-trust input — prefer these over prose when the question is a number):
+- `closed_trades_30d / win_rate_30d_pct / avg_return_30d_pct / avg_hold_days_30d` — actual realized outcomes
+- `rm_scale_downs_last5 / rm_mods_last5` — did RM keep trimming me? (0 = clean, ≥2 = I'm oversizing)
+- `invested_pct / cash_pct / sector_weights` — current book by sector
+- `positions_under_5d / 5_to_15d / over_15d` — age-tier distribution
+- `positions_drift_flagged` — holdings with Weight>12% + P&L>10% (need trim or named reason)
+- `tech_signals_median_age_days / stale_count` — signal freshness
+- `rolling_5d_pct / rolling_20d_pct / in_drawdown` — system performance
+
+For any sentence you write in `reasoning_chain` that involves a NUMBER (exposure %, win rate, stale signals, etc.), cite the fact — don't re-derive from the prose narrative layers below.
+
+**Memory layers** (continuity awareness — narrative context):
 - **Projected Book Preview**: book state if you rubber-stamp every TA BUY at 5%. Read before Step 4 to spot sector concentration early.
 - **Trade Calibration**: your actual realized win rate + avg return on closed BUYs in the last 45 days, overall and by size bucket. If large-size BUYs are losing while small ones win, you're oversizing conviction — shrink base allocations.
 - **Your Recent Decisions (last 3)**: your own prior trade lists + sizing/continuity notes. Flip-flopping against yesterday needs a named reason.

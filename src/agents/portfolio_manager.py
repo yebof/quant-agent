@@ -361,6 +361,7 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
         projected_portfolio: str = kwargs.get("projected_portfolio") or ""
         calibration_note: str = kwargs.get("calibration_note") or ""
         macro_tech_alignment: str = kwargs.get("macro_tech_alignment") or ""
+        facts = kwargs.get("facts")  # PMFacts | None
 
         rm_verdicts_section = (
             f"## Risk Manager Verdicts (last 5 sessions — self-calibrate)\n{rm_recent_verdicts}"
@@ -386,6 +387,13 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
             f"## Macro-Tech Alignment Advisory\n{macro_tech_alignment}"
             if macro_tech_alignment else ""
         )
+        # Phase 4 #4: structured facts block — numbers, not prose. PM should
+        # prefer these over the derived narrative sections below for quantitative
+        # questions (win rate, sector weight, age distribution).
+        facts_section = (
+            f"## Quantitative Facts (read these first for numbers)\n{facts.render()}"
+            if facts is not None else ""
+        )
 
         return f"""## Account Status
 - Total Value: ${total_value:,.2f}
@@ -394,6 +402,8 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
 
 ## Current Positions (with entry context + signal trajectory)
 {positions_text}
+
+{facts_section}
 
 {projected_section}
 
@@ -441,7 +451,8 @@ Based on all the above (memory of past decisions + environment trajectory + toda
                pm_recent_decisions: str = "",
                projected_portfolio: str = "",
                calibration_note: str = "",
-               macro_tech_alignment: str = "") -> tuple[PortfolioDecision | None, "AgentResult"]:
+               macro_tech_alignment: str = "",
+               facts=None) -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
             analyses=analyses,
             positions=positions,
@@ -461,6 +472,7 @@ Based on all the above (memory of past decisions + environment trajectory + toda
             projected_portfolio=projected_portfolio,
             calibration_note=calibration_note,
             macro_tech_alignment=macro_tech_alignment,
+            facts=facts,
         )
         parsed = result.parse_json()
         if parsed is None:

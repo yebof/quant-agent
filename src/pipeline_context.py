@@ -1,4 +1,4 @@
-"""Per-run context — replaces the ``self._last_*`` implicit state pattern.
+"""Per-run context + structured PM facts.
 
 Previously `TradingPipeline` stashed cross-stage data on its own instance
 (``self._last_symbols_bars``, ``self._bg_threads``). That conflated per-run
@@ -75,6 +75,11 @@ class RunContext:
     # prevents stale thread references from one run bleeding into the next.
     bg_threads: list[threading.Thread] = field(default_factory=list)
 
+    # === Structured facts for PM — Phase 4 #4 ===
+    # Populated at the top of the DecisionStage so PM sees numbers, not
+    # LLM-summarized-prose, for the quantitative stuff.
+    facts: "PMFacts | None" = None
+
     @classmethod
     def start(cls, session: SessionType) -> "RunContext":
         """Build a fresh context for a new session.
@@ -87,3 +92,81 @@ class RunContext:
             run_id=f"{rid_prefix}-{uuid.uuid4().hex[:8]}",
             session=session,
         )
+
+
+@dataclass
+class PMFacts:
+    """Quantitative snapshot surfaced to PM as structured fields, not prose.
+
+    Codex: 'Memory is LLM-summarizing-LLM — events, interpretations, and
+    facts get mashed together in prose.' PMFacts carries pure numbers so
+    PM can reference, compare, and reason against them directly instead
+    of re-parsing prose that may have drifted.
+
+    All values are POST-trade (i.e., current book state) unless tagged
+    _pre_ (e.g., cash before executing). The snapshot is captured once
+    at the top of DecisionStage and passed down — not recomputed.
+    """
+
+    # Calibration (realized outcomes)
+    closed_trades_30d: int = 0
+    win_rate_30d_pct: float | None = None
+    avg_return_30d_pct: float | None = None
+    avg_hold_days_30d: float | None = None
+
+    # RM discipline (how often RM overrode PM lately)
+    rm_verdicts_seen: int = 0
+    rm_scale_downs_last5: int = 0   # count with scale_all_buys < 1.0
+    rm_mods_last5: int = 0           # count with any modifications
+
+    # Current book state
+    invested_pct: float = 0.0
+    cash_pct: float = 100.0
+    position_count: int = 0
+    sector_weights: dict[str, float] = field(default_factory=dict)  # {sector: % of equity}
+    positions_under_5d: int = 0
+    positions_5_to_15d: int = 0
+    positions_over_15d: int = 0
+    positions_drift_flagged: int = 0  # weight > 12% + P&L > 10%
+
+    # Signal freshness (from TA output)
+    tech_signals_count: int = 0
+    tech_signals_median_age_days: int | None = None
+    tech_signals_stale_count: int = 0  # age >= 8
+
+    # System performance (existing; surfaced here as facts)
+    rolling_5d_pct: float | None = None
+    rolling_20d_pct: float | None = None
+    in_drawdown: bool = False
+
+    def render(self) -> str:
+        """Format as a compact markdown block for PM's prompt."""
+        def _pct(v: float | None) -> str:
+            return f"{v:+.2f}%" if v is not None else "n/a"
+
+        def _num(v: float | int | None) -> str:
+            return f"{v}" if v is not None else "n/a"
+
+        sector_lines = "\n".join(
+            f"  - {s}: {w:.1f}%"
+            for s, w in sorted(self.sector_weights.items(), key=lambda kv: -kv[1])[:8]
+        ) or "  (none)"
+
+        return f"""### Calibration (last 30d closed trades)
+- n={self.closed_trades_30d} · win_rate={_pct(self.win_rate_30d_pct)} · avg_return={_pct(self.avg_return_30d_pct)} · avg_hold={_num(self.avg_hold_days_30d)}d
+
+### RM Discipline (last 5 verdicts)
+- scale_all_buys<1.0 count: {self.rm_scale_downs_last5}/5 · mods emitted: {self.rm_mods_last5}/5
+
+### Book State (current)
+- invested={self.invested_pct:.1f}% · cash={self.cash_pct:.1f}% · positions={self.position_count}
+- age buckets: <5d={self.positions_under_5d} · 5-15d={self.positions_5_to_15d} · >15d={self.positions_over_15d}
+- drift-flagged (weight>12% + P&L>10%): {self.positions_drift_flagged}
+- sector weights (top 8):
+{sector_lines}
+
+### Signal Freshness (TA output this session)
+- signals={self.tech_signals_count} · median_age={_num(self.tech_signals_median_age_days)}d · stale(≥8d)={self.tech_signals_stale_count}
+
+### System Performance
+- rolling 5d={_pct(self.rolling_5d_pct)} · 20d={_pct(self.rolling_20d_pct)} · in_drawdown={self.in_drawdown}"""
