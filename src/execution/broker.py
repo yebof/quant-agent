@@ -329,6 +329,35 @@ class AlpacaBroker:
             logger.warning("Failed to cancel open entry orders: %s", exc)
             return 0
 
+    def get_order_fill_info(self, order_id: str) -> dict | None:
+        """Return {status, filled_qty, filled_avg_price} for an order, or None.
+
+        Used by Phase 3 reconciliation. The caller decides whether the
+        returned status is terminal; this method does not block / poll.
+        """
+        try:
+            order = self.client.get_order_by_id(order_id)
+        except Exception as exc:
+            logger.warning("get_order_fill_info failed for %s: %s", order_id, exc)
+            return None
+        status = str(
+            getattr(getattr(order, "status", None), "value",
+                    getattr(order, "status", ""))
+        ).lower()
+        try:
+            filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+        except (TypeError, ValueError):
+            filled_qty = 0.0
+        try:
+            filled_avg_price = float(getattr(order, "filled_avg_price", 0) or 0)
+        except (TypeError, ValueError):
+            filled_avg_price = 0.0
+        return {
+            "status": status,
+            "filled_qty": filled_qty,
+            "filled_avg_price": filled_avg_price,
+        }
+
     def wait_for_order_terminal(
         self,
         order_id: str,

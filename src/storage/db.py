@@ -31,6 +31,11 @@ class Database:
                 price REAL NOT NULL,
                 reasoning TEXT,
                 run_id TEXT,
+                broker_order_id TEXT,
+                fill_status TEXT,                      -- submitted | filled | canceled | rejected | expired | NULL(legacy)
+                fill_qty REAL,                         -- actual qty filled (may differ from requested)
+                fill_price REAL,                       -- actual avg fill price
+                fill_reconciled_at TEXT,               -- when we confirmed the terminal status
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -116,6 +121,15 @@ class Database:
         _ensure_column("insights", "tomorrow_conviction", "tomorrow_conviction TEXT DEFAULT 'medium'")
         _ensure_column("insights", "tomorrow_key_risks", "tomorrow_key_risks TEXT DEFAULT '[]'")
         _ensure_column("insights", "sell_decisions_assessment", "sell_decisions_assessment TEXT DEFAULT ''")
+        # Phase 3: fill reconciliation — tells memory readers which 'trades'
+        # rows actually executed vs which were just submitted. Legacy rows
+        # default to NULL and are treated as 'filled' by the calibration
+        # query (backward compat — those predate the reconciliation path).
+        _ensure_column("trades", "broker_order_id", "broker_order_id TEXT")
+        _ensure_column("trades", "fill_status", "fill_status TEXT")
+        _ensure_column("trades", "fill_qty", "fill_qty REAL")
+        _ensure_column("trades", "fill_price", "fill_price REAL")
+        _ensure_column("trades", "fill_reconciled_at", "fill_reconciled_at TEXT")
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
@@ -123,13 +137,65 @@ class Database:
 
     def insert_trade(self, symbol: str, action: str, qty: float, price: float,
                      reasoning: str, run_id: str,
-                     stop_loss: float = 0, take_profit: float = 0):
+                     stop_loss: float = 0, take_profit: float = 0,
+                     broker_order_id: str | None = None,
+                     fill_status: str | None = None) -> int:
+        """Insert a trade record. Returns the new row's id.
+
+        `fill_status` semantics:
+          - 'submitted'  — sent to broker, terminal status pending
+          - 'filled'     — broker confirmed execution (full or partial)
+          - 'canceled' / 'rejected' / 'expired' — did not execute
+          - None         — pre-reconciliation / system row (HOLD, TRAIL_STOP, TAKE_PROFIT).
+                           Legacy rows also carry None and are treated as filled by memory readers.
+        """
         with self._lock:
-            self.conn.execute(
-                "INSERT INTO trades (symbol, action, qty, price, reasoning, run_id, stop_loss, take_profit) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (symbol, action, qty, price, reasoning, run_id, stop_loss, take_profit),
+            cur = self.conn.execute(
+                "INSERT INTO trades (symbol, action, qty, price, reasoning, run_id, "
+                "stop_loss, take_profit, broker_order_id, fill_status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (symbol, action, qty, price, reasoning, run_id,
+                 stop_loss, take_profit, broker_order_id, fill_status),
             )
             self.conn.commit()
+            return cur.lastrowid
+
+    def update_trade_fill(
+        self, broker_order_id: str, fill_status: str,
+        fill_qty: float | None = None, fill_price: float | None = None,
+    ) -> int:
+        """Update a trade row's fill reconciliation after broker terminal status.
+
+        Matches on broker_order_id. Returns row count updated.
+        """
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE trades SET fill_status = ?, fill_qty = ?, fill_price = ?, "
+                "fill_reconciled_at = datetime('now') "
+                "WHERE broker_order_id = ?",
+                (fill_status, fill_qty, fill_price, broker_order_id),
+            )
+            self.conn.commit()
+            return cur.rowcount or 0
+
+    def get_unreconciled_orders(self, run_id: str | None = None) -> list[dict]:
+        """Trade rows with broker_order_id set but fill_status still 'submitted'.
+
+        Pipeline's reconciliation step fetches these and asks the broker for
+        their terminal status. Scoping to run_id lets per-run reconciliation
+        not touch stragglers from other runs.
+        """
+        conditions = ["fill_status = 'submitted'", "broker_order_id IS NOT NULL"]
+        params: list = []
+        if run_id:
+            conditions.append("run_id = ?")
+            params.append(run_id)
+        where = " AND ".join(conditions)
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT * FROM trades WHERE {where}", tuple(params),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_trades(self, symbol: str | None = None, limit: int = 100,
                     today_only: bool = False) -> list[dict]:
@@ -308,10 +374,17 @@ class Database:
             self.conn.commit()
 
     def get_symbol_last_buy(self, symbol: str) -> dict | None:
-        """Most recent BUY row for a symbol — used by PM to anchor 'when bought / why'."""
+        """Most recent FILLED BUY row for a symbol.
+
+        Phase 3: filter on fill_status so a BUY that was submitted but never
+        filled doesn't show up in PM's position_history memory as if we
+        opened a position. Legacy NULL rows pre-date reconciliation and are
+        treated as filled for backward compatibility.
+        """
         with self._lock:
             row = self.conn.execute(
                 "SELECT * FROM trades WHERE symbol = ? AND action = 'BUY' "
+                "AND (fill_status IS NULL OR fill_status = 'filled') "
                 "ORDER BY timestamp DESC LIMIT 1",
                 (symbol,),
             ).fetchone()
@@ -349,9 +422,14 @@ class Database:
             or {} when there are too few closed trades to be meaningful.
         """
         with self._lock:
+            # Phase 3: skip non-filled orders (submitted-but-canceled, rejected,
+            # expired). Legacy rows with NULL fill_status pre-date reconciliation
+            # and are treated as filled for backward compatibility.
             rows = self.conn.execute(
-                "SELECT symbol, action, qty, price, timestamp FROM trades "
-                "WHERE timestamp > datetime('now', ?) ORDER BY timestamp",
+                "SELECT symbol, action, qty, price, timestamp, fill_qty, fill_price "
+                "FROM trades WHERE timestamp > datetime('now', ?) "
+                "AND (fill_status IS NULL OR fill_status = 'filled') "
+                "ORDER BY timestamp",
                 (f"-{lookback_days} days",),
             ).fetchall()
         # FIFO queue of open BUY lots per symbol
@@ -361,8 +439,9 @@ class Database:
         for row in rows:
             sym = row["symbol"]
             act = row["action"] or ""
-            qty = float(row["qty"] or 0)
-            price = float(row["price"] or 0)
+            # Prefer actual fill data when present; fall back to requested.
+            qty = float(row["fill_qty"] if row["fill_qty"] else row["qty"] or 0)
+            price = float(row["fill_price"] if row["fill_price"] else row["price"] or 0)
             ts = row["timestamp"]
             if qty <= 0 or price <= 0:
                 continue

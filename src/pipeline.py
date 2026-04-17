@@ -390,6 +390,61 @@ class TradingPipeline:
             logger.warning("Trading-day check failed; assuming market closed: %s", exc)
             return False
 
+    def _reconcile_fills(self, ctx: RunContext | None = None) -> None:
+        """Update trade rows' fill_status by asking the broker for terminal info.
+
+        Phase 3 groundwork: decouples "we submitted an order" from "the order
+        actually filled." Readers (compute_trade_calibration, get_symbol_last_buy,
+        recent_sells) filter on fill_status so a limit order that never crossed
+        doesn't pollute PM memory or calibration stats.
+
+        Scoped to a single run_id when ctx is provided — we don't want to
+        retroactively flip stale submissions from previous days. Alpaca
+        purges order history after a few days; unreconciled-and-unreachable
+        orders stay at 'submitted' and are effectively treated as filled by
+        the legacy-compat NULL-or-filled filter, which is a tolerable
+        failure mode.
+        """
+        run_id = ctx.run_id if ctx is not None else None
+        try:
+            rows = self.db.get_unreconciled_orders(run_id=run_id)
+        except Exception as e:
+            logger.warning("reconcile_fills: DB lookup failed: %s", e)
+            return
+        if not rows:
+            return
+        terminal_ok = {"filled"}
+        terminal_fail = {"canceled", "cancelled", "expired", "rejected", "done_for_day"}
+        for row in rows:
+            order_id = row.get("broker_order_id")
+            if not order_id:
+                continue
+            try:
+                info = self.broker.get_order_fill_info(order_id)
+            except Exception as e:
+                logger.warning("reconcile_fills: broker lookup failed for %s: %s", order_id, e)
+                continue
+            if info is None:
+                continue
+            status = info.get("status") or ""
+            if status in terminal_ok:
+                self.db.update_trade_fill(
+                    broker_order_id=order_id, fill_status="filled",
+                    fill_qty=info.get("filled_qty") or None,
+                    fill_price=info.get("filled_avg_price") or None,
+                )
+                logger.info(
+                    "Reconciled %s: filled (qty=%s, avg=$%s)",
+                    order_id, info.get("filled_qty"), info.get("filled_avg_price"),
+                )
+            elif status in terminal_fail:
+                self.db.update_trade_fill(
+                    broker_order_id=order_id, fill_status=status,
+                )
+                logger.warning("Reconciled %s: did NOT fill (status=%s)", order_id, status)
+            # Non-terminal statuses (new, accepted, partially_filled) stay
+            # 'submitted' for the next reconciliation pass to pick up.
+
     def _wait_bg_threads(self, ctx: RunContext | None = None, timeout_s: float = 120.0) -> None:
         """Wait for queued earnings-analysis threads to finish before the run exits.
 
@@ -618,6 +673,8 @@ class TradingPipeline:
                     ),
                     run_id=run_id,
                     stop_loss=new_stop,
+                    broker_order_id=order.get("id"),
+                    fill_status="submitted",
                 )
             except Exception as e:
                 logger.warning("ex-div: audit log failed for %s: %s", p.symbol, e)
@@ -706,6 +763,8 @@ class TradingPipeline:
                         f"shares continue riding stop)"
                     ),
                     run_id=run_id,
+                    broker_order_id=order.get("id"),
+                    fill_status="submitted",
                 )
             except Exception as e:
                 logger.warning("auto_take_profit: audit log failed for %s: %s", p.symbol, e)
@@ -1890,6 +1949,8 @@ class TradingPipeline:
                 self.db.insert_trade(
                     symbol=decision.symbol, action=action_label, qty=qty,
                     price=sell_price, reasoning=decision.reasoning, run_id=run_id,
+                    broker_order_id=order.get("id"),
+                    fill_status="submitted",
                 )
                 logger.info(
                     "Executed: %s %s %s @ limit $%.2f",
@@ -2045,6 +2106,8 @@ class TradingPipeline:
                     symbol=decision.symbol, action="BUY", qty=qty,
                     price=executed_price, reasoning=decision.reasoning, run_id=run_id,
                     stop_loss=decision.stop_loss, take_profit=decision.take_profit,
+                    broker_order_id=order.get("id"),
+                    fill_status="submitted",
                 )
                 order_type = "limit" if limit_price is not None else "market"
                 logger.info("Executed: buy %d %s @ %s $%.2f", qty, decision.symbol, order_type, executed_price)
@@ -2053,6 +2116,9 @@ class TradingPipeline:
 
         logger.info("=== Morning run complete: %d orders executed ===", len(orders))
         self._wait_bg_threads(ctx)
+        # Phase 3: ask broker which of today's submitted orders actually filled.
+        # Unfilled ones get flagged so PM memory / calibration skip them.
+        self._reconcile_fills(ctx)
         return {"status": "executed", "orders": orders, "run_id": run_id}
 
     def run_midday(self) -> dict:
@@ -2157,6 +2223,8 @@ class TradingPipeline:
                             price=emergency_limit,
                             reasoning=f"Daily loss limit breached: {loss_violation.message}",
                             run_id=run_id,
+                            broker_order_id=order.get("id"),
+                            fill_status="submitted",
                         )
                         logger.info(
                             "Emergency sell: %s %s @ limit $%.2f",
@@ -2231,6 +2299,8 @@ class TradingPipeline:
                                         reasoning=action_item.get("reason", "midday trailing stop"),
                                         run_id=run_id,
                                         stop_loss=new_stop,
+                                        broker_order_id=order.get("id"),
+                                        fill_status="submitted",
                                     )
                                     logger.info(
                                         "Midday action: TRAIL_STOP %s → $%.2f — %s",
@@ -2257,6 +2327,8 @@ class TradingPipeline:
                                 price=existing[0].current_price,
                                 reasoning=action_item.get("reason", "midday review"),
                                 run_id=run_id,
+                                broker_order_id=order.get("id"),
+                                fill_status="submitted",
                             )
                             logger.info(
                                 "Midday action: %s %s %s — %s",
@@ -2271,6 +2343,11 @@ class TradingPipeline:
                      review.get("risk_level", "N/A") if review else "no_positions",
                      len(orders))
         self._wait_bg_threads(ctx)
+        # Reconcile BOTH today's midday submissions AND any lingering
+        # morning submissions that hadn't reached terminal by the time
+        # morning's _reconcile_fills ran. Pass run_id=None so midday
+        # sweeps all unreconciled orders regardless of run.
+        self._reconcile_fills()
         return {"status": "reviewed", "positions": len(positions),
                 "review": review, "orders": orders, "run_id": run_id}
 
@@ -2348,6 +2425,8 @@ class TradingPipeline:
                         f"Intra-session daily-loss breach: {loss_violation.message}"
                     ),
                     run_id=run_id,
+                    broker_order_id=order.get("id"),
+                    fill_status="submitted",
                 )
                 logger.info(
                     "Intra emergency sell: %s %s @ limit $%.2f",
@@ -2482,6 +2561,9 @@ class TradingPipeline:
             logger.info("Summary: %s", analysis.get("daily_summary", ""))
             logger.info("Tomorrow: %s", analysis.get("tomorrow_outlook", ""))
         self._wait_bg_threads(ctx)
+        # Evening is the last chance to reconcile today's orders before the
+        # next trading day. Sweep everything still marked submitted.
+        self._reconcile_fills()
         return {
             "status": "analyzed",
             "total_value": total_value,
