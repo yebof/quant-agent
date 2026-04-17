@@ -21,21 +21,53 @@ class AgentResult:
     model: str
     user_message: str = ""
 
+    # Top-level keys we recognize as "this looks like a real agent output."
+    # When the LLM prose includes an extra JSON fragment (self-correction,
+    # partial thinking-out-loud, or a tool-like object), these anchors let us
+    # pick the actual output instead of the largest stray fragment.
+    _EXPECTED_AGENT_KEYS = frozenset({
+        "decisions",           # PortfolioDecision
+        "approved",            # RiskVerdict
+        "actions",             # MiddayReview
+        "daily_summary",       # EveningReport
+        "tomorrow_outlook",    # EveningReport alt anchor
+        "regime",              # MacroAnalysis
+        "reasoning_chain",     # any analyst with CoT
+        "investment_implications",  # EarningsAnalysis
+        "macro_narrative",     # NewsIntelligenceReport
+        "analyses",            # TechAnalyst batch wrapper
+        "symbol",              # TechAnalysisResult single
+        "rating",              # TechAnalysisResult single
+    })
+
+    @staticmethod
+    def _shape_score(parsed) -> int:
+        """How 'agent-output shaped' a JSON candidate looks. Higher is better."""
+        if not isinstance(parsed, dict):
+            return 0
+        keys = set(parsed.keys())
+        return len(keys & AgentResult._EXPECTED_AGENT_KEYS)
+
     def parse_json(self) -> dict | list | None:
         text = self.raw_text.strip()
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
+            # Full-text parse wins outright if it's a dict/list; no candidate
+            # search needed. This is the happy path — LLM returned clean JSON.
+            return parsed
         except json.JSONDecodeError:
             pass
 
-        candidates: list[tuple[int, int, dict | list]] = []
+        candidates: list[tuple[int, int, int, dict | list]] = []
+        # idx preserves source order so we can break ties predictably.
         idx = 0
+        # Fenced ```json blocks — highest trust.
         for match in re.finditer(r"```(?:json)?\s*\n(.*?)\n```", self.raw_text, re.DOTALL):
             try:
                 parsed = json.loads(match.group(1).strip())
             except json.JSONDecodeError:
                 continue
-            candidates.append((len(json.dumps(parsed)), idx, parsed))
+            candidates.append((self._shape_score(parsed), len(json.dumps(parsed)), idx, parsed))
             idx += 1
 
         decoder = json.JSONDecoder()
@@ -46,11 +78,14 @@ class AgentResult:
                 parsed, end = decoder.raw_decode(self.raw_text[i:])
             except json.JSONDecodeError:
                 continue
-            candidates.append((len(json.dumps(parsed)), idx, parsed))
+            candidates.append((self._shape_score(parsed), len(json.dumps(parsed)), idx, parsed))
             idx += 1
         if candidates:
-            # Pick the largest JSON object; on tie, pick the later one (higher idx)
-            return max(candidates, key=lambda item: (item[0], item[1]))[2]
+            # Sort priority: (1) shape-score (has expected keys), (2) size,
+            # (3) source order as tiebreaker. The old behavior of pure "pick
+            # largest" would pick a 500-char helper object over a 200-char
+            # correct one. Shape-score first fixes that.
+            return max(candidates, key=lambda item: (item[0], item[1], item[2]))[3]
 
         logger.warning("Failed to parse agent response as JSON: %s", self.raw_text[:200])
         return None
