@@ -2719,12 +2719,12 @@ class TradingPipeline:
         ctx.last_equity = last_equity
         ctx.daily_pnl = daily_pnl
 
-        self.db.insert_daily_pnl(
-            date=today_str,
-            total_value=total_value,
-            daily_pnl=daily_pnl,
-            daily_return_pct=daily_return_pct,
-        )
+        # Phase 4 #5: daily_pnl write is deferred to the atomic
+        # save_evening_snapshot() below, along with insights. Doing both in
+        # one transaction means a crash between them doesn't leave next
+        # morning reading a P&L number with no insights narrative attached.
+        # Fallback: if the evening LLM fails (analysis is None), we still
+        # save the daily_pnl alone below to preserve the P&L audit trail.
 
         # 2. News + Earnings update — capture end-of-day developments
         evening_news = self._run_news_update(run_id, session="evening")
@@ -2769,10 +2769,14 @@ class TradingPipeline:
             tokens_used=ev_result.tokens_used,
         )
 
-        # Save insights for next morning's PM
+        # Save daily_pnl + insights atomically (Phase 4 #5). If the LLM
+        # failed (analysis is None), still record the P&L number so the
+        # audit trail is complete — just with empty insights fields.
         if analysis:
-            self.db.save_insights(
+            self.db.save_evening_snapshot(
                 date=today_str,
+                total_value=total_value, daily_pnl=daily_pnl,
+                daily_return_pct=daily_return_pct,
                 tomorrow_outlook=analysis.tomorrow_outlook,
                 lessons=analysis.lessons,
                 suggested_actions=analysis.suggested_actions,
@@ -2781,6 +2785,14 @@ class TradingPipeline:
                 tomorrow_conviction=analysis.tomorrow_conviction,
                 tomorrow_key_risks=analysis.tomorrow_key_risks,
                 sell_decisions_assessment=analysis.sell_decisions_assessment,
+            )
+        else:
+            # LLM failed — keep at least the P&L number for daily audit.
+            self.db.insert_daily_pnl(
+                date=today_str,
+                total_value=total_value,
+                daily_pnl=daily_pnl,
+                daily_return_pct=daily_return_pct,
             )
 
         # Housekeeping: drop agent_logs older than 2 years (full_response bloats the DB

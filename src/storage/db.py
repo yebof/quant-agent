@@ -135,6 +135,67 @@ class Database:
         with self._lock:
             return self.conn.execute(sql, params)
 
+    def save_evening_snapshot(
+        self,
+        *,
+        date: str,
+        total_value: float,
+        daily_pnl: float,
+        daily_return_pct: float,
+        tomorrow_outlook: str,
+        lessons: str,
+        suggested_actions,
+        risk_rating: str,
+        tomorrow_bias: str = "neutral",
+        tomorrow_conviction: str = "medium",
+        tomorrow_key_risks=(),
+        sell_decisions_assessment: str = "",
+    ) -> None:
+        """Atomically write the evening's daily_pnl + insights rows.
+
+        Phase 4 #5: transaction boundary. These two writes are two sides
+        of the same fact ("here's today's P&L; here's the narrative I
+        wrote about it") — if the process crashes between them, next
+        morning's PM reads inconsistent state. Doing both in one BEGIN /
+        COMMIT prevents that split-brain.
+
+        All writes happen under the same _lock acquisition, matching the
+        pattern used by the single-write insert methods. Callers should
+        treat this as the sanctioned way to persist evening output.
+        """
+        import json
+        actions_json = (
+            json.dumps(suggested_actions) if isinstance(suggested_actions, list)
+            else suggested_actions
+        )
+        risks_json = (
+            json.dumps(list(tomorrow_key_risks))
+            if not isinstance(tomorrow_key_risks, str) else tomorrow_key_risks
+        )
+        with self._lock:
+            try:
+                self.conn.execute("BEGIN")
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO daily_pnl "
+                    "(date, total_value, daily_pnl, daily_return_pct) "
+                    "VALUES (?, ?, ?, ?)",
+                    (date, total_value, daily_pnl, daily_return_pct),
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO insights "
+                    "(date, tomorrow_outlook, lessons, suggested_actions, risk_rating, "
+                    "tomorrow_bias, tomorrow_conviction, tomorrow_key_risks, "
+                    "sell_decisions_assessment) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (date, tomorrow_outlook, lessons, actions_json, risk_rating,
+                     tomorrow_bias, tomorrow_conviction, risks_json,
+                     sell_decisions_assessment or ""),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
     def insert_trade(self, symbol: str, action: str, qty: float, price: float,
                      reasoning: str, run_id: str,
                      stop_loss: float = 0, take_profit: float = 0,
