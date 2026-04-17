@@ -27,6 +27,7 @@ from src.agents.earnings_analyst import EarningsAnalystAgent
 from src.data.earnings import EarningsDataProvider
 from src.risk.rules import RiskRuleEngine
 from src.execution.broker import AlpacaBroker, _get_sector
+from src.pipeline_context import RunContext, SessionType
 from src.storage.db import Database
 from src.models import (
     NewsIntelligenceReport,
@@ -124,9 +125,11 @@ class TradingPipeline:
         self.market.set_fallback_bars(self.broker.get_bars)
         self.db = Database(config.storage.db_path)
         self.db.initialize()
-        # Background earnings-analysis threads. We join them before each run_* exits
-        # so launchd doesn't SIGKILL mid-LLM (leaving the manifest stuck).
-        self._bg_threads: list[threading.Thread] = []
+        # Stragglers from prior runs that exceeded _wait_bg_threads' timeout.
+        # Per-run threads are tracked on RunContext.bg_threads; this list only
+        # catches the rare thread that refused to join within the budget so we
+        # can make another attempt on the next run.
+        self._straggler_bg_threads: list[threading.Thread] = []
 
     @staticmethod
     def _format_qty(qty: float) -> str:
@@ -381,14 +384,21 @@ class TradingPipeline:
             logger.warning("Trading-day check failed; assuming market closed: %s", exc)
             return False
 
-    def _wait_bg_threads(self, timeout_s: float = 120.0) -> None:
-        """Wait for queued earnings-analysis threads to finish before the process exits.
+    def _wait_bg_threads(self, ctx: RunContext | None = None, timeout_s: float = 120.0) -> None:
+        """Wait for queued earnings-analysis threads to finish before the run exits.
 
         daemon=True means they'd get SIGKILL'd if main() returns first — a half-finished
         LLM response would never call confirm_filing, leaving the filing marked is_new
         forever and burning tokens on every re-run.
+
+        Joins both this run's threads (ctx.bg_threads) AND any stragglers from
+        prior runs that exceeded the timeout. Threads still alive after the
+        budget are shelved in self._straggler_bg_threads so the NEXT run gets
+        another chance to drain them.
         """
-        bg = getattr(self, "_bg_threads", None)
+        current = list(ctx.bg_threads) if ctx and ctx.bg_threads else []
+        stragglers = list(getattr(self, "_straggler_bg_threads", []) or [])
+        bg = current + stragglers
         if not bg:
             return
         deadline = time.monotonic() + timeout_s
@@ -403,7 +413,9 @@ class TradingPipeline:
                 "_wait_bg_threads: %d/%d background thread(s) still alive after %.0fs — will be killed on process exit",
                 len(alive), len(bg), timeout_s,
             )
-        self._bg_threads = alive
+        # Surviving threads shelter on the pipeline instance — not on the ctx,
+        # because the ctx dies at the end of this run. Next run picks them up.
+        self._straggler_bg_threads = alive
 
     def _build_position_history(self, positions) -> dict[str, dict]:
         """L2 memory: for each held symbol, entry context + Tech rating trajectory.
@@ -887,7 +899,10 @@ class TradingPipeline:
                 )
         return "\n".join(lines)
 
-    def _build_recent_sells_for_grading(self, lookback_days: int = 2) -> list[dict]:
+    def _build_recent_sells_for_grading(
+        self, lookback_days: int = 2,
+        symbols_bars: dict | None = None,
+    ) -> list[dict]:
         """Return recent SELL-family trades joined with current quote for grading.
 
         Used by evening to produce `sell_decisions_assessment`. For each SELL
@@ -929,7 +944,7 @@ class TradingPipeline:
             except Exception as e:
                 logger.warning("recent_sells: latest price failed for %s: %s", sym, e)
             if curr <= 0:
-                bars = getattr(self, "_last_symbols_bars", {}).get(sym) or []
+                bars = (symbols_bars or {}).get(sym) or []
                 if bars:
                     curr = float(bars[-1].close or 0)
             pct = ((curr / sell_price - 1) * 100) if (curr > 0 and sell_price > 0) else 0.0
@@ -1124,7 +1139,10 @@ class TradingPipeline:
             logger.error("[%s] News analyst failed: %s", session, e)
             return None
 
-    def _run_earnings_check(self, run_id: str, session: str = "morning") -> tuple[list, list]:
+    def _run_earnings_check(
+        self, run_id: str, session: str = "morning",
+        ctx: RunContext | None = None,
+    ) -> tuple[list, list]:
         """Check for new SEC filings, analyze in background, return cached results."""
         try:
             reports = self.earnings_provider.check_and_fetch(self.config.trading.universe)
@@ -1213,7 +1231,13 @@ class TradingPipeline:
                     daemon=True,
                 )
                 bg.start()
-                self._bg_threads.append(bg)
+                if ctx is not None:
+                    ctx.bg_threads.append(bg)
+                else:
+                    # Caller didn't pass a ctx (e.g., in a test or an older
+                    # code path). Fall back to the straggler list so the
+                    # thread still gets joined later.
+                    self._straggler_bg_threads.append(bg)
 
             logger.info("[%s] Earnings: %d cached analyses, %d new filings queued",
                         session, len(cached_results), len(new_reports))
@@ -1223,7 +1247,8 @@ class TradingPipeline:
             return [], []
 
     def run_morning(self) -> dict:
-        run_id = f"run-{uuid.uuid4().hex[:8]}"
+        ctx = RunContext.start("morning")
+        run_id = ctx.run_id
         logger.info("=== Morning run started: %s ===", run_id)
 
         if not self._is_trading_day():
@@ -1233,12 +1258,17 @@ class TradingPipeline:
         # 0. Cancel stale entry orders from previous sessions, but preserve live protective exits.
         self.broker.cancel_open_entry_orders()
 
-        # 1. Get account state
+        # 1. Get account state (snapshot into ctx)
         account = self.broker.get_account()
         positions = self.broker.get_positions()
         cash = account["cash"]
         total_value = account["portfolio_value"]
         last_equity = account.get("last_equity", total_value)
+        ctx.account = account
+        ctx.positions = positions
+        ctx.cash = cash
+        ctx.total_value = total_value
+        ctx.last_equity = last_equity
         logger.info("Account: $%.2f total, $%.2f cash, %d positions (last close $%.2f)",
                      total_value, cash, len(positions), last_equity)
 
@@ -1332,10 +1362,11 @@ class TradingPipeline:
                 indicators = compute_indicators(symbol, bars)
                 all_symbols_data.append({"symbol": symbol, "bars": bars, "indicators": indicators})
                 symbols_bars[symbol] = bars
-            # Stash on self so the risk filter below can reuse for correlation clustering
-            # without re-downloading. Bars are already in memory; only marginal cost is
-            # the correlation DataFrame (few KB).
-            self._last_symbols_bars = symbols_bars
+            # Stash on the run context so the risk filter below can reuse
+            # for correlation clustering without re-downloading. Bars are
+            # already in memory; only marginal cost is the correlation
+            # DataFrame (few KB).
+            ctx.symbols_bars = symbols_bars
             # Pre-filter: only send actionable symbols to the LLM
             symbols_data = [
                 s for s in all_symbols_data
@@ -1383,7 +1414,7 @@ class TradingPipeline:
             return analyses_map, ta_res
 
         def _run_earnings():
-            return self._run_earnings_check(run_id, session="morning")
+            return self._run_earnings_check(run_id, session="morning", ctx=ctx)
 
         logger.info("Starting parallel: macro_analyst + news_analyst + tech_analyst + earnings_check")
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -1580,7 +1611,7 @@ class TradingPipeline:
         correlation_matrix = None
         try:
             from src.data.correlation import build_correlation_matrix
-            pool_bars = dict(getattr(self, "_last_symbols_bars", {}))
+            pool_bars = dict(ctx.symbols_bars)
             # Include held symbols that weren't in today's analyzed set (fetch their bars).
             for p in positions:
                 if p.symbol not in pool_bars:
@@ -1845,7 +1876,7 @@ class TradingPipeline:
                 # Better than trusting the LLM's entry_price blindly when we
                 # have no way to sanity-check it.
                 if not market_price or market_price <= 0:
-                    bars = getattr(self, "_last_symbols_bars", {}).get(decision.symbol) or []
+                    bars = ctx.symbols_bars.get(decision.symbol) or []
                     if bars:
                         last_close = float(bars[-1].close)
                         if last_close > 0:
@@ -1963,23 +1994,29 @@ class TradingPipeline:
                 logger.error("Order failed for %s %s: %s", decision.action, decision.symbol, e)
 
         logger.info("=== Morning run complete: %d orders executed ===", len(orders))
-        self._wait_bg_threads()
+        self._wait_bg_threads(ctx)
         return {"status": "executed", "orders": orders, "run_id": run_id}
 
     def run_midday(self) -> dict:
-        run_id = f"midday-{uuid.uuid4().hex[:8]}"
+        ctx = RunContext.start("midday")
+        run_id = ctx.run_id
         logger.info("=== Midday check: %s ===", run_id)
 
         if not self._is_trading_day():
             logger.info("Midday run skipped: market closed for non-trading day")
             return {"status": "market_holiday", "positions": 0, "orders": [], "run_id": run_id}
 
-        # 1. Sync positions
+        # 1. Sync positions (snapshot into ctx)
         account = self.broker.get_account()
         positions = self.broker.get_positions()
         cash = account["cash"]
         total_value = account["portfolio_value"]
         last_equity = account.get("last_equity", total_value)
+        ctx.account = account
+        ctx.positions = positions
+        ctx.cash = cash
+        ctx.total_value = total_value
+        ctx.last_equity = last_equity
 
         # Replace the positions snapshot (drops rows for symbols no longer held).
         self.db.sync_positions(positions)
@@ -2004,7 +2041,7 @@ class TradingPipeline:
         midday_news = self._run_news_update(run_id, session="midday")
         if midday_news:
             logger.info("Midday news: %s", midday_news.pm_briefing[:200])
-        _, midday_earnings = self._run_earnings_check(run_id, session="midday")
+        _, midday_earnings = self._run_earnings_check(run_id, session="midday", ctx=ctx)
 
         # 3. LLM midday review — assess positions and recommend actions
         macro_summary = self.macro.get_macro_summary()
@@ -2175,7 +2212,7 @@ class TradingPipeline:
                      len(positions),
                      review.get("risk_level", "N/A") if review else "no_positions",
                      len(orders))
-        self._wait_bg_threads()
+        self._wait_bg_threads(ctx)
         return {"status": "reviewed", "positions": len(positions),
                 "review": review, "orders": orders, "run_id": run_id}
 
@@ -2188,7 +2225,8 @@ class TradingPipeline:
         breached, emergency-sell every position. Runs in ~5 seconds; OK for
         a 30-minute cadence if the user wants even tighter coverage.
         """
-        run_id = f"intra-{uuid.uuid4().hex[:8]}"
+        ctx = RunContext.start("intra_check")
+        run_id = ctx.run_id
         logger.info("=== Intra-session risk check: %s ===", run_id)
 
         if not self._is_trading_day():
@@ -2205,6 +2243,11 @@ class TradingPipeline:
         total_value = account["portfolio_value"]
         last_equity = account.get("last_equity", total_value)
         daily_pnl = total_value - last_equity
+        ctx.account = account
+        ctx.positions = positions
+        ctx.total_value = total_value
+        ctx.last_equity = last_equity
+        ctx.daily_pnl = daily_pnl
         daily_return_pct = (daily_pnl / last_equity * 100) if last_equity > 0 else 0
         logger.info(
             "Intra snapshot: equity=$%.2f, last_close=$%.2f, pnl=$%.2f (%.2f%%), positions=%d",
@@ -2264,7 +2307,8 @@ class TradingPipeline:
         }
 
     def run_evening(self) -> dict:
-        run_id = f"evening-{uuid.uuid4().hex[:8]}"
+        ctx = RunContext.start("evening")
+        run_id = ctx.run_id
         logger.info("=== Evening report: %s ===", run_id)
 
         if not self._is_trading_day():
@@ -2287,6 +2331,11 @@ class TradingPipeline:
         else:
             daily_pnl = 0.0
             daily_return_pct = 0.0
+        ctx.account = account
+        ctx.positions = positions
+        ctx.total_value = total_value
+        ctx.last_equity = last_equity
+        ctx.daily_pnl = daily_pnl
 
         self.db.insert_daily_pnl(
             date=today_str,
@@ -2299,7 +2348,7 @@ class TradingPipeline:
         evening_news = self._run_news_update(run_id, session="evening")
         if evening_news:
             logger.info("Evening news: %s", evening_news.pm_briefing[:200])
-        _, evening_earnings = self._run_earnings_check(run_id, session="evening")
+        _, evening_earnings = self._run_earnings_check(run_id, session="evening", ctx=ctx)
 
         # 3. LLM evening analysis — daily review and tomorrow outlook
         macro_summary = self.macro.get_macro_summary()
@@ -2310,7 +2359,10 @@ class TradingPipeline:
         # SELL decisions from the last 2 days + each symbol's move since sell.
         # Evening grades each one {correct|premature|wrong} — the feedback loop
         # on selling discipline.
-        recent_sells = self._build_recent_sells_for_grading(lookback_days=2)
+        recent_sells = self._build_recent_sells_for_grading(
+            lookback_days=2,
+            symbols_bars=ctx.symbols_bars,  # empty for evening (no tech fetch) — OK, we use broker price
+        )
 
         analysis, ev_result = self.evening_analyst.analyze(
             positions=positions,
@@ -2371,7 +2423,7 @@ class TradingPipeline:
         if analysis:
             logger.info("Summary: %s", analysis.get("daily_summary", ""))
             logger.info("Tomorrow: %s", analysis.get("tomorrow_outlook", ""))
-        self._wait_bg_threads()
+        self._wait_bg_threads(ctx)
         return {
             "status": "analyzed",
             "total_value": total_value,
