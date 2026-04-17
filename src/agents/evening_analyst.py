@@ -4,11 +4,47 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from src.agents.base import BaseAgent
-from src.models import EveningReport, Position
+from src.models import EveningReport, NewsIntelligenceReport, Position
 
 logger = logging.getLogger(__name__)
 
 PROMPT_PATH = Path(__file__).parent.parent.parent / "config" / "prompts" / "evening_analyst.md"
+
+
+def _fmt_news_for_evening(news_intel: NewsIntelligenceReport | None) -> str:
+    if news_intel is None:
+        return "(no news report today)"
+    state_lines = [
+        f"- [{c.conviction.upper()}] {c.event}: impact {c.market_impact}"
+        for c in (news_intel.state_changes or [])[:5]
+    ]
+    state_text = "\n".join(state_lines) or "No major state changes."
+    return (
+        f"PM Briefing: {news_intel.pm_briefing[:400]}\n"
+        f"Sentiment: {news_intel.market_sentiment} ({news_intel.confidence})\n"
+        f"Top state changes:\n{state_text}"
+    )
+
+
+def _fmt_earnings_for_evening(earnings_analyses: list[dict]) -> str:
+    if not earnings_analyses:
+        return "No filings today."
+    lines = []
+    for ea in earnings_analyses:
+        sym = ea.get("symbol", "?")
+        if ea.get("queued"):
+            lines.append(
+                f"- {sym}: JUST FILED {ea.get('form_type','?')} ({ea.get('filing_date','?')}) "
+                f"— analysis still running"
+            )
+            continue
+        analysis = ea.get("analysis") or {}
+        impl = analysis.get("investment_implications") or {}
+        lines.append(
+            f"- {sym}: {impl.get('sentiment','?')} ({impl.get('conviction','?')}) — "
+            f"{impl.get('key_thesis','')[:120]}"
+        )
+    return "\n".join(lines)
 
 
 class EveningAnalystAgent(BaseAgent):
@@ -31,6 +67,8 @@ class EveningAnalystAgent(BaseAgent):
         today_trades: list[dict] = kwargs.get("today_trades", []) or []
         prior_outlook: dict | None = kwargs.get("prior_outlook")
         recent_sells: list[dict] = kwargs.get("recent_sells", []) or []
+        news_intel: NewsIntelligenceReport | None = kwargs.get("news_intel")
+        earnings_analyses: list[dict] = kwargs.get("earnings_analyses", []) or []
 
         positions_text = "\n".join(
             f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Close: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} | Sector: {p.sector}"
@@ -98,13 +136,21 @@ market ripped, say so. Calibration matters more than looking smart."""
 
 {prior_section}
 
+## Today's News (use to explain the day's P&L and shape tomorrow's outlook)
+{_fmt_news_for_evening(news_intel)}
+
+## Today's Earnings Filings
+{_fmt_earnings_for_evening(earnings_analyses)}
+
 Provide your end-of-day analysis as JSON."""
 
     def analyze(self, positions: list[Position], macro_summary: dict,
                 total_value: float, daily_pnl: float, daily_return_pct: float,
                 today_trades: list[dict] | None = None,
                 prior_outlook: dict | None = None,
-                recent_sells: list[dict] | None = None) -> tuple[dict | None, "AgentResult"]:
+                recent_sells: list[dict] | None = None,
+                news_intel: NewsIntelligenceReport | None = None,
+                earnings_analyses: list[dict] | None = None) -> tuple[dict | None, "AgentResult"]:
         result = self.run(
             positions=positions,
             macro_summary=macro_summary,
@@ -114,6 +160,8 @@ Provide your end-of-day analysis as JSON."""
             today_trades=today_trades or [],
             prior_outlook=prior_outlook,
             recent_sells=recent_sells or [],
+            news_intel=news_intel,
+            earnings_analyses=earnings_analyses or [],
         )
         parsed = result.parse_json()
         if parsed is None:

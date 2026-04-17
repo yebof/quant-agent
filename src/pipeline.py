@@ -1558,12 +1558,16 @@ class TradingPipeline:
 
         # 6. Risk Manager LLM review (with remaining non-blocking violations as advisory).
         # Pass tech_analyses so RM can audit PM's fidelity to the underlying ratings.
+        # Pass news_intel + earnings so RM can catch silent contradictions between
+        # PM's proposals and today's news / earnings events.
         verdict, rm_result = self.risk_manager.review(
             portfolio_decision=portfolio_decision,
             positions=positions,
             macro_summary=macro_summary,
             rule_violations=rule_violations,
             tech_analyses=analyses,
+            news_intel=news_intel,
+            earnings_analyses=earnings_results,
         )
 
         self.db.insert_agent_log(
@@ -1898,7 +1902,7 @@ class TradingPipeline:
         midday_news = self._run_news_update(run_id, session="midday")
         if midday_news:
             logger.info("Midday news: %s", midday_news.pm_briefing[:200])
-        self._run_earnings_check(run_id, session="midday")
+        _, midday_earnings = self._run_earnings_check(run_id, session="midday")
 
         # 3. LLM midday review — assess positions and recommend actions
         macro_summary = self.macro.get_macro_summary()
@@ -1914,6 +1918,8 @@ class TradingPipeline:
                 cash_balance=cash,
                 total_value=total_value,
                 morning_trades=morning_trades,
+                news_intel=midday_news,
+                earnings_analyses=midday_earnings,
             )
             self.db.insert_agent_log(
                 agent_name="midday_reviewer", run_id=run_id,
@@ -2191,7 +2197,7 @@ class TradingPipeline:
         evening_news = self._run_news_update(run_id, session="evening")
         if evening_news:
             logger.info("Evening news: %s", evening_news.pm_briefing[:200])
-        self._run_earnings_check(run_id, session="evening")
+        _, evening_earnings = self._run_earnings_check(run_id, session="evening")
 
         # 3. LLM evening analysis — daily review and tomorrow outlook
         macro_summary = self.macro.get_macro_summary()
@@ -2213,6 +2219,8 @@ class TradingPipeline:
             today_trades=today_trades,
             prior_outlook=prior_outlook,
             recent_sells=recent_sells,
+            news_intel=evening_news,
+            earnings_analyses=evening_earnings,
         )
 
         self.db.insert_agent_log(
