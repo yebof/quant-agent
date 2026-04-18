@@ -195,6 +195,155 @@ def test_pm_prompt_no_mandate_when_margin_enabled():
     assert "DE-LEVER MANDATE" not in msg
 
 
+def test_force_delever_noop_when_margin_allowed():
+    """With `allow_margin=True`, the safety-net never fires."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.config = MagicMock()
+    pipeline.config.risk.allow_margin = True
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+
+    from src.pipeline_context import RunContext
+    ctx = RunContext.start("morning")
+    ctx.cash = -5_000.0  # on margin
+    ctx.positions = [Position(
+        symbol="SPY", qty=10, avg_entry=500, current_price=600,
+        market_value=6_000, unrealized_pnl=1_000, sector="ETF",
+    )]
+
+    orders = pipeline._force_delever(ctx)
+    assert orders == []
+    pipeline.broker.submit_order.assert_not_called()
+
+
+def test_force_delever_noop_when_cash_positive():
+    """Positive cash → never fires, even with margin disabled."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.config = MagicMock()
+    pipeline.config.risk.allow_margin = False
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+
+    from src.pipeline_context import RunContext
+    ctx = RunContext.start("morning")
+    ctx.cash = 1_234.56
+    ctx.positions = []
+
+    orders = pipeline._force_delever(ctx)
+    assert orders == []
+    pipeline.broker.submit_order.assert_not_called()
+
+
+def test_force_delever_skips_sub_dollar_noise():
+    """Cash=-$0.30 is rounding noise; don't fire the safety-net either."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.config = MagicMock()
+    pipeline.config.risk.allow_margin = False
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+
+    from src.pipeline_context import RunContext
+    ctx = RunContext.start("morning")
+    ctx.cash = -0.30
+    ctx.positions = [Position(
+        symbol="SPY", qty=10, avg_entry=500, current_price=600,
+        market_value=6_000, unrealized_pnl=1_000, sector="ETF",
+    )]
+
+    orders = pipeline._force_delever(ctx)
+    assert orders == []
+    pipeline.broker.submit_order.assert_not_called()
+
+
+def test_force_delever_picks_biggest_loser_first():
+    """Biggest unrealized loss gets sold first (cut-losers discipline)."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.config = MagicMock()
+    pipeline.config.risk.allow_margin = False
+    pipeline.broker = MagicMock()
+    pipeline.broker.submit_order.return_value = {
+        "id": "ord-1", "status": "accepted", "symbol": "LOSER",
+    }
+    pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline.broker.get_account.return_value = {
+        "cash": 500.0, "portfolio_value": 10_000.0, "last_equity": 10_500.0,
+    }
+    pipeline.broker.get_positions.return_value = []
+    pipeline.db = MagicMock()
+
+    from src.pipeline_context import RunContext
+    ctx = RunContext.start("morning")
+    ctx.cash = -500.0
+    ctx.positions = [
+        Position(symbol="WINNER", qty=10, avg_entry=100, current_price=120,
+                 market_value=1_200, unrealized_pnl=200, sector="ETF"),
+        Position(symbol="LOSER",  qty=5,  avg_entry=300, current_price=250,
+                 market_value=1_250, unrealized_pnl=-250, sector="Tech"),
+    ]
+
+    orders = pipeline._force_delever(ctx)
+
+    assert len(orders) == 1
+    # LOSER goes first (unrealized_pnl=-250 < 200)
+    first_call = pipeline.broker.submit_order.call_args_list[0].kwargs
+    assert first_call["symbol"] == "LOSER"
+    assert first_call["side"] == "sell"
+    # 1% below market limit
+    assert first_call["limit_price"] == round(250 * 0.99, 2)
+
+
+def test_force_delever_stops_once_deficit_covered():
+    """Sells only as many positions as needed to cover the deficit."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.config = MagicMock()
+    pipeline.config.risk.allow_margin = False
+    pipeline.broker = MagicMock()
+    pipeline.broker.submit_order.return_value = {
+        "id": "ord-X", "status": "accepted", "symbol": "X",
+    }
+    pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline.broker.get_account.return_value = {
+        "cash": 1_000.0, "portfolio_value": 10_000.0, "last_equity": 11_000.0,
+    }
+    pipeline.broker.get_positions.return_value = []
+    pipeline.db = MagicMock()
+
+    from src.pipeline_context import RunContext
+    ctx = RunContext.start("morning")
+    ctx.cash = -1_000.0  # $1000 deficit
+    ctx.positions = [
+        # One $5k position covers the whole deficit — second should NOT sell.
+        Position(symbol="A", qty=50, avg_entry=100, current_price=100,
+                 market_value=5_000, unrealized_pnl=-100, sector="Tech"),
+        Position(symbol="B", qty=20, avg_entry=100, current_price=100,
+                 market_value=2_000, unrealized_pnl=-50, sector="Tech"),
+    ]
+
+    orders = pipeline._force_delever(ctx)
+
+    assert len(orders) == 1
+    assert pipeline.broker.submit_order.call_count == 1
+    assert pipeline.broker.submit_order.call_args.kwargs["symbol"] == "A"
+
+
+def test_force_delever_noop_on_empty_positions():
+    """Negative cash but no positions to sell — logs error and exits cleanly."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.config = MagicMock()
+    pipeline.config.risk.allow_margin = False
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+
+    from src.pipeline_context import RunContext
+    ctx = RunContext.start("morning")
+    ctx.cash = -500.0
+    ctx.positions = []
+
+    orders = pipeline._force_delever(ctx)
+    assert orders == []
+    pipeline.broker.submit_order.assert_not_called()
+
+
 def test_midday_reviewer_surfaces_delever_when_cash_negative():
     from src.agents.midday_reviewer import MiddayReviewerAgent
 
