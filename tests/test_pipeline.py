@@ -412,6 +412,28 @@ def test_pipeline_morning_skips_non_trading_day():
     pipeline.broker.cancel_open_entry_orders.assert_not_called()
 
 
+def test_pipeline_morning_bails_cleanly_on_broker_snapshot_failure():
+    """If Alpaca's get_account / get_positions raises at the snapshot step,
+    morning should return a broker_error status rather than propagate and
+    leave ctx half-populated. Mirrors the existing run_intra_check guard."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.cancel_open_entry_orders.return_value = None
+    pipeline.broker.get_account.side_effect = RuntimeError("Alpaca 503")
+    pipeline._reconcile_fills = MagicMock()
+    pipeline.morning_research_stage = MagicMock()
+
+    result = pipeline.run_morning()
+
+    assert result["status"] == "broker_error"
+    assert "Alpaca 503" in result["error"]
+    # Never got past the snapshot — no research, no decision, no execution
+    pipeline.morning_research_stage.run.assert_not_called()
+    # But reconcile_fills still ran in the finally block — that's correct
+    pipeline._reconcile_fills.assert_called_once()
+
+
 def test_pipeline_morning_early_return_still_reconciles_fills():
     """Even when research returns no analyses (early exit), the morning finally
     block must still sweep broker fills for any orders that made it out."""

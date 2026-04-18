@@ -306,8 +306,8 @@ class PositionReviewerAgent(BaseAgent):
 
         # Margin mandate (carried over from v2 — sub-dollar threshold).
         allow_margin: bool = bool(kwargs.get("allow_margin", True))
-        _MARGIN_DEFICIT_FLOOR = 1.0
-        if not allow_margin and cash_balance < -_MARGIN_DEFICIT_FLOOR:
+        from src.risk.constants import MARGIN_DEFICIT_FLOOR_USD
+        if not allow_margin and cash_balance < -MARGIN_DEFICIT_FLOOR_USD:
             deficit = -cash_balance
             margin_section = (
                 f"### ⚠️ Cash-only policy — de-lever required\n"

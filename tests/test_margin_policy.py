@@ -326,6 +326,89 @@ def test_force_delever_stops_once_deficit_covered():
     assert pipeline.broker.submit_order.call_args.kwargs["symbol"] == "A"
 
 
+def test_filter_does_not_credit_zero_allocation_sell_as_proceeds():
+    """Regression: PM emitting `SELL X alloc=0` must NOT make the filter
+    pre-credit that position's full market_value as BUY cash budget. CLAUDE.md
+    convention is alloc=0 → SKIP; execution stage skips; filter must match or
+    BUY slips through against phantom cash and actually borrows margin."""
+    pipeline = _pipeline_with_engine(_risk_config(allow_margin=False))
+    held = Position(
+        symbol="SPY", qty=100, avg_entry=500, current_price=600,
+        market_value=60_000, unrealized_pnl=10_000, sector="ETF",
+    )
+    pipeline.config.trading.universe = ["SPY", "NVDA"]
+    phantom_sell = TradeDecision(
+        action="SELL", symbol="SPY", allocation_pct=0,  # skip per CLAUDE.md
+        entry_price=0, stop_loss=0, take_profit=0, reasoning="phantom",
+    )
+    buy = TradeDecision(
+        action="BUY", symbol="NVDA", allocation_pct=10.0,  # $10k needed
+        entry_price=100.0, stop_loss=95.0, take_profit=110.0,
+        reasoning="needs real cash, not phantom SELL proceeds",
+    )
+
+    allowed, _, blocked = pipeline._filter_hard_risk_decisions(
+        [phantom_sell, buy], positions=[held], total_value=100_000.0,
+        daily_pnl=0, baseline=100_000.0, cash=5_000.0,  # only $5k actual
+    )
+
+    symbols = {d.symbol for d in allowed}
+    assert "NVDA" not in symbols, (
+        f"BUY slipped through against phantom SELL proceeds; blocked={blocked}"
+    )
+    assert any("NVDA" in msg and "cash" in msg.lower() for msg in blocked)
+
+
+def test_force_delever_tiebreak_is_deterministic_on_equal_pnl():
+    """When multiple positions tie on (unrealized_pnl, market_value), sort
+    must fall back to symbol alphabetical so behavior is reproducible."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.config = MagicMock()
+    pipeline.config.risk.allow_margin = False
+    pipeline.broker = MagicMock()
+    pipeline.broker.submit_order.return_value = {
+        "id": "ord-1", "status": "accepted", "symbol": "AAA",
+    }
+    pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline.broker.get_account.return_value = {
+        "cash": 100.0, "portfolio_value": 10_000.0, "last_equity": 10_500.0,
+    }
+    pipeline.broker.get_positions.return_value = []
+    pipeline.db = MagicMock()
+
+    from src.pipeline_context import RunContext
+    ctx = RunContext.start("morning")
+    ctx.cash = -100.0
+    # Three positions all identical PnL + market_value. Reverse-alphabetical
+    # iteration order so a naive (stable-but-input-order-dependent) sort
+    # would pick CCC; the correct symbol-tiebreak picks AAA.
+    ctx.positions = [
+        Position(symbol="CCC", qty=5, avg_entry=100, current_price=100,
+                 market_value=500, unrealized_pnl=0.0, sector="Tech"),
+        Position(symbol="BBB", qty=5, avg_entry=100, current_price=100,
+                 market_value=500, unrealized_pnl=0.0, sector="Tech"),
+        Position(symbol="AAA", qty=5, avg_entry=100, current_price=100,
+                 market_value=500, unrealized_pnl=0.0, sector="Tech"),
+    ]
+
+    orders = pipeline._force_delever(ctx)
+    assert len(orders) == 1
+    first_sym = pipeline.broker.submit_order.call_args.kwargs["symbol"]
+    assert first_sym == "AAA"
+
+
+def test_margin_deficit_floor_is_single_source_of_truth():
+    """The $1 floor must live in one module so tightening doesn't leave
+    prompt text or one agent out of sync."""
+    from src.risk.constants import MARGIN_DEFICIT_FLOOR_USD
+    assert MARGIN_DEFICIT_FLOOR_USD == 1.0
+    # Defensive: pipeline shouldn't have reintroduced a private copy
+    from src.pipeline import TradingPipeline
+    assert not hasattr(TradingPipeline, "_FORCE_DELEVER_FLOOR_USD"), (
+        "Remove duplicate floor constant — use MARGIN_DEFICIT_FLOOR_USD"
+    )
+
+
 def test_force_delever_noop_on_empty_positions():
     """Negative cash but no positions to sell — logs error and exits cleanly."""
     pipeline = TradingPipeline.__new__(TradingPipeline)

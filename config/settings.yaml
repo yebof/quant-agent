@@ -126,6 +126,11 @@ trading:
     - AMT
     - PLD
   lookback_days: 120
+  # NOTE: these times are only consumed by `main.py --mode live` (APScheduler).
+  # Production runs via launchd — see `src/trading_calendar.py SESSION_WINDOWS`
+  # for the authoritative ET windows and `scripts/run_if_et_window.sh` for the
+  # launchd-gated wrapper. The `intra_check` time here is meaningless in prod
+  # (launchd fires it every 30-min tick across 09:30-16:00 ET; see wrapper).
   schedule:
     earnings_preprocess: "05:00"
     morning: "06:00"

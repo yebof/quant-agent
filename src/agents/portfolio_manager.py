@@ -274,13 +274,8 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
         # which positions to trim rather than having every BUY rejected
         # without context.
         allow_margin: bool = bool(kwargs.get("allow_margin", True))
-        # Threshold: only treat cash as "negative" when it's meaningfully below
-        # zero. Fill rounding (mid-price × share_count, commissions) routinely
-        # leaves cash at -$0.01 to -$0.50 transiently — those would fire the
-        # full DE-LEVER mandate and force a SELL on sub-dollar noise that the
-        # next reconcile clears. $1 is the practical floor for a trading bot.
-        _MARGIN_DEFICIT_FLOOR = 1.0
-        if not allow_margin and cash_balance < -_MARGIN_DEFICIT_FLOOR:
+        from src.risk.constants import MARGIN_DEFICIT_FLOOR_USD
+        if not allow_margin and cash_balance < -MARGIN_DEFICIT_FLOOR_USD:
             deficit = -cash_balance
             margin_section = (
                 "## ⚠️ DE-LEVER MANDATE (margin disabled, cash is negative)\n"
