@@ -160,6 +160,26 @@ def test_pm_prompt_surfaces_delever_mandate_when_cash_negative():
     assert "$2,500" in msg  # deficit figure surfaced
 
 
+def test_pm_prompt_ignores_sub_dollar_cash_noise():
+    """Fill-rounding leftovers like cash=-$0.30 should NOT fire the full
+    DE-LEVER mandate — those clear on the next reconcile and a mandate
+    would force an unnecessary SELL on sub-dollar noise."""
+    from src.agents.portfolio_manager import PortfolioManagerAgent
+
+    with patch("anthropic.Anthropic"):
+        agent = PortfolioManagerAgent(api_key="test", model="claude-opus-4-6")
+        msg = agent.build_user_message(
+            analyses=[], positions=[], macro_analysis=None,
+            cash_balance=-0.30,  # rounding noise
+            total_value=50_000.0,
+            earnings_analyses=[], allow_margin=False,
+        )
+
+    assert "DE-LEVER MANDATE" not in msg
+    # Generic cash-only reminder is still rendered (no deficit figure though)
+    assert "Cash-only account" in msg
+
+
 def test_pm_prompt_no_mandate_when_margin_enabled():
     """With margin allowed, the mandate section stays empty even with negative cash."""
     from src.agents.portfolio_manager import PortfolioManagerAgent
