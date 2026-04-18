@@ -10,7 +10,62 @@ existing pipeline integration tests in test_pipeline.py.
 from unittest.mock import MagicMock, patch
 
 from src.pipeline_context import RunContext
-from src.pipeline_stages import MorningResearchStage
+from src.pipeline_stages import (
+    DecisionStage,
+    ExecutionStage,
+    MorningResearchStage,
+    RiskStage,
+)
+
+
+def test_stage_classes_take_pipeline_reference():
+    """DecisionStage / RiskStage / ExecutionStage wire a pipeline for helpers."""
+    fake_pipeline = MagicMock()
+    for cls in (DecisionStage, RiskStage, ExecutionStage):
+        stage = cls(pipeline=fake_pipeline)
+        assert stage._pipeline is fake_pipeline
+
+
+def test_execution_stage_delegation_runs_pipeline_path():
+    """Pipeline's `_execution_stage` thunks into `execution_stage.run(ctx)`."""
+    from src.pipeline import TradingPipeline
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.execution_stage = MagicMock()
+    pipeline.execution_stage.run.return_value = ["order-1"]
+    ctx = RunContext.start("morning")
+
+    out = TradingPipeline._execution_stage(pipeline, ctx)
+
+    assert out == ["order-1"]
+    pipeline.execution_stage.run.assert_called_once_with(ctx)
+
+
+def test_risk_stage_delegation_returns_early_exit_dict():
+    from src.pipeline import TradingPipeline
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.risk_stage = MagicMock()
+    pipeline.risk_stage.run.return_value = {"status": "rejected", "orders": []}
+    ctx = RunContext.start("morning")
+
+    out = TradingPipeline._risk_stage(pipeline, ctx)
+
+    assert out["status"] == "rejected"
+
+
+def test_decision_stage_delegation_returns_none():
+    """Method contract preserved: _decision_stage mutates ctx, returns None."""
+    from src.pipeline import TradingPipeline
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.decision_stage = MagicMock()
+    ctx = RunContext.start("morning")
+
+    out = TradingPipeline._decision_stage(pipeline, ctx)
+
+    assert out is None
+    pipeline.decision_stage.run.assert_called_once_with(ctx)
 
 
 def test_morning_research_stage_constructs_with_all_deps():
@@ -31,7 +86,7 @@ def test_morning_research_stage_constructs_with_all_deps():
         earnings_analyst=MagicMock(),
         has_actionable_signal_fn=lambda *args, **kw: True,
         run_news_update_fn=lambda *a, **kw: None,
-        run_earnings_check_fn=lambda *a, **kw: ([], []),
+        load_earnings_analyses_fn=lambda *a, **kw: ([], []),
     )
     assert stage is not None
     # Dependencies retained as attributes for future tests to swap in
@@ -90,7 +145,7 @@ def test_morning_research_stage_populates_ctx_on_success():
         earnings_analyst=MagicMock(),
         has_actionable_signal_fn=lambda *args, **kw: False,
         run_news_update_fn=lambda run_id, session: None,
-        run_earnings_check_fn=lambda run_id, session, ctx=None: ([], []),
+        load_earnings_analyses_fn=lambda run_id, session, ctx=None: ([], []),
     )
 
     ctx = RunContext.start("morning")
@@ -195,7 +250,7 @@ def test_morning_research_stage_tech_uses_prior_macro_snapshot(mock_compute_indi
         earnings_analyst=MagicMock(),
         has_actionable_signal_fn=lambda *args, **kw: True,
         run_news_update_fn=lambda run_id, session: None,
-        run_earnings_check_fn=lambda run_id, session, ctx=None: ([], []),
+        load_earnings_analyses_fn=lambda run_id, session, ctx=None: ([], []),
     )
 
     ctx = RunContext.start("morning")

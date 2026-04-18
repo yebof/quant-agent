@@ -471,7 +471,7 @@ def test_pipeline_midday_fetches_only_executed_morning_trades():
     pipeline._auto_take_profit = MagicMock(return_value=[])
     pipeline._handle_ex_dividends = MagicMock(return_value=[])
     pipeline._run_news_update = MagicMock(return_value=None)
-    pipeline._run_earnings_check = MagicMock(return_value=(None, []))
+    pipeline._load_earnings_analyses = MagicMock(return_value=(None, []))
     pipeline._midday_execute_llm_actions = MagicMock(return_value=[])
     pipeline._wait_bg_threads = MagicMock()
     pipeline._reconcile_fills = MagicMock()

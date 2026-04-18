@@ -100,3 +100,56 @@ def test_preprocess_records_failures_on_llm_error(tmp_path):
 
     assert result["status"] == "analysis_error"
     earnings_provider.record_failure.assert_called_once_with(new_filing)
+
+
+def test_load_earnings_analyses_never_confirms_or_spawns_threads(tmp_path):
+    """Hot-path invariant: `_load_earnings_analyses` is read-only.
+
+    It may return placeholders for `is_new` filings that preprocessing missed,
+    but it MUST NOT spawn a background thread, call `confirm_filing`, or
+    record any failure — those side-effects belong to run_earnings_preprocess.
+    """
+    import threading
+
+    new_filing = EarningsReport(
+        symbol="NVDA", form_type="10-Q", filing_date="2026-04-20",
+        filing_path="/tmp/nvda.html", analysis_path="/tmp/nvda.md",
+        text_excerpt="...", is_new=True,
+    )
+    cached_filing = EarningsReport(
+        symbol="AAPL", form_type="10-K", filing_date="2026-04-15",
+        filing_path="/tmp/aapl.html", analysis_path="/tmp/aapl.md",
+        text_excerpt="", is_new=False,
+    )
+    earnings_provider = MagicMock()
+    earnings_provider.check_and_fetch.return_value = [new_filing, cached_filing]
+    earnings_analyst = MagicMock()
+    earnings_analyst.analyze_reports.return_value = [{
+        "symbol": "AAPL", "is_new": False, "form_type": "10-K",
+        "filing_date": "2026-04-15", "agent_result": None,
+        "analysis": {"investment_implications": {"sentiment": "neutral"}},
+    }]
+
+    pipeline = _mk_pipeline(tmp_path, earnings_provider, earnings_analyst)
+    pipeline._straggler_bg_threads = []
+
+    threads_before = threading.active_count()
+    reports, results = pipeline._load_earnings_analyses("r1", session="morning")
+    threads_after = threading.active_count()
+
+    # Thread-count invariant — nothing spawned.
+    assert threads_after == threads_before
+    # LLM analyze_reports called ONLY on the already-confirmed cached slice.
+    earnings_analyst.analyze_reports.assert_called_once_with([cached_filing])
+    # No confirm/failure calls — those are preprocess-only.
+    earnings_provider.confirm_filing.assert_not_called()
+    earnings_provider.record_failure.assert_not_called()
+    # NVDA surfaces as a placeholder (queued=True) so PM can size down.
+    nvda_entries = [r for r in results if r["symbol"] == "NVDA"]
+    assert len(nvda_entries) == 1
+    assert nvda_entries[0]["queued"] is True
+    assert nvda_entries[0]["analysis"] is None
+    # AAPL comes through with a real analysis.
+    aapl_entries = [r for r in results if r["symbol"] == "AAPL"]
+    assert len(aapl_entries) == 1
+    assert aapl_entries[0]["analysis"] is not None

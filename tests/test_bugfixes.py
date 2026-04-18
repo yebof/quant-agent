@@ -481,7 +481,7 @@ def test_evening_reconciles_before_loading_trade_inputs():
     pipeline.config = MagicMock()
     pipeline.config.llm.evening_analyst_model = "test-model"
     pipeline._run_news_update = MagicMock(return_value=None)
-    pipeline._run_earnings_check = MagicMock(return_value=([], []))
+    pipeline._load_earnings_analyses = MagicMock(return_value=([], []))
     pipeline._wait_bg_threads = MagicMock()
 
     events: list = []

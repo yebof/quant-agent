@@ -3,7 +3,7 @@ import threading
 import time
 import uuid
 from datetime import date
-from src.util.time import et_today
+from src.trading_calendar import et_today, session_date_key
 
 from pydantic import ValidationError
 
@@ -29,7 +29,12 @@ from src.data.earnings import EarningsDataProvider
 from src.risk.rules import RiskRuleEngine
 from src.execution.broker import AlpacaBroker, _get_sector
 from src.pipeline_context import PMFacts, RunContext, SessionType
-from src.pipeline_stages import MorningResearchStage
+from src.pipeline_stages import (
+    DecisionStage,
+    ExecutionStage,
+    MorningResearchStage,
+    RiskStage,
+)
 from src.portfolio_constructor import PortfolioConstructor
 from src.storage.db import Database
 from src.models import (
@@ -147,8 +152,16 @@ class TradingPipeline:
             earnings_analyst=self.earnings_analyst,
             has_actionable_signal_fn=self._has_actionable_signal_fn,
             run_news_update_fn=self._run_news_update,
-            run_earnings_check_fn=self._run_earnings_check,
+            load_earnings_analyses_fn=self._load_earnings_analyses,
         )
+        # Downstream stages for run_morning: decision → risk → execution.
+        # They take a `pipeline` reference so they can reuse the 15+ memory /
+        # filter / sizing helpers that still live on TradingPipeline. Those
+        # helpers are the next extraction boundary — see pipeline_stages.py
+        # header for the rationale.
+        self.decision_stage = DecisionStage(pipeline=self)
+        self.risk_stage = RiskStage(pipeline=self)
+        self.execution_stage = ExecutionStage(pipeline=self)
         # Stragglers from prior runs that exceeded _wait_bg_threads' timeout.
         # Per-run threads are tracked on RunContext.bg_threads; this list only
         # catches the rare thread that refused to join within the budget so we
@@ -858,7 +871,7 @@ class TradingPipeline:
         try:
             rows = self.db.get_recent_agent_outputs(
                 agent_name="risk_manager", limit=limit,
-                before_date=str(et_today()),
+                before_date=session_date_key(),
             )
         except Exception as e:
             logger.warning("rm_recent_verdicts: DB fetch failed: %s", e)
@@ -899,7 +912,7 @@ class TradingPipeline:
         try:
             rows = self.db.get_recent_agent_outputs(
                 agent_name="portfolio_manager", limit=limit,
-                before_date=str(et_today()),
+                before_date=session_date_key(),
             )
         except Exception as e:
             logger.warning("pm_recent_decisions: DB fetch failed: %s", e)
@@ -1202,7 +1215,7 @@ class TradingPipeline:
         try:
             rm_rows = self.db.get_recent_agent_outputs(
                 agent_name="risk_manager", limit=5,
-                before_date=str(et_today()),
+                before_date=session_date_key(),
             )
         except Exception as e:
             logger.warning("pm_facts: rm outputs failed: %s", e)
@@ -1417,11 +1430,28 @@ class TradingPipeline:
             logger.error("[%s] News analyst failed: %s", session, e)
             return None
 
-    def _run_earnings_check(
+    def _load_earnings_analyses(
         self, run_id: str, session: str = "morning",
         ctx: RunContext | None = None,
     ) -> tuple[list, list]:
-        """Check for new SEC filings, analyze in background, return cached results."""
+        """Hot-path consumer: read cached earnings analyses, never call the LLM.
+
+        The LLM-producing path is `run_earnings_preprocess()`, which runs
+        pre-market (08:00-09:15 ET) and synchronously analyzes + confirms
+        every new 10-Q/10-K. By the time morning/midday/evening fire, the
+        authoritative result is already on disk.
+
+        This method returns:
+          - cached analyses for any filing already confirmed by preprocess
+          - placeholder `queued=True` entries for filings that preprocess
+            missed (e.g. preprocess didn't run, or the filing dropped after
+            preprocess but before a later session). PM sees these and sizes
+            down accordingly — better than blocking the session on an LLM.
+
+        No background threads, no session-time token spend, no bg_threads
+        churn. The `run_id` + `session` + `ctx` signature is preserved for
+        compatibility with MorningResearchStage's callable injection.
+        """
         try:
             reports = self.earnings_provider.check_and_fetch(self.config.trading.universe)
             if not reports:
@@ -1432,9 +1462,6 @@ class TradingPipeline:
 
             cached_results = self.earnings_analyst.analyze_reports(cached_reports)
 
-            # Insert lightweight placeholder entries for filings whose LLM analysis is
-            # running in the background. PM needs to know "a fresh 10-Q dropped today,
-            # treat the cached prior analysis with a bigger grain of salt".
             for r in new_reports:
                 cached_results.append({
                     "symbol": r.symbol,
@@ -1447,81 +1474,19 @@ class TradingPipeline:
 
             if new_reports:
                 symbols = ", ".join(r.symbol for r in new_reports)
-                logger.info("[%s] Background: queued %d new filings for analysis (%s)",
-                            session, len(new_reports), symbols)
-
-                def _bg_analyze(bg_reports):
-                    try:
-                        results = self.earnings_analyst.analyze_reports(bg_reports)
-
-                        # Log every fresh LLM call to db.agent_logs — full prompt +
-                        # full raw_text (includes the investment_reasoning_chain JSON).
-                        # Parity with the 7 other agents that already write here.
-                        for res in results:
-                            agent_result = res.get("agent_result")
-                            if agent_result is None:
-                                continue  # cached reads — no LLM call to log
-                            sym = res.get("symbol", "?")
-                            analysis = res.get("analysis") or {}
-                            sentiment = (analysis.get("investment_implications") or {}).get("sentiment", "?")
-                            try:
-                                self.db.insert_agent_log(
-                                    agent_name=f"earnings_analyst_{session}",
-                                    run_id=run_id,
-                                    input_summary=f"{sym} {res.get('form_type', '?')} filed {res.get('filing_date', '?')}",
-                                    input_message=agent_result.user_message,
-                                    output_summary=(
-                                        f"sentiment={sentiment}"
-                                        if res.get("analysis") else "parse_error"
-                                    ),
-                                    full_response=agent_result.raw_text,
-                                    model=self.config.llm.earnings_analyst_model,
-                                    tokens_used=agent_result.tokens_used,
-                                )
-                            except Exception as e:
-                                logger.error(
-                                    "[%s] Failed to insert earnings agent_log for %s: %s",
-                                    session, sym, e,
-                                )
-
-                        for r in bg_reports:
-                            if any(res["symbol"] == r.symbol and res["is_new"] for res in results):
-                                self.earnings_provider.confirm_filing(r)
-                    except Exception as e:
-                        logger.error("[%s] Background earnings analysis failed: %s", session, e, exc_info=True)
-                        # Track failed attempts per filing so we eventually
-                        # abandon the ones that keep failing — prevents an
-                        # unparseable 10-Q from burning tokens every session
-                        # forever.
-                        for r in bg_reports:
-                            try:
-                                self.earnings_provider.record_failure(r)
-                            except Exception as re:
-                                logger.error(
-                                    "[%s] record_failure failed for %s: %s",
-                                    session, r.symbol, re,
-                                )
-
-                bg = threading.Thread(
-                    target=_bg_analyze,
-                    args=(new_reports,),
-                    name=f"earnings-bg-{session}",
-                    daemon=True,
+                logger.warning(
+                    "[%s] %d filings missed pre-market preprocessing (%s); "
+                    "surfacing as placeholder only — PM will size down.",
+                    session, len(new_reports), symbols,
                 )
-                bg.start()
-                if ctx is not None:
-                    ctx.bg_threads.append(bg)
-                else:
-                    # Caller didn't pass a ctx (e.g., in a test or an older
-                    # code path). Fall back to the straggler list so the
-                    # thread still gets joined later.
-                    self._straggler_bg_threads.append(bg)
 
-            logger.info("[%s] Earnings: %d cached analyses, %d new filings queued",
-                        session, len(cached_results), len(new_reports))
+            logger.info(
+                "[%s] Earnings: %d cached analyses, %d unanalyzed placeholders",
+                session, len(cached_results) - len(new_reports), len(new_reports),
+            )
             return reports, cached_results
         except Exception as e:
-            logger.error("[%s] Earnings check failed: %s", session, e)
+            logger.error("[%s] Earnings load failed: %s", session, e)
             return [], []
 
     # ---------------------------------------------------------------
@@ -1696,570 +1661,16 @@ class TradingPipeline:
         return orders
 
     def _execution_stage(self, ctx: RunContext) -> list[dict]:
-        """Execute HOLD logging → SELLs → wait fills → refresh → BUYs.
-
-        Reads:  ctx.portfolio_decision.decisions, ctx.positions, ctx.cash,
-                ctx.total_value, ctx.symbols_bars
-
-        Writes: ctx.orders (the submitted order dicts)
-
-        Returns the orders list (also available as ctx.orders). Extracted from
-        run_morning for size + unit-testability of the execution flow.
-        """
-        run_id = ctx.run_id
-        positions = ctx.positions
-        total_value = ctx.total_value
-        cash = ctx.cash
-        portfolio_decision = ctx.portfolio_decision
-
-        orders: list[dict] = []
-        sell_decisions = [d for d in portfolio_decision.decisions if d.action == "SELL"]
-        buy_decisions = [d for d in portfolio_decision.decisions if d.action == "BUY"]
-        hold_decisions = [d for d in portfolio_decision.decisions if d.action == "HOLD"]
-
-        # Audit HOLDs — no order submitted, but intent preserved.
-        for d in hold_decisions:
-            try:
-                self.db.insert_trade(
-                    symbol=d.symbol, action="HOLD", qty=0.0, price=0.0,
-                    reasoning=d.reasoning, run_id=run_id,
-                )
-            except Exception as e:
-                logger.warning("Failed to record HOLD decision for %s: %s", d.symbol, e)
-
-        # Execute SELLs first (frees cash), wait for fills, then BUYs.
-        sell_order_ids: list[str] = []
-        for decision in sell_decisions:
-            try:
-                existing = [p for p in positions if p.symbol == decision.symbol]
-                if not existing or existing[0].qty <= 0:
-                    continue
-                if decision.allocation_pct == 0:
-                    logger.warning(
-                        "Skipping SELL %s with allocation_pct=0 (ambiguous — use 100 for full exit)",
-                        decision.symbol,
-                    )
-                    continue
-                if 0 < decision.allocation_pct < 100:
-                    sell_fraction = decision.allocation_pct / 100
-                    qty = existing[0].qty * sell_fraction
-                    if float(existing[0].qty).is_integer():
-                        qty = max(1.0, float(int(qty)))
-                    if qty <= 0:
-                        continue
-                    if qty >= existing[0].qty:
-                        qty = self._full_sell_qty(existing[0].qty)
-                        if qty is None:
-                            continue
-                        action_label = "SELL"
-                    else:
-                        action_label = f"PARTIAL_SELL({decision.allocation_pct:.0f}%)"
-                else:
-                    qty = self._full_sell_qty(existing[0].qty)
-                    if qty is None:
-                        continue
-                    action_label = "SELL"
-                sell_price = existing[0].current_price
-                sell_limit = round(sell_price * 0.995, 2)
-                order = self.broker.submit_order(
-                    symbol=decision.symbol, qty=qty, side="sell",
-                    limit_price=sell_limit,
-                    reference_price=existing[0].current_price,
-                )
-                if not self._order_accepted(order, decision.symbol, "sell"):
-                    continue
-                orders.append(order)
-                sell_order_ids.append(order["id"])
-                self.db.insert_trade(
-                    symbol=decision.symbol, action=action_label, qty=qty,
-                    price=sell_price, reasoning=decision.reasoning, run_id=run_id,
-                    broker_order_id=order.get("id"),
-                    fill_status="submitted",
-                )
-                logger.info(
-                    "Executed: %s %s %s @ limit $%.2f",
-                    action_label.lower(), self._format_qty(qty), decision.symbol, sell_limit,
-                )
-            except Exception as e:
-                logger.error("Order failed for %s %s: %s", decision.action, decision.symbol, e)
-
-        for order_id in sell_order_ids:
-            status = self.broker.wait_for_order_terminal(order_id)
-            if status != "filled":
-                logger.warning(
-                    "Sell order %s did not fill before buy phase (status=%s); buys will use current cash only",
-                    order_id, status or "unknown",
-                )
-
-        # Refresh broker snapshot so BUYs see post-sell cash + positions.
-        if sell_decisions:
-            account, positions, price_map = self._refresh_account_state()
-            cash = account["cash"]
-            total_value = account["portfolio_value"]
-            # Mirror updated state into ctx so observers (evening, tests) read truth.
-            ctx.positions = positions
-            ctx.cash = cash
-            ctx.total_value = total_value
-            logger.info(
-                "Post-sell refresh: $%.2f total, $%.2f cash, %d positions",
-                total_value, cash, len(positions),
-            )
-        else:
-            price_map = {p.symbol: p.current_price for p in positions}
-
-        available_cash = cash
-        for decision in buy_decisions:
-            if decision.action != "BUY":
-                continue
-            try:
-                market_price = price_map.get(decision.symbol)
-                if not market_price or market_price <= 0:
-                    live_price = self.broker.get_latest_price(decision.symbol)
-                    if live_price and live_price > 0:
-                        market_price = live_price
-                        price_map[decision.symbol] = live_price
-                if not market_price or market_price <= 0:
-                    bars = ctx.symbols_bars.get(decision.symbol) or []
-                    if bars:
-                        last_close = float(bars[-1].close)
-                        if last_close > 0:
-                            logger.info(
-                                "Using last-bar close $%.2f as price reference for %s "
-                                "(broker pricing unavailable)",
-                                last_close, decision.symbol,
-                            )
-                            market_price = last_close
-
-                limit_price = None
-                sizing_price = None
-                if decision.entry_price > 0:
-                    limit_price = decision.entry_price
-
-                if market_price and market_price > 0:
-                    if limit_price is not None:
-                        deviation = abs(limit_price - market_price) / market_price
-                        if deviation > 0.10:
-                            logger.warning(
-                                "LLM entry_price $%.2f for %s is %.1f%% away from market $%.2f, using market order",
-                                decision.entry_price, decision.symbol, deviation * 100, market_price,
-                            )
-                            limit_price = None
-                            sizing_price = market_price
-                        elif limit_price < market_price:
-                            logger.info(
-                                "Adjusting limit price for %s: $%.2f → $%.2f (raised to market)",
-                                decision.symbol, limit_price, market_price,
-                            )
-                            limit_price = market_price
-                            sizing_price = market_price
-                        else:
-                            sizing_price = max(market_price, limit_price)
-                    else:
-                        sizing_price = market_price
-                else:
-                    logger.error(
-                        "BUY %s skipped: no verifiable price reference "
-                        "(broker + bars both unavailable). "
-                        "LLM proposed entry $%.2f but cannot be validated.",
-                        decision.symbol, decision.entry_price,
-                    )
-                    continue
-
-                qty_by_alloc = int((total_value * decision.allocation_pct / 100) / sizing_price)
-                qty_by_risk = None
-                RISK_BUDGET_PCT = 0.5
-                if decision.stop_loss > 0 and sizing_price > decision.stop_loss:
-                    risk_per_share = sizing_price - decision.stop_loss
-                    if risk_per_share > 0:
-                        risk_dollars = total_value * RISK_BUDGET_PCT / 100
-                        qty_by_risk = int(risk_dollars / risk_per_share)
-                if qty_by_risk is not None and qty_by_risk < qty_by_alloc:
-                    logger.info(
-                        "Vol-adjusted sizing for %s: qty_by_alloc=%d → qty_by_risk=%d "
-                        "(risk %.2f/share, budget $%.0f = %.1f%% of equity)",
-                        decision.symbol, qty_by_alloc, qty_by_risk,
-                        sizing_price - decision.stop_loss,
-                        total_value * RISK_BUDGET_PCT / 100, RISK_BUDGET_PCT,
-                    )
-                    qty = qty_by_risk
-                else:
-                    qty = qty_by_alloc
-                if qty <= 0:
-                    logger.warning("Calculated qty=0 for %s, skipping", decision.symbol)
-                    continue
-
-                estimated_cost = qty * sizing_price
-                if estimated_cost > available_cash:
-                    logger.warning(
-                        "Skipping BUY %s: estimated cost $%.2f exceeds available cash $%.2f after sell phase",
-                        decision.symbol, estimated_cost, available_cash,
-                    )
-                    continue
-
-                order = self.broker.submit_order(
-                    symbol=decision.symbol, qty=qty, side="buy",
-                    limit_price=limit_price,
-                    stop_loss_price=decision.stop_loss if decision.stop_loss > 0 else None,
-                    reference_price=market_price,
-                )
-                if not self._order_accepted(order, decision.symbol, "buy"):
-                    continue
-                orders.append(order)
-                available_cash -= estimated_cost
-                executed_price = limit_price if limit_price is not None else sizing_price
-                self.db.insert_trade(
-                    symbol=decision.symbol, action="BUY", qty=qty,
-                    price=executed_price, reasoning=decision.reasoning, run_id=run_id,
-                    stop_loss=decision.stop_loss, take_profit=decision.take_profit,
-                    broker_order_id=order.get("id"),
-                    fill_status="submitted",
-                )
-                order_type = "limit" if limit_price is not None else "market"
-                logger.info(
-                    "Executed: buy %d %s @ %s $%.2f",
-                    qty, decision.symbol, order_type, executed_price,
-                )
-            except Exception as e:
-                logger.error("Order failed for %s %s: %s", decision.action, decision.symbol, e)
-
-        ctx.orders = orders
-        return orders
+        """Delegates to ExecutionStage (class lives in pipeline_stages.py)."""
+        return self.execution_stage.run(ctx)
 
     def _risk_stage(self, ctx: RunContext) -> dict | None:
-        """Apply hard risk filter → earnings cap → RM review → modifications.
-
-        Reads:  ctx.portfolio_decision (with .decisions populated by decision stage),
-                ctx.positions, ctx.total_value, ctx.last_equity, ctx.earnings_results,
-                ctx.macro_analysis, ctx.analyses, ctx.symbols_bars, ctx.data_status,
-                ctx.news_intel, ctx.macro_summary
-
-        Writes: ctx.portfolio_decision.decisions (mutated: filtered, capped,
-                modified, scaled), ctx.correlation_matrix, ctx.daily_pnl
-
-        Returns a response dict when the pipeline should short-circuit
-        (hard risk block, RM rejection), else None to continue.
-        """
-        run_id = ctx.run_id
-        portfolio_decision = ctx.portfolio_decision
-        positions = ctx.positions
-        total_value = ctx.total_value
-        last_equity = ctx.last_equity
-        earnings_results = ctx.earnings_results
-        macro_analysis = ctx.macro_analysis
-        analyses = ctx.analyses
-        news_intel = ctx.news_intel
-        data_status = ctx.data_status
-
-        # Symbol guard
-        portfolio_decision.decisions, symbol_blocked_reasons = self._filter_supported_symbols(
-            portfolio_decision.decisions, analyses, positions,
-        )
-        if symbol_blocked_reasons:
-            reasons = "; ".join(dict.fromkeys(symbol_blocked_reasons))
-            logger.warning("SYMBOL GUARD BLOCK: %s", reasons)
-            if not portfolio_decision.decisions:
-                return {"status": "symbol_block", "orders": [], "reason": reasons}
-            logger.info(
-                "Allowing %d supported orders through after symbol guard filter",
-                len(portfolio_decision.decisions),
-            )
-
-        # Earnings-queued 5% cap on BUYs whose 10-Q/10-K just dropped.
-        portfolio_decision.decisions = self._clamp_queued_earnings_buys(
-            portfolio_decision.decisions, earnings_results,
-        )
-
-        daily_pnl = total_value - last_equity
-        ctx.daily_pnl = daily_pnl
-        macro_target_pct = None
-        if macro_analysis:
-            macro_target_pct = macro_analysis.position_guidance.target_invested_pct
-        ctx.macro_target_pct = macro_target_pct
-
-        # Correlation matrix from today's bars + held positions.
-        correlation_matrix = None
-        try:
-            from src.data.correlation import build_correlation_matrix
-            pool_bars = dict(ctx.symbols_bars)
-            for p in positions:
-                if p.symbol not in pool_bars:
-                    pool_bars[p.symbol] = self.market.get_ohlcv(
-                        p.symbol, self.config.trading.lookback_days,
-                    ) or []
-            correlation_matrix = build_correlation_matrix(pool_bars)
-        except Exception as e:
-            logger.warning("Failed to build correlation matrix: %s (continuing without)", e)
-        ctx.correlation_matrix = correlation_matrix or {}
-
-        portfolio_decision.decisions, rule_violations, blocked_reasons = (
-            self._filter_hard_risk_decisions(
-                portfolio_decision.decisions,
-                positions, total_value, daily_pnl,
-                baseline=last_equity,
-                macro_target_invested_pct=macro_target_pct,
-                correlation_matrix=correlation_matrix,
-            )
-        )
-        if blocked_reasons:
-            reasons = "; ".join(dict.fromkeys(blocked_reasons))
-            logger.warning("HARD RISK BLOCK (BUY blocked): %s", reasons)
-            if not portfolio_decision.decisions:
-                return {"status": "hard_risk_block", "orders": [], "reason": reasons}
-            logger.info(
-                "Allowing %d non-blocked orders through after hard risk filter",
-                len(portfolio_decision.decisions),
-            )
-
-        # Advisory: ≥2 upstream sources degraded → RM should consider scaling down.
-        degraded = [k for k, v in data_status.items() if v not in ("ok", "empty")]
-        if len(degraded) >= 2:
-            from src.risk.rules import RiskViolation as _RV
-            rule_violations.append(_RV(
-                rule="data_degraded",
-                message=(
-                    f"Upstream data sources degraded: {', '.join(sorted(degraded))} "
-                    f"(status: {data_status}). Decisions may be built on incomplete input — "
-                    f"RM should consider scale_all_buys < 1.0."
-                ),
-                value=float(len(degraded)),
-                limit=1.0,
-            ))
-            logger.warning("Morning data degradation: %s", data_status)
-
-        # Advisory: empty correlation matrix with book to check.
-        has_book_to_check = len(positions) >= 2 or any(
-            d.action == "BUY" for d in portfolio_decision.decisions
-        )
-        if (not correlation_matrix) and has_book_to_check:
-            from src.risk.rules import RiskViolation as _RV
-            rule_violations.append(_RV(
-                rule="correlation_coverage_gap",
-                message=(
-                    "Correlation matrix is empty (insufficient bar data this run). "
-                    "The cluster-concentration advisory is DISABLED. Consider "
-                    "scale_all_buys < 1.0 until coverage returns, especially for "
-                    "thematic names (AI, semis, energy)."
-                ),
-                value=0.0,
-                limit=2.0,
-            ))
-            logger.warning(
-                "Correlation matrix empty — cluster risk check disabled for this run "
-                "(positions=%d, buy_candidates=%d)",
-                len(positions),
-                sum(1 for d in portfolio_decision.decisions if d.action == "BUY"),
-            )
-
-        # RM review
-        verdict, rm_result = self.risk_manager.review(
-            portfolio_decision=portfolio_decision,
-            positions=positions,
-            macro_summary=ctx.macro_summary,
-            rule_violations=rule_violations,
-            tech_analyses=analyses,
-            news_intel=news_intel,
-            earnings_analyses=earnings_results,
-        )
-
-        self.db.insert_agent_log(
-            agent_name="risk_manager", run_id=run_id,
-            input_summary=f"{len(portfolio_decision.decisions)} trades, {len(rule_violations)} violations",
-            input_message=rm_result.user_message,
-            output_summary=f"Approved: {verdict.approved if verdict else 'error'}",
-            full_response=rm_result.raw_text,
-            model=self.config.llm.risk_manager_model,
-            tokens_used=rm_result.tokens_used,
-        )
-
-        if not verdict or not verdict.approved:
-            logger.info(
-                "Risk manager REJECTED trades: %s",
-                verdict.reasoning if verdict else "parse error",
-            )
-            return {
-                "status": "rejected", "orders": [],
-                "reason": verdict.reasoning if verdict else "error",
-            }
-
-        if verdict.modifications:
-            portfolio_decision.decisions = self._apply_risk_modifications(
-                portfolio_decision.decisions, verdict.modifications,
-            )
-
-        scale = getattr(verdict, "scale_all_buys", 1.0) or 1.0
-        if scale < 1.0 and scale >= 0.0:
-            scaled: list[TradeDecision] = []
-            for d in portfolio_decision.decisions:
-                if d.action == "BUY":
-                    new_alloc = max(0.0, min(100.0, d.allocation_pct * scale))
-                    if new_alloc <= 0:
-                        logger.info(
-                            "scale_all_buys=%.2f drops %s (alloc 0 after scaling)",
-                            scale, d.symbol,
-                        )
-                        continue
-                    try:
-                        scaled.append(d.model_copy(update={"allocation_pct": new_alloc}))
-                        logger.info(
-                            "scale_all_buys=%.2f: %s %.2f%% → %.2f%%",
-                            scale, d.symbol, d.allocation_pct, new_alloc,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "scale_all_buys copy failed for %s: %s — keeping original",
-                            d.symbol, e,
-                        )
-                        scaled.append(d)
-                else:
-                    scaled.append(d)
-            portfolio_decision.decisions = scaled
-
-        # Re-filter after RM modifications/scaling.
-        if verdict.modifications or scale < 1.0:
-            portfolio_decision.decisions, _, blocked_reasons = (
-                self._filter_hard_risk_decisions(
-                    portfolio_decision.decisions,
-                    positions, total_value, daily_pnl,
-                    baseline=last_equity,
-                    macro_target_invested_pct=macro_target_pct,
-                    correlation_matrix=correlation_matrix,
-                )
-            )
-            if blocked_reasons:
-                reasons = "; ".join(dict.fromkeys(blocked_reasons))
-                logger.warning("HARD RISK BLOCK AFTER MODIFICATIONS: %s", reasons)
-                if not portfolio_decision.decisions:
-                    return {"status": "hard_risk_block", "orders": [], "reason": reasons}
-
-        return None
+        """Delegates to RiskStage (class lives in pipeline_stages.py)."""
+        return self.risk_stage.run(ctx)
 
     def _decision_stage(self, ctx: RunContext):
-        """Build PM memory layers → call PM → run Constructor.
-
-        Reads:  ctx.positions, ctx.analyses, ctx.news_intel, ctx.earnings_results,
-                ctx.macro_analysis, ctx.total_value, ctx.cash, ctx.last_equity
-        Writes: ctx.portfolio_decision (with .targets AND .decisions populated),
-                ctx.facts
-
-        Returns None; stage completion is indicated by ctx.portfolio_decision
-        being set. When PM parse fails, portfolio_decision stays None and the
-        caller composes the early-exit response.
-        """
-        run_id = ctx.run_id
-        positions = ctx.positions
-        analyses = ctx.analyses
-        news_intel = ctx.news_intel
-        earnings_results = ctx.earnings_results
-        macro_analysis = ctx.macro_analysis
-        total_value = ctx.total_value
-        cash = ctx.cash
-        last_equity = ctx.last_equity
-
-        # Yesterday's evening insights — PM uses for outlook continuity.
-        yesterday_insights = self.db.get_latest_insights(before_date=str(et_today()))
-        # System performance over 5d / 20d — in_drawdown flag drives PM sizing.
-        recent_performance = self._compute_recent_performance(last_equity)
-        if yesterday_insights:
-            logger.info("Loaded yesterday's insights (risk=%s): %s",
-                        yesterday_insights.get("risk_rating", "?"),
-                        yesterday_insights.get("tomorrow_outlook", "")[:100])
-
-        # Multi-layer memory for PM — investment continuity awareness.
-        position_history = self._build_position_history(positions)
-        weekly_narrative = self._build_weekly_narrative()
-        macro_trajectory = self._build_macro_trajectory()
-        active_state_changes = self._build_active_state_changes()
-        rm_recent_verdicts = self._build_rm_recent_verdicts()
-        pm_recent_decisions = self._build_pm_recent_decisions()
-        projected_portfolio = self._build_projected_portfolio(
-            positions, analyses, total_value,
-        )
-        calibration_note = self._build_calibration_note()
-        macro_tech_alignment = self._build_macro_tech_alignment(macro_analysis, analyses)
-        # L4 structured facts — numbers for PM, not prose.
-        pm_facts = self._build_pm_facts(
-            positions=positions, analyses=analyses,
-            total_value=total_value, cash=cash,
-            recent_performance=recent_performance,
-        )
-        ctx.facts = pm_facts
-
-        portfolio_decision, pm_result = self.portfolio_manager.decide(
-            analyses=analyses,
-            positions=positions,
-            # PM template is dict-oriented; serialize at the boundary.
-            macro_analysis=(macro_analysis.model_dump() if macro_analysis else None),
-            cash_balance=cash,
-            total_value=total_value,
-            news_intel=news_intel,
-            earnings_analyses=earnings_results,
-            yesterday_insights=yesterday_insights,
-            recent_performance=recent_performance,
-            position_history=position_history,
-            weekly_narrative=weekly_narrative,
-            macro_trajectory=macro_trajectory,
-            active_state_changes=active_state_changes,
-            rm_recent_verdicts=rm_recent_verdicts,
-            pm_recent_decisions=pm_recent_decisions,
-            projected_portfolio=projected_portfolio,
-            calibration_note=calibration_note,
-            macro_tech_alignment=macro_tech_alignment,
-            facts=pm_facts,
-        )
-
-        if portfolio_decision and portfolio_decision.reasoning_chain:
-            rc = portfolio_decision.reasoning_chain
-            logger.info(
-                "PM Reasoning Chain:\n  Macro: %s\n  News: %s\n  Earnings: %s\n  "
-                "Conflicts: %s\n  Sizing: %s\n  Balance: %s\n  Cash: %s",
-                rc.macro_filter[:120], rc.news_check[:120], rc.earnings_check[:120],
-                rc.signal_conflicts[:120], rc.sizing_logic[:120],
-                rc.portfolio_balance[:120], rc.cash_target[:120],
-            )
-
-        self.db.insert_agent_log(
-            agent_name="portfolio_manager", run_id=run_id,
-            input_summary=f"{len(analyses)} analyses, ${total_value:.0f} total",
-            input_message=pm_result.user_message,
-            output_summary=portfolio_decision.portfolio_view if portfolio_decision else "no trades",
-            full_response=pm_result.raw_text,
-            model=self.config.llm.portfolio_manager_model,
-            tokens_used=pm_result.tokens_used,
-        )
-
-        if not portfolio_decision:
-            ctx.portfolio_decision = None
-            return
-
-        # Constructor: targets → concrete TradeDecisions.
-        price_map = {p.symbol: p.current_price for p in positions}
-        for target in portfolio_decision.targets:
-            sym = target.symbol.strip().upper()
-            if sym in price_map:
-                continue
-            try:
-                live = self.broker.get_latest_price(sym)
-            except Exception as e:
-                logger.warning("Constructor price lookup failed for %s: %s", sym, e)
-                continue
-            if live and live > 0:
-                price_map[sym] = live
-        portfolio_decision.decisions = self.portfolio_constructor.construct_orders(
-            targets=portfolio_decision.targets,
-            positions=positions,
-            analyses=analyses,
-            total_value=total_value,
-            price_map=price_map,
-        )
-        logger.info(
-            "Constructor: %d targets → %d decisions (%d BUY, %d SELL, %d HOLD)",
-            len(portfolio_decision.targets),
-            len(portfolio_decision.decisions),
-            sum(1 for d in portfolio_decision.decisions if d.action == "BUY"),
-            sum(1 for d in portfolio_decision.decisions if d.action == "SELL"),
-            sum(1 for d in portfolio_decision.decisions if d.action == "HOLD"),
-        )
-        ctx.portfolio_decision = portfolio_decision
+        """Delegates to DecisionStage (class lives in pipeline_stages.py)."""
+        self.decision_stage.run(ctx)
 
     def run_morning(self) -> dict:
         ctx = RunContext.start("morning")
@@ -2375,7 +1786,7 @@ class TradingPipeline:
         midday_news = self._run_news_update(run_id, session="midday")
         if midday_news:
             logger.info("Midday news: %s", midday_news.pm_briefing[:200])
-        _, midday_earnings = self._run_earnings_check(run_id, session="midday", ctx=ctx)
+        _, midday_earnings = self._load_earnings_analyses(run_id, session="midday", ctx=ctx)
 
         # 3. LLM midday review — assess positions and recommend actions
         macro_summary = self.macro.get_macro_summary()
@@ -2434,26 +1845,17 @@ class TradingPipeline:
                 "orders": orders, "run_id": run_id}
 
     def run_earnings_preprocess(self) -> dict:
-        """Pre-market earnings analysis scheduled ahead of the main morning run.
+        """Pre-market earnings analysis — the ONLY place that calls the LLM
+        for 10-Q/10-K filings.
 
-        Phase 4 #6 of the architecture work. Previously morning's
-        `_run_earnings_check` fired a background thread AT THE SAME TIME as
-        PM was making decisions — PM saw a placeholder for any just-filed
-        10-Q/10-K and had to work without the analysis. Half-sync /
-        half-async, data-freshness uncertain, and the bg thread made
-        pipeline shutdown coupling ugly.
+        Scheduled at 08:00-09:15 ET via launchd. Synchronously fetches any
+        new filings, runs the earnings analyst on each, saves the analysis,
+        and confirms the filing so later sessions see it as cached.
 
-        Running preprocessing ahead of market open decouples the two
-        concerns:
-          - pre-market: download pending filings, run the LLM analysis to
-            completion, save + confirm. No time pressure.
-          - 09:30 ET: morning trading sees ONLY cached, confirmed analyses
-            (is_new=False). No placeholders, no bg threads, PM always has
-            the full earnings signal.
-
-        This method is synchronous by design — preprocessing runs with a
-        30-minute budget before market open, so waiting for the LLM
-        serially is fine. No need for daemon threads.
+        Hot sessions (morning/midday/evening) use `_load_earnings_analyses`
+        which is read-only. That separation guarantees no session burns
+        tokens on fresh LLM work — a filing that drops after preprocess
+        surfaces as a `queued=True` placeholder and PM sizes down.
         """
         ctx = RunContext.start("earnings_preprocess")
         run_id = ctx.run_id
@@ -2650,7 +2052,7 @@ class TradingPipeline:
         positions = self.broker.get_positions()
         total_value = account["portfolio_value"]
         last_equity = account.get("last_equity", total_value)
-        today_str = str(et_today())  # trading-day date in ET — stable across host TZ
+        today_str = session_date_key()  # ET trading-day key — stable across host TZ
 
         if last_equity > 0:
             daily_pnl = total_value - last_equity
@@ -2680,7 +2082,7 @@ class TradingPipeline:
         evening_news = self._run_news_update(run_id, session="evening")
         if evening_news:
             logger.info("Evening news: %s", evening_news.pm_briefing[:200])
-        _, evening_earnings = self._run_earnings_check(run_id, session="evening", ctx=ctx)
+        _, evening_earnings = self._load_earnings_analyses(run_id, session="evening", ctx=ctx)
 
         # 3. LLM evening analysis — daily review and tomorrow outlook
         macro_summary = self.macro.get_macro_summary()

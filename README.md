@@ -148,7 +148,12 @@ python main.py --mode live       # Scheduler (all three on cron, weekdays)
 
 Automated via macOS launchd — plist files in `~/Library/LaunchAgents/com.quant-agent.*.plist`.
 
-**Timezone-resilient scheduling**: plists fire every 30 minutes (`StartInterval=1800`); a bash wrapper `scripts/run_if_et_window.sh` checks whether the current **US/Eastern** time is inside the target window and whether the mode already ran in the last hour. Runs the right session at the right ET moment regardless of the host's timezone (handy when traveling). Windows: morning 09:30-12:00 ET, midday 15:00-16:30 ET, evening 20:00-22:00 ET, Mon-Fri.
+**Timezone-resilient scheduling**: plists fire every 30 minutes (`StartInterval=1800`); a bash wrapper `scripts/run_if_et_window.sh` checks whether the current **US/Eastern** time is inside the target window and whether the mode already ran in the last hour. Runs the right session at the right ET moment regardless of the host's timezone (handy when traveling). Windows (Mon-Fri ET, authoritative Python table at `src/trading_calendar.py` `SESSION_WINDOWS`, locked to the bash wrapper by `test_trading_calendar.py`):
+- `earnings_preprocess` 08:00-09:15 ET — pre-market LLM analysis of fresh 10-Q/10-K filings
+- `morning` 09:30-12:00 ET — research + trading
+- `intra_check` 12:00-13:30 ET — lightweight circuit-breaker (no LLM)
+- `midday` 15:00-16:30 ET — position review + real trailing stops
+- `evening` 20:00-22:00 ET — daily P&L + insights for next morning
 
 ## Trading Universe
 
@@ -167,7 +172,11 @@ quant-agent/
 │   ├── settings.yaml              # Models, risk params, universe, schedule
 │   └── prompts/                   # System prompts for each agent
 ├── src/
-│   ├── pipeline.py                # Orchestrator (morning/midday/evening)
+│   ├── pipeline.py                # Orchestrator (morning/midday/evening/earnings_preprocess/intra_check)
+│   ├── pipeline_stages.py         # MorningResearch / Decision / Risk / Execution stage classes
+│   ├── pipeline_context.py        # RunContext dataclass — explicit shared state across stages
+│   ├── portfolio_constructor.py   # Deterministic Target → TradeDecision translator (risk-budget sizing)
+│   ├── trading_calendar.py        # ET timezone + SESSION_WINDOWS + session_date_key (single source of truth)
 │   ├── scheduler.py               # APScheduler + launchd
 │   ├── config.py                  # Pydantic config with API key validation
 │   ├── models.py                  # Data models (ReasoningChain, MacroNarrative, etc.)
@@ -188,7 +197,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 219 tests
+├── tests/                         # 325 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -199,7 +208,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 219 tests
+pytest tests/ -v    # 325 tests
 ```
 
 ## Data Sources
@@ -234,5 +243,9 @@ pytest tests/ -v    # 219 tests
 - `last_ratings.json` — per-symbol prior rating + first_seen_date for signal-age tracking; TechAnalyst reads on next morning, PM uses age to cut allocations on stale setups
 
 **File-based** (`data/earnings/`):
-- `{SYMBOL}/analysis_{10-Q}_{date}.md` — cached SEC filing analyses
-- `manifest.json` — tracks processed filings; `failed_attempts` counter bounds bg-analysis retries (abandon + mark `abandoned=True` after 3 failures so a consistently-unparseable 10-Q doesn't burn tokens every session forever)
+- `{SYMBOL}/analysis_{10-Q}_{date}.md` — cached SEC filing analyses, written by `run_earnings_preprocess` (the only LLM-producing path — see **Hot / Cold Earnings Path** below)
+- `manifest.json` — tracks processed filings; `failed_attempts` counter bounds preprocess retries (abandon + mark `abandoned=True` after 3 failures so a consistently-unparseable 10-Q doesn't burn tokens every run forever)
+
+### Hot / Cold Earnings Path
+
+LLM analysis of 10-Q/10-K filings runs **only** in the pre-market `earnings_preprocess` window (08:00-09:15 ET). Hot sessions (morning / midday / evening) are read-only consumers: `_load_earnings_analyses` surfaces the cached analysis for already-confirmed filings, and any filing that preprocess missed appears as a `queued=True` placeholder — PM then caps the BUY at 5% regardless of conviction. No background threads in hot sessions, no session-time LLM token spend on earnings.

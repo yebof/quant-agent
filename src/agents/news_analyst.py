@@ -112,8 +112,8 @@ State changes captured earlier:
         else:
             stock_section = "## Stock-Specific News\nNo universe symbols detected in today's headlines."
 
-        from src.util.time import et_today
-        today = str(et_today())
+        from src.trading_calendar import session_date_key
+        today = session_date_key()
 
         return f"""## Today's Date: {today}
 

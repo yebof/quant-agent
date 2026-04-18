@@ -1,43 +1,17 @@
-"""Single source of truth for 'US trading day' semantics.
+"""Backwards-compat shim — real implementation lives in `src.trading_calendar`.
 
-The account trades US equities. Every date that encodes *which trading day
-something belongs to* — daily P&L keys, insights lookups, trading-calendar
-queries, news/macro snapshot directories — must be expressed in US/Eastern,
-NOT in the host's local timezone.
-
-Without this, the same system running from SGT and from NYC will use
-different date strings for the same trading session and daily_pnl /
-insights tables silently develop gaps and duplicates as the user travels.
+New code should import from `src.trading_calendar` directly. This shim
+exists so the migration to a single trading-calendar module doesn't have
+to happen in one giant diff.
 """
 
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
+from src.trading_calendar import (
+    ET,
+    UTC,
+    et_now,
+    et_today,
+    session_date_key,
+    to_et,
+)
 
-ET = ZoneInfo("America/New_York")
-UTC = ZoneInfo("UTC")
-
-
-def et_now() -> datetime:
-    """Current instant as a timezone-aware datetime in US/Eastern."""
-    return datetime.now(ET)
-
-
-def et_today() -> date:
-    """The current trading-day date in US/Eastern.
-
-    Example: when host is SGT and local time is 2026-04-18 09:00 (UTC+8),
-    the ET instant is 2026-04-17 21:00, and this returns date(2026, 4, 17) —
-    the correct 'trading day just ended'.
-    """
-    return et_now().date()
-
-
-def to_et(when: datetime) -> datetime:
-    """Convert any datetime (naive-UTC or aware) into US/Eastern-aware.
-
-    Naive datetimes are assumed to be UTC — that's how SQLite stores
-    `datetime('now')` and how most of our logs are timestamped.
-    """
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    return when.astimezone(ET)
+__all__ = ["ET", "UTC", "et_now", "et_today", "session_date_key", "to_et"]

@@ -59,7 +59,8 @@ def test_et_today_stable_regardless_of_host_tz(monkeypatch):
                 return fixed_utc.replace(tzinfo=None)
             return fixed_utc.astimezone(tz)
 
-    monkeypatch.setattr("src.util.time.datetime", _FrozenDatetime)
+    # Helpers live in `trading_calendar`; `util.time` is a re-export shim.
+    monkeypatch.setattr("src.trading_calendar.datetime", _FrozenDatetime)
 
     assert et_today() == date(2026, 4, 16)
     assert et_now().hour == 23  # 03:00 UTC = 23:00 EDT previous day

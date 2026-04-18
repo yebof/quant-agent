@@ -38,6 +38,9 @@ if [[ "$ET_DOW" -gt 5 ]]; then
 fi
 
 # === Window per mode (minutes past ET midnight) ===
+# Python authoritative source: src/trading_calendar.py SESSION_WINDOWS.
+# tests/test_trading_calendar.py asserts this table matches that one —
+# don't edit one without the other.
 # earnings_preprocess: 08:00-09:15 ET (pre-market, analyze fresh filings)
 # morning            : 09:30-12:00 ET (pre-market / early session, wide for late-wake grace)
 # intra_check        : 12:00-13:30 ET (flash-crash circuit breaker midway through session)
