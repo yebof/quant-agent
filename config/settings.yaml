@@ -26,6 +26,11 @@ risk:
   max_daily_loss_pct: 3
   max_sector_pct: 40
   require_stop_loss: true
+  # Cash-only by default. Flip to true to allow margin — BUYs can then spend
+  # beyond available cash. When false (default) the risk engine hard-blocks
+  # any BUY that would drive cash negative, and the PM + midday prompts get
+  # a mandatory de-lever directive when cash is already negative.
+  allow_margin: false
 
 trading:
   universe:

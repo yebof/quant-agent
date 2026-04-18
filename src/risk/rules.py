@@ -53,7 +53,9 @@ class RiskRuleEngine:
               pending_symbol_investment: dict[str, float] | None = None,
               baseline: float | None = None,
               correlation_matrix: dict[str, dict[str, float]] | None = None,
-              max_correlated_cluster_pct: float = 50.0) -> list[RiskViolation]:
+              max_correlated_cluster_pct: float = 50.0,
+              cash: float | None = None,
+              pending_cash_outflow: float = 0.0) -> list[RiskViolation]:
         if decision.action == "SELL":
             return []
         if total_value <= 0:
@@ -144,6 +146,26 @@ class RiskRuleEngine:
                         value=cluster_pct,
                         limit=max_correlated_cluster_pct,
                     ))
+
+        # 4c. Cash-only policy — when allow_margin is False, no BUY may spend more
+        # than the cash remaining after prior BUYs in this session. `cash` is the
+        # session-start broker cash; `pending_cash_outflow` is the dollar total of
+        # BUYs already allowed earlier in the same filter pass. Sector / leverage
+        # multipliers don't apply here — cash is spent at gross dollar notional
+        # regardless of whether the symbol is an inverse / leveraged ETF.
+        if not self.config.allow_margin and cash is not None:
+            projected_cash = cash - pending_cash_outflow - new_investment
+            if projected_cash < 0:
+                violations.append(RiskViolation(
+                    rule="cash_only",
+                    message=(
+                        f"{decision.symbol} BUY for ${new_investment:,.0f} would "
+                        f"spend beyond available cash (cash=${cash:,.0f}, pending "
+                        f"BUYs=${pending_cash_outflow:,.0f}); margin is disabled"
+                    ),
+                    value=abs(projected_cash),
+                    limit=max(cash - pending_cash_outflow, 0.0),
+                ))
 
         # 5. Sector concentration — gross (existing, pending, and new all use unsigned magnitude)
         from src.execution.broker import _get_sector

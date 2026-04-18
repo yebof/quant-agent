@@ -59,6 +59,13 @@ class RiskConfig(BaseModel):
     max_daily_loss_pct: float
     max_sector_pct: float
     require_stop_loss: bool
+    # Cash-only default. When False: no BUY may drive `cash` below zero, and
+    # any session that starts with `cash < 0` must de-lever (SELL) before any
+    # new BUY. When True: normal margin account behavior, risk engine only
+    # enforces the exposure / sector / loss caps. Default False is the
+    # conservative choice — margin leverage amplifies drawdowns and is not
+    # the bot's intended mode unless explicitly opted in.
+    allow_margin: bool = False
 
 
 class ScheduleConfig(BaseModel):

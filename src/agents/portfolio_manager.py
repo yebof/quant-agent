@@ -267,6 +267,34 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
         invested = total_value - cash_balance
         invested_pct = (invested / total_value * 100) if total_value else 0
 
+        # Margin policy — when allow_margin is False and cash is already
+        # negative, de-lever SELLs are mandatory this session. The risk
+        # engine will hard-block any new BUY that doesn't fit in cash, so
+        # surfacing the mandate here gives the LLM the chance to pick
+        # which positions to trim rather than having every BUY rejected
+        # without context.
+        allow_margin: bool = bool(kwargs.get("allow_margin", True))
+        if not allow_margin and cash_balance < 0:
+            deficit = -cash_balance
+            margin_section = (
+                "## ⚠️ DE-LEVER MANDATE (margin disabled, cash is negative)\n"
+                f"- Current cash: ${cash_balance:,.2f} (deficit ${deficit:,.2f})\n"
+                f"- Policy: this account runs cash-only — new BUYs cannot draw margin.\n"
+                f"- **You MUST emit SELL targets summing to at least ${deficit:,.2f} of "
+                f"market value this session.** Pick the weakest-conviction / most-extended "
+                f"positions per your usual rules.\n"
+                "- Any BUY you propose will be hard-blocked until cash is ≥ 0 after the "
+                "session's SELLs clear."
+            )
+        elif not allow_margin:
+            margin_section = (
+                "## Margin Policy\n"
+                "- Cash-only account: BUYs are capped at available cash after prior "
+                "BUYs this session. Margin is disabled."
+            )
+        else:
+            margin_section = ""
+
         # Recent system performance (drawdown awareness).
         recent_perf = kwargs.get("recent_performance") or {}
         if recent_perf:
@@ -403,6 +431,8 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
 ## Current Positions (with entry context + signal trajectory)
 {positions_text}
 
+{margin_section}
+
 {facts_section}
 
 {projected_section}
@@ -452,7 +482,8 @@ Based on all the above (memory of past decisions + environment trajectory + toda
                projected_portfolio: str = "",
                calibration_note: str = "",
                macro_tech_alignment: str = "",
-               facts=None) -> tuple[PortfolioDecision | None, "AgentResult"]:
+               facts=None,
+               allow_margin: bool = True) -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
             analyses=analyses,
             positions=positions,
@@ -473,6 +504,7 @@ Based on all the above (memory of past decisions + environment trajectory + toda
             calibration_note=calibration_note,
             macro_tech_alignment=macro_tech_alignment,
             facts=facts,
+            allow_margin=allow_margin,
         )
         parsed = result.parse_json()
         if parsed is None:

@@ -53,6 +53,7 @@ HARD_BLOCK_RULES = {
     "max_position_pct",
     "require_stop_loss",
     "max_sector_pct",
+    "cash_only",
 }
 
 
@@ -245,6 +246,7 @@ class TradingPipeline:
         baseline: float | None = None,
         macro_target_invested_pct: float | None = None,
         correlation_matrix: dict[str, dict[str, float]] | None = None,
+        cash: float | None = None,
     ) -> tuple[list[TradeDecision], list, list[str]]:
         allowed_decisions: list[TradeDecision] = []
         remaining_violations = []
@@ -252,6 +254,24 @@ class TradingPipeline:
         pending_investment = 0.0
         pending_sector_investment: dict[str, float] = {}
         pending_symbol_investment: dict[str, float] = {}
+        pending_cash_outflow = 0.0
+
+        # Pre-pass: sum the cash SELLs in this session will return. The
+        # execution stage always runs SELLs before BUYs and waits for fills,
+        # so by the time a BUY submits, `cash + sell_proceeds` is available.
+        # Without this the cash-only rule would block legitimate SELL→BUY
+        # rotations that never actually draw on margin.
+        sell_proceeds = 0.0
+        if cash is not None:
+            for d in decisions:
+                if d.action != "SELL":
+                    continue
+                held = next((p for p in positions if p.symbol == d.symbol), None)
+                if held is None or held.qty <= 0:
+                    continue
+                frac = 1.0 if d.allocation_pct >= 100 or d.allocation_pct <= 0 else d.allocation_pct / 100.0
+                sell_proceeds += held.market_value * frac
+        effective_cash = None if cash is None else cash + sell_proceeds
 
         for decision in decisions:
             if decision.action != "BUY":
@@ -268,6 +288,8 @@ class TradingPipeline:
                 pending_symbol_investment=pending_symbol_investment,
                 baseline=baseline,
                 correlation_matrix=correlation_matrix,
+                cash=effective_cash,
+                pending_cash_outflow=pending_cash_outflow,
             )
             hard_violations = [v for v in violations if v.rule in HARD_BLOCK_RULES]
             if hard_violations:
@@ -286,6 +308,10 @@ class TradingPipeline:
             signed_investment = raw_investment * _effective_multiplier(decision.symbol)
             gross_investment = raw_investment * _gross_multiplier(decision.symbol)
             pending_investment += signed_investment
+            # Cash outflow is raw $ notional — leverage/direction don't change
+            # the brokerage cash the BUY consumes. Inverse/leveraged ETFs still
+            # cost their sticker price in cash.
+            pending_cash_outflow += raw_investment
             pending_symbol_investment[decision.symbol] = (
                 pending_symbol_investment.get(decision.symbol, 0.0) + raw_investment
             )
@@ -1848,6 +1874,7 @@ class TradingPipeline:
                 morning_trades=morning_trades,
                 news_intel=midday_news,
                 earnings_analyses=midday_earnings,
+                allow_margin=bool(getattr(self.config.risk, "allow_margin", False)),
             )
             self.db.insert_agent_log(
                 agent_name="midday_reviewer", run_id=run_id,
