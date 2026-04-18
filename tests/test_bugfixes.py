@@ -16,7 +16,7 @@ from src.models import (
     MacroAnalysis, MacroReasoningChain, MacroPositionGuidance, MacroSectorGuidance,
     TechReasoningChain,
     RiskVerdict, RiskReasoningChain,
-    MiddayReview, MiddayAction,
+    PositionReview, PositionAction,
     EveningReport,
 )
 
@@ -186,10 +186,10 @@ def test_parse_json_prefers_later_raw_json_over_earlier_code_block():
 
 def test_midday_pnl_pct_zero_qty():
     """Midday reviewer should not crash on zero qty position."""
-    from src.agents.midday_reviewer import MiddayReviewerAgent
+    from src.agents.position_reviewer import PositionReviewerAgent
 
     with patch("anthropic.Anthropic"):
-        agent = MiddayReviewerAgent(api_key="test", model="claude-sonnet-4-6")
+        agent = PositionReviewerAgent(api_key="test", model="claude-sonnet-4-6")
         # Should not raise ZeroDivisionError
         msg = agent.build_user_message(
             positions=[Position(symbol="TEST", qty=0, avg_entry=0,
@@ -203,10 +203,10 @@ def test_midday_pnl_pct_zero_qty():
 
 
 def test_midday_reviewer_ignores_unfilled_buys_in_trade_context():
-    from src.agents.midday_reviewer import MiddayReviewerAgent
+    from src.agents.position_reviewer import PositionReviewerAgent
 
     with patch("anthropic.Anthropic"):
-        agent = MiddayReviewerAgent(api_key="test", model="claude-sonnet-4-6")
+        agent = PositionReviewerAgent(api_key="test", model="claude-sonnet-4-6")
         msg = agent.build_user_message(
             positions=[Position(
                 symbol="SPY", qty=10, avg_entry=500,
@@ -924,14 +924,30 @@ def test_risk_verdict_accepts_reasoning_chain():
 
 def test_midday_action_trail_stop_requires_price():
     with pytest.raises(ValidationError):
-        MiddayAction(action="TRAIL_STOP", symbol="SPY", reason="x")  # no new_stop_price
-    ok = MiddayAction(action="TRAIL_STOP", symbol="SPY", reason="x", new_stop_price=500.0)
+        PositionAction(action="TRAIL_STOP", symbol="SPY", reason="x")  # no new_stop_price
+    ok = PositionAction(action="TRAIL_STOP", symbol="SPY", reason="x", new_stop_price=500.0)
     assert ok.new_stop_price == 500.0
+
+
+def _stub_reasoning_chain(**overrides):
+    """Test helper — minimal valid PositionReasoningChain."""
+    from src.models import PositionReasoningChain
+    defaults = {
+        "macro_continuity_check": "regime stable vs morning",
+        "thesis_progress_check": "all positions on pace",
+        "thesis_integrity_check": "no triggers firing",
+        "winners_discipline_check": "no flags set",
+        "session_disposition_check": "patient — nothing forcing action",
+        "execution_rationale": "all HOLD; nothing to justify",
+    }
+    defaults.update(overrides)
+    return PositionReasoningChain(**defaults)
 
 
 def test_midday_review_rejects_unknown_action():
     with pytest.raises(ValidationError):
-        MiddayReview(
+        PositionReview(
+            reasoning_chain=_stub_reasoning_chain(),
             actions=[{"action": "TRIAL_STOP", "symbol": "SPY", "reason": "typo"}],  # TRIAL vs TRAIL
             overall_assessment="x",
             risk_level="moderate",
@@ -939,11 +955,12 @@ def test_midday_review_rejects_unknown_action():
 
 
 def test_midday_review_accepts_full_schema():
-    r = MiddayReview(
+    r = PositionReview(
+        reasoning_chain=_stub_reasoning_chain(),
         actions=[
-            MiddayAction(action="HOLD", symbol="SPY", reason="still green"),
-            MiddayAction(action="TRAIL_STOP", symbol="NVDA", reason="up 12%", new_stop_price=195.0),
-            MiddayAction(action="SELL", symbol="AAPL", reason="thesis broke"),
+            PositionAction(action="HOLD", symbol="SPY", reason="still green"),
+            PositionAction(action="TRAIL_STOP", symbol="NVDA", reason="up 12%", new_stop_price=195.0),
+            PositionAction(action="SELL", symbol="AAPL", reason="thesis broke"),
         ],
         overall_assessment="Mix of hold + one trail + one cut",
         risk_level="moderate",

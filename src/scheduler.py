@@ -47,12 +47,22 @@ class TradingScheduler:
             id="intra_check",
         )
 
-        # Midday check
+        # Midday check (position reviewer, patient disposition)
         h, m = self._parse_time(schedule.midday)
         self.scheduler.add_job(
             self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
             args=[self.pipeline.run_midday, "midday"],
             id="midday_check",
+        )
+
+        # Close check (position reviewer, act-on-trigger disposition, 17.5h
+        # until next intraday control means genuine triggers should fire now
+        # rather than waiting for tomorrow morning).
+        h, m = self._parse_time(schedule.close)
+        self.scheduler.add_job(
+            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
+            args=[self.pipeline.run_close, "close"],
+            id="close_check",
         )
 
         # Evening report
@@ -65,11 +75,12 @@ class TradingScheduler:
 
         logger.info(
             "Scheduler configured: earnings_preprocess=%s, morning=%s, "
-            "intra_check=%s, midday=%s, evening=%s",
+            "intra_check=%s, midday=%s, close=%s, evening=%s",
             schedule.earnings_preprocess,
             schedule.morning,
             schedule.intra_check,
             schedule.midday,
+            schedule.close,
             schedule.evening,
         )
 

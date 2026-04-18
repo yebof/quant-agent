@@ -37,7 +37,7 @@ class LLMConfig(BaseModel):
     earnings_analyst_model: str = "claude-opus-4-6"
     portfolio_manager_model: str = "claude-opus-4-6"
     risk_manager_model: str = "claude-opus-4-6"
-    midday_reviewer_model: str = "claude-opus-4-6"
+    position_reviewer_model: str = "claude-opus-4-6"
     evening_analyst_model: str = "claude-opus-4-6"
     max_tokens: int
 
@@ -73,6 +73,7 @@ class ScheduleConfig(BaseModel):
     morning: str
     intra_check: str = "10:30"
     midday: str
+    close: str = "15:30"
     evening: str
 
 

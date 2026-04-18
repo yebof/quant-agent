@@ -31,7 +31,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=[
-            "live", "once", "morning", "midday", "evening",
+            "live", "once", "morning", "midday", "close", "evening",
             "intra_check", "earnings_preprocess",
         ],
         default="once", help="Run mode",
@@ -58,6 +58,8 @@ def main():
             result = pipeline.run_morning()
         elif args.mode == "midday":
             result = pipeline.run_midday()
+        elif args.mode == "close":
+            result = pipeline.run_close()
         elif args.mode == "evening":
             result = pipeline.run_evening()
         elif args.mode == "intra_check":

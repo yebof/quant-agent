@@ -52,6 +52,7 @@ EOF
 
 write_plist "morning"             "morning"  "launchd_morning.log"
 write_plist "midday"              "midday"   "launchd_midday.log"
+write_plist "close"               "close"    "launchd_close.log"
 write_plist "evening"             "evening"  "launchd_evening.log"
 write_plist "intra_check"         "intra"    "launchd_intra.log"
 write_plist "earnings_preprocess" "earnings" "launchd_earnings.log"
@@ -61,6 +62,7 @@ for p in \
     "${SCRIPT}" \
     "${AGENTS}/com.quant-agent.morning.plist" \
     "${AGENTS}/com.quant-agent.midday.plist" \
+    "${AGENTS}/com.quant-agent.close.plist" \
     "${AGENTS}/com.quant-agent.evening.plist" \
     "${AGENTS}/com.quant-agent.intra.plist" \
     "${AGENTS}/com.quant-agent.earnings.plist"; do
@@ -70,7 +72,7 @@ echo "xattr com.apple.provenance cleared"
 
 # Bootout + bootstrap so launchd picks up the new plists. `|| true` on
 # bootout so a first-time install (nothing to unload) doesn't abort.
-for suffix in morning midday evening intra earnings; do
+for suffix in morning midday close evening intra earnings; do
     launchctl bootout "gui/${UID}/com.quant-agent.${suffix}" 2>/dev/null || true
     launchctl bootstrap "gui/${UID}" "${AGENTS}/com.quant-agent.${suffix}.plist"
     echo "reloaded com.quant-agent.${suffix}"

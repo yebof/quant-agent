@@ -72,7 +72,8 @@ def test_is_weekday_weekday_vs_weekend():
         ("earnings_preprocess", 480, 555),
         ("morning",             570, 720),
         ("intra_check",         720, 810),
-        ("midday",              900, 990),
+        ("midday",              780, 870),
+        ("close",               930, 955),
         ("evening",            1200, 1320),
     ],
 )

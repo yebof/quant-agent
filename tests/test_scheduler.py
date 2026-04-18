@@ -30,13 +30,14 @@ def test_scheduler_runs_on_trading_day(mock_pipeline_cls):
 
 
 @patch("src.scheduler.TradingPipeline")
-def test_scheduler_setup_registers_preprocess_and_intra_jobs(mock_pipeline_cls):
+def test_scheduler_setup_registers_all_six_sessions(mock_pipeline_cls):
     cfg = MagicMock()
     cfg.trading.schedule = SimpleNamespace(
         earnings_preprocess="05:00",
         morning="06:00",
         intra_check="10:30",
-        midday="12:00",
+        midday="13:00",
+        close="15:30",
         evening="16:30",
     )
     mock_pipeline_cls.return_value = MagicMock()
@@ -50,5 +51,6 @@ def test_scheduler_setup_registers_preprocess_and_intra_jobs(mock_pipeline_cls):
         "morning_run",
         "intra_check",
         "midday_check",
+        "close_check",
         "evening_report",
     }

@@ -13,7 +13,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 
 ## 架构速览
 
-- 8 个 LLM agent：tech / news / macro / earnings / portfolio_manager / risk_manager / midday_reviewer / evening_analyst
+- 8 个 LLM agent：tech / news / macro / earnings / portfolio_manager / risk_manager / position_reviewer / evening_analyst
 - 双层风控：硬规则引擎（仓位/暴露/日损/板块/相关性/earnings-queued） + LLM RiskManager 审核
 - 三时段：morning（分析+交易）、midday（持仓检查+真 trailing stop）、evening（日报 + 次日 insights）
 - 数据源：yfinance、FRED、RSS、SEC EDGAR
@@ -37,7 +37,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 
 ### 时区
 - ET 统一走 `src/trading_calendar.py`（`et_today` / `et_now` / `session_date_key` / `in_session_window` / `SESSION_WINDOWS`）。`src/util/time.py` 是向后兼容 shim，新代码直接 import `src.trading_calendar`。`daily_pnl` 主键、`insights` 查询、`broker.is_trading_day`、news/macro 快照目录、earnings cutoff、market OHLCV 全部 ET——任何 host TZ 都要出同样数据
-- launchd 每 30 分钟触发 `scripts/run_if_et_window.sh`，wrapper 看 **ET 时间**判断窗口 + last-run 文件去重。窗口对应 `SESSION_WINDOWS`（Python 权威源，bash 表由 `test_trading_calendar.py` 锁定一致）：earnings_preprocess 08:00-09:15、morning 09:30-12:00、intra_check 12:00-13:30、midday 15:00-16:30、evening 20:00-22:00（Mon-Fri ET）。用户经常出差，不同时区必须都正确
+- launchd 每 30 分钟触发 `scripts/run_if_et_window.sh`，wrapper 看 **ET 时间**判断窗口 + last-run 文件去重。窗口对应 `SESSION_WINDOWS`（Python 权威源，bash 表由 `test_trading_calendar.py` 锁定一致）：earnings_preprocess 08:00-09:15、morning 09:30-12:00、intra_check 12:00-13:30、midday 13:00-14:30、close 15:30-15:55、evening 20:00-22:00（Mon-Fri ET）。用户经常出差，不同时区必须都正确。**midday + close 都跑 position_reviewer（同一 agent，`session_type` 分流：midday = patient，close = act-on-trigger；都只卖不买，核心原则"好股长持"）**
 
 ### 生产侧防挂死 / 防拒单（都有血泪）
 - 所有 Alpaca SDK 调用通过 `_install_http_timeout()` 注入 30s HTTP timeout；launchd plist 外层 `/opt/homebrew/bin/timeout --kill-after=30 600 ...` 10 分钟兜底——**双层**，防再次出现 13 小时 hang（2026-04-17 事故）

@@ -28,7 +28,7 @@ ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 
 SessionMode = Literal[
-    "earnings_preprocess", "morning", "intra_check", "midday", "evening"
+    "earnings_preprocess", "morning", "intra_check", "midday", "close", "evening"
 ]
 
 # Session windows as (start_minute_of_day, end_minute_of_day) in ET.
@@ -38,9 +38,10 @@ SessionMode = Literal[
 SESSION_WINDOWS: dict[str, tuple[int, int]] = {
     "earnings_preprocess": (480, 555),   # 08:00 - 09:15 ET
     "morning":             (570, 720),   # 09:30 - 12:00 ET
-    "intra_check":         (720, 810),   # 12:00 - 13:30 ET
-    "midday":              (900, 990),   # 15:00 - 16:30 ET
-    "evening":             (1200, 1320), # 20:00 - 22:00 ET
+    "intra_check":         (720, 810),   # 12:00 - 13:30 ET  (P&L circuit-breaker, no LLM)
+    "midday":              (780, 870),   # 13:00 - 14:30 ET  (position reviewer, patient)
+    "close":               (930, 955),   # 15:30 - 15:55 ET  (position reviewer, act-on-trigger)
+    "evening":             (1200, 1320), # 20:00 - 22:00 ET  (reporting only)
 }
 
 

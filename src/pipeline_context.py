@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from src.models import NewsIntelligenceReport, PortfolioDecision, Position
 
-SessionType = Literal["morning", "midday", "evening", "intra_check", "earnings_preprocess"]
+SessionType = Literal["morning", "midday", "close", "evening", "intra_check", "earnings_preprocess"]
 
 
 @dataclass
