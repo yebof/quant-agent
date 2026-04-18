@@ -141,8 +141,23 @@ Overall sentiment: {news_intel.market_sentiment} ({news_intel.confidence})
         else:
             earnings_section = ""
 
-        return f"""## Midday Position Review
+        # Cash-only mandate — surface to the reviewer so it can proactively
+        # emit SELL/REDUCE when the account drifts into margin.
+        allow_margin: bool = bool(kwargs.get("allow_margin", True))
+        if not allow_margin and cash_balance < 0:
+            deficit = -cash_balance
+            margin_section = (
+                f"### ⚠️ Cash-only policy — de-lever required\n"
+                f"Cash is ${cash_balance:,.2f} (deficit ${deficit:,.2f}). "
+                f"This account runs cash-only; prefer SELL or REDUCE on the "
+                f"weakest-conviction position(s) to restore cash ≥ 0. Do NOT "
+                f"TRAIL_STOP when the real problem is over-leverage.\n"
+            )
+        else:
+            margin_section = ""
 
+        return f"""## Midday Position Review
+{margin_section}
 ### Account
 - Total Value: ${total_value:,.2f}
 - Cash: ${cash_balance:,.2f} ({cash_pct})
@@ -165,12 +180,14 @@ bearish HIGH-conviction state changes touching held symbols, prefer TRAIL_STOP
                cash_balance: float, total_value: float,
                morning_trades: list[dict] | None = None,
                news_intel: NewsIntelligenceReport | None = None,
-               earnings_analyses: list[dict] | None = None) -> tuple[MiddayReview | None, "AgentResult"]:
+               earnings_analyses: list[dict] | None = None,
+               allow_margin: bool = True) -> tuple[MiddayReview | None, "AgentResult"]:
         result = self.run(
             positions=positions,
             macro_summary=macro_summary,
             cash_balance=cash_balance,
             total_value=total_value,
+            allow_margin=allow_margin,
             morning_trades=morning_trades or [],
             news_intel=news_intel,
             earnings_analyses=earnings_analyses or [],

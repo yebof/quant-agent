@@ -366,6 +366,7 @@ class DecisionStage:
             calibration_note=calibration_note,
             macro_tech_alignment=macro_tech_alignment,
             facts=pm_facts,
+            allow_margin=bool(getattr(pipeline.config.risk, "allow_margin", False)),
         )
 
         if portfolio_decision and portfolio_decision.reasoning_chain:
@@ -500,6 +501,7 @@ class RiskStage:
                 baseline=last_equity,
                 macro_target_invested_pct=macro_target_pct,
                 correlation_matrix=correlation_matrix,
+                cash=ctx.cash,
             )
         )
         if blocked_reasons:
@@ -621,6 +623,7 @@ class RiskStage:
                     baseline=last_equity,
                     macro_target_invested_pct=macro_target_pct,
                     correlation_matrix=correlation_matrix,
+                    cash=ctx.cash,
                 )
             )
             if blocked_reasons:

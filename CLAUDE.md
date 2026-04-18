@@ -29,6 +29,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 - **反向 ETF**（SH/SDS/PSQ/SQQQ）用**签名乘数**算净敞口（对冲相消），**abs 乘数**算单仓/板块上限。`src/risk/rules.py:_effective_multiplier` vs `_gross_multiplier`
 - **日 P&L** = `broker.equity - broker.last_equity`（含已实现 fill，包括 broker 触发的 OTO 止损）；熔断基准永远是 `last_equity`，**不是**昨晚 DB 里的快照
 - **SELL `allocation_pct`** 约定：`100` = 全卖，`1-99` = 部分，`0` = 跳过（**不要再用 0 表示全卖**）；pipeline 会 warning 然后 skip
+- **现金 / 保证金**：`RiskConfig.allow_margin` 默认 `false`，意味着 BUY 不能透支现金（硬规则 `cash_only` in `HARD_BLOCK_RULES`）。Filter 会先汇总当次 session 的 SELL proceeds 再判断 BUY 能否吃现金，所以合法的 SELL→BUY 轮换不会误杀。已经欠保证金（`cash<0`）时 PM/midday prompt 会带 **DE-LEVER MANDATE** 强制先 SELL 到 `cash≥0`。允许保证金请显式改 `allow_margin: true`
 
 ### 责任边界
 - Macro 拥有 regime 枚举（risk-on / risk-off / transitional / neutral）的权威；News 的 `current_regime` 只描述新闻/地缘背景，不重复 Macro 的枚举
@@ -40,8 +41,9 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 
 ### 生产侧防挂死 / 防拒单（都有血泪）
 - 所有 Alpaca SDK 调用通过 `_install_http_timeout()` 注入 30s HTTP timeout；launchd plist 外层 `/opt/homebrew/bin/timeout --kill-after=30 600 ...` 10 分钟兜底——**双层**，防再次出现 13 小时 hang（2026-04-17 事故）
-- `broker.submit_order` 提交前 `_quantize_price()` 按 Alpaca tick 归整（≥$1 → 0.01、<$1 → 0.0001）——防 sub-penny reject
-- `_bg_analyze` earnings 分析失败调 `record_failure()`；连 3 次失败就 abandon + 标 `abandoned=True`，不再重分析——防 LLM 失败循环烧 token
+- `broker.submit_order` 提交前 `_quantize_price()` 按 Alpaca tick 归整（≥$1 → 0.01、<$1 → 0.0001）——防 sub-penny reject（2026-04-17 UPS 事故）
+- 预处理 LLM 分析失败调 `record_failure()`；连 3 次失败就 abandon + 标 `abandoned=True`，不再重分析——防 LLM 失败循环烧 token
+- **macOS Sequoia launchd + `com.apple.provenance`**：plist 的 `ProgramArguments` **必须**以 `/bin/bash` 开头，后面把 wrapper 作为参数传（不能直接 exec wrapper）。launchd 只 exec 系统 binary `/bin/bash`，provenance 不会挡；bash 读 wrapper 当文本源走，provenance 也不管。配套 `scripts/install_plists.sh` 会一键重写 + reload，编辑 wrapper 后务必重跑（2026-04-17 周五事故，launchd 5 个 job 全 exit 126 + 没跑）
 
 ## 开发规范
 
