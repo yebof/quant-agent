@@ -345,10 +345,10 @@ def test_force_delever_noop_on_empty_positions():
 
 
 def test_midday_reviewer_surfaces_delever_when_cash_negative():
-    from src.agents.midday_reviewer import MiddayReviewerAgent
+    from src.agents.position_reviewer import PositionReviewerAgent
 
     with patch("anthropic.Anthropic"):
-        agent = MiddayReviewerAgent(api_key="test", model="claude-sonnet-4-6")
+        agent = PositionReviewerAgent(api_key="test", model="claude-sonnet-4-6")
         msg = agent.build_user_message(
             positions=[Position(
                 symbol="SPY", qty=10, avg_entry=500, current_price=600,

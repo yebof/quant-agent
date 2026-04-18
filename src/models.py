@@ -569,7 +569,7 @@ class EarningsAnalysis(BaseModel):
         return text
 
 
-class MiddayAction(BaseModel):
+class PositionAction(BaseModel):
     action: Literal["SELL", "REDUCE", "TRAIL_STOP", "HOLD"]
     symbol: str
     reason: str
@@ -587,9 +587,45 @@ class MiddayAction(BaseModel):
         return self
 
 
-class MiddayReview(BaseModel):
-    actions: list[MiddayAction] = []
-    overall_assessment: str
+class PositionReasoningChain(BaseModel):
+    """Six-step chain the position reviewer must fill before emitting actions.
+
+    Parallel depth to morning PM's 7-step reasoning_chain — prevents
+    intraday-price knee-jerk selling and forces memory-aware, thesis-driven
+    decisions. Each field is required; empty strings will fail validation
+    so the agent can't skip a step by sending "".
+    """
+    macro_continuity_check: str = Field(min_length=1)
+    """Regime + outlook today vs morning vs this week. Stable ⇒ HOLD bias."""
+
+    thesis_progress_check: str = Field(min_length=1)
+    """Per-position thesis_progress_pct / pace / distance-to-stop|target.
+    Distinguishes 'fast mover' / 'on pace' / 'stalled' / 'broken'."""
+
+    thesis_integrity_check: str = Field(min_length=1)
+    """Every SELL/REDUCE must cite a specific named trigger — thesis_invalid_if
+    condition, HIGH-conviction state_change reversal, bearish earnings
+    analysis, or correlation breach. Intraday price alone is NOT a trigger."""
+
+    winners_discipline_check: str = Field(min_length=1)
+    """For positions with profit > 10%: is momentum fading, is it parabolic,
+    has target been exceeded? If no, default is HOLD regardless of size —
+    good stocks are meant to be held."""
+
+    session_disposition_check: str = Field(min_length=1)
+    """Session-aware framing: 'midday' = afternoon patience, TRAIL_STOP over
+    SELL; 'close' = act-if-triggered-not-act-because-time, 17.5h no control,
+    act only on clear thesis signals never on clock-driven fear."""
+
+    execution_rationale: str = Field(min_length=1)
+    """For each SELL/REDUCE action, a 'lock now' vs 'hold outcome' comparison.
+    HOLD needs no comparison. TRAIL_STOP names the upside protected vs given up."""
+
+
+class PositionReview(BaseModel):
+    reasoning_chain: PositionReasoningChain
+    actions: list[PositionAction] = []
+    overall_assessment: str = Field(min_length=1)
     risk_level: Literal["low", "moderate", "elevated", "high"]
 
 

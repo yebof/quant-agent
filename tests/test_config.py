@@ -177,7 +177,7 @@ llm:
   earnings_analyst_model: "gpt-5.4"
   portfolio_manager_model: "gpt-5.4"
   risk_manager_model: "gpt-5.4"
-  midday_reviewer_model: "gpt-5.4"
+  position_reviewer_model: "gpt-5.4"
   evening_analyst_model: "gpt-5.4"
   max_tokens: 4096
 risk:

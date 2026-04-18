@@ -18,7 +18,7 @@ from src.agents.tech_analyst import TechAnalystAgent
 from src.data.technical import compute_indicators  # noqa: F401
 from src.agents.portfolio_manager import PortfolioManagerAgent
 from src.agents.risk_manager import RiskManagerAgent
-from src.agents.midday_reviewer import MiddayReviewerAgent
+from src.agents.position_reviewer import PositionReviewerAgent
 from src.agents.evening_analyst import EveningAnalystAgent
 from src.agents.news_analyst import NewsAnalystAgent
 from src.agents.macro_analyst import MacroAnalystAgent
@@ -92,9 +92,9 @@ class TradingPipeline:
             max_sector_pct=config.risk.max_sector_pct,
             require_stop_loss=config.risk.require_stop_loss,
         ))
-        self.midday_reviewer = MiddayReviewerAgent(
-            api_key=_key_for(config.llm.midday_reviewer_model),
-            model=config.llm.midday_reviewer_model,
+        self.position_reviewer = PositionReviewerAgent(
+            api_key=_key_for(config.llm.position_reviewer_model),
+            model=config.llm.position_reviewer_model,
             max_tokens=config.llm.max_tokens,
         )
         self.evening_analyst = EveningAnalystAgent(
@@ -1348,7 +1348,12 @@ class TradingPipeline:
         except Exception as e:
             logger.warning("calibration_note: stats failed: %s", e)
             return ""
-        if not stats or stats.get("n", 0) < 3:
+        if not isinstance(stats, dict) or not stats:
+            return ""
+        try:
+            if stats.get("n", 0) < 3:
+                return ""
+        except TypeError:
             return ""
         lines = [
             f"- Overall (last {stats.get('lookback_days', lookback_days)}d): "
@@ -1927,12 +1932,165 @@ class TradingPipeline:
             self._reconcile_fills(ctx)
 
     def run_midday(self) -> dict:
-        ctx = RunContext.start("midday")
+        """13:00 ET — position reviewer, patient disposition."""
+        return self.run_position_review(session_type="midday")
+
+    def run_close(self) -> dict:
+        """15:30 ET — position reviewer, act-on-trigger disposition.
+        17.5 hours until next intraday control; genuine thesis triggers
+        fire now rather than waiting for tomorrow morning."""
+        return self.run_position_review(session_type="close")
+
+    def _build_position_facts(self, positions, morning_trades, total_value, avg_hold_days):
+        """Deterministic per-position metrics surfaced to the reviewer.
+
+        Python does the math (progress %, pace, distance-to-stop/target,
+        winner flags) so the LLM sees clean numbers and just interprets
+        them. Prevents hallucination of percentages.
+        """
+        # Morning BUY lookup by symbol for stop/target/days_held.
+        buy_rows: dict[str, dict] = {}
+        for t in morning_trades or []:
+            sym = t.get("symbol")
+            if not sym or t.get("action") != "BUY":
+                continue
+            if sym not in buy_rows:
+                buy_rows[sym] = t
+
+        facts: dict[str, dict] = {}
+        for p in positions:
+            sym = p.symbol
+            entry = p.avg_entry
+            cur = p.current_price
+
+            # Find the last executed BUY in the DB for this symbol to derive
+            # target/stop/days_held. Falls back to the morning row if present.
+            buy = buy_rows.get(sym)
+            if not buy:
+                try:
+                    buy = self.db.get_symbol_last_buy(sym)
+                except Exception:
+                    buy = None
+
+            stop_loss = float((buy or {}).get("stop_loss") or 0)
+            take_profit = float((buy or {}).get("take_profit") or 0)
+
+            # days_held — from BUY timestamp; fall back to None.
+            days_held = None
+            buy_ts = (buy or {}).get("timestamp")
+            if buy_ts:
+                try:
+                    from src.trading_calendar import to_et
+                    from datetime import datetime as _dt
+                    dt = _dt.fromisoformat(buy_ts.replace("Z", "+00:00")) if "T" in buy_ts \
+                        else _dt.strptime(buy_ts, "%Y-%m-%d %H:%M:%S")
+                    days_held = (et_today() - to_et(dt).date()).days
+                    days_held = max(0, days_held)
+                except Exception:
+                    days_held = None
+
+            # Progress: 0 at entry, 100 at target, >100 beyond target.
+            progress_pct = None
+            if take_profit and entry and take_profit != entry:
+                progress_pct = (cur - entry) / (take_profit - entry) * 100
+
+            # Pace = progress / (days_held / avg_hold_days_from_calibration)
+            pace = None
+            if (progress_pct is not None and days_held is not None
+                    and avg_hold_days and avg_hold_days > 0 and days_held > 0):
+                time_fraction = days_held / avg_hold_days
+                if time_fraction > 0:
+                    pace = progress_pct / (time_fraction * 100)  # normalize to 1× = on pace
+
+            # Distance-to-stop / distance-to-target as % of current price.
+            dist_stop_pct = None
+            dist_target_pct = None
+            if stop_loss and cur > 0:
+                dist_stop_pct = (cur - stop_loss) / cur * 100
+            if take_profit and cur > 0:
+                dist_target_pct = (take_profit - cur) / cur * 100
+
+            weight_pct = (p.market_value / total_value * 100) if total_value else 0
+
+            # Winner flags.
+            pnl_pct = (p.unrealized_pnl / (entry * p.qty) * 100) if (entry and p.qty) else 0
+            parabolic_flag = (
+                pnl_pct >= 15 and days_held is not None and days_held < 3
+            )
+            drift_flag = weight_pct > 12 and pnl_pct > 10
+            target_breach_flag = progress_pct is not None and progress_pct > 150
+
+            facts[sym] = {
+                "days_held": days_held,
+                "thesis_progress_pct": progress_pct,
+                "pace": pace,
+                "distance_to_stop_pct": dist_stop_pct,
+                "distance_to_target_pct": dist_target_pct,
+                "weight_pct": weight_pct,
+                "parabolic_flag": parabolic_flag,
+                "drift_flag": drift_flag,
+                "target_breach_flag": target_breach_flag,
+            }
+        return facts
+
+    def _build_own_recent_decisions(self, limit: int = 3) -> str:
+        """Pull last N position_reviewer sessions from agent_logs.
+
+        Anti-flip-flop memory: shows the reviewer its own previous 3 sessions'
+        actions per symbol so it can't silently reverse itself within hours
+        without a named trigger. Complement to PM's `_build_pm_recent_decisions`.
+        """
+        import json as _json
+        try:
+            rows = self.db.get_recent_agent_outputs(
+                agent_name="position_reviewer", limit=limit,
+                before_date=session_date_key(),
+            )
+        except Exception as e:
+            logger.warning("own_recent_decisions: DB fetch failed: %s", e)
+            return ""
+        if not rows:
+            return ""
+        lines: list[str] = []
+        for row in reversed(rows):  # oldest → newest
+            ts = (row.get("timestamp") or "")[:16]
+            try:
+                data = _json.loads(row.get("full_response") or "{}")
+            except (_json.JSONDecodeError, TypeError):
+                continue
+            actions = data.get("actions") or []
+            if not isinstance(actions, list):
+                continue
+            action_bits = []
+            for a in actions:
+                if not isinstance(a, dict):
+                    continue
+                sym = a.get("symbol", "?")
+                act = a.get("action", "?")
+                if act == "HOLD":
+                    continue  # only surface actionable past decisions
+                action_bits.append(f"{sym}:{act}")
+            if action_bits:
+                lines.append(f"- {ts}: {', '.join(action_bits[:8])}")
+        return "\n".join(lines)
+
+    def run_position_review(self, session_type: str = "midday") -> dict:
+        """Unified entry for both midday (13:00 ET) and close (15:30 ET).
+
+        Same memory layers, same schema, same agent. Session bias is injected
+        via prompt language driven by `session_type`. Everything else — force
+        de-lever / auto take-profit / ex-div / news / earnings / LLM review /
+        emergency liquidate / execution / reconcile — is identical.
+        """
+        if session_type not in ("midday", "close"):
+            raise ValueError(f"run_position_review: unknown session_type {session_type!r}")
+
+        ctx = RunContext.start(session_type)
         run_id = ctx.run_id
-        logger.info("=== Midday check: %s ===", run_id)
+        logger.info("=== %s check: %s ===", session_type.capitalize(), run_id)
 
         if not self._is_trading_day():
-            logger.info("Midday run skipped: market closed for non-trading day")
+            logger.info("%s run skipped: market closed for non-trading day", session_type)
             return {"status": "market_holiday", "positions": 0, "orders": [], "run_id": run_id}
 
         # 1. Sync positions (snapshot into ctx)
@@ -1950,82 +2108,124 @@ class TradingPipeline:
         # Replace the positions snapshot (drops rows for symbols no longer held).
         self.db.sync_positions(positions)
 
-        # 1a. Cash-only safety net — force-sell before any other logic if the
-        # account drifted into margin between morning and midday (fill
-        # rounding, dividend timing, etc). Refreshes ctx.cash / positions /
-        # total_value on completion; we re-bind the local names below.
+        # 1a. Cash-only safety net — force-sell if the account drifted into
+        # margin. Refreshes ctx fields on completion.
         self._force_delever(ctx)
         positions = ctx.positions
         cash = ctx.cash
         total_value = ctx.total_value
         last_equity = ctx.last_equity
 
-        # 1b. Auto take-profit on winners. Any position up ≥ 15% that hasn't
-        # already had a take-profit this holding → sell 33%. Locks in partial
-        # gains before winners give back in a pullback. Runs before the LLM
-        # review so midday_reviewer sees the trimmed position and doesn't
-        # double-sell.
-        auto_tp_orders = self._auto_take_profit(positions, run_id)
-        blocked_midday_symbols: set[str] = set()
-        if auto_tp_orders:
-            blocked_midday_symbols = self._wait_for_midday_auto_tp_orders(auto_tp_orders)
-            # Refresh account + positions after the auto-TP phase so downstream
-            # review uses post-trim broker truth, not the stale pre-trim snapshot.
-            account = self.broker.get_account()
-            positions = self.broker.get_positions()
-            cash = account["cash"]
-            total_value = account["portfolio_value"]
-            last_equity = account.get("last_equity", total_value)
-            ctx.account = account
-            ctx.positions = positions
-            ctx.cash = cash
-            ctx.total_value = total_value
-            ctx.last_equity = last_equity
-            self.db.sync_positions(positions)
+        # 1b. Auto take-profit (midday only — close is too near EOD to start
+        # a partial-trim cycle that won't finish). At close, LLM handles trims
+        # explicitly via the reasoning chain.
+        auto_tp_orders: list[dict] = []
+        blocked_position_symbols: set[str] = set()
+        if session_type == "midday":
+            auto_tp_orders = self._auto_take_profit(positions, run_id)
+            if auto_tp_orders:
+                blocked_position_symbols = self._wait_for_midday_auto_tp_orders(auto_tp_orders)
+                # Refresh account + positions after auto-TP.
+                account = self.broker.get_account()
+                positions = self.broker.get_positions()
+                cash = account["cash"]
+                total_value = account["portfolio_value"]
+                last_equity = account.get("last_equity", total_value)
+                ctx.account = account
+                ctx.positions = positions
+                ctx.cash = cash
+                ctx.total_value = total_value
+                ctx.last_equity = last_equity
+                self.db.sync_positions(positions)
 
-        # 1b. Ex-dividend stop adjustment. For any held position with ex-div
-        # TOMORROW, lower the stop by the dividend amount so tomorrow's
-        # mechanical open gap doesn't kick us out for a non-thesis reason.
+        # 1c. Ex-dividend stop adjustment (both sessions — a dividend tomorrow
+        # is still a dividend tomorrow no matter which session looks at it).
         exdiv_orders = self._handle_ex_dividends(positions, run_id)
 
-        # 2. News + Earnings update — capture midday developments
-        midday_news = self._run_news_update(run_id, session="midday")
-        if midday_news:
-            logger.info("Midday news: %s", midday_news.pm_briefing[:200])
-        _, midday_earnings = self._load_earnings_analyses(run_id, session="midday", ctx=ctx)
+        # 2. News + Earnings update — capture developments since morning.
+        session_news = self._run_news_update(run_id, session=session_type)
+        if session_news:
+            logger.info("%s news: %s", session_type.capitalize(), session_news.pm_briefing[:200])
+        _, session_earnings = self._load_earnings_analyses(
+            run_id, session=session_type, ctx=ctx,
+        )
 
-        # 3. LLM midday review — assess positions and recommend actions
+        # 3. LLM position review — memory-heavy, 6-step CoT.
         macro_summary = self.macro.get_macro_summary()
         review = None
-        # Feed pre-LLM action orders (take-profit + ex-div adjustments) into
-        # the same return bucket so evening / caller see a complete action list.
+        # Pre-LLM orders (take-profit + ex-div) feed into the same bucket.
         orders = list(auto_tp_orders) + list(exdiv_orders)
+
         if positions:
             morning_trades = self.db.get_trades(
                 limit=50, today_only=True, executed_only=True,
             )
-            review, md_result = self.midday_reviewer.review(
+
+            # Reuse morning's macro_analysis from macro_store so the
+            # reviewer sees the same regime the PM committed to today.
+            macro_analysis_dict = None
+            try:
+                macro_analysis_dict = self.macro_store.load_last_state()
+            except Exception as e:
+                logger.warning("%s: macro_store load failed: %s", session_type, e)
+
+            # Pre-compute deterministic per-position metrics.
+            calib = {}
+            try:
+                raw_calib = self.db.compute_trade_calibration(lookback_days=45)
+                calib = raw_calib if isinstance(raw_calib, dict) else {}
+            except Exception as e:
+                logger.warning("%s: calibration query failed: %s", session_type, e)
+            raw_avg = calib.get("avg_hold_days")
+            avg_hold_days = raw_avg if isinstance(raw_avg, (int, float)) else None
+            position_facts = self._build_position_facts(
+                positions, morning_trades, total_value, avg_hold_days,
+            )
+
+            # Memory layers — share the same helpers PM uses.
+            weekly_narrative = self._build_weekly_narrative()
+            macro_trajectory = self._build_macro_trajectory()
+            active_state_changes = self._build_active_state_changes()
+            calibration_note = self._build_calibration_note()
+            own_recent_decisions = self._build_own_recent_decisions()
+
+            yesterday_insights = self.db.get_latest_insights(before_date=session_date_key())
+            recent_performance = self._compute_recent_performance(last_equity)
+
+            review, md_result = self.position_reviewer.review(
                 positions=positions,
                 macro_summary=macro_summary,
                 cash_balance=cash,
                 total_value=total_value,
+                session_type=session_type,
+                position_facts=position_facts,
                 morning_trades=morning_trades,
-                news_intel=midday_news,
-                earnings_analyses=midday_earnings,
+                news_intel=session_news,
+                earnings_analyses=session_earnings,
+                macro_analysis=macro_analysis_dict,
+                weekly_narrative=weekly_narrative,
+                macro_trajectory=macro_trajectory,
+                active_state_changes=active_state_changes,
+                calibration_note=calibration_note,
+                own_recent_decisions=own_recent_decisions,
+                yesterday_insights=yesterday_insights,
+                recent_performance=recent_performance,
                 allow_margin=bool(getattr(self.config.risk, "allow_margin", False)),
             )
             self.db.insert_agent_log(
-                agent_name="midday_reviewer", run_id=run_id,
-                input_summary=f"{len(positions)} positions, ${total_value:.0f} total",
+                agent_name="position_reviewer", run_id=run_id,
+                input_summary=(
+                    f"{session_type} | {len(positions)} positions, ${total_value:.0f} total"
+                ),
                 input_message=md_result.user_message,
                 output_summary=review.overall_assessment if review else "parse_error",
                 full_response=md_result.raw_text,
-                model=self.config.llm.midday_reviewer_model,
+                model=self.config.llm.position_reviewer_model,
                 tokens_used=md_result.tokens_used,
             )
 
-            # Risk check: if daily loss limit breached, force-sell all
-            # positions. Else: dispatch the LLM's per-position action list.
+            # Risk check: if daily loss limit breached, force-sell all. Else:
+            # dispatch the LLM's per-position action list.
             daily_pnl = total_value - last_equity
             loss_violation = self.risk_engine.check_daily_loss(last_equity, daily_pnl)
             if loss_violation:
@@ -2034,21 +2234,24 @@ class TradingPipeline:
                 ))
             else:
                 orders.extend(self._midday_execute_llm_actions(
-                    positions, review, run_id, blocked_symbols=blocked_midday_symbols,
+                    positions, review, run_id, blocked_symbols=blocked_position_symbols,
                 ))
 
-        logger.info("Midday: %d positions, risk=%s, %d orders",
-                     len(positions),
+        logger.info("%s: %d positions, risk=%s, %d orders",
+                     session_type.capitalize(), len(positions),
                      review.risk_level if review else "no_positions",
                      len(orders))
-        # Reconcile BOTH today's midday submissions AND any lingering
-        # morning submissions that hadn't reached terminal by the time
-        # morning's _reconcile_fills ran. Pass run_id=None so midday
-        # sweeps all unreconciled orders regardless of run.
+        # Reconcile everything still marked submitted (today's new orders +
+        # any lingering from morning that didn't reach terminal in time).
         self._reconcile_fills()
-        return {"status": "reviewed", "positions": len(positions),
-                "review": review.model_dump() if review else None,
-                "orders": orders, "run_id": run_id}
+        return {
+            "status": "reviewed",
+            "session": session_type,
+            "positions": len(positions),
+            "review": review.model_dump() if review else None,
+            "orders": orders,
+            "run_id": run_id,
+        }
 
     def run_earnings_preprocess(self) -> dict:
         """Pre-market earnings analysis — the ONLY place that calls the LLM

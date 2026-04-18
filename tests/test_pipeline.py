@@ -6,8 +6,21 @@ from src.agents.base import AgentResult
 from src.models import (
     TechAnalysisResult, PortfolioDecision, TradeDecision, RiskVerdict, Position,
     NewsAnalysisResult, TargetPosition,
-    MacroAnalysis, MacroReasoningChain, MacroPositionGuidance, MiddayReview,
+    MacroAnalysis, MacroReasoningChain, MacroPositionGuidance,
+    PositionReview, PositionReasoningChain,
 )
+
+
+def _review_rc():
+    """Stub PositionReasoningChain for tests that construct PositionReview."""
+    return PositionReasoningChain(
+        macro_continuity_check="stable",
+        thesis_progress_check="ok",
+        thesis_integrity_check="no triggers",
+        winners_discipline_check="no flags",
+        session_disposition_check="patient",
+        execution_rationale="n/a",
+    )
 
 
 def _macro_stub(regime="risk-on", outlook="bullish", confidence="medium",
@@ -53,7 +66,7 @@ def mock_config():
     cfg.llm.earnings_analyst_model = "claude-opus-4-6-20250725"
     cfg.llm.portfolio_manager_model = "claude-opus-4-6-20250725"
     cfg.llm.risk_manager_model = "claude-opus-4-6-20250725"
-    cfg.llm.midday_reviewer_model = "claude-opus-4-6-20250725"
+    cfg.llm.position_reviewer_model = "claude-opus-4-6-20250725"
     cfg.llm.evening_analyst_model = "claude-opus-4-6-20250725"
     cfg.llm.max_tokens = 4096
     cfg.risk.max_position_pct = 20
@@ -466,7 +479,7 @@ def test_pipeline_midday_fetches_only_executed_morning_trades():
     pipeline.db = MagicMock()
     pipeline.db.get_trades.return_value = []
     pipeline.config = MagicMock()
-    pipeline.config.llm.midday_reviewer_model = "test-model"
+    pipeline.config.llm.position_reviewer_model = "test-model"
     pipeline._auto_take_profit = MagicMock(return_value=[])
     pipeline._handle_ex_dividends = MagicMock(return_value=[])
     pipeline._run_news_update = MagicMock(return_value=None)
@@ -475,9 +488,9 @@ def test_pipeline_midday_fetches_only_executed_morning_trades():
     pipeline._reconcile_fills = MagicMock()
     pipeline.risk_engine = MagicMock()
     pipeline.risk_engine.check_daily_loss.return_value = None
-    pipeline.midday_reviewer = MagicMock()
-    pipeline.midday_reviewer.review.return_value = (
-        MiddayReview(actions=[], overall_assessment="stable", risk_level="low"),
+    pipeline.position_reviewer = MagicMock()
+    pipeline.position_reviewer.review.return_value = (
+        PositionReview(reasoning_chain=_review_rc(), actions=[], overall_assessment="stable", risk_level="low"),
         _mock_agent_result(),
     )
 
@@ -508,7 +521,7 @@ def test_pipeline_midday_blocks_llm_sells_while_auto_take_profit_pending():
     pipeline.db = MagicMock()
     pipeline.db.get_trades.return_value = []
     pipeline.config = MagicMock()
-    pipeline.config.llm.midday_reviewer_model = "test-model"
+    pipeline.config.llm.position_reviewer_model = "test-model"
     pipeline._auto_take_profit = MagicMock(return_value=[
         {"id": "tp-1", "status": "accepted", "symbol": "SPY"}
     ])
@@ -518,9 +531,10 @@ def test_pipeline_midday_blocks_llm_sells_while_auto_take_profit_pending():
     pipeline._reconcile_fills = MagicMock()
     pipeline.risk_engine = MagicMock()
     pipeline.risk_engine.check_daily_loss.return_value = None
-    pipeline.midday_reviewer = MagicMock()
-    pipeline.midday_reviewer.review.return_value = (
-        MiddayReview(
+    pipeline.position_reviewer = MagicMock()
+    pipeline.position_reviewer.review.return_value = (
+        PositionReview(
+            reasoning_chain=_review_rc(),
             actions=[{"action": "SELL", "symbol": "SPY", "reason": "cut it"}],
             overall_assessment="take the win",
             risk_level="moderate",
