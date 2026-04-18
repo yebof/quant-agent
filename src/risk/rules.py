@@ -1,6 +1,9 @@
+import logging
 from dataclasses import dataclass
 from src.config import RiskConfig
 from src.models import TradeDecision, Position
+
+logger = logging.getLogger(__name__)
 
 # Leveraged/inverse ETF multipliers for effective exposure calculation.
 # Negative = inverse/short (hedge-like against the underlying index).
@@ -57,7 +60,16 @@ class RiskRuleEngine:
             return []
 
         # Daily-loss denominator: yesterday-close equity if provided, else current equity.
+        # The fallback is only intended for first-day / fresh-account cases where Alpaca
+        # legitimately has no last_equity. On an established account a missing baseline
+        # usually signals a broker API glitch, so log a warning — the denominator silently
+        # flipping from yesterday-close to current equity can make the loss cap appear
+        # stricter (or more permissive) than intended within a single session.
         if baseline is None or baseline <= 0:
+            logger.warning(
+                "daily-loss baseline missing (%s); falling back to current total_value=%.2f",
+                baseline, total_value,
+            )
             baseline = total_value
 
         violations = []

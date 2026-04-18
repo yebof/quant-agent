@@ -14,7 +14,15 @@ PROMPT_PATH = Path(__file__).parent.parent.parent / "config" / "prompts" / "midd
 class MiddayReviewerAgent(BaseAgent):
     @staticmethod
     def _trade_executed(trade: dict) -> bool:
-        """Match DB executed_only semantics for safety in prompt assembly."""
+        """Belt-and-braces guard for BUY rows surfaced to the LLM prompt.
+
+        In practice the caller has already filtered via db.get_trades(
+        executed_only=True), so by the time a row reaches here it's either
+        filled, legacy NULL-status, or canceled-with-partial-fill. This
+        predicate re-applies the same shape check so a future caller that
+        forgets executed_only can't accidentally inject a submitted-only or
+        zero-fill canceled BUY into the reviewer's trade-context map.
+        """
         status = trade.get("fill_status")
         if status is None:
             return True

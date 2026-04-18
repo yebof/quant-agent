@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from src.agents.base import _is_openai_model
 
@@ -40,6 +40,17 @@ class LLMConfig(BaseModel):
     midday_reviewer_model: str = "claude-opus-4-6"
     evening_analyst_model: str = "claude-opus-4-6"
     max_tokens: int
+
+    @field_validator("max_tokens")
+    @classmethod
+    def _max_tokens_sane(cls, v: int) -> int:
+        # A non-positive or trivially small max_tokens will fail at LLM-call
+        # time with an opaque provider error. Fail fast at config load instead.
+        if v < 512:
+            raise ValueError(
+                f"llm.max_tokens must be >= 512 for agent outputs; got {v}"
+            )
+        return v
 
 
 class RiskConfig(BaseModel):

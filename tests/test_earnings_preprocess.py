@@ -168,7 +168,6 @@ def test_load_earnings_analyses_never_confirms_or_spawns_threads(tmp_path):
     }]
 
     pipeline = _mk_pipeline(tmp_path, earnings_provider, earnings_analyst)
-    pipeline._straggler_bg_threads = []
 
     threads_before = threading.active_count()
     reports, results = pipeline._load_earnings_analyses("r1", session="morning")

@@ -204,3 +204,47 @@ storage:
     cfg = load_config(config_file)
     assert cfg.api_keys.openai == "openai-key"
     assert cfg.api_keys.anthropic == ""
+
+
+def test_llm_config_rejects_tiny_max_tokens():
+    """A garbage max_tokens (0 / negative / too-small) must fail at parse time,
+    not silently reach the LLM provider and error opaquely."""
+    from pydantic import ValidationError
+
+    from src.config import LLMConfig
+
+    for bad in (0, -1, 100):
+        with pytest.raises(ValidationError):
+            LLMConfig(max_tokens=bad)
+
+    # A sane value loads fine
+    cfg = LLMConfig(max_tokens=4096)
+    assert cfg.max_tokens == 4096
+
+
+def test_risk_rules_warn_when_baseline_missing(caplog):
+    """The daily-loss denominator silently falling back to current total_value
+    should emit a warning — the check appears correct but the semantic changed.
+    """
+    import logging
+
+    from src.config import RiskConfig
+    from src.models import TradeDecision
+    from src.risk.rules import RiskRuleEngine
+
+    engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=20, max_total_position_pct=90,
+        max_daily_loss_pct=3, max_sector_pct=40, require_stop_loss=True,
+    ))
+    decision = TradeDecision(
+        action="BUY", symbol="SPY", allocation_pct=5,
+        entry_price=500, stop_loss=480, take_profit=530, reasoning="test",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="src.risk.rules"):
+        engine.check(
+            decision=decision, positions=[], total_value=100_000.0,
+            daily_pnl=-1_000.0, baseline=0,  # broker returned 0 for last_equity
+        )
+
+    assert any("baseline missing" in rec.message for rec in caplog.records)

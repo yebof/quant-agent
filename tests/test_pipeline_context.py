@@ -25,13 +25,13 @@ def test_runcontext_default_containers_are_independent_per_instance():
     ctx2 = RunContext.start("morning")
 
     ctx1.symbols_bars["NVDA"] = ["some bars"]
-    ctx1.bg_threads.append("dummy thread ref")
     ctx1.orders.append({"id": "x"})
+    ctx1.earnings_results.append({"symbol": "NVDA"})
 
     # ctx2 MUST NOT see ctx1's mutations — classic shared-default-list bug
     assert ctx2.symbols_bars == {}
-    assert ctx2.bg_threads == []
     assert ctx2.orders == []
+    assert ctx2.earnings_results == []
 
 
 def test_runcontext_run_ids_are_unique():
