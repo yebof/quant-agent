@@ -1328,6 +1328,86 @@ class TradingPipeline:
             "low_conviction_hit_rate_pct": _rate(lambda s: s["predicted_conviction"] == "low"),
         }
 
+    def _build_trade_grade_summary(self, lookback_days: int = 14) -> dict:
+        """Aggregate evening's structured sell_grades + buy_grades over N days.
+
+        Feeds position_reviewer so it can see patterns like "you marked 5 of
+        7 recent SELLs as premature" and lean patient today. Reads the new
+        JSON columns on insights (introduced 2026-04-19); pre-v2 rows return
+        NULL → treated as empty, summary gracefully degrades.
+
+        Returns {
+            "n_sells": int, "n_buys": int,
+            "sell_counts": {"correct": int, "premature": int, "wrong": int},
+            "buy_counts":  {"correct": int, "premature": int, "wrong": int},
+            "repeat_premature_symbols": [str, ...],   # symbol premature >= 2×
+            "repeat_wrong_symbols":     [str, ...],
+        }
+        """
+        import json as _json
+        empty = {
+            "n_sells": 0, "n_buys": 0,
+            "sell_counts": {"correct": 0, "premature": 0, "wrong": 0},
+            "buy_counts":  {"correct": 0, "premature": 0, "wrong": 0},
+            "repeat_premature_symbols": [],
+            "repeat_wrong_symbols": [],
+        }
+        try:
+            rows = self.db.get_recent_insights(limit=lookback_days + 5)
+        except Exception as e:
+            logger.warning("trade_grade_summary: insights fetch failed: %s", e)
+            return empty
+        if not rows:
+            return empty
+
+        sell_counts = {"correct": 0, "premature": 0, "wrong": 0}
+        buy_counts = {"correct": 0, "premature": 0, "wrong": 0}
+        sell_premature_by_symbol: dict[str, int] = {}
+        sell_wrong_by_symbol: dict[str, int] = {}
+
+        def _load(col: str, row: dict) -> list[dict]:
+            raw = row.get(col)
+            if not raw:
+                return []
+            try:
+                v = _json.loads(raw)
+            except (TypeError, ValueError):
+                return []
+            return v if isinstance(v, list) else []
+
+        rows_in_window = rows[:lookback_days]  # newest first from get_recent_insights
+        for row in rows_in_window:
+            for g in _load("sell_grades_json", row):
+                if not isinstance(g, dict):
+                    continue
+                grade = g.get("grade")
+                if grade in sell_counts:
+                    sell_counts[grade] += 1
+                sym = g.get("symbol")
+                if sym and grade == "premature":
+                    sell_premature_by_symbol[sym] = sell_premature_by_symbol.get(sym, 0) + 1
+                if sym and grade == "wrong":
+                    sell_wrong_by_symbol[sym] = sell_wrong_by_symbol.get(sym, 0) + 1
+            for g in _load("buy_grades_json", row):
+                if not isinstance(g, dict):
+                    continue
+                grade = g.get("grade")
+                if grade in buy_counts:
+                    buy_counts[grade] += 1
+
+        return {
+            "n_sells": sum(sell_counts.values()),
+            "n_buys": sum(buy_counts.values()),
+            "sell_counts": sell_counts,
+            "buy_counts": buy_counts,
+            "repeat_premature_symbols": sorted(
+                s for s, c in sell_premature_by_symbol.items() if c >= 2
+            ),
+            "repeat_wrong_symbols": sorted(
+                s for s, c in sell_wrong_by_symbol.items() if c >= 2
+            ),
+        }
+
     @staticmethod
     def _actualize_trade_row(row: dict) -> dict:
         """Prefer broker-confirmed execution details when present."""
@@ -2361,6 +2441,10 @@ class TradingPipeline:
             active_state_changes = self._build_active_state_changes()
             calibration_note = self._build_calibration_note()
             own_recent_decisions = self._build_own_recent_decisions()
+            # v2: evening's per-trade grades feed back into position_reviewer.
+            # 14-day rolling counts of correct/premature/wrong SELLs (and BUYs)
+            # let the reviewer lean patient when past SELLs trended premature.
+            trade_grade_summary = self._build_trade_grade_summary(lookback_days=14)
 
             yesterday_insights = self.db.get_latest_insights(before_date=session_date_key())
             recent_performance = self._compute_recent_performance(last_equity)
@@ -2381,6 +2465,7 @@ class TradingPipeline:
                 active_state_changes=active_state_changes,
                 calibration_note=calibration_note,
                 own_recent_decisions=own_recent_decisions,
+                trade_grade_summary=trade_grade_summary,
                 yesterday_insights=yesterday_insights,
                 recent_performance=recent_performance,
                 allow_margin=bool(getattr(self.config.risk, "allow_margin", False)),
@@ -2751,6 +2836,10 @@ class TradingPipeline:
                 tomorrow_conviction=analysis.tomorrow_conviction,
                 tomorrow_key_risks=analysis.tomorrow_key_risks,
                 sell_decisions_assessment=analysis.sell_decisions_assessment,
+                # v2: persist structured grades so next-day position_reviewer
+                # can aggregate counts into its "lean patient" bias.
+                sell_grades=analysis.sell_grades,
+                buy_grades=analysis.buy_grades,
             )
         else:
             # LLM failed — keep at least the P&L number for daily audit.

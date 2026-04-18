@@ -109,6 +109,7 @@ class PositionReviewerAgent(BaseAgent):
         active_state_changes: str = kwargs.get("active_state_changes") or ""
         calibration_note: str = kwargs.get("calibration_note") or ""
         own_recent_decisions: str = kwargs.get("own_recent_decisions") or ""
+        trade_grade_summary: dict = kwargs.get("trade_grade_summary") or {}
         yesterday_insights: dict | None = kwargs.get("yesterday_insights")
         recent_performance: dict = kwargs.get("recent_performance") or {}
 
@@ -281,13 +282,73 @@ class PositionReviewerAgent(BaseAgent):
             yi_bias = yesterday_insights.get("tomorrow_bias", "neutral")
             yi_conviction = yesterday_insights.get("tomorrow_conviction", "medium")
             yi_risk = yesterday_insights.get("risk_rating", "moderate")
-            yesterday_section = (
-                f"### Yesterday Evening's Outlook for Today\n"
-                f"- Bias: {yi_bias} ({yi_conviction}) | Risk: {yi_risk}\n"
-                f"- Outlook: {yi_outlook}\n"
-            )
+            # v2: surface lessons + sell_decisions_assessment (prose) so the
+            # reviewer sees what evening learned last night, not just the
+            # forward-looking bias. PM already reads these; position reviewer
+            # was reading a narrower slice of yesterday_insights.
+            yi_lessons = (yesterday_insights.get("lessons") or "").strip()[:280]
+            yi_sell_prose = (yesterday_insights.get("sell_decisions_assessment") or "").strip()[:280]
+            lines = [
+                "### Yesterday Evening's Outlook for Today",
+                f"- Bias: {yi_bias} ({yi_conviction}) | Risk: {yi_risk}",
+                f"- Outlook: {yi_outlook}",
+            ]
+            if yi_lessons:
+                lines.append(f"- Lessons: {yi_lessons}")
+            if yi_sell_prose:
+                lines.append(f"- SELL discipline note: {yi_sell_prose}")
+            yesterday_section = "\n".join(lines) + "\n"
         else:
             yesterday_section = ""
+
+        # v2: recent SELL/BUY calibration counts from evening's structured
+        # grades over the last 14 days. When premature + wrong >= correct,
+        # tilt toward patience — you've been cutting winners too early.
+        grade_section = ""
+        if trade_grade_summary and trade_grade_summary.get("n_sells", 0) > 0:
+            sc = trade_grade_summary.get("sell_counts") or {}
+            bc = trade_grade_summary.get("buy_counts") or {}
+            n_sells = trade_grade_summary.get("n_sells", 0)
+            n_buys = trade_grade_summary.get("n_buys", 0)
+            premature = sc.get("premature", 0)
+            wrong = sc.get("wrong", 0)
+            correct = sc.get("correct", 0)
+            miss_rate = ((premature + wrong) / n_sells * 100) if n_sells else 0
+            tilt_note = ""
+            if miss_rate >= 50:
+                tilt_note = (
+                    "⚠️ SELL miss rate ≥ 50% — you've been cutting winners too "
+                    "early. Lean PATIENT today; require a clearly-named thesis "
+                    "trigger before any SELL."
+                )
+            elif miss_rate >= 33:
+                tilt_note = (
+                    "SELL miss rate elevated — raise the bar on today's SELL "
+                    "triggers; no price-action-only exits."
+                )
+            repeat_premature = trade_grade_summary.get("repeat_premature_symbols") or []
+            repeat_wrong = trade_grade_summary.get("repeat_wrong_symbols") or []
+            symbol_warn = ""
+            if repeat_premature:
+                symbol_warn += (
+                    f"\n- Symbols you've marked premature ≥ 2× (be extra patient on these): "
+                    f"{', '.join(repeat_premature)}"
+                )
+            if repeat_wrong:
+                symbol_warn += (
+                    f"\n- Symbols marked wrong ≥ 2× (thesis repeatedly defended in hindsight): "
+                    f"{', '.join(repeat_wrong)}"
+                )
+            grade_section = (
+                f"### Recent Trade Calibration from Evening (last 14 days)\n"
+                f"SELLs graded: {n_sells} (correct {correct} / premature {premature} "
+                f"/ wrong {wrong})\n"
+                f"BUYs graded: {n_buys} "
+                f"(correct {bc.get('correct', 0)} / premature {bc.get('premature', 0)} "
+                f"/ wrong {bc.get('wrong', 0)})"
+                f"{symbol_warn}\n"
+                f"{tilt_note}\n"
+            ).rstrip() + "\n"
 
         if recent_performance:
             r5 = recent_performance.get("rolling_5d_pct")
@@ -348,6 +409,7 @@ class PositionReviewerAgent(BaseAgent):
 
 {narrative_section}
 {yesterday_section}
+{grade_section}
 {calibration_section}
 {decisions_section}
 {perf_section}
@@ -370,6 +432,7 @@ schema."""
                active_state_changes: str = "",
                calibration_note: str = "",
                own_recent_decisions: str = "",
+               trade_grade_summary: dict | None = None,
                yesterday_insights: dict | None = None,
                recent_performance: dict | None = None,
                allow_margin: bool = True) -> tuple[PositionReview | None, "AgentResult"]:
@@ -389,6 +452,7 @@ schema."""
             active_state_changes=active_state_changes,
             calibration_note=calibration_note,
             own_recent_decisions=own_recent_decisions,
+            trade_grade_summary=trade_grade_summary or {},
             yesterday_insights=yesterday_insights,
             recent_performance=recent_performance or {},
             allow_margin=allow_margin,
