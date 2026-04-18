@@ -129,3 +129,110 @@ def test_run_if_et_window_fires_once_per_et_session_date(tmp_path):
     )
     assert second.returncode == 0
     assert counter_file.read_text().splitlines() == ["run"]
+
+
+def test_run_if_et_window_intra_check_fires_every_tick(tmp_path):
+    """intra_check is a stateless circuit breaker — must fire on every 30-min
+    launchd tick inside market hours, ignoring the once-per-day guard used by
+    morning / midday / close / evening / earnings_preprocess."""
+    script = Path(__file__).resolve().parents[1] / "scripts" / "run_if_et_window.sh"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("")
+
+    last_run_dir = tmp_path / "cache"
+    timeout_bin = tmp_path / "timeout"
+    python_bin = tmp_path / "fake-python"
+    counter_file = tmp_path / "intra-invocations.txt"
+
+    _write_executable(
+        timeout_bin,
+        "#!/bin/bash\n"
+        "shift 2\n"
+        "exec \"$@\"\n",
+    )
+    _write_executable(
+        python_bin,
+        "#!/bin/bash\n"
+        f"echo tick >> \"{counter_file}\"\n"
+        "exit 0\n",
+    )
+
+    base_env = os.environ | {
+        "PROJECT_ROOT_OVERRIDE": str(project_root),
+        "PYTHON_OVERRIDE": str(python_bin),
+        "TIMEOUT_OVERRIDE": str(timeout_bin),
+        "LAST_RUN_DIR_OVERRIDE": str(last_run_dir),
+        "ET_DOW_OVERRIDE": "1",  # Monday
+        "ET_DATE_OVERRIDE": "2026-04-20",
+    }
+
+    # Fire four times across the market day. Each must succeed + increment counter.
+    for hh, mm, ts in (("09", "30", "1"), ("11", "30", "2"), ("14", "00", "3"), ("15", "45", "4")):
+        result = subprocess.run(
+            ["bash", str(script), "intra_check"],
+            env=base_env | {
+                "ET_HOUR_OVERRIDE": hh,
+                "ET_MIN_OVERRIDE": mm,
+                "NOW_UNIX_OVERRIDE": ts,
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"{hh}:{mm} should have fired: {result.stderr}"
+
+    assert counter_file.read_text().splitlines() == ["tick", "tick", "tick", "tick"]
+    # Critical: intra_check must NOT write a last-run marker (would re-introduce
+    # the once-per-day cap it's explicitly exempt from).
+    assert not (last_run_dir / "last-intra_check").exists()
+
+
+def test_run_if_et_window_intra_check_skips_outside_window(tmp_path):
+    """intra_check window is 09:30-16:00 ET. Outside, it must not fire."""
+    script = Path(__file__).resolve().parents[1] / "scripts" / "run_if_et_window.sh"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("")
+
+    last_run_dir = tmp_path / "cache"
+    timeout_bin = tmp_path / "timeout"
+    python_bin = tmp_path / "fake-python"
+    counter_file = tmp_path / "out-of-window.txt"
+
+    _write_executable(timeout_bin, "#!/bin/bash\nshift 2\nexec \"$@\"\n")
+    _write_executable(
+        python_bin,
+        "#!/bin/bash\n"
+        f"echo fired >> \"{counter_file}\"\n"
+        "exit 0\n",
+    )
+
+    base_env = os.environ | {
+        "PROJECT_ROOT_OVERRIDE": str(project_root),
+        "PYTHON_OVERRIDE": str(python_bin),
+        "TIMEOUT_OVERRIDE": str(timeout_bin),
+        "LAST_RUN_DIR_OVERRIDE": str(last_run_dir),
+        "ET_DOW_OVERRIDE": "1",
+        "ET_DATE_OVERRIDE": "2026-04-20",
+        "NOW_UNIX_OVERRIDE": "1",
+    }
+
+    # Pre-market 08:00: outside window → skip
+    r1 = subprocess.run(
+        ["bash", str(script), "intra_check"],
+        env=base_env | {"ET_HOUR_OVERRIDE": "08", "ET_MIN_OVERRIDE": "00"},
+        capture_output=True, text=True, check=False,
+    )
+    assert r1.returncode == 0
+
+    # Post-close 16:30: outside window → skip
+    r2 = subprocess.run(
+        ["bash", str(script), "intra_check"],
+        env=base_env | {"ET_HOUR_OVERRIDE": "16", "ET_MIN_OVERRIDE": "30"},
+        capture_output=True, text=True, check=False,
+    )
+    assert r2.returncode == 0
+
+    # Neither tick should have exec'd the fake-python
+    assert not counter_file.exists()

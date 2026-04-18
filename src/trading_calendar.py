@@ -38,7 +38,7 @@ SessionMode = Literal[
 SESSION_WINDOWS: dict[str, tuple[int, int]] = {
     "earnings_preprocess": (480, 555),   # 08:00 - 09:15 ET
     "morning":             (570, 720),   # 09:30 - 12:00 ET
-    "intra_check":         (720, 810),   # 12:00 - 13:30 ET  (P&L circuit-breaker, no LLM)
+    "intra_check":         (570, 960),   # 09:30 - 16:00 ET  (P&L circuit-breaker, no LLM, every 30min tick; NOT subject to once-per-day guard)
     "midday":              (780, 870),   # 13:00 - 14:30 ET  (position reviewer, patient)
     "close":               (930, 955),   # 15:30 - 15:55 ET  (position reviewer, act-on-trigger)
     "evening":             (1200, 1320), # 20:00 - 22:00 ET  (reporting only)

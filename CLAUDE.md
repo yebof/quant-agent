@@ -37,7 +37,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 
 ### 时区
 - ET 统一走 `src/trading_calendar.py`（`et_today` / `et_now` / `session_date_key` / `in_session_window` / `SESSION_WINDOWS`）。`src/util/time.py` 是向后兼容 shim，新代码直接 import `src.trading_calendar`。`daily_pnl` 主键、`insights` 查询、`broker.is_trading_day`、news/macro 快照目录、earnings cutoff、market OHLCV 全部 ET——任何 host TZ 都要出同样数据
-- launchd 每 30 分钟触发 `scripts/run_if_et_window.sh`，wrapper 看 **ET 时间**判断窗口 + last-run 文件去重。窗口对应 `SESSION_WINDOWS`（Python 权威源，bash 表由 `test_trading_calendar.py` 锁定一致）：earnings_preprocess 08:00-09:15、morning 09:30-12:00、intra_check 12:00-13:30、midday 13:00-14:30、close 15:30-15:55、evening 20:00-22:00（Mon-Fri ET）。用户经常出差，不同时区必须都正确。**midday + close 都跑 position_reviewer（同一 agent，`session_type` 分流：midday = patient，close = act-on-trigger；都只卖不买，核心原则"好股长持"）**
+- launchd 每 30 分钟触发 `scripts/run_if_et_window.sh`，wrapper 看 **ET 时间**判断窗口 + last-run 文件去重。窗口对应 `SESSION_WINDOWS`（Python 权威源，bash 表由 `test_trading_calendar.py` 锁定一致）：earnings_preprocess 08:00-09:15、morning 09:30-12:00、**intra_check 09:30-16:00（全交易时段每 30 分钟 tick 都跑，stateless 熔断器；last-run 去重对它不生效）**、midday 13:00-14:30、close 15:30-15:55、evening 20:00-22:00（Mon-Fri ET）。用户经常出差，不同时区必须都正确。**midday + close 都跑 position_reviewer（同一 agent，`session_type` 分流：midday = patient，close = act-on-trigger；都只卖不买，核心原则"好股长持"）**
 
 ### 生产侧防挂死 / 防拒单（都有血泪）
 - 所有 Alpaca SDK 调用通过 `_install_http_timeout()` 注入 30s HTTP timeout；launchd plist 外层 `/opt/homebrew/bin/timeout --kill-after=30 600 ...` 10 分钟兜底——**双层**，防再次出现 13 小时 hang（2026-04-17 事故）

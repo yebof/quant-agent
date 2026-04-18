@@ -43,14 +43,14 @@ fi
 # don't edit one without the other.
 # earnings_preprocess: 08:00-09:15 ET (pre-market, analyze fresh filings)
 # morning            : 09:30-12:00 ET (pre-market / early session, wide for late-wake grace)
-# intra_check        : 12:00-13:30 ET (flash-crash circuit breaker midway through session)
+# intra_check        : 09:30-16:00 ET (flash-crash circuit breaker, fires every 30min tick; NOT subject to once-per-day guard — stateless, all actions idempotent)
 # midday             : 13:00-14:30 ET (position reviewer, afternoon patience)
 # close              : 15:30-15:55 ET (position reviewer, act-on-trigger before overnight)
 # evening            : 20:00-22:00 ET (post-market, insights written before next morning)
 case "$MODE" in
     earnings_preprocess) LO=480; HI=555  ;;
     morning)             LO=570; HI=720  ;;
-    intra_check)         LO=720; HI=810  ;;
+    intra_check)         LO=570; HI=960  ;;
     midday)              LO=780; HI=870  ;;
     close)               LO=930; HI=955  ;;
     evening)             LO=1200; HI=1320 ;;
@@ -62,14 +62,18 @@ if [[ "$ET_TOTAL_MIN" -lt "$LO" || "$ET_TOTAL_MIN" -gt "$HI" ]]; then
 fi
 
 # === Last-run guard — don't fire more than once per window ===
+# Exception: intra_check is a stateless circuit breaker designed to fire on
+# every 30-min launchd tick during market hours. All of its actions
+# (force_delever / emergency_liquidate / P&L read) are idempotent, so the
+# once-per-day guard is skipped and no last-run file is written for it.
 LAST_FILE="${LAST_RUN_DIR}/last-${MODE}"
 NOW_UNIX="${NOW_UNIX_OVERRIDE:-$(date +%s)}"
-if [[ -f "$LAST_FILE" ]]; then
+if [[ "$MODE" != "intra_check" && -f "$LAST_FILE" ]]; then
     LAST_VALUE="$(cat "$LAST_FILE" 2>/dev/null || echo 0)"
     LAST_DATE="${LAST_VALUE%% *}"
     # Primary guard: never fire the same mode twice in the same ET session date.
     # This is stricter than a simple min-gap and matches the once-per-session
-    # contract for morning/midday/evening/preprocess windows.
+    # contract for morning/midday/evening/preprocess/close windows.
     if [[ "$LAST_DATE" == "$ET_DATE" ]]; then
         exit 0
     fi
@@ -99,7 +103,11 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
 fi
 
 if "$TIMEOUT" --kill-after=30 600 "$PYTHON" main.py --mode "$MODE"; then
-    echo "${ET_DATE} ${NOW_UNIX}" > "$LAST_FILE"
+    # intra_check is intentionally guard-less (see last-run guard block above) —
+    # we don't write the marker for it, so the next 30-min tick can fire freely.
+    if [[ "$MODE" != "intra_check" ]]; then
+        echo "${ET_DATE} ${NOW_UNIX}" > "$LAST_FILE"
+    fi
     exit 0
 else
     STATUS=$?
