@@ -68,7 +68,7 @@ Evening (post-market)
 | **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain + continuity check across **8 memory layers**: L1 today's signals, L2 per-position entry context + Tech rating 7-day trajectory with `Weight:%` and `⚠️DRIFT` flag on concentrated winners, L3a rolling Portfolio Narrative (7 evenings), L3b Macro Regime Trajectory (7 days), L3c Active HIGH-conviction state_changes (14 days), **L4 Trade Calibration** — actual realized win rate + avg return on closed BUYs (45d), bucketed by size, **L5 RM Verdicts** (last 5 sessions — PM shrinks sizing when RM keeps scaling it down), **L6 Own Recent Decisions** (last 3 sessions — spot flip-flops), **L7 Projected Book Preview** — if you rubber-stamp all TA BUYs @ 5%, flags sectors nearing 35% cap. Sizing scales by TechAnalyst's `risk_reward` (R/R ≥ 3 boost, < 1.5 requires catalyst). **Regime-adaptive cash floor**: risk-off 25% / transitional 15% / risk-on 5%. **Drawdown-aware**: halves new BUYs when `in_drawdown` flagged. **Drift trim**: Weight > 12% + P&L > 10% → must trim or justify; Weight > 18% → hard trim. **Earnings-queued hard cap**: just-filed 10-Q with no analysis yet → BUY capped at 5% (enforced in pipeline). **Holding discipline** (tiered by days_held): <5d → default HOLD unless thesis_invalid_if or macro regime flipped today; 5-15d → standard; >15d profitable + trend intact → let it run. 11-row **Rule Priority** cheat sheet resolves conflicts (thesis_invalid > holding > earnings-cap > drift > cash-floor > R/R > ...). |
 | **Risk Manager** | Trade review with veto power | Mandatory 6-step `reasoning_chain` (rr_audit / signal_fidelity / correlation_check / event_risk / sizing_sanity / overall) — vague approvals rejected. Enforces R/R discipline: BUYs with R/R < 1.5 must be downsized via modifications or rejected unless PM named a catalyst. Sees raw Tech ratings + R/R + full macro context. Can modify per-symbol fields OR apply portfolio-wide `scale_all_buys` (0.0-1.0). |
 | **Position Reviewer** | Profit management & trailing-stop execution | Trailing-stop logic is **real**, not cosmetic — `TRAIL_STOP` action actually cancels the broker's old stop and submits a new one at the specified price via `AlpacaBroker.replace_stop_loss`. Sees VIX + HY OAS + core CPI to gauge whether to tighten stops broadly. Output is Pydantic `PositionReview` — action enum enforced (typos like `TRIAL_STOP` rejected); `TRAIL_STOP` requires `new_stop_price > 0`. |
-| **Evening Analyst** | Daily P&L review & learning | Pydantic `EveningReport` with enum `risk_rating`. **Outlook retrospective**: reads yesterday's `tomorrow_outlook` and grades it honestly against today's reality via `previous_outlook_assessment` — builds calibration over time. Outputs feed into next morning's PM prompt (cross-session memory). |
+| **Evening Analyst** | Daily P&L review & multi-layer learning | Pydantic `EveningReport` with mandatory 6-step `EveningReasoningChain` (parallel depth to morning PM's 7-step). **Single-day outlook retrospection** — grades yesterday's `tomorrow_outlook` against today's actual via `previous_outlook_assessment`. **Multi-day calibration meta-loop** — sees its own tomorrow_bias / tomorrow_conviction hit rate over the last ~10 sessions (deterministic mirror from `insights` × `daily_pnl`); can't self-delude when numbers disagree. **Structured trade grading** — `sell_grades` / `buy_grades` lists with `correct/premature/wrong` per recent trade. Plus 7-day portfolio narrative + 14-day active HIGH state changes (same memory layers PM sees). Outputs feed next morning's PM (cross-session memory). |
 
 ## Risk Management
 
@@ -198,7 +198,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 343 tests
+├── tests/                         # 385 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -209,7 +209,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 343 tests
+pytest tests/ -v    # 385 tests
 ```
 
 ## Data Sources

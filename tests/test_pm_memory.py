@@ -536,19 +536,28 @@ def test_pm_renders_structured_evening_tilt():
 
 def test_evening_report_parses_structured_fields():
     """EveningReport accepts and defaults the new structured fields."""
-    from src.models import EveningReport
+    from src.models import EveningReport, EveningReasoningChain
 
-    # Defaults kick in when fields are omitted (backward compat)
+    rc = EveningReasoningChain(
+        performance_attribution="x", outlook_retrospection="x",
+        decision_quality_review="x", calibration_meta="x",
+        market_regime_read="x", tomorrow_preparation="x",
+    )
+    # Defaults kick in when optional fields are omitted
     r = EveningReport(
+        reasoning_chain=rc,
         daily_summary="x", lessons="x", tomorrow_outlook="x",
         risk_rating="low",
     )
     assert r.tomorrow_bias == "neutral"
     assert r.tomorrow_conviction == "medium"
     assert r.tomorrow_key_risks == []
+    assert r.sell_grades == []
+    assert r.buy_grades == []
 
     # Explicit values parse
     r2 = EveningReport(
+        reasoning_chain=rc,
         daily_summary="x", lessons="x", tomorrow_outlook="x",
         risk_rating="high",
         tomorrow_bias="bearish", tomorrow_conviction="high",

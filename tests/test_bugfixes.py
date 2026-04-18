@@ -17,8 +17,20 @@ from src.models import (
     TechReasoningChain,
     RiskVerdict, RiskReasoningChain,
     PositionReview, PositionAction,
-    EveningReport,
+    EveningReport, EveningReasoningChain,
 )
+
+
+def _valid_evening_rc() -> EveningReasoningChain:
+    """Test helper — minimal valid 6-step evening reasoning chain."""
+    return EveningReasoningChain(
+        performance_attribution="flat day, no major attribution",
+        outlook_retrospection="n/a (no prior)",
+        decision_quality_review="no trades today",
+        calibration_meta="insufficient history",
+        market_regime_read="regime stable",
+        tomorrow_preparation="no key events",
+    )
 
 
 # === Fix 1: Hard risk rules actually block trades ===
@@ -433,7 +445,7 @@ def test_evening_return_pct_handles_zero_last_equity():
     pipeline.db.get_trades.return_value = []
     pipeline.macro.get_macro_summary.return_value = {}
     pipeline.evening_analyst.analyze.return_value = (
-        EveningReport(daily_summary="Flat", lessons="", tomorrow_outlook="Watch", risk_rating="low"),
+        EveningReport(reasoning_chain=_valid_evening_rc(), daily_summary="Flat", lessons="n/a", tomorrow_outlook="Watch", risk_rating="low"),
         AgentResult(raw_text="{}", tokens_used=10, model="test", user_message="test"),
     )
 
@@ -460,7 +472,7 @@ def test_evening_daily_pnl_uses_last_equity():
     pipeline.db.get_trades.return_value = []
     pipeline.macro.get_macro_summary.return_value = {}
     pipeline.evening_analyst.analyze.return_value = (
-        EveningReport(daily_summary="Up", lessons="", tomorrow_outlook="Watch", risk_rating="low"),
+        EveningReport(reasoning_chain=_valid_evening_rc(), daily_summary="Up", lessons="n/a", tomorrow_outlook="Watch", risk_rating="low"),
         AgentResult(raw_text="{}", tokens_used=10, model="test", user_message="test"),
     )
 
@@ -468,8 +480,9 @@ def test_evening_daily_pnl_uses_last_equity():
 
     assert result["daily_pnl"] == 200.0
     assert result["daily_return_pct"] == pytest.approx(2.0)
-    # DB should no longer be consulted for previous total_value
-    pipeline.db.get_daily_pnl.assert_not_called()
+    # daily_pnl computation must derive from broker.last_equity (not DB
+    # lookup). Evening v2 does call db.get_daily_pnl for outlook-calibration
+    # (different purpose), so we only assert the computed number here.
 
 
 def test_evening_reconciles_before_loading_trade_inputs():
@@ -501,7 +514,7 @@ def test_evening_reconciles_before_loading_trade_inputs():
     pipeline.macro.get_macro_summary.return_value = {}
     pipeline._build_recent_sells_for_grading = MagicMock(return_value=[])
     pipeline.evening_analyst.analyze.return_value = (
-        EveningReport(daily_summary="Up", lessons="", tomorrow_outlook="Watch", risk_rating="low"),
+        EveningReport(reasoning_chain=_valid_evening_rc(), daily_summary="Up", lessons="n/a", tomorrow_outlook="Watch", risk_rating="low"),
         AgentResult(raw_text="{}", tokens_used=10, model="test", user_message="test"),
     )
 
@@ -970,9 +983,11 @@ def test_midday_review_accepts_full_schema():
 
 
 def test_evening_report_requires_core_fields():
+    # Missing reasoning_chain + lessons + tomorrow_outlook + risk_rating all fail.
     with pytest.raises(ValidationError):
-        EveningReport(daily_summary="x")  # missing lessons / tomorrow_outlook / risk_rating
+        EveningReport(daily_summary="x")
     ok = EveningReport(
+        reasoning_chain=_valid_evening_rc(),
         daily_summary="up 0.8%", lessons="be patient",
         tomorrow_outlook="watch FOMC", risk_rating="moderate",
         suggested_actions=["tighten IWM stop"],
@@ -984,6 +999,7 @@ def test_evening_report_requires_core_fields():
 def test_evening_report_rejects_invalid_risk_rating():
     with pytest.raises(ValidationError):
         EveningReport(
+            reasoning_chain=_valid_evening_rc(),
             daily_summary="x", lessons="y",
             tomorrow_outlook="z", risk_rating="catastrophic",  # not in enum
         )
