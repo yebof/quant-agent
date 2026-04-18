@@ -623,7 +623,21 @@ class AlpacaBroker:
                     self._restore_stop_orders(symbol, cancelled_specs)
                 return None
 
-        qty = positions[0].qty
+        # Re-read position right before submit — in the sub-second window
+        # between our cancel-stops and this submit, the position may have
+        # been closed (liquidated by another path, or market-sold into a
+        # fill). If it's gone, the new-stop submit would fail with a qty
+        # mismatch AND our rollback would then re-attach a phantom stop to
+        # a non-existent position. Bail cleanly in that case.
+        fresh_positions = [p for p in self.get_positions() if p.symbol == symbol]
+        if not fresh_positions or fresh_positions[0].qty <= 0:
+            logger.warning(
+                "replace_stop_loss: %s was closed between cancel and submit; "
+                "NOT restoring old stops (position no longer exists)",
+                symbol,
+            )
+            return None
+        qty = fresh_positions[0].qty
         try:
             order = self._submit_stop_limit_order(symbol=symbol, qty=qty, stop_price=new_stop_price)
             logger.info(

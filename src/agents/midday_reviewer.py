@@ -144,7 +144,10 @@ Overall sentiment: {news_intel.market_sentiment} ({news_intel.confidence})
         # Cash-only mandate — surface to the reviewer so it can proactively
         # emit SELL/REDUCE when the account drifts into margin.
         allow_margin: bool = bool(kwargs.get("allow_margin", True))
-        if not allow_margin and cash_balance < 0:
+        # See PortfolioManagerAgent — sub-dollar cash noise shouldn't fire the
+        # full de-lever mandate; those clear on next reconcile.
+        _MARGIN_DEFICIT_FLOOR = 1.0
+        if not allow_margin and cash_balance < -_MARGIN_DEFICIT_FLOOR:
             deficit = -cash_balance
             margin_section = (
                 f"### ⚠️ Cash-only policy — de-lever required\n"

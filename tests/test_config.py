@@ -248,3 +248,56 @@ def test_risk_rules_warn_when_baseline_missing(caplog):
         )
 
     assert any("baseline missing" in rec.message for rec in caplog.records)
+
+
+def test_load_config_preserves_allow_margin_from_yaml(tmp_path):
+    """Regression: the allow_margin flag must survive the settings.yaml → RiskConfig
+    round-trip. Class-default False can mask a loader bug where the key is
+    silently dropped. Lock both values explicitly."""
+    from src.config import load_config
+
+    base_yaml = """
+api_keys:
+  anthropic: "k"
+  fred: "k"
+  alpaca_key: "k"
+  alpaca_secret: "k"
+alpaca:
+  base_url: "https://paper-api.alpaca.markets"
+  paper: true
+llm:
+  tech_analyst_model: "claude-sonnet-4-6"
+  max_tokens: 4096
+risk:
+  max_position_pct: 20
+  max_total_position_pct: 90
+  max_daily_loss_pct: 3
+  max_sector_pct: 40
+  require_stop_loss: true
+  allow_margin: {margin}
+trading:
+  universe: ["SPY"]
+  lookback_days: 60
+  schedule:
+    morning: "06:00"
+    midday: "12:00"
+    evening: "16:30"
+storage:
+  db_path: "data/t.db"
+"""
+    for yaml_bool, expected in (("false", False), ("true", True)):
+        f = tmp_path / f"settings_{yaml_bool}.yaml"
+        f.write_text(base_yaml.format(margin=yaml_bool))
+        cfg = load_config(f)
+        assert cfg.risk.allow_margin is expected, (
+            f"settings.yaml allow_margin={yaml_bool} should load as {expected}"
+        )
+
+    # Omitting the key falls back to the class default (False).
+    no_key_yaml = base_yaml.format(margin="false").replace(
+        "  allow_margin: false\n", ""
+    )
+    f = tmp_path / "settings_default.yaml"
+    f.write_text(no_key_yaml)
+    cfg = load_config(f)
+    assert cfg.risk.allow_margin is False
