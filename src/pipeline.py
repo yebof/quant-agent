@@ -2032,9 +2032,20 @@ class TradingPipeline:
             # 0. Cancel stale entry orders from previous sessions, but preserve live protective exits.
             self.broker.cancel_open_entry_orders()
 
-            # 1. Get account state (snapshot into ctx)
-            account = self.broker.get_account()
-            positions = self.broker.get_positions()
+            # 1. Get account state (snapshot into ctx). Explicit guard mirrors
+            # `run_intra_check` — a broker-API failure at snapshot time should
+            # bail cleanly with a clear status, not propagate an exception
+            # that leaves `ctx` half-populated and every downstream stage
+            # guessing at state.
+            try:
+                account = self.broker.get_account()
+                positions = self.broker.get_positions()
+            except Exception as e:
+                logger.error("Morning: broker snapshot failed: %s", e)
+                return {
+                    "status": "broker_error", "orders": [],
+                    "run_id": run_id, "error": str(e),
+                }
             cash = account["cash"]
             total_value = account["portfolio_value"]
             last_equity = account.get("last_equity", total_value)

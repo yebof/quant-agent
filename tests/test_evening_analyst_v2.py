@@ -359,3 +359,32 @@ def test_prompt_contains_money_making_principles():
     assert "Calibration > looking smart" in sp
     assert "Good stocks are meant to be held" in sp
     assert "Intraday noise" in sp
+
+
+def test_old_evening_json_without_reasoning_chain_fails_gracefully():
+    """Backward-compat documentation test.
+
+    Pre-v2 agent_logs rows stored EveningReport JSON without a
+    reasoning_chain field. If any future code re-parses that JSON through
+    `EveningReport(**data)`, it will ValidationError — which is the
+    correct behavior (we WANT v2 to demand the 6-step chain). This test
+    pins that failure mode so no one silently adds a backward-compat
+    shim that weakens the schema guarantee.
+
+    In practice nothing re-parses old agent_logs into Pydantic — callers
+    parse JSON and use `dict.get(...)`. This test is only here as a
+    structural guardrail.
+    """
+    old_json = {
+        "daily_summary": "legacy row from before v2",
+        "lessons": "no reasoning_chain field existed",
+        "tomorrow_outlook": "watch FOMC",
+        "risk_rating": "moderate",
+        "tomorrow_bias": "neutral",
+        "tomorrow_conviction": "medium",
+        # NO reasoning_chain key
+    }
+    with pytest.raises(ValidationError) as exc_info:
+        EveningReport(**old_json)
+    # Error must mention reasoning_chain by name so operators can diagnose
+    assert "reasoning_chain" in str(exc_info.value)
