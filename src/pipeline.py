@@ -1167,6 +1167,161 @@ class TradingPipeline:
         out.sort(key=lambda r: r["sell_date"], reverse=True)
         return out[:10]
 
+    def _build_recent_buys_for_grading(
+        self, lookback_days: int = 5,
+        symbols_bars: dict | None = None,
+    ) -> list[dict]:
+        """Mirror of `_build_recent_sells_for_grading` for entry quality.
+
+        For each executed BUY in the window, compute the pct move since
+        entry vs current price. Positive = entry still in the money (so
+        far); negative = entry is underwater. Lookback is wider than
+        SELLs (5d vs 2d) because BUY outcomes take longer to reveal.
+        """
+        try:
+            all_rows = self.db.get_trades(limit=200, executed_only=True)
+        except Exception as e:
+            logger.warning("recent_buys: db fetch failed: %s", e)
+            return []
+        if not all_rows:
+            return []
+        from datetime import date as _date, timedelta as _td
+        cutoff = et_today() - _td(days=lookback_days)
+        out: list[dict] = []
+        seen_symbols: set[str] = set()  # dedupe multiple buys on same symbol — use latest
+        for row in all_rows:
+            action = (row.get("action") or "").upper()
+            if action != "BUY":
+                continue
+            ts = row.get("timestamp") or ""
+            try:
+                buy_date = _date.fromisoformat(ts[:10])
+            except ValueError:
+                continue
+            if buy_date < cutoff:
+                continue
+            sym = row.get("symbol")
+            buy_price = float(row.get("fill_price") or row.get("price") or 0) or 0.0
+            if not sym or buy_price <= 0:
+                continue
+            if sym in seen_symbols:
+                continue  # only surface latest BUY per symbol
+            seen_symbols.add(sym)
+            curr = 0.0
+            try:
+                curr = float(self.broker.get_latest_price(sym) or 0) or 0.0
+            except Exception as e:
+                logger.warning("recent_buys: latest price failed for %s: %s", sym, e)
+            if curr <= 0:
+                bars = (symbols_bars or {}).get(sym) or []
+                if bars:
+                    curr = float(bars[-1].close or 0)
+            pct = ((curr / buy_price - 1) * 100) if (curr > 0 and buy_price > 0) else 0.0
+            out.append({
+                "symbol": sym,
+                "buy_date": str(buy_date),
+                "buy_price": buy_price,
+                "current_price": round(curr, 2) if curr else 0.0,
+                "pct_move_since_buy": round(pct, 2),
+                "reasoning": row.get("reasoning") or "",
+            })
+        out.sort(key=lambda r: r["buy_date"], reverse=True)
+        return out[:10]
+
+    def _build_recent_outlook_calibration(self, lookback: int = 10) -> dict:
+        """Evening's self-calibration — pairs its own past `tomorrow_bias`
+        predictions with the actual next-day return from daily_pnl.
+
+        Returns a dict:
+        {
+          "samples": [{date, predicted_bias, predicted_conviction,
+                       actual_return_pct, matched: bool}, ...],
+          "bullish_hit_rate": float | None,
+          "bearish_hit_rate": float | None,
+          "high_conviction_hit_rate": float | None,
+          "n": int,
+        }
+        Empty / None when there aren't enough pairs (first N days of run).
+
+        "Matched" for bullish = actual > 0, bearish = actual < 0, neutral =
+        within ±0.3%. This gives evening a deterministic mirror of its own
+        accuracy — it can't bullshit itself into pretending it's been right
+        when the numbers say otherwise.
+        """
+        try:
+            insights = self.db.get_recent_insights(limit=lookback + 5)
+        except Exception as e:
+            logger.warning("outlook_calibration: insights fetch failed: %s", e)
+            return {"samples": [], "n": 0}
+        if not insights:
+            return {"samples": [], "n": 0}
+        try:
+            pnl_rows = self.db.get_daily_pnl(limit=lookback + 10)
+        except Exception as e:
+            logger.warning("outlook_calibration: daily_pnl fetch failed: %s", e)
+            return {"samples": [], "n": 0}
+        pnl_by_date = {r["date"]: r.get("daily_return_pct") for r in (pnl_rows or [])}
+
+        from datetime import date as _date, timedelta as _td
+        samples: list[dict] = []
+        for ins in insights:
+            pred_date_str = ins.get("date")
+            if not pred_date_str:
+                continue
+            try:
+                pred_date = _date.fromisoformat(pred_date_str)
+            except ValueError:
+                continue
+            # tomorrow_bias written on day D predicts day D+1's direction.
+            # But "D+1" has to be a trading day — so we find the NEXT daily_pnl
+            # row after pred_date. Simplest: try +1, +2, +3 days until hit.
+            actual = None
+            for delta in (1, 2, 3, 4):
+                cand = str(pred_date + _td(days=delta))
+                if cand in pnl_by_date:
+                    actual = pnl_by_date[cand]
+                    break
+            if actual is None:
+                continue
+
+            bias = (ins.get("tomorrow_bias") or "neutral").lower()
+            conv = (ins.get("tomorrow_conviction") or "medium").lower()
+            # Match rule:
+            NEUTRAL_BAND = 0.3
+            if bias == "bullish":
+                matched = actual > NEUTRAL_BAND
+            elif bias == "bearish":
+                matched = actual < -NEUTRAL_BAND
+            else:  # neutral
+                matched = -NEUTRAL_BAND <= actual <= NEUTRAL_BAND
+            samples.append({
+                "date": pred_date_str,
+                "predicted_bias": bias,
+                "predicted_conviction": conv,
+                "actual_return_pct": round(actual, 2),
+                "matched": bool(matched),
+            })
+            if len(samples) >= lookback:
+                break
+
+        n = len(samples)
+        def _rate(filter_fn):
+            eligible = [s for s in samples if filter_fn(s)]
+            if not eligible:
+                return None
+            return round(100 * sum(1 for s in eligible if s["matched"]) / len(eligible), 1)
+
+        return {
+            "samples": samples,
+            "n": n,
+            "overall_hit_rate_pct": _rate(lambda s: True),
+            "bullish_hit_rate_pct": _rate(lambda s: s["predicted_bias"] == "bullish"),
+            "bearish_hit_rate_pct": _rate(lambda s: s["predicted_bias"] == "bearish"),
+            "neutral_hit_rate_pct": _rate(lambda s: s["predicted_bias"] == "neutral"),
+            "high_conviction_hit_rate_pct": _rate(lambda s: s["predicted_conviction"] == "high"),
+            "low_conviction_hit_rate_pct": _rate(lambda s: s["predicted_conviction"] == "low"),
+        }
+
     @staticmethod
     def _actualize_trade_row(row: dict) -> dict:
         """Prefer broker-confirmed execution details when present."""
@@ -2522,6 +2677,18 @@ class TradingPipeline:
             lookback_days=2,
             symbols_bars=ctx.symbols_bars,  # empty for evening (no tech fetch) — OK, we use broker price
         )
+        # v2: mirror SELL grading with BUY grading. Entry quality feedback loop.
+        recent_buys = self._build_recent_buys_for_grading(
+            lookback_days=5, symbols_bars=ctx.symbols_bars,
+        )
+        # v2: meta-calibration — evening sees its own recent tomorrow_bias vs
+        # actual outcomes so it can detect "I've been too bullish 7/10 days".
+        outlook_calibration = self._build_recent_outlook_calibration(lookback=10)
+        # v2: share the PM's 7-day narrative + 14-day active state-change
+        # memory so evening doesn't drift from or repeat its own previous
+        # language unchecked.
+        weekly_narrative = self._build_weekly_narrative()
+        active_state_changes = self._build_active_state_changes()
 
         analysis, ev_result = self.evening_analyst.analyze(
             positions=positions,
@@ -2532,8 +2699,12 @@ class TradingPipeline:
             today_trades=today_trades,
             prior_outlook=prior_outlook,
             recent_sells=recent_sells,
+            recent_buys=recent_buys,
             news_intel=evening_news,
             earnings_analyses=evening_earnings,
+            weekly_narrative=weekly_narrative,
+            active_state_changes=active_state_changes,
+            outlook_calibration=outlook_calibration,
         )
 
         self.db.insert_agent_log(

@@ -629,10 +629,83 @@ class PositionReview(BaseModel):
     risk_level: Literal["low", "moderate", "elevated", "high"]
 
 
+class EveningReasoningChain(BaseModel):
+    """Six-step chain evening analyst must fill before emitting the report.
+
+    Parallel to morning PM's 7-step and position_reviewer's 6-step chains.
+    Empty strings fail validation — the agent cannot skip a step. Gives
+    evening the same thought-depth structure as other LLM agents so its
+    decisions are auditable, not just narrative.
+    """
+    performance_attribution: str = Field(min_length=1)
+    """What drove today's P&L? Which positions contributed + / −, which macro /
+    news factors explain the moves. Concrete, not vague."""
+
+    outlook_retrospection: str = Field(min_length=1)
+    """Honest grade of yesterday's tomorrow_outlook vs today's actual. If
+    yesterday said bullish and today ripped down, say so. Calibration > saving
+    face. Cross-reference specific predictions to specific outcomes."""
+
+    decision_quality_review: str = Field(min_length=1)
+    """BUY / SELL / HOLD decisions today + the last few days. Pattern check:
+    are you selling winners too early? Buying near tops? Hedging at the wrong
+    time? Name the pattern if one exists."""
+
+    calibration_meta: str = Field(min_length=1)
+    """Zoom out on your recent bias / conviction track record (surfaced in the
+    prompt). Are you systematically too bullish? Does HIGH conviction actually
+    outperform LOW? This is the meta-loop — learning from your own accuracy
+    not just yesterday's single call."""
+
+    market_regime_read: str = Field(min_length=1)
+    """Where is the market now, where's it going, what's the key evidence from
+    today's tape + news. This is the foundation the tomorrow_bias rests on."""
+
+    tomorrow_preparation: str = Field(min_length=1)
+    """Key events tomorrow (earnings, econ data, Fed), levels to watch, how
+    today's action shapes tomorrow's posture. What PM needs to know at 09:30."""
+
+
+class SellGrade(BaseModel):
+    """Structured grade of a single recent SELL — what evening judged right or
+    wrong. PM / position reviewer can read aggregate counts to feed back into
+    their SELL discretion."""
+    symbol: str
+    sell_date: str   # "YYYY-MM-DD"
+    sell_price: float
+    current_price: float
+    pct_move_since_sell: float
+    grade: Literal["correct", "premature", "wrong"]
+    reason: str = Field(min_length=1)
+
+    @field_validator("symbol")
+    @classmethod
+    def _sym(cls, v: str) -> str:
+        return _normalize_symbol(v)
+
+
+class BuyGrade(BaseModel):
+    """Structured grade of a recent BUY — did the entry play out?
+    Mirrors SellGrade so the feedback loop is symmetric."""
+    symbol: str
+    buy_date: str
+    buy_price: float
+    current_price: float
+    pct_move_since_buy: float
+    grade: Literal["correct", "premature", "wrong"]
+    reason: str = Field(min_length=1)
+
+    @field_validator("symbol")
+    @classmethod
+    def _sym(cls, v: str) -> str:
+        return _normalize_symbol(v)
+
+
 class EveningReport(BaseModel):
-    daily_summary: str
-    lessons: str
-    tomorrow_outlook: str  # prose; retained for evening narrative + PM context
+    reasoning_chain: EveningReasoningChain
+    daily_summary: str = Field(min_length=1)
+    lessons: str = Field(min_length=1)
+    tomorrow_outlook: str = Field(min_length=1)  # prose narrative for PM context
     risk_rating: Literal["low", "moderate", "elevated", "high"]
     suggested_actions: list[str] = []
     # Outlook-vs-reality retrospection — was yesterday's tomorrow_outlook right?
@@ -643,11 +716,16 @@ class EveningReport(BaseModel):
     tomorrow_bias: Literal["bullish", "neutral", "bearish"] = "neutral"
     tomorrow_conviction: Literal["high", "medium", "low"] = "medium"
     tomorrow_key_risks: list[str] = []
-    # SELL discipline feedback loop. Evening grades each recent SELL against
-    # what actually happened to the stock afterwards. Pure-prose field so the
-    # LLM can reference specific trades and the "should we have sold" judgment;
-    # PM doesn't consume it directly but EveningAnalyst logs it for learning.
+    # SELL discipline feedback loop — prose summary retained for narrative
+    # continuity + backward compat.
     sell_decisions_assessment: str = ""
+    # Structured per-trade grades. PM / position reviewer can compute aggregate
+    # stats ("last 14d: correct 5 / premature 3 / wrong 1") from these without
+    # parsing prose. Empty list = no grades this session (no recent trades or
+    # LLM skipped). Both lists are filled by the LLM from the `recent_*`
+    # tables surfaced in the prompt.
+    sell_grades: list[SellGrade] = []
+    buy_grades: list[BuyGrade] = []
 
 
 class AgentLog(BaseModel):
