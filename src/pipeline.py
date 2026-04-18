@@ -882,6 +882,43 @@ class TradingPipeline:
             )
         return orders
 
+    def _wait_for_midday_auto_tp_orders(self, auto_tp_orders: list[dict]) -> set[str]:
+        """Wait briefly for midday auto take-profit sells and return symbols still in flight."""
+        pending_symbols: set[str] = set()
+        terminal_states = {
+            "filled",
+            "canceled",
+            "cancelled",
+            "expired",
+            "rejected",
+            "done_for_day",
+            "replaced",
+        }
+        for order in auto_tp_orders:
+            symbol = (order.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            order_id = order.get("id")
+            status = str(order.get("status") or "").lower()
+            if order_id:
+                try:
+                    polled = self.broker.wait_for_order_terminal(order_id)
+                    if polled:
+                        status = str(polled).lower()
+                except Exception as e:
+                    logger.warning(
+                        "Midday auto-TP wait failed for %s (%s): %s",
+                        symbol, order_id, e,
+                    )
+            if status not in terminal_states:
+                pending_symbols.add(symbol)
+        if pending_symbols:
+            logger.info(
+                "Midday: blocking same-symbol LLM exits while auto take-profit is still in flight: %s",
+                ", ".join(sorted(pending_symbols)),
+            )
+        return pending_symbols
+
     def _build_rm_recent_verdicts(self, limit: int = 5) -> str:
         """How RM has been judging PM's output over the last N sessions.
 
@@ -1565,15 +1602,21 @@ class TradingPipeline:
         return orders
 
     def _midday_execute_llm_actions(
-        self, positions, review, run_id: str,
+        self, positions, review, run_id: str, blocked_symbols: set[str] | None = None,
     ) -> list[dict]:
         """Dispatch LLM-recommended SELL / REDUCE / TRAIL_STOP actions to broker.
 
         Dedups same-symbol conflicting actions by priority (SELL > REDUCE >
         TRAIL_STOP > HOLD) to avoid the broker seeing two orders fighting
-        each other on one position.
+        each other on one position. `blocked_symbols` lets midday suppress
+        LLM exits for symbols that already have an in-flight system sell order.
         """
         orders: list[dict] = []
+        blocked = {
+            symbol.strip().upper()
+            for symbol in (blocked_symbols or set())
+            if symbol and symbol.strip()
+        }
         _priority = {"SELL": 0, "REDUCE": 1, "TRAIL_STOP": 2, "HOLD": 3}
         best_by_symbol: dict[str, dict] = {}
         actions_raw = review.actions if review else []
@@ -1600,6 +1643,12 @@ class TradingPipeline:
             if act not in ("SELL", "REDUCE", "TRAIL_STOP"):
                 continue
             symbol = action_item.get("symbol", "")
+            if symbol in blocked:
+                logger.info(
+                    "Midday: skipping %s %s — auto take-profit sell still in flight",
+                    act, symbol,
+                )
+                continue
             existing = [p for p in positions if p.symbol == symbol]
             if not existing or existing[0].qty <= 0:
                 logger.warning("Midday: skipping %s %s — no matching position",
@@ -1794,9 +1843,21 @@ class TradingPipeline:
         # review so midday_reviewer sees the trimmed position and doesn't
         # double-sell.
         auto_tp_orders = self._auto_take_profit(positions, run_id)
+        blocked_midday_symbols: set[str] = set()
         if auto_tp_orders:
-            # Refresh positions after take-profit so downstream review is accurate
+            blocked_midday_symbols = self._wait_for_midday_auto_tp_orders(auto_tp_orders)
+            # Refresh account + positions after the auto-TP phase so downstream
+            # review uses post-trim broker truth, not the stale pre-trim snapshot.
+            account = self.broker.get_account()
             positions = self.broker.get_positions()
+            cash = account["cash"]
+            total_value = account["portfolio_value"]
+            last_equity = account.get("last_equity", total_value)
+            ctx.account = account
+            ctx.positions = positions
+            ctx.cash = cash
+            ctx.total_value = total_value
+            ctx.last_equity = last_equity
             self.db.sync_positions(positions)
 
         # 1b. Ex-dividend stop adjustment. For any held position with ex-div
@@ -1849,7 +1910,7 @@ class TradingPipeline:
                 ))
             else:
                 orders.extend(self._midday_execute_llm_actions(
-                    positions, review, run_id,
+                    positions, review, run_id, blocked_symbols=blocked_midday_symbols,
                 ))
 
         logger.info("Midday: %d positions, risk=%s, %d orders",

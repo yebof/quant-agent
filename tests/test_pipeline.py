@@ -491,6 +491,53 @@ def test_pipeline_midday_fetches_only_executed_morning_trades():
     )
 
 
+def test_pipeline_midday_blocks_llm_sells_while_auto_take_profit_pending():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.get_account.side_effect = [
+        {"cash": 1000.0, "portfolio_value": 5000.0},
+        {"cash": 1200.0, "portfolio_value": 5050.0},
+    ]
+    position = Position(
+        symbol="SPY", qty=10.0, avg_entry=500.0, current_price=505.0,
+        market_value=5050.0, unrealized_pnl=50.0, sector="ETF",
+    )
+    pipeline.broker.get_positions.side_effect = [[position], [position]]
+    pipeline.broker.wait_for_order_terminal.return_value = "accepted"
+    pipeline.macro = MagicMock()
+    pipeline.macro.get_macro_summary.return_value = {}
+    pipeline.db = MagicMock()
+    pipeline.db.get_trades.return_value = []
+    pipeline.config = MagicMock()
+    pipeline.config.llm.midday_reviewer_model = "test-model"
+    pipeline._auto_take_profit = MagicMock(return_value=[
+        {"id": "tp-1", "status": "accepted", "symbol": "SPY"}
+    ])
+    pipeline._handle_ex_dividends = MagicMock(return_value=[])
+    pipeline._run_news_update = MagicMock(return_value=None)
+    pipeline._load_earnings_analyses = MagicMock(return_value=(None, []))
+    pipeline._wait_bg_threads = MagicMock()
+    pipeline._reconcile_fills = MagicMock()
+    pipeline.risk_engine = MagicMock()
+    pipeline.risk_engine.check_daily_loss.return_value = None
+    pipeline.midday_reviewer = MagicMock()
+    pipeline.midday_reviewer.review.return_value = (
+        MiddayReview(
+            actions=[{"action": "SELL", "symbol": "SPY", "reason": "cut it"}],
+            overall_assessment="take the win",
+            risk_level="moderate",
+        ),
+        _mock_agent_result(),
+    )
+
+    result = pipeline.run_midday()
+
+    assert result["status"] == "reviewed"
+    pipeline.broker.wait_for_order_terminal.assert_called_once_with("tp-1")
+    pipeline.broker.submit_order.assert_not_called()
+
+
 def test_pipeline_evening_skips_non_trading_day():
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.broker = MagicMock()

@@ -192,6 +192,9 @@ def test_replace_stop_loss_cancels_old_and_submits_new(mock_tc_cls):
     old_stop.id = "old-stop"
     old_stop.order_type = "stop"
     old_stop.side = "sell"
+    old_stop.qty = "10"
+    old_stop.stop_price = "185.0"
+    old_stop.limit_price = "179.45"
 
     buy_order = MagicMock()
     buy_order.id = "some-buy"
@@ -218,6 +221,36 @@ def test_replace_stop_loss_cancels_old_and_submits_new(mock_tc_cls):
     # The old stop must be cancelled, the buy order untouched.
     mock_client.cancel_order_by_id.assert_called_once_with("old-stop")
     mock_client.submit_order.assert_called_once()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_restores_old_protection_if_new_submit_fails(mock_tc_cls):
+    old_stop = MagicMock()
+    old_stop.id = "old-stop"
+    old_stop.order_type = "stop"
+    old_stop.side = "sell"
+    old_stop.qty = "10"
+    old_stop.stop_price = "185.0"
+    old_stop.limit_price = "179.45"
+
+    restored_order = MagicMock()
+    restored_order.id = "restored-stop"
+    restored_order.status = "accepted"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.side_effect = [[old_stop], []]
+    mock_client.submit_order.side_effect = [RuntimeError("submit failed"), restored_order]
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("NVDA", 10, 180.0, 200.0, 2000.0, 200.0),
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.replace_stop_loss("NVDA", 192.0)
+
+    assert result is None
+    mock_client.cancel_order_by_id.assert_called_once_with("old-stop")
+    assert mock_client.submit_order.call_count == 2
 
 
 @patch("src.execution.broker.TradingClient")
