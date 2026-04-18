@@ -29,7 +29,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 - **反向 ETF**（SH/SDS/PSQ/SQQQ）用**签名乘数**算净敞口（对冲相消），**abs 乘数**算单仓/板块上限。`src/risk/rules.py:_effective_multiplier` vs `_gross_multiplier`
 - **日 P&L** = `broker.equity - broker.last_equity`（含已实现 fill，包括 broker 触发的 OTO 止损）；熔断基准永远是 `last_equity`，**不是**昨晚 DB 里的快照
 - **SELL `allocation_pct`** 约定：`100` = 全卖，`1-99` = 部分，`0` = 跳过（**不要再用 0 表示全卖**）；pipeline 会 warning 然后 skip
-- **现金 / 保证金**：`RiskConfig.allow_margin` 默认 `false`，意味着 BUY 不能透支现金（硬规则 `cash_only` in `HARD_BLOCK_RULES`）。Filter 会先汇总当次 session 的 SELL proceeds 再判断 BUY 能否吃现金，所以合法的 SELL→BUY 轮换不会误杀。已经欠保证金（`cash<0`）时 PM/midday prompt 会带 **DE-LEVER MANDATE** 强制先 SELL 到 `cash≥0`。允许保证金请显式改 `allow_margin: true`
+- **现金 / 保证金**：`RiskConfig.allow_margin` 默认 `false`。三层防护：(1) 硬规则 `cash_only` 拦新 BUY 透支现金（filter 先汇总同 session SELL proceeds 避免误杀轮换）；(2) `_force_delever()` — session 开头 cash<-$1 时**自动按 biggest-loser-first 强卖**到 cash≥0，不依赖 LLM 判断，morning/midday 都跑；(3) PM/midday prompt 的 DE-LEVER MANDATE 段是给 LLM 看的 advisory。强卖用 `FORCE_DELEVER` 动作名（calibration + recent_sells 都识别）。允许保证金请显式改 `allow_margin: true`
 
 ### 责任边界
 - Macro 拥有 regime 枚举（risk-on / risk-off / transitional / neutral）的权威；News 的 `current_regime` 只描述新闻/地缘背景，不重复 Macro 的枚举

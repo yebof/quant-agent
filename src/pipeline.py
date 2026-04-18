@@ -1126,7 +1126,7 @@ class TradingPipeline:
             return []
         from datetime import date as _date, timedelta as _td
         cutoff = et_today() - _td(days=lookback_days)
-        sell_actions = ("SELL", "EMERGENCY_SELL")
+        sell_actions = ("SELL", "EMERGENCY_SELL", "FORCE_DELEVER")
         out: list[dict] = []
         for row in all_rows:
             action = row.get("action") or ""
@@ -1717,6 +1717,129 @@ class TradingPipeline:
                 logger.error("Midday order failed for %s: %s", symbol, e)
         return orders
 
+    # Minimum deficit in dollars before force-deleverage fires. Matches the
+    # DE-LEVER MANDATE threshold in the PM / midday prompts so both layers
+    # agree on what counts as "meaningfully on margin" vs rounding noise.
+    _FORCE_DELEVER_FLOOR_USD = 1.0
+
+    def _force_delever(self, ctx: RunContext) -> list[dict]:
+        """Safety net for `allow_margin=False` accounts.
+
+        When cash is meaningfully negative at session start we do NOT trust
+        the LLM to pick which positions to cut — we force-sell biggest-loser
+        first (most negative unrealized P&L, largest size as tiebreaker)
+        until projected cash is ≥ 0. This runs BEFORE any decision / review
+        stage, so the rest of the session operates on a clean, cash-only
+        snapshot.
+
+        Rationale: the DE-LEVER MANDATE in the PM / midday prompts is
+        advisory — if the LLM emits only HOLDs, margin sits. Users who opt
+        in to `allow_margin=False` want structural enforcement, not an LLM
+        nudge. Speed and safety > LLM judgment here.
+
+        Sell limit uses a 1% below-market buffer (same as
+        `_midday_emergency_liquidate`) because we prioritize fill over price
+        when clearing an unintended margin position.
+
+        Returns the submitted orders list (empty when no de-lever is needed).
+        ctx.cash / positions / total_value are refreshed from broker after
+        fills so downstream stages see truth.
+        """
+        # `config` may be missing in tests that bypass __init__ via
+        # TradingPipeline.__new__. Treat that as "not configured for cash-only
+        # policy" and skip — the full-init pipeline always has config.
+        risk_cfg = getattr(getattr(self, "config", None), "risk", None)
+        if risk_cfg is None or bool(getattr(risk_cfg, "allow_margin", False)):
+            return []
+        if ctx.cash >= -self._FORCE_DELEVER_FLOOR_USD:
+            return []
+
+        deficit = -ctx.cash
+        logger.warning(
+            "FORCE DE-LEVER: cash=$%.2f, deficit=$%.2f — auto-selling to restore "
+            "cash ≥ 0 (allow_margin=False)", ctx.cash, deficit,
+        )
+
+        sellable = [p for p in ctx.positions if p.qty > 0]
+        if not sellable:
+            logger.error(
+                "FORCE DE-LEVER: cash=$%.2f deficit=$%.2f but no long positions "
+                "to sell — account stuck on margin until cash arrives externally",
+                ctx.cash, deficit,
+            )
+            return []
+
+        # Biggest loser first (most negative unrealized_pnl); larger positions
+        # first as a tiebreaker to clear the deficit in fewer orders.
+        targets = sorted(sellable, key=lambda p: (p.unrealized_pnl, -p.market_value))
+
+        orders: list[dict] = []
+        projected_proceeds = 0.0
+        for p in targets:
+            if projected_proceeds >= deficit:
+                break
+            qty = self._full_sell_qty(p.qty)
+            if qty is None:
+                continue
+            sell_limit = round(p.current_price * 0.99, 2)
+            try:
+                order = self.broker.submit_order(
+                    symbol=p.symbol, qty=qty, side="sell",
+                    limit_price=sell_limit,
+                    reference_price=p.current_price,
+                )
+                if not self._order_accepted(order, p.symbol, "sell"):
+                    continue
+                self.db.insert_trade(
+                    symbol=p.symbol, action="FORCE_DELEVER", qty=qty,
+                    price=p.current_price,
+                    reasoning=(
+                        f"cash-only auto de-lever: session opened with "
+                        f"cash=${ctx.cash:.2f} (deficit ${deficit:.2f}); "
+                        f"biggest-loser-first sweep"
+                    ),
+                    run_id=ctx.run_id,
+                    broker_order_id=order.get("id"),
+                    fill_status="submitted",
+                )
+                orders.append(order)
+                # Conservative estimate: market × 0.99 (matches our limit).
+                projected_proceeds += p.market_value * 0.99
+                logger.info(
+                    "FORCE DE-LEVER SELL %s qty=%s @ limit=$%.2f "
+                    "(unrealized_pnl=$%.2f, mkt_value=$%.2f)",
+                    p.symbol, self._format_qty(qty), sell_limit,
+                    p.unrealized_pnl, p.market_value,
+                )
+            except Exception as e:
+                logger.error("FORCE DE-LEVER SELL %s failed: %s", p.symbol, e)
+
+        # Block the session until fills land so the post-refresh cash is real.
+        for o in orders:
+            oid = o.get("id")
+            if oid:
+                try:
+                    self.broker.wait_for_order_terminal(oid)
+                except Exception as e:
+                    logger.warning("FORCE DE-LEVER: wait failed for %s: %s", oid, e)
+
+        # Refresh ctx so downstream stages see post-sell truth.
+        try:
+            account = self.broker.get_account()
+            ctx.positions = self.broker.get_positions()
+            ctx.cash = account["cash"]
+            ctx.total_value = account["portfolio_value"]
+            ctx.last_equity = account.get("last_equity", ctx.total_value)
+            logger.info(
+                "FORCE DE-LEVER complete: %d orders, post-refresh cash=$%.2f, "
+                "positions=%d",
+                len(orders), ctx.cash, len(ctx.positions),
+            )
+        except Exception as e:
+            logger.error("FORCE DE-LEVER: broker refresh failed: %s", e)
+
+        return orders
+
     def _execution_stage(self, ctx: RunContext) -> list[dict]:
         """Delegates to ExecutionStage (class lives in pipeline_stages.py)."""
         return self.execution_stage.run(ctx)
@@ -1755,6 +1878,11 @@ class TradingPipeline:
             ctx.last_equity = last_equity
             logger.info("Account: $%.2f total, $%.2f cash, %d positions (last close $%.2f)",
                          total_value, cash, len(positions), last_equity)
+
+            # 1a. Cash-only safety net — force-sell if margin was entered before
+            # this session. Refreshes ctx.cash / positions on completion, so
+            # every stage below runs on clean truth.
+            self._force_delever(ctx)
 
             # Phase 4 #1: research stage runs the parallel fan-out (macro / news /
             # tech / earnings). Populates ctx fields; we unpack to local names so
@@ -1822,7 +1950,17 @@ class TradingPipeline:
         # Replace the positions snapshot (drops rows for symbols no longer held).
         self.db.sync_positions(positions)
 
-        # 1a. Auto take-profit on winners. Any position up ≥ 15% that hasn't
+        # 1a. Cash-only safety net — force-sell before any other logic if the
+        # account drifted into margin between morning and midday (fill
+        # rounding, dividend timing, etc). Refreshes ctx.cash / positions /
+        # total_value on completion; we re-bind the local names below.
+        self._force_delever(ctx)
+        positions = ctx.positions
+        cash = ctx.cash
+        total_value = ctx.total_value
+        last_equity = ctx.last_equity
+
+        # 1b. Auto take-profit on winners. Any position up ≥ 15% that hasn't
         # already had a take-profit this holding → sell 33%. Locks in partial
         # gains before winners give back in a pullback. Runs before the LLM
         # review so midday_reviewer sees the trimmed position and doesn't
