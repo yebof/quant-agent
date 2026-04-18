@@ -210,8 +210,9 @@ class Database:
           - 'filled'     — broker confirmed execution (full or partial)
           - 'canceled' / 'rejected' / 'expired' / 'done_for_day' — terminal broker
                            status; may still carry fill_qty/fill_price for partial fills
-          - None         — pre-reconciliation / system row (HOLD, TRAIL_STOP, TAKE_PROFIT).
-                           Legacy rows also carry None and are treated as filled by memory readers.
+          - None         — legacy row or non-executed audit row (currently HOLD).
+                           Legacy BUY/SELL rows still count as executed for back-compat;
+                           synthetic HOLD rows are explicitly excluded from executed_only.
         """
         with self._lock:
             cur = self.conn.execute(
@@ -265,7 +266,7 @@ class Database:
     def _executed_trade_predicate() -> str:
         """SQL predicate for trades that executed at least some quantity."""
         return (
-            "(fill_status IS NULL OR fill_status = 'filled' "
+            "((fill_status IS NULL AND action != 'HOLD') OR fill_status = 'filled' "
             "OR COALESCE(fill_qty, 0) > 0)"
         )
 

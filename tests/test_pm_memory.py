@@ -390,6 +390,50 @@ def test_auto_take_profit_triggers_once_at_15pct(tmp_path):
     pipeline.broker.submit_order.assert_not_called()
 
 
+def test_auto_take_profit_retries_after_canceled_zero_fill(tmp_path):
+    """A canceled trim with zero fill must not block future auto-TP attempts."""
+    from unittest.mock import MagicMock
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    db.insert_trade("NVDA", "BUY", 100, 100.0, "opened", "r1")
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline.broker.submit_order.return_value = {
+        "id": "tp-1", "status": "accepted", "symbol": "NVDA",
+    }
+
+    winner = Position(
+        symbol="NVDA", qty=100, avg_entry=100, current_price=118,
+        market_value=11800, unrealized_pnl=1800, sector="Technology",
+    )
+
+    orders_1 = pipeline._auto_take_profit([winner], run_id="r2")
+    assert len(orders_1) == 1
+
+    db.update_trade_fill(
+        broker_order_id="tp-1",
+        fill_status="canceled",
+        fill_qty=0.0,
+        fill_price=0.0,
+    )
+
+    pipeline.broker.submit_order.reset_mock()
+    pipeline.broker.submit_order.return_value = {
+        "id": "tp-2", "status": "accepted", "symbol": "NVDA",
+    }
+    orders_2 = pipeline._auto_take_profit([winner], run_id="r3")
+
+    assert len(orders_2) == 1
+    kw = pipeline.broker.submit_order.call_args.kwargs
+    assert kw["symbol"] == "NVDA"
+    assert kw["qty"] == 33
+
+
 def test_vol_adjusted_sizing_caps_qty_on_wide_stops():
     """SQQQ-style wide-stop name gets fewer shares than raw allocation would suggest.
 

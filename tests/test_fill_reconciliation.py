@@ -89,6 +89,27 @@ def test_legacy_null_fill_status_treated_as_filled(tmp_path):
     assert row["fill_status"] is None
 
 
+def test_executed_only_excludes_hold_audit_rows(tmp_path):
+    """Synthetic HOLD rows must not show up as executed trades."""
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    db.insert_trade(
+        symbol="AAPL", action="HOLD", qty=0.0, price=0.0,
+        reasoning="audit only", run_id="r1",
+    )
+    db.insert_trade(
+        symbol="AAPL", action="BUY", qty=10.0, price=180.0,
+        reasoning="filled buy", run_id="r1",
+        broker_order_id="ord-buy", fill_status="filled",
+    )
+
+    rows = db.get_trades(symbol="AAPL", executed_only=True)
+
+    assert len(rows) == 1
+    assert rows[0]["action"] == "BUY"
+
+
 def test_reconcile_fills_updates_filled_orders(tmp_path):
     """_reconcile_fills pulls submitted orders, asks broker, updates DB."""
     from src.pipeline_context import RunContext

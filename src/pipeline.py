@@ -188,6 +188,24 @@ class TradingPipeline:
             return max(1.0, float(int(position_qty) // 2))
         return float(position_qty) / 2
 
+    @staticmethod
+    def _trade_executed_or_pending(trade: dict) -> bool:
+        """True when a trade either executed or is still an open live attempt.
+
+        Used for idempotence checks on system-generated orders like
+        TAKE_PROFIT: a pending submitted trim should block a duplicate order,
+        but a canceled/rejected/expired zero-fill should not.
+        """
+        status = str(trade.get("fill_status") or "").lower()
+        if not status:
+            return True
+        if status in {"submitted", "filled"}:
+            return True
+        try:
+            return float(trade.get("fill_qty") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
     def _filter_supported_symbols(
         self,
         decisions: list[TradeDecision],
@@ -803,7 +821,10 @@ class TradingPipeline:
             # and check for TAKE_PROFIT rows AFTER it.
             recent_buy_idx = None
             for i, t in enumerate(sym_trades):
-                if (t.get("action") or "").upper() == "BUY":
+                if (
+                    (t.get("action") or "").upper() == "BUY"
+                    and self._trade_executed_or_pending(t)
+                ):
                     recent_buy_idx = i
                     break
             if recent_buy_idx is None:
@@ -812,6 +833,7 @@ class TradingPipeline:
                 continue
             already_tp = any(
                 (t.get("action") or "").upper() == "TAKE_PROFIT"
+                and self._trade_executed_or_pending(t)
                 for t in sym_trades[:recent_buy_idx]
             )
             if already_tp:
@@ -1895,6 +1917,18 @@ class TradingPipeline:
                     logger.error("record_failure failed for %s: %s", r.symbol, re)
             return {"status": "analysis_error", "run_id": run_id, "error": str(e)}
 
+        successful_symbols = {
+            res["symbol"]
+            for res in results
+            if res.get("is_new")
+        }
+        failed_reports = [r for r in new_reports if r.symbol not in successful_symbols]
+        for report in failed_reports:
+            try:
+                self.earnings_provider.record_failure(report)
+            except Exception as re:
+                logger.error("record_failure failed for %s: %s", report.symbol, re)
+
         # Log each LLM call (parity with the inline bg-thread path).
         analyzed_count = 0
         for res in results:
@@ -1933,14 +1967,15 @@ class TradingPipeline:
                     logger.warning("confirm_filing failed for %s: %s", r.symbol, e)
 
         logger.info(
-            "Earnings preprocess complete: %d analyzed, %d confirmed",
-            analyzed_count, confirmed,
+            "Earnings preprocess complete: %d analyzed, %d confirmed, %d failed",
+            analyzed_count, confirmed, len(failed_reports),
         )
         return {
             "status": "preprocessed",
             "run_id": run_id,
             "analyzed": analyzed_count,
             "confirmed": confirmed,
+            "failed": len(failed_reports),
         }
 
     def run_intra_check(self) -> dict:
