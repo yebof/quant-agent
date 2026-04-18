@@ -63,10 +63,21 @@ fi
 LAST_FILE="${LAST_RUN_DIR}/last-${MODE}"
 NOW_UNIX="${NOW_UNIX_OVERRIDE:-$(date +%s)}"
 if [[ -f "$LAST_FILE" ]]; then
-    LAST_UNIX=$(cat "$LAST_FILE" 2>/dev/null || echo 0)
-    GAP=$((NOW_UNIX - LAST_UNIX))
-    if [[ "$GAP" -lt "$MIN_GAP_SEC" ]]; then
+    LAST_VALUE="$(cat "$LAST_FILE" 2>/dev/null || echo 0)"
+    LAST_DATE="${LAST_VALUE%% *}"
+    # Primary guard: never fire the same mode twice in the same ET session date.
+    # This is stricter than a simple min-gap and matches the once-per-session
+    # contract for morning/midday/evening/preprocess windows.
+    if [[ "$LAST_DATE" == "$ET_DATE" ]]; then
         exit 0
+    fi
+
+    # Legacy compatibility: old guard files stored just a unix timestamp.
+    if [[ "$LAST_VALUE" =~ ^[0-9]+$ ]]; then
+        GAP=$((NOW_UNIX - LAST_VALUE))
+        if [[ "$GAP" -lt "$MIN_GAP_SEC" ]]; then
+            exit 0
+        fi
     fi
 fi
 
@@ -86,7 +97,7 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
 fi
 
 if "$TIMEOUT" --kill-after=30 600 "$PYTHON" main.py --mode "$MODE"; then
-    echo "$NOW_UNIX" > "$LAST_FILE"
+    echo "${ET_DATE} ${NOW_UNIX}" > "$LAST_FILE"
     exit 0
 else
     STATUS=$?

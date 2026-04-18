@@ -102,6 +102,43 @@ def test_preprocess_records_failures_on_llm_error(tmp_path):
     earnings_provider.record_failure.assert_called_once_with(new_filing)
 
 
+def test_preprocess_records_per_filing_validation_failures(tmp_path):
+    """A silently dropped filing still consumes retry budget and is not confirmed."""
+    good = EarningsReport(
+        symbol="NVDA", form_type="10-Q", filing_date="2026-04-20",
+        filing_path="/tmp/nvda.html", analysis_path="/tmp/nvda.md",
+        text_excerpt="...", is_new=True,
+    )
+    bad = EarningsReport(
+        symbol="AAPL", form_type="10-K", filing_date="2026-04-20",
+        filing_path="/tmp/aapl.html", analysis_path="/tmp/aapl.md",
+        text_excerpt="...", is_new=True,
+    )
+    earnings_provider = MagicMock()
+    earnings_provider.check_and_fetch.return_value = [good, bad]
+
+    earnings_analyst = MagicMock()
+    agent_result = AgentResult(raw_text="{}", tokens_used=50, model="test", user_message="x")
+    earnings_analyst.analyze_reports.return_value = [{
+        "symbol": "NVDA",
+        "is_new": True,
+        "form_type": "10-Q",
+        "filing_date": "2026-04-20",
+        "agent_result": agent_result,
+        "analysis": {"investment_implications": {"sentiment": "bullish", "conviction": "high"}},
+    }]
+
+    pipeline = _mk_pipeline(tmp_path, earnings_provider, earnings_analyst)
+    result = pipeline.run_earnings_preprocess()
+
+    assert result["status"] == "preprocessed"
+    assert result["analyzed"] == 1
+    assert result["confirmed"] == 1
+    assert result["failed"] == 1
+    earnings_provider.confirm_filing.assert_called_once_with(good)
+    earnings_provider.record_failure.assert_called_once_with(bad)
+
+
 def test_load_earnings_analyses_never_confirms_or_spawns_threads(tmp_path):
     """Hot-path invariant: `_load_earnings_analyses` is read-only.
 
