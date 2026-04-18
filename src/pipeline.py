@@ -269,7 +269,13 @@ class TradingPipeline:
                 held = next((p for p in positions if p.symbol == d.symbol), None)
                 if held is None or held.qty <= 0:
                     continue
-                frac = 1.0 if d.allocation_pct >= 100 or d.allocation_pct <= 0 else d.allocation_pct / 100.0
+                # CLAUDE.md convention: allocation_pct=0 means SKIP (not full sell).
+                # Execution stage skips the order; filter must match or we'd
+                # credit phantom SELL proceeds to the BUY cash budget, allowing
+                # a BUY that actually draws margin at execution time.
+                if d.allocation_pct <= 0:
+                    continue
+                frac = 1.0 if d.allocation_pct >= 100 else d.allocation_pct / 100.0
                 sell_proceeds += held.market_value * frac
         effective_cash = None if cash is None else cash + sell_proceeds
 
@@ -1877,11 +1883,6 @@ class TradingPipeline:
                 logger.error("Midday order failed for %s: %s", symbol, e)
         return orders
 
-    # Minimum deficit in dollars before force-deleverage fires. Matches the
-    # DE-LEVER MANDATE threshold in the PM / midday prompts so both layers
-    # agree on what counts as "meaningfully on margin" vs rounding noise.
-    _FORCE_DELEVER_FLOOR_USD = 1.0
-
     def _force_delever(self, ctx: RunContext) -> list[dict]:
         """Safety net for `allow_margin=False` accounts.
 
@@ -1911,7 +1912,8 @@ class TradingPipeline:
         risk_cfg = getattr(getattr(self, "config", None), "risk", None)
         if risk_cfg is None or bool(getattr(risk_cfg, "allow_margin", False)):
             return []
-        if ctx.cash >= -self._FORCE_DELEVER_FLOOR_USD:
+        from src.risk.constants import MARGIN_DEFICIT_FLOOR_USD
+        if ctx.cash >= -MARGIN_DEFICIT_FLOOR_USD:
             return []
 
         deficit = -ctx.cash
@@ -1930,8 +1932,13 @@ class TradingPipeline:
             return []
 
         # Biggest loser first (most negative unrealized_pnl); larger positions
-        # first as a tiebreaker to clear the deficit in fewer orders.
-        targets = sorted(sellable, key=lambda p: (p.unrealized_pnl, -p.market_value))
+        # first as a tiebreaker to clear the deficit in fewer orders; symbol
+        # alphabetical as a final tiebreaker so two positions with identical
+        # P&L + market_value (rare but possible) pick a deterministic winner.
+        targets = sorted(
+            sellable,
+            key=lambda p: (p.unrealized_pnl, -p.market_value, p.symbol),
+        )
 
         orders: list[dict] = []
         projected_proceeds = 0.0
