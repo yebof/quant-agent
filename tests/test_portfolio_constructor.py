@@ -144,6 +144,28 @@ def test_construct_orders_orders_sells_before_buys():
     assert decisions[1].symbol == "NVDA"
 
 
+def test_construct_orders_orders_buys_by_weight_descending():
+    """BUYs should be prioritized by larger target weight under cash rationing."""
+    constructor = PortfolioConstructor()
+    targets = [
+        TargetPosition(symbol="AAPL", target_weight_pct=3.0,
+                       conviction="medium", thesis="smaller"),
+        TargetPosition(symbol="NVDA", target_weight_pct=8.0,
+                       conviction="high", thesis="larger"),
+    ]
+    analyses = [
+        _analysis("AAPL", entry=200, stop=190, target=220),
+        _analysis("NVDA", entry=100, stop=95, target=115),
+    ]
+
+    decisions = constructor.construct_orders(
+        targets=targets, positions=[], analyses=analyses,
+        total_value=100_000, price_map={"AAPL": 200.0, "NVDA": 100.0},
+    )
+
+    assert [d.symbol for d in decisions] == ["NVDA", "AAPL"]
+
+
 def test_construct_orders_uses_suggested_stop_when_provided():
     """PM override: target.suggested_stop_price wins over TA's stop."""
     constructor = PortfolioConstructor()

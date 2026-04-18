@@ -116,6 +116,7 @@ class PortfolioConstructor:
         # weight descending (largest commitments first so cash rationing
         # in a tight-cash session prioritizes highest conviction).
         sells.sort(key=lambda d: 0 if d.allocation_pct >= 100 else 1)
+        buys.sort(key=lambda d: d.allocation_pct, reverse=True)
         return sells + buys
 
     @staticmethod
