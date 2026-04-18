@@ -399,7 +399,9 @@ def test_pipeline_morning_skips_non_trading_day():
     pipeline.broker.cancel_open_entry_orders.assert_not_called()
 
 
-def test_pipeline_morning_early_return_still_cleans_up_background_work():
+def test_pipeline_morning_early_return_still_reconciles_fills():
+    """Even when research returns no analyses (early exit), the morning finally
+    block must still sweep broker fills for any orders that made it out."""
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.broker = MagicMock()
     pipeline.broker.is_trading_day.return_value = True
@@ -407,19 +409,16 @@ def test_pipeline_morning_early_return_still_cleans_up_background_work():
     pipeline.broker.get_account.return_value = {"cash": 1000.0, "portfolio_value": 5000.0}
     pipeline.broker.get_positions.return_value = []
     pipeline.morning_research_stage = MagicMock()
-    pipeline._wait_bg_threads = MagicMock()
     pipeline._reconcile_fills = MagicMock()
 
     def _populate_empty_research(ctx):
         ctx.analyses = []
-        ctx.bg_threads.append(MagicMock())
 
     pipeline.morning_research_stage.run.side_effect = _populate_empty_research
 
     result = pipeline.run_morning()
 
     assert result["status"] == "no_data"
-    pipeline._wait_bg_threads.assert_called_once()
     pipeline._reconcile_fills.assert_called_once()
 
 
@@ -473,7 +472,6 @@ def test_pipeline_midday_fetches_only_executed_morning_trades():
     pipeline._run_news_update = MagicMock(return_value=None)
     pipeline._load_earnings_analyses = MagicMock(return_value=(None, []))
     pipeline._midday_execute_llm_actions = MagicMock(return_value=[])
-    pipeline._wait_bg_threads = MagicMock()
     pipeline._reconcile_fills = MagicMock()
     pipeline.risk_engine = MagicMock()
     pipeline.risk_engine.check_daily_loss.return_value = None
@@ -517,7 +515,6 @@ def test_pipeline_midday_blocks_llm_sells_while_auto_take_profit_pending():
     pipeline._handle_ex_dividends = MagicMock(return_value=[])
     pipeline._run_news_update = MagicMock(return_value=None)
     pipeline._load_earnings_analyses = MagicMock(return_value=(None, []))
-    pipeline._wait_bg_threads = MagicMock()
     pipeline._reconcile_fills = MagicMock()
     pipeline.risk_engine = MagicMock()
     pipeline.risk_engine.check_daily_loss.return_value = None

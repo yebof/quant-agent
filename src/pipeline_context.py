@@ -19,7 +19,6 @@ its own mutable snapshot.
 
 from __future__ import annotations
 
-import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -68,12 +67,6 @@ class RunContext:
 
     # === Populated by execution stage ===
     orders: list[dict] = field(default_factory=list)
-
-    # === Lifecycle — background threads started during this run ===
-    # Earnings analyses are launched in daemon threads and joined before the
-    # run returns. Storing them on the ctx (instead of self._bg_threads)
-    # prevents stale thread references from one run bleeding into the next.
-    bg_threads: list[threading.Thread] = field(default_factory=list)
 
     # === Structured facts for PM — Phase 4 #4 ===
     # Populated at the top of the DecisionStage so PM sees numbers, not
