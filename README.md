@@ -4,58 +4,79 @@ LLM multi-agent quantitative trading system for US equities. 8 specialized AI ag
 
 ## Architecture
 
-```
-Morning (pre-market)
-     │
-     ├─ Cancel stale orders
-     ├─ Check market calendar (skip holidays)
-     │
-     ├─── Parallel Data Fetch ─────────────────────────────┐
-     │  Macro Analyst    News Intelligence    Tech Analyst  │  Earnings
-     │  (FRED: VIX,      (3-layer: narrative  (pre-filtered │  (SEC EDGAR,
-     │   yields, fed)     + state changes      actionable    │   background)
-     │                    + stock alerts)       signals only) │
-     │                                                       │
-     ├─ Load yesterday's evening insights (cross-session memory)
-     │
-     ▼
-  Portfolio Manager (7-step CoT; R/R-weighted sizing; drawdown-aware)
-     │
-     ├─ Symbol Guard (universe + analysis check)
-     ├─ Hard Risk Engine (per-BUY, leverage-adjusted)
-     │     includes advisory violations:
-     │     • macro_exposure_deviation  (>15pp from Macro target)
-     │     • correlation_cluster       (>50% of book in corr>0.7 peers)
-     │     • data_degraded             (>=2 upstream sources failed)
-     ├─ Risk Manager LLM (6-step CoT; R/R veto; scale_all_buys; tech fidelity)
-     │
-     ▼
-  Execute: SELLs first → refresh cash → BUYs
-           (limit orders, auto-raised to market price, tick-size quantized)
-           (OTO bracket: stop-loss only, no hard take-profit)
+Six sessions per trading day (ET, Mon-Fri), launchd-scheduled, with
+their own cadence + scope:
 
-Midday (intraday)
-     │
-     ├─ Sync positions (closed symbols purged)
-     ├─ Load morning trade context (stop/target/reasoning)
-     ▼
-  Position Reviewer (real trailing stop + profit management)
-     │  < 3%  profit → keep original stop
-     │  3-8%  profit → trail to breakeven
-     │  8-15% profit → trail to halfway
-     │  > 15% profit → trail to 70% of move
-     │
-     ├─ Daily loss check → emergency sell-all if > 3%
-     └─ Execute SELL / REDUCE / TRAIL_STOP recommendations
-        (TRAIL_STOP actually cancels broker stop + submits new one)
-
-Evening (post-market)
-     │
-     ├─ Record daily PnL
-     ▼
-  Evening Analyst → save insights for next morning
-     (lessons, outlook, suggested actions, risk rating)
 ```
+08:00-09:15  earnings_preprocess  (once/day, pre-market)
+             └─ Earnings Analyst runs LLM on newly-filed 10-Q/10-K — the
+                ONLY session that calls the earnings LLM. Writes analysis
+                to disk + confirms filing. Hot sessions below only READ
+                this cache.
+
+09:30-12:00  morning              (once/day, main trading)
+             ├─ Cancel stale entry orders, keep protective exits
+             ├─ Force-delever if cash<-$1 (cash-only default; safety net)
+             │
+             ├─── Parallel fan-out ───────────────────┐
+             │  Macro     News Intel     Tech          │   Earnings
+             │  (6-step)  (3-layer)      (5-step CoT)  │   (read cache)
+             │                                         │
+             ├─ Load L1-L8 memory + yesterday's evening insights
+             ▼
+          Portfolio Manager (7-step CoT; R/R-weighted sizing; drawdown-aware;
+                             regime-adaptive cash floor; drift trim)
+             │
+             ├─ Symbol Guard (universe + analyst-coverage check)
+             ├─ Hard Risk Engine (per-BUY, leverage-adjusted)
+             │    cash_only / max_position / max_sector / max_total /
+             │    max_daily_loss / require_stop_loss — blocking
+             │    + advisory: macro_exposure_deviation / correlation_cluster
+             ├─ Risk Manager LLM (6-step CoT; scale_all_buys; R/R veto)
+             ▼
+          Execute: SELLs first → refresh cash → BUYs
+                   (OTO bracket with broker-enforced stop; no hard TP)
+
+09:30-16:00  intra_check          (EVERY 30-MIN TICK, no LLM, ~5 sec)
+             └─ Daily P&L vs -3% loss cap — emergency sell-all if breached.
+                Stateless circuit breaker; not subject to once-per-day guard.
+
+13:00-14:30  midday               (once/day, sell-only)
+             ├─ Force-delever
+             ├─ Auto take-profit (≥15% gain → trim 33%)
+             ├─ Ex-dividend stop adjustment for held names
+             ▼
+          Position Reviewer (6-step CoT, session_type="midday" = patient)
+             │  Default: HOLD unless named thesis trigger fires
+             │  3-8% profit → consider trail to breakeven
+             │  8-15% profit → consider trail to halfway
+             │  > 15% profit → consider trail to 70% of move
+             │
+             └─ SELL / REDUCE / TRAIL_STOP only on trigger (thesis_invalid_if
+                / HIGH state_change reversal / bearish earnings / cluster
+                breach). Price alone is never a trigger.
+
+15:30-15:55  close                (once/day, sell-only, 25-min window)
+             └─ Same Position Reviewer, session_type="close" = act-on-trigger.
+                17.5h until next intraday control — if a thesis trigger is
+                firing, act NOW. But "near close" is never itself a trigger.
+                Good stocks are meant to be held through the night.
+
+20:00-22:00  evening              (once/day, post-market)
+             ├─ Reconcile all submitted orders → terminal status
+             ▼
+          Evening Analyst (6-step CoT)
+             │  previous_outlook_assessment — grade yesterday's call
+             │  sell_grades / buy_grades — structured per-trade labels
+             │  outlook_calibration meta-loop — own bias vs actual across
+             │                                  ~10 sessions
+             │  tomorrow_bias / conviction / key_risks — PM reads these at open
+             │
+             └─ Atomic write: daily_pnl + insights in one transaction.
+```
+
+See CLAUDE.md "不要违反的约定" for the locked-in invariants (cash-only default,
+SELL allocation_pct semantics, ET-everywhere timezone, etc.).
 
 ## Agents
 

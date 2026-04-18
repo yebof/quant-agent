@@ -14,10 +14,22 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 ## 架构速览
 
 - 8 个 LLM agent：tech / news / macro / earnings / portfolio_manager / risk_manager / position_reviewer / evening_analyst
-- 双层风控：硬规则引擎（仓位/暴露/日损/板块/相关性/earnings-queued） + LLM RiskManager 审核
-- 三时段：morning（分析+交易）、midday（持仓检查+真 trailing stop）、evening（日报 + 次日 insights）
+- 双层风控：硬规则引擎（cash_only / 仓位 / 暴露 / 日损 / 板块 / 相关性 / earnings-queued） + LLM RiskManager 审核 + `_force_delever()` 硬兜底
+- **6 个 session**（ET Mon-Fri）：earnings_preprocess 08:00-09:15（唯一跑 earnings LLM）、morning 09:30-12:00（full team）、intra_check 09:30-16:00 每 30min tick（熔断器，零 LLM）、midday 13:00-14:30（position_reviewer patient）、close 15:30-15:55（position_reviewer act-on-trigger）、evening 20:00-22:00（report + outlook）
 - 数据源：yfinance、FRED、RSS、SEC EDGAR
 - 配置：`config/settings.yaml` + `.env`；按 agent 独立选 OpenAI / Anthropic 模型
+
+### Agent CoT 结构（schema-enforced 必填字段数；违反 → ValidationError）
+| Agent | CoT 步数 | 备注 |
+|---|---|---|
+| tech_analyst | 5 | trend / momentum / volatility / volume / S&R |
+| news_analyst | ❌ 无 | 故意；结构化输出 `state_changes` + `stock_news` 本身就是它的思维结构 |
+| macro_analyst | 6 | vol / yield curve / monetary / inflation+labor+credit / cross-signal / sector |
+| earnings_analyst | 5 | 嵌在 `investment_implications.reasoning_chain` |
+| portfolio_manager | 7 | 8 层 memory (L1-L8) 喂进来 |
+| risk_manager | 6 | rr_audit / signal_fidelity / correlation / event_risk / sizing / overall |
+| position_reviewer | 6 | midday + close 共用；`session_type` 切换 disposition |
+| evening_analyst | 6 | performance / retrospection / decision_quality / calibration_meta / regime / tomorrow_prep。**另外有结构化 `sell_grades` / `buy_grades` 给其他 agent 读 counts + `outlook_calibration` 元循环（自己看自己 bias hit rate）** |
 
 详细设计见 `README.md`，agent 行为规则见 `config/prompts/*.md`。
 
@@ -28,8 +40,8 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 ### 金额 / 仓位语义
 - **反向 ETF**（SH/SDS/PSQ/SQQQ）用**签名乘数**算净敞口（对冲相消），**abs 乘数**算单仓/板块上限。`src/risk/rules.py:_effective_multiplier` vs `_gross_multiplier`
 - **日 P&L** = `broker.equity - broker.last_equity`（含已实现 fill，包括 broker 触发的 OTO 止损）；熔断基准永远是 `last_equity`，**不是**昨晚 DB 里的快照
-- **SELL `allocation_pct`** 约定：`100` = 全卖，`1-99` = 部分，`0` = 跳过（**不要再用 0 表示全卖**）；pipeline 会 warning 然后 skip
-- **现金 / 保证金**：`RiskConfig.allow_margin` 默认 `false`。三层防护：(1) 硬规则 `cash_only` 拦新 BUY 透支现金（filter 先汇总同 session SELL proceeds 避免误杀轮换）；(2) `_force_delever()` — session 开头 cash<-$1 时**自动按 biggest-loser-first 强卖**到 cash≥0，不依赖 LLM 判断，morning/midday 都跑；(3) PM/midday prompt 的 DE-LEVER MANDATE 段是给 LLM 看的 advisory。强卖用 `FORCE_DELEVER` 动作名（calibration + recent_sells 都识别）。允许保证金请显式改 `allow_margin: true`
+- **SELL `allocation_pct`** 约定：`100` = 全卖，`1-99` = 部分，`0` = 跳过（**不要再用 0 表示全卖**）；pipeline 会 warning 然后 skip。**两个地方都要守住**：(a) `ExecutionStage` 执行时 skip；(b) `_filter_hard_risk_decisions` pre-sum SELL proceeds 时也 skip（曾经 filter 错把 alloc=0 当满卖预扣 phantom cash，让 BUY 偷借保证金，2026-04-19 修）
+- **现金 / 保证金**：`RiskConfig.allow_margin` 默认 `false`。三层防护：(1) 硬规则 `cash_only` 拦新 BUY 透支现金（filter 先汇总同 session SELL proceeds 避免误杀轮换）；(2) `_force_delever()` — session 开头 cash<-$1 时**自动按 biggest-loser-first 强卖**到 cash≥0，不依赖 LLM 判断，morning/midday 都跑；(3) PM/midday prompt 的 DE-LEVER MANDATE 段是给 LLM 看的 advisory。强卖用 `FORCE_DELEVER` 动作名（calibration + recent_sells 都识别）。阈值 `$1` 单一常量 `src/risk/constants.py:MARGIN_DEFICIT_FLOOR_USD`，三处 import（force_delever / PM prompt / position_reviewer prompt）——别在任何一处重建私有常量。允许保证金请显式改 `allow_margin: true`
 
 ### 责任边界
 - Macro 拥有 regime 枚举（risk-on / risk-off / transitional / neutral）的权威；News 的 `current_regime` 只描述新闻/地缘背景，不重复 Macro 的枚举
