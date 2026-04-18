@@ -83,6 +83,8 @@ class Database:
                 tomorrow_conviction TEXT DEFAULT 'medium',
                 tomorrow_key_risks TEXT DEFAULT '[]',
                 sell_decisions_assessment TEXT DEFAULT '',
+                sell_grades_json TEXT DEFAULT '[]',
+                buy_grades_json TEXT DEFAULT '[]',
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
         """)
@@ -132,6 +134,11 @@ class Database:
         _ensure_column("trades", "fill_qty", "fill_qty REAL")
         _ensure_column("trades", "fill_price", "fill_price REAL")
         _ensure_column("trades", "fill_reconciled_at", "fill_reconciled_at TEXT")
+        # Evening v2 structured per-trade grades. Stored as JSON arrays so
+        # position_reviewer can aggregate counts (correct/premature/wrong)
+        # without parsing prose. NULL for pre-v2 rows → treated as [].
+        _ensure_column("insights", "sell_grades_json", "sell_grades_json TEXT")
+        _ensure_column("insights", "buy_grades_json", "buy_grades_json TEXT")
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
@@ -152,6 +159,8 @@ class Database:
         tomorrow_conviction: str = "medium",
         tomorrow_key_risks=(),
         sell_decisions_assessment: str = "",
+        sell_grades=(),
+        buy_grades=(),
     ) -> None:
         """Atomically write the evening's daily_pnl + insights rows.
 
@@ -164,8 +173,26 @@ class Database:
         All writes happen under the same _lock acquisition, matching the
         pattern used by the single-write insert methods. Callers should
         treat this as the sanctioned way to persist evening output.
+
+        sell_grades / buy_grades are stored as JSON-serialized lists
+        (list[dict] or list[Pydantic]). `_build_sell_calibration_summary`
+        aggregates them into counts for position_reviewer's prompt.
         """
         import json
+
+        def _to_json_list(val) -> str:
+            if isinstance(val, str):
+                return val or "[]"
+            if not val:
+                return "[]"
+            out = []
+            for item in val:
+                if hasattr(item, "model_dump"):
+                    out.append(item.model_dump())
+                elif isinstance(item, dict):
+                    out.append(item)
+            return json.dumps(out)
+
         actions_json = (
             json.dumps(suggested_actions) if isinstance(suggested_actions, list)
             else suggested_actions
@@ -174,6 +201,8 @@ class Database:
             json.dumps(list(tomorrow_key_risks))
             if not isinstance(tomorrow_key_risks, str) else tomorrow_key_risks
         )
+        sell_grades_json = _to_json_list(sell_grades)
+        buy_grades_json = _to_json_list(buy_grades)
         with self._lock:
             try:
                 self.conn.execute("BEGIN")
@@ -187,11 +216,12 @@ class Database:
                     "INSERT OR REPLACE INTO insights "
                     "(date, tomorrow_outlook, lessons, suggested_actions, risk_rating, "
                     "tomorrow_bias, tomorrow_conviction, tomorrow_key_risks, "
-                    "sell_decisions_assessment) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "sell_decisions_assessment, sell_grades_json, buy_grades_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (date, tomorrow_outlook, lessons, actions_json, risk_rating,
                      tomorrow_bias, tomorrow_conviction, risks_json,
-                     sell_decisions_assessment or ""),
+                     sell_decisions_assessment or "",
+                     sell_grades_json, buy_grades_json),
                 )
                 self.conn.commit()
             except Exception:

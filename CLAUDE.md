@@ -29,7 +29,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 | portfolio_manager | 7 | 8 层 memory (L1-L8) 喂进来 |
 | risk_manager | 6 | rr_audit / signal_fidelity / correlation / event_risk / sizing / overall |
 | position_reviewer | 6 | midday + close 共用；`session_type` 切换 disposition |
-| evening_analyst | 6 | performance / retrospection / decision_quality / calibration_meta / regime / tomorrow_prep。**另外有结构化 `sell_grades` / `buy_grades` 给其他 agent 读 counts + `outlook_calibration` 元循环（自己看自己 bias hit rate）** |
+| evening_analyst | 6 | performance / retrospection / decision_quality / calibration_meta / regime / tomorrow_prep。**结构化 `sell_grades` / `buy_grades` 持久化到 `insights.sell_grades_json` / `buy_grades_json`（JSON 列），`_build_trade_grade_summary(lookback=14)` 聚合成 counts + repeat-offender 列表，传入 position_reviewer 形成 SELL 纪律闭环**。同时 `outlook_calibration` 元循环（自己看自己 bias hit rate）自学 |
 
 详细设计见 `README.md`，agent 行为规则见 `config/prompts/*.md`。
 
