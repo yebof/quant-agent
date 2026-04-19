@@ -17,7 +17,10 @@ from src.trading_calendar import (
     et_today,
     format_window,
     in_session_window,
+    is_last_business_day_of_quarter,
     is_weekday,
+    quarter_label,
+    quarter_of,
     session_date_key,
     to_et,
 )
@@ -135,6 +138,51 @@ def test_bash_wrapper_windows_match_python():
         assert seen[mode] == (lo, hi), (
             f"Window drift for {mode}: python={lo}-{hi}, bash={seen[mode]}"
         )
+
+
+def test_quarter_of_maps_months_correctly():
+    assert quarter_of(date(2026, 1, 15)) == 1
+    assert quarter_of(date(2026, 3, 31)) == 1
+    assert quarter_of(date(2026, 4, 1)) == 2
+    assert quarter_of(date(2026, 6, 30)) == 2
+    assert quarter_of(date(2026, 7, 1)) == 3
+    assert quarter_of(date(2026, 9, 30)) == 3
+    assert quarter_of(date(2026, 10, 1)) == 4
+    assert quarter_of(date(2026, 12, 31)) == 4
+
+
+def test_quarter_label_format():
+    assert quarter_label(date(2026, 3, 15)) == "2026-Q1"
+    assert quarter_label(date(2026, 12, 31)) == "2026-Q4"
+
+
+def test_is_last_business_day_of_quarter_basic():
+    """Last weekday of Mar/Jun/Sep/Dec only; other months → False."""
+    # 2026-03-31 is a Tuesday — last business day of Q1 2026
+    assert is_last_business_day_of_quarter(date(2026, 3, 31)) is True
+    # 2026-03-30 Mon — NOT last business day (31st is Tuesday)
+    assert is_last_business_day_of_quarter(date(2026, 3, 30)) is False
+    # Non-quarter month always False
+    assert is_last_business_day_of_quarter(date(2026, 2, 27)) is False
+    assert is_last_business_day_of_quarter(date(2026, 10, 31)) is False  # not quarter end
+    # A Saturday → False even in quarter-end month
+    # 2026-05-30 is a Saturday (but May is not quarter-end anyway);
+    # Pick 2026-09-30 = Wednesday → True, then check the Sat before.
+    assert is_last_business_day_of_quarter(date(2026, 9, 30)) is True
+
+
+def test_is_last_business_day_of_quarter_rolls_back_from_weekend():
+    """When quarter-end calendar date is Saturday/Sunday, the last *business*
+    day is the preceding Friday. The reflector's scheduler relies on this
+    so it runs on Friday, not Sunday."""
+    # 2027-03-31 is Wednesday so not useful; find a year where Q-end is a weekend.
+    # 2024-03-31 is Sunday → last biz day is 2024-03-29 (Friday)
+    assert is_last_business_day_of_quarter(date(2024, 3, 31)) is False  # Sunday
+    assert is_last_business_day_of_quarter(date(2024, 3, 29)) is True   # Friday, last biz
+
+    # 2024-06-30 is Sunday → last biz day is 2024-06-28 (Friday)
+    assert is_last_business_day_of_quarter(date(2024, 6, 30)) is False
+    assert is_last_business_day_of_quarter(date(2024, 6, 28)) is True
 
 
 def test_util_time_shim_still_re_exports():
