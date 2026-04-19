@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from pathlib import Path
 
 from src.agents.base import BaseAgent, AgentResult
@@ -8,6 +9,18 @@ from src.models import NewsIntelligenceReport
 logger = logging.getLogger(__name__)
 
 PROMPT_PATH = Path(__file__).parent.parent.parent / "config" / "prompts" / "news_analyst.md"
+
+# Tokens too common to anchor an event on — they'd let any hallucinated event
+# survive a keyword match. Deliberately conservative: we only want to exclude
+# words that appear in virtually any headline.
+_STATE_CHANGE_STOPWORDS = frozenset({
+    "from", "into", "with", "that", "this", "these", "those",
+    "have", "been", "will", "would", "could", "should",
+    "change", "state", "event", "today", "more", "less",
+    "than", "some", "many", "much", "also", "very",
+    "after", "before", "during", "while", "about", "against", "between",
+    "said", "says", "reports", "reported", "according",
+})
 
 
 class NewsAnalystAgent(BaseAgent):
@@ -132,6 +145,68 @@ State changes captured earlier:
 
 Analyze all the above and produce your intelligence report as JSON."""
 
+    @staticmethod
+    def _extract_event_keywords(event: str) -> set[str]:
+        """Lowercase 4+ letter tokens that aren't generic structural words.
+
+        Used to check whether a state_change.event is actually supported by
+        the input headlines. Four-letter floor keeps out a/an/is/on/etc.
+        without excluding meaningful short acronyms (we accept the false-drop
+        risk on a 3-letter event for the false-accept-safety).
+        """
+        tokens = re.findall(r"[A-Za-z]{4,}", event.lower())
+        return {t for t in tokens if t not in _STATE_CHANGE_STOPWORDS}
+
+    @classmethod
+    def _filter_hallucinated_state_changes(
+        cls,
+        report: NewsIntelligenceReport,
+        news_text: str,
+    ) -> NewsIntelligenceReport:
+        """Drop state_changes whose event keywords do not appear in the input
+        headlines — a rough but effective guard against LLM-invented narrative
+        shifts ("Iran ceasefire" when the input only had Fed news).
+
+        A state_change is kept when either:
+          - any extracted event keyword appears in the headlines text, OR
+          - any ticker in `affected_symbols` appears in the headlines text, OR
+          - the event has no extractable keywords AND no affected_symbols
+            (can't verify either way — keep rather than silently drop).
+
+        Matching is case-insensitive substring. Not perfect for paraphrasing,
+        but dropping a correctly-interpreted-but-reworded change is far less
+        costly than letting a fabricated change reach PM sizing logic.
+        """
+        if not report.state_changes or not news_text:
+            return report
+
+        text_lower = news_text.lower()
+        kept: list = []
+        dropped: list[str] = []
+        for sc in report.state_changes:
+            event_kws = cls._extract_event_keywords(sc.event)
+            affected = [s for s in (sc.affected_symbols or []) if s]
+            symbol_hits = [s for s in affected if s.lower() in text_lower]
+            kw_hits = [k for k in event_kws if k in text_lower]
+
+            if kw_hits or symbol_hits:
+                kept.append(sc)
+            elif not event_kws and not affected:
+                # Nothing verifiable either way — err on keep.
+                kept.append(sc)
+            else:
+                dropped.append(sc.event[:80])
+
+        if dropped:
+            logger.warning(
+                "news_analyst: dropped %d state_change(s) whose event "
+                "keywords and affected_symbols are absent from the input "
+                "headlines — likely hallucination: %s",
+                len(dropped), dropped,
+            )
+            return report.model_copy(update={"state_changes": kept})
+        return report
+
     def analyze(self, news_text: str, universe: list[str] | None = None,
                 stock_mentions: dict | None = None,
                 previous_narrative: dict | None = None,
@@ -150,7 +225,9 @@ Analyze all the above and produce your intelligence report as JSON."""
             logger.error("News analyst returned non-JSON response")
             return None, result
         try:
-            return NewsIntelligenceReport(**parsed), result
+            report = NewsIntelligenceReport(**parsed)
         except Exception as e:
             logger.error("Failed to parse news intelligence report: %s", e)
             return None, result
+        report = self._filter_hallucinated_state_changes(report, news_text)
+        return report, result

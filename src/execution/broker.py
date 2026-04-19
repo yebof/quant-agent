@@ -158,6 +158,48 @@ class AlpacaBroker:
             )
             return False
 
+    def get_session_close(self, on_date: date | None = None):
+        """Return the ET-aware datetime when the regular cash session closes
+        today, or None if today is not a trading day (weekend / holiday) or
+        the calendar lookup fails.
+
+        Distinct from `is_trading_day` because it answers a different
+        question: "WHEN does today close?" — needed to detect early-close
+        days (Thanksgiving Friday 13:00, July 3 half-day) where the
+        launchd-scheduled midday (13:00-14:30 ET) and close (15:30-15:55 ET)
+        sessions would otherwise keep running against an already-shut market.
+        """
+        from src.trading_calendar import ET, et_today
+        from datetime import datetime as _dt
+        target_date = on_date or et_today()
+        try:
+            from alpaca.trading.requests import GetCalendarRequest
+
+            calendar = self.client.get_calendar(
+                GetCalendarRequest(start=target_date, end=target_date)
+            )
+        except Exception as exc:
+            logger.warning(
+                "get_session_close: calendar query failed for %s: %s",
+                target_date, exc,
+            )
+            return None
+        if not calendar:
+            return None
+        entry = calendar[0]
+        entry_date = getattr(entry, "date", None)
+        entry_close = getattr(entry, "close", None)
+        if entry_date is None or entry_close is None:
+            return None
+        try:
+            return _dt.combine(entry_date, entry_close).replace(tzinfo=ET)
+        except Exception as exc:
+            logger.warning(
+                "get_session_close: failed to combine date=%s close=%s: %s",
+                entry_date, entry_close, exc,
+            )
+            return None
+
     def get_bars(self, symbol: str, lookback_days: int = 120) -> list:
         """Fetch daily OHLCV bars from Alpaca as a list[OHLCV].
 
@@ -584,7 +626,13 @@ class AlpacaBroker:
             )
         return restored
 
-    def replace_stop_loss(self, symbol: str, new_stop_price: float) -> dict | None:
+    def replace_stop_loss(
+        self,
+        symbol: str,
+        new_stop_price: float,
+        *,
+        allow_lowering: bool = False,
+    ) -> dict | None:
         """Replace an existing sell-stop with rollback so protection is preserved on failure.
 
         Used by the midday trailing-stop logic. Alpaca's OTO stop-loss leg cannot be edited
@@ -606,6 +654,23 @@ class AlpacaBroker:
                 )
                 return None
             stop_specs.append(spec)
+
+        # Direction check: "trailing" means stop ratchets UP, never DOWN. If the
+        # LLM hallucinates a lower stop (or the caller passes the wrong value),
+        # accepting it would weaken existing protection — the opposite of what
+        # a trail is for. Ex-dividend adjustments intentionally lower the stop
+        # to absorb tomorrow's mechanical dividend gap, so that caller opts in
+        # via allow_lowering=True.
+        if stop_specs and not allow_lowering:
+            highest_existing = max(spec["stop_price"] for spec in stop_specs)
+            if new_stop_price <= highest_existing:
+                logger.warning(
+                    "replace_stop_loss rejected for %s: new_stop $%.4f is not "
+                    "above highest existing stop $%.4f — trailing stops must "
+                    "ratchet up only (protection would weaken).",
+                    symbol, new_stop_price, highest_existing,
+                )
+                return None
 
         positions = [p for p in self.get_positions() if p.symbol == symbol]
         if not positions or positions[0].qty <= 0:

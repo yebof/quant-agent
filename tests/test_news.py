@@ -127,6 +127,174 @@ def test_news_analyst_analyze(mock_cls):
     assert agent_result.tokens_used == 2500
 
 
+def _make_news_intel_report(state_changes: list[dict]):
+    """Helper: build a minimal NewsIntelligenceReport with custom state_changes."""
+    from src.models import NewsIntelligenceReport
+    return NewsIntelligenceReport.model_validate({
+        "macro_narrative": {
+            "last_updated": "2026-04-18",
+            "era_themes": ["test"],
+            "current_regime": "test regime",
+            "key_state_tracker": {},
+        },
+        "state_changes": state_changes,
+        "stock_news": {},
+        "pm_briefing": "test",
+        "market_sentiment": "neutral",
+        "confidence": "medium",
+    })
+
+
+def test_filter_drops_state_change_with_no_keyword_overlap():
+    """Invented event — no keyword in headlines — must be dropped."""
+    report = _make_news_intel_report([
+        {
+            "event": "Iran ceasefire brokered",
+            "previous_state": "hot war",
+            "new_state": "truce",
+            "market_impact": "oil down",
+            "affected_symbols": ["XOM"],
+            "conviction": "high",
+        }
+    ])
+    filtered = NewsAnalystAgent._filter_hallucinated_state_changes(
+        report, news_text="Fed signals pause in rate hikes; unrelated macro story."
+    )
+    assert filtered.state_changes == []
+
+
+def test_filter_keeps_state_change_when_event_keyword_present():
+    report = _make_news_intel_report([
+        {
+            "event": "Fed signals pause",
+            "previous_state": "cutting",
+            "new_state": "paused",
+            "market_impact": "bearish rate-sensitive",
+            "affected_symbols": [],
+            "conviction": "high",
+        }
+    ])
+    filtered = NewsAnalystAgent._filter_hallucinated_state_changes(
+        report,
+        news_text="The Fed today signals a pause in further rate hikes...",
+    )
+    assert len(filtered.state_changes) == 1
+    assert "Fed signals pause" == filtered.state_changes[0].event
+
+
+def test_filter_keeps_state_change_when_affected_symbol_present():
+    """Event wording may be paraphrased but if an affected ticker literally
+    shows up in the headlines, treat the change as grounded enough to keep."""
+    report = _make_news_intel_report([
+        {
+            "event": "Regulatory pressure escalating",
+            "previous_state": "normal",
+            "new_state": "under scrutiny",
+            "market_impact": "bearish",
+            "affected_symbols": ["NVDA"],
+            "conviction": "medium",
+        }
+    ])
+    filtered = NewsAnalystAgent._filter_hallucinated_state_changes(
+        report,
+        # "Regulatory", "pressure", "escalating", "scrutiny" aren't in text,
+        # but NVDA is.
+        news_text="NVDA shares slipped today on industry concerns.",
+    )
+    assert len(filtered.state_changes) == 1
+
+
+def test_filter_drops_some_keeps_others_in_mixed_batch():
+    report = _make_news_intel_report([
+        {
+            "event": "Fed signals pause",
+            "previous_state": "cutting", "new_state": "paused",
+            "market_impact": "x", "affected_symbols": [], "conviction": "high",
+        },
+        {
+            "event": "Hurricane shuts Gulf refineries",
+            "previous_state": "normal", "new_state": "disrupted",
+            "market_impact": "oil up", "affected_symbols": ["XOM"],
+            "conviction": "high",
+        },
+    ])
+    filtered = NewsAnalystAgent._filter_hallucinated_state_changes(
+        report,
+        news_text="Fed officials signal pause on policy. No weather news.",
+    )
+    events = [sc.event for sc in filtered.state_changes]
+    assert "Fed signals pause" in events
+    assert "Hurricane shuts Gulf refineries" not in events
+
+
+def test_filter_empty_news_text_keeps_all():
+    """No news_text to verify against (unusual but possible) — err on keep
+    rather than silently drop the LLM's whole state-change list."""
+    report = _make_news_intel_report([
+        {
+            "event": "Something happened",
+            "previous_state": "a", "new_state": "b",
+            "market_impact": "x", "affected_symbols": [], "conviction": "low",
+        }
+    ])
+    filtered = NewsAnalystAgent._filter_hallucinated_state_changes(
+        report, news_text="",
+    )
+    assert len(filtered.state_changes) == 1
+
+
+@patch("anthropic.Anthropic")
+def test_news_analyst_analyze_filters_hallucinated_state_change(mock_cls):
+    """Integration: analyze() now runs the hallucination filter after parsing.
+    An LLM-invented state_change (event keywords not in input) must not
+    survive into the returned NewsIntelligenceReport."""
+    response_json = json.dumps({
+        "macro_narrative": {
+            "last_updated": "2026-04-18",
+            "era_themes": ["AI"],
+            "current_regime": "risk-on",
+            "key_state_tracker": {},
+        },
+        "state_changes": [
+            # This one is supported by the headlines.
+            {
+                "event": "Fed signals pause",
+                "previous_state": "cutting", "new_state": "paused",
+                "market_impact": "bearish rate-sensitive",
+                "affected_symbols": [], "conviction": "high",
+            },
+            # This one is a pure hallucination — no keyword match.
+            {
+                "event": "Iran ceasefire brokered",
+                "previous_state": "war", "new_state": "truce",
+                "market_impact": "oil down",
+                "affected_symbols": ["XOM"], "conviction": "high",
+            },
+        ],
+        "stock_news": {},
+        "pm_briefing": "Fed pause.",
+        "market_sentiment": "neutral",
+        "confidence": "medium",
+    })
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text=response_json)]
+    mock_response.usage.input_tokens = 100
+    mock_response.usage.output_tokens = 50
+    mock_client.messages.create.return_value = mock_response
+    mock_cls.return_value = mock_client
+
+    agent = NewsAnalystAgent(api_key="test", model="claude-sonnet-4-6")
+    report, _ = agent.analyze(
+        news_text="The Fed today signals a pause on further rate hikes. "
+                  "No other material news.",
+    )
+    assert report is not None
+    events = [sc.event for sc in report.state_changes]
+    assert "Fed signals pause" in events
+    assert "Iran ceasefire brokered" not in events
+
+
 @patch("anthropic.Anthropic")
 def test_news_analyst_bad_response(mock_cls):
     mock_client = MagicMock()

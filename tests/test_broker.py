@@ -93,6 +93,52 @@ def test_is_trading_day_uses_calendar(mock_tc_cls):
 
 
 @patch("src.execution.broker.TradingClient")
+def test_get_session_close_returns_et_datetime_on_trading_day(mock_tc_cls):
+    """Half-day detection path: calendar is queried; combines returned
+    date + close time into an ET-aware datetime. This is what the pipeline's
+    early-close guard compares `et_now()` against."""
+    from datetime import date as _date, time as _time, datetime as _dt
+    from src.trading_calendar import ET
+
+    entry = MagicMock()
+    entry.date = _date(2026, 11, 27)  # Thanksgiving Friday — 13:00 early close
+    entry.close = _time(13, 0)
+    mock_client = MagicMock()
+    mock_client.get_calendar.return_value = [entry]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    close = broker.get_session_close(on_date=_date(2026, 11, 27))
+
+    assert isinstance(close, _dt)
+    assert close.tzinfo is ET
+    assert close.hour == 13 and close.minute == 0
+    assert close.date() == _date(2026, 11, 27)
+
+
+@patch("src.execution.broker.TradingClient")
+def test_get_session_close_returns_none_on_non_trading_day(mock_tc_cls):
+    mock_client = MagicMock()
+    mock_client.get_calendar.return_value = []  # weekend / holiday
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    assert broker.get_session_close() is None
+
+
+@patch("src.execution.broker.TradingClient")
+def test_get_session_close_returns_none_on_api_error(mock_tc_cls):
+    """Broker outage / SDK exception must not crash the pipeline — return
+    None so the early-close guard defaults to 'proceed with the session'."""
+    mock_client = MagicMock()
+    mock_client.get_calendar.side_effect = RuntimeError("calendar down")
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    assert broker.get_session_close() is None
+
+
+@patch("src.execution.broker.TradingClient")
 def test_cancel_open_entry_orders_preserves_sell_protection(mock_tc_cls):
     buy_order = MagicMock()
     buy_order.id = "buy-1"
@@ -251,6 +297,135 @@ def test_replace_stop_loss_restores_old_protection_if_new_submit_fails(mock_tc_c
     assert result is None
     mock_client.cancel_order_by_id.assert_called_once_with("old-stop")
     assert mock_client.submit_order.call_count == 2
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_rejects_lower_new_stop(mock_tc_cls):
+    """Trailing stops must ratchet UP, never down. If the LLM hallucinates a
+    lower new_stop (or a caller passes wrong value), weakening existing
+    protection would be the opposite of a 'trail'. Reject before any cancel
+    so the current protection is untouched."""
+    old_stop = MagicMock()
+    old_stop.id = "old-stop"
+    old_stop.order_type = "stop"
+    old_stop.side = "sell"
+    old_stop.qty = "10"
+    old_stop.stop_price = "190.0"
+    old_stop.limit_price = "184.3"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [old_stop]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    # New stop $185 is BELOW existing $190 — reject.
+    result = broker.replace_stop_loss("NVDA", 185.0)
+
+    assert result is None
+    # Critical: no cancel, no submit — existing stop must still be in place.
+    mock_client.cancel_order_by_id.assert_not_called()
+    mock_client.submit_order.assert_not_called()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_rejects_equal_new_stop(mock_tc_cls):
+    """Equal stop = no improvement = reject (avoids needless cancel/submit)."""
+    old_stop = MagicMock()
+    old_stop.id = "old-stop"
+    old_stop.order_type = "stop"
+    old_stop.side = "sell"
+    old_stop.qty = "10"
+    old_stop.stop_price = "190.0"
+    old_stop.limit_price = "184.3"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [old_stop]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.replace_stop_loss("NVDA", 190.0)
+
+    assert result is None
+    mock_client.cancel_order_by_id.assert_not_called()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_allows_new_stop_when_no_existing(mock_tc_cls):
+    """With no prior sell-stop on the symbol, placing any positive stop is
+    pure protection-gain — always allowed. The direction-ratchet check only
+    applies when there's something to compare against."""
+    new_order = MagicMock()
+    new_order.id = "new-stop"
+    new_order.status = "accepted"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = []  # no existing stops
+    mock_client.submit_order.return_value = new_order
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("NVDA", 10, 180.0, 200.0, 2000.0, 200.0),
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    # $150 stop against current $200 — fresh protection, no ratchet violation.
+    result = broker.replace_stop_loss("NVDA", 150.0)
+
+    assert result is not None
+    assert result["id"] == "new-stop"
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_allows_lowering_when_explicitly_requested(mock_tc_cls):
+    """Ex-dividend adjustments intentionally lower the stop by dividend amount."""
+    old_stop = MagicMock()
+    old_stop.id = "old-stop"
+    old_stop.order_type = "stop"
+    old_stop.side = "sell"
+    old_stop.qty = "10"
+    old_stop.stop_price = "190.0"
+    old_stop.limit_price = "184.3"
+
+    new_order = MagicMock()
+    new_order.id = "new-stop"
+    new_order.status = "accepted"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [old_stop]
+    mock_client.submit_order.return_value = new_order
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("NVDA", 10, 180.0, 200.0, 2000.0, 200.0),
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.replace_stop_loss("NVDA", 185.0, allow_lowering=True)
+
+    assert result is not None
+    mock_client.cancel_order_by_id.assert_called_once_with("old-stop")
+    mock_client.submit_order.assert_called_once()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_uses_max_of_multiple_existing_stops(mock_tc_cls):
+    """If multiple stops exist (rare; possible with partial-fill legs), the
+    ratchet must be measured against the HIGHEST existing — otherwise the
+    LLM could squeeze a downgrade through by picking between two values."""
+    stop_low = MagicMock()
+    stop_low.id = "s-low"; stop_low.order_type = "stop"; stop_low.side = "sell"
+    stop_low.qty = "5"; stop_low.stop_price = "180.0"; stop_low.limit_price = "175.0"
+    stop_high = MagicMock()
+    stop_high.id = "s-high"; stop_high.order_type = "stop"; stop_high.side = "sell"
+    stop_high.qty = "5"; stop_high.stop_price = "195.0"; stop_high.limit_price = "189.0"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [stop_low, stop_high]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    # $190 is above the LOW but below the HIGH — must reject (direction check
+    # uses max existing = 195).
+    assert broker.replace_stop_loss("NVDA", 190.0) is None
+    mock_client.cancel_order_by_id.assert_not_called()
 
 
 @patch("src.execution.broker.TradingClient")
