@@ -61,6 +61,18 @@ sections.
   A silent agent (n_sessions far below peers) is a problem; a noisy
   agent (PM issuing many decisions RM keeps scaling down) is a
   different kind of problem.
+- **watchlist_candidates** — symbols OUTSIDE the curated universe that
+  the daily evening analyst flagged as `add` or `watch` over the
+  window. `high_conviction` is the subset with `add_count >= 2`
+  (evening said "add to universe" at least twice, independently).
+  You MUST NOT propose adding these to the universe yourself —
+  universe changes are strictly a human decision. Your job is to
+  surface them honestly in `theme_coverage_report.emerging_themes_to_
+  watch` and let the reader (the user) decide whether to edit
+  settings.yaml manually. A symbol hit by many `add` calls across
+  distinct dates across DIFFERENT themes would warrant a prompt edit
+  to news_analyst / macro_analyst (to broaden coverage) rather than
+  a universe add.
 - **corrigibility_trend** (only present when a prior-quarter digest
   exists) — loss causes improved / worsened / stable; themes
   resolved / persistent / newly_emerging. **This is the key check
