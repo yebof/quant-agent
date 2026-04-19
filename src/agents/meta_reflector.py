@@ -47,8 +47,11 @@ def _fmt_period_performance(perf: dict | None) -> str:
 def _fmt_calibration(calib: dict | None) -> str:
     if not calib:
         return "(no closed-trade calibration available this quarter)"
-    if calib.get("n_closed", 0) == 0:
-        return "(n_closed=0 — no round-trips to calibrate on)"
+    # db.compute_trade_calibration returns 'n' (total closed trades). An
+    # empty dict {} is also normalized upstream to "too-few-closed" so we
+    # only have to disambiguate n=0 here.
+    if calib.get("n", 0) == 0:
+        return "(n=0 — no round-trips to calibrate on)"
     lines = [
         f"- Total closed trades: {calib.get('n', 0)}",
         f"- Overall win rate: {calib.get('win_rate_pct', 'n/a')}%",

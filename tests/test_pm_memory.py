@@ -510,6 +510,34 @@ def test_build_recent_sells_joins_current_prices(tmp_path):
     assert row["pct_move_since_sell"] == 6.0
 
 
+def test_build_recent_sells_includes_reduce_action(tmp_path):
+    """Midday reviewer trims are persisted with action='REDUCE'. They must
+    flow into sell_grades_json so evening grading covers partial exits, not
+    just full SELLs."""
+    from unittest.mock import MagicMock
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    db.insert_trade("GOOGL", "REDUCE", 5, 320.0, "trim half", "r1")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-1 day') "
+        "WHERE symbol='GOOGL'"
+    )
+    db.conn.commit()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline.broker.get_latest_price = MagicMock(return_value=327.0)
+
+    out = pipeline._build_recent_sells_for_grading(lookback_days=2)
+    assert len(out) == 1
+    assert out[0]["symbol"] == "GOOGL"
+    assert out[0]["sell_price"] == 320.0
+
+
 def test_pm_renders_structured_evening_tilt():
     """PM surfaces tomorrow_bias + conviction + key_risks from evening insights."""
     import json

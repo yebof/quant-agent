@@ -180,8 +180,9 @@ Automated via macOS launchd — plist files in `~/Library/LaunchAgents/com.quant
 **Timezone-resilient scheduling**: plists fire every 30 minutes (`StartInterval=1800`); a bash wrapper `scripts/run_if_et_window.sh` checks whether the current **US/Eastern** time is inside the target window and whether the mode already ran in the last hour. Runs the right session at the right ET moment regardless of the host's timezone (handy when traveling). Windows (Mon-Fri ET, authoritative Python table at `src/trading_calendar.py` `SESSION_WINDOWS`, locked to the bash wrapper by `test_trading_calendar.py`):
 - `earnings_preprocess` 08:00-09:15 ET — pre-market LLM analysis of fresh 10-Q/10-K filings
 - `morning` 09:30-12:00 ET — research + trading
-- `intra_check` 12:00-13:30 ET — lightweight circuit-breaker (no LLM)
-- `midday` 15:00-16:30 ET — position review + real trailing stops
+- `intra_check` 09:30-16:00 ET — every 30min tick; stateless circuit-breaker (no LLM)
+- `midday` 13:00-14:30 ET — position review + real trailing stops (patient disposition)
+- `close` 15:30-15:55 ET — position review (act-on-trigger; final 25min gate)
 - `evening` 20:00-22:00 ET — daily P&L + insights for next morning
 
 ## Trading Universe
@@ -201,7 +202,7 @@ quant-agent/
 │   ├── settings.yaml              # Models, risk params, universe, schedule
 │   └── prompts/                   # System prompts for each agent
 ├── src/
-│   ├── pipeline.py                # Orchestrator (morning/midday/evening/earnings_preprocess/intra_check)
+│   ├── pipeline.py                # Orchestrator (morning/midday/close/evening/earnings_preprocess/intra_check/meta)
 │   ├── pipeline_stages.py         # MorningResearch / Decision / Risk / Execution stage classes
 │   ├── pipeline_context.py        # RunContext dataclass — explicit shared state across stages
 │   ├── portfolio_constructor.py   # Deterministic Target → TradeDecision translator (risk-budget sizing)
@@ -209,7 +210,7 @@ quant-agent/
 │   ├── scheduler.py               # APScheduler + launchd
 │   ├── config.py                  # Pydantic config with API key validation
 │   ├── models.py                  # Data models (ReasoningChain, MacroNarrative, etc.)
-│   ├── agents/                    # 8 LLM agents
+│   ├── agents/                    # 8 daily LLM agents + 1 quarterly meta_reflector
 │   ├── data/
 │   │   ├── market.py              # yfinance OHLCV
 │   │   ├── macro.py               # FRED API (VIX, yields, DFF, CPI, UNRATE, HY OAS)

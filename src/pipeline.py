@@ -1253,7 +1253,10 @@ class TradingPipeline:
             return []
         from datetime import date as _date, timedelta as _td
         cutoff = et_today() - _td(days=lookback_days)
-        sell_actions = ("SELL", "EMERGENCY_SELL", "FORCE_DELEVER")
+        # REDUCE = midday reviewer trim (discretionary partial exit — a SELL
+        # decision the reviewer owns and should be graded on). TAKE_PROFIT
+        # stays out because it's rule-based, not a reviewer decision.
+        sell_actions = ("SELL", "EMERGENCY_SELL", "FORCE_DELEVER", "REDUCE")
         out: list[dict] = []
         for row in all_rows:
             action = row.get("action") or ""
@@ -3571,7 +3574,15 @@ class TradingPipeline:
 
         # 1a. Cash-only safety net — force-sell if the account drifted into
         # margin. Refreshes ctx fields on completion.
-        self._force_delever(ctx)
+        forced_orders = self._force_delever(ctx)
+        if forced_orders:
+            # Reconcile immediately so the FORCE_DELEVER rows flip from
+            # fill_status='submitted' to 'filled' before the reviewer's
+            # morning_trades query (executed_only=True) is built. Otherwise
+            # the reviewer can't see the same-session forced sells in
+            # system_action_lines and would reason about a shrunken book
+            # without the explanation.
+            self._reconcile_fills(ctx)
         positions = ctx.positions
         cash = ctx.cash
         total_value = ctx.total_value

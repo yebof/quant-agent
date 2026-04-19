@@ -546,8 +546,9 @@ class Database:
         """Win rate + avg realized return on BUYs that closed in the window.
 
         Matches each BUY to the next SELL-family action (SELL, PARTIAL_SELL%,
-        EMERGENCY_SELL, FORCE_DELEVER) for the same symbol, FIFO. Open positions are excluded
-        because their outcome isn't known yet.
+        EMERGENCY_SELL, FORCE_DELEVER, REDUCE, TAKE_PROFIT) for the same
+        symbol, FIFO. Open positions are excluded because their outcome isn't
+        known yet.
 
         Bucketed by allocation size (proxy for conviction): a larger dollar
         commitment implies higher conviction when PM sized it. Lets PM see
@@ -555,7 +556,7 @@ class Database:
         explicit conviction column in trades.
 
         Returns:
-            {"n_closed": int, "win_rate_pct": float, "avg_return_pct": float,
+            {"n": int, "win_rate_pct": float, "avg_return_pct": float,
              "avg_hold_days": float,
              "by_size": {
                 "large": {...},  # $ entry >= 10k
@@ -591,7 +592,8 @@ class Database:
             if act == "BUY":
                 open_lots[sym].append({"qty": qty, "price": price, "ts": ts})
             elif (act.startswith("SELL") or act.startswith("PARTIAL_SELL")
-                  or act == "EMERGENCY_SELL" or act == "FORCE_DELEVER"):
+                  or act in ("EMERGENCY_SELL", "FORCE_DELEVER",
+                             "REDUCE", "TAKE_PROFIT")):
                 # Close from oldest lot first
                 remaining = qty
                 lots = open_lots[sym]

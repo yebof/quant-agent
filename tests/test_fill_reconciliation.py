@@ -279,3 +279,53 @@ def test_compute_trade_calibration_excludes_unfilled(tmp_path):
     # 3 filled/legacy pairs — NVDA (+10%), JPM (+8.33%), MSFT (+3.33%). AAPL excluded.
     assert stats["n"] == 3
     assert stats["win_rate_pct"] == 100.0
+
+
+def test_compute_trade_calibration_counts_reduce_and_take_profit(tmp_path):
+    """REDUCE (midday reviewer trim) and TAKE_PROFIT (rule-based auto-trim)
+    are real exits that retire FIFO lots. Before the fix they were silently
+    skipped, so PMFacts/calibration undercounted closed trades."""
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    # BUY 10 @ 100, then partial TAKE_PROFIT 3 @ 110 (+10% on 3 shares)
+    db.insert_trade("AAPL", "BUY", 10, 100.0, "x", "r1",
+                    broker_order_id="b1", fill_status="filled")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-10 days') WHERE broker_order_id='b1'"
+    )
+    db.insert_trade("AAPL", "TAKE_PROFIT", 3, 110.0, "x", "r2",
+                    broker_order_id="tp1", fill_status="filled")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-3 days') WHERE broker_order_id='tp1'"
+    )
+
+    # BUY 5 @ 200, then midday REDUCE 5 @ 220 (full trim, +10%)
+    db.insert_trade("MSFT", "BUY", 5, 200.0, "x", "r1",
+                    broker_order_id="b2", fill_status="filled")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-8 days') WHERE broker_order_id='b2'"
+    )
+    db.insert_trade("MSFT", "REDUCE", 5, 220.0, "x", "r2",
+                    broker_order_id="red1", fill_status="filled")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-2 days') WHERE broker_order_id='red1'"
+    )
+
+    # BUY 4 @ 50, full SELL at 55 — third pair to cross the n>=3 threshold
+    db.insert_trade("JPM", "BUY", 4, 50.0, "x", "r1",
+                    broker_order_id="b3", fill_status="filled")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-7 days') WHERE broker_order_id='b3'"
+    )
+    db.insert_trade("JPM", "SELL", 4, 55.0, "x", "r2",
+                    broker_order_id="s3", fill_status="filled")
+    db.conn.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-1 days') WHERE broker_order_id='s3'"
+    )
+    db.conn.commit()
+
+    stats = db.compute_trade_calibration(lookback_days=30)
+    # 3 closed pairs: AAPL-TAKE_PROFIT, MSFT-REDUCE, JPM-SELL. All winners.
+    assert stats["n"] == 3
+    assert stats["win_rate_pct"] == 100.0

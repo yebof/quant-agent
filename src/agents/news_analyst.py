@@ -162,6 +162,7 @@ Analyze all the above and produce your intelligence report as JSON."""
         cls,
         report: NewsIntelligenceReport,
         news_text: str,
+        prior_session_report: dict | None = None,
     ) -> NewsIntelligenceReport:
         """Drop state_changes whose event keywords do not appear in the input
         headlines — a rough but effective guard against LLM-invented narrative
@@ -171,7 +172,11 @@ Analyze all the above and produce your intelligence report as JSON."""
           - any extracted event keyword appears in the headlines text, OR
           - any ticker in `affected_symbols` appears in the headlines text, OR
           - the event has no extractable keywords AND no affected_symbols
-            (can't verify either way — keep rather than silently drop).
+            (can't verify either way — keep rather than silently drop), OR
+          - the event was already present in `prior_session_report`
+            state_changes (the reason midday/evening passes prior_session is
+            to let the model carry forward / resolve a morning event even
+            when fresh headlines don't repeat it verbatim).
 
         Matching is case-insensitive substring. Not perfect for paraphrasing,
         but dropping a correctly-interpreted-but-reworded change is far less
@@ -181,6 +186,19 @@ Analyze all the above and produce your intelligence report as JSON."""
             return report
 
         text_lower = news_text.lower()
+        # Build a supplementary token pool from the prior session's
+        # state_changes so events carried forward across sessions survive.
+        prior_tokens: set[str] = set()
+        prior_symbols: set[str] = set()
+        if prior_session_report:
+            for psc in prior_session_report.get("state_changes") or []:
+                event = psc.get("event") if isinstance(psc, dict) else None
+                if event:
+                    prior_tokens.update(cls._extract_event_keywords(event))
+                syms = psc.get("affected_symbols") if isinstance(psc, dict) else None
+                for s in syms or []:
+                    if s:
+                        prior_symbols.add(s.lower())
         kept: list = []
         dropped: list[str] = []
         for sc in report.state_changes:
@@ -188,8 +206,10 @@ Analyze all the above and produce your intelligence report as JSON."""
             affected = [s for s in (sc.affected_symbols or []) if s]
             symbol_hits = [s for s in affected if s.lower() in text_lower]
             kw_hits = [k for k in event_kws if k in text_lower]
+            prior_kw_hit = bool(event_kws & prior_tokens)
+            prior_sym_hit = any(s.lower() in prior_symbols for s in affected)
 
-            if kw_hits or symbol_hits:
+            if kw_hits or symbol_hits or prior_kw_hit or prior_sym_hit:
                 kept.append(sc)
             elif not event_kws and not affected:
                 # Nothing verifiable either way — err on keep.
@@ -229,5 +249,7 @@ Analyze all the above and produce your intelligence report as JSON."""
         except Exception as e:
             logger.error("Failed to parse news intelligence report: %s", e)
             return None, result
-        report = self._filter_hallucinated_state_changes(report, news_text)
+        report = self._filter_hallucinated_state_changes(
+            report, news_text, prior_session_report=prior_session_report,
+        )
         return report, result

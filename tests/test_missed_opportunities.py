@@ -1276,7 +1276,7 @@ def test_quarterly_digest_includes_watchlist_candidates():
          ])},
     ]
     db.get_recent_agent_outputs.return_value = []
-    db.compute_trade_calibration.return_value = {"n_closed": 0}
+    db.compute_trade_calibration.return_value = {"n": 0}
 
     digest = build_quarterly_digest(
         db, market=None, period_end=_date(2026, 3, 31), lookback_days=90,
@@ -1311,7 +1311,7 @@ def test_quarterly_digest_watchlist_high_conviction_threshold():
          ])},
     ]
     db.get_recent_agent_outputs.return_value = []
-    db.compute_trade_calibration.return_value = {"n_closed": 0}
+    db.compute_trade_calibration.return_value = {"n": 0}
     digest = build_quarterly_digest(
         db, market=None, period_end=_date(2026, 3, 31), lookback_days=90,
     )
