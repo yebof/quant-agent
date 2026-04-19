@@ -168,37 +168,95 @@ The prompt surfaces:
   for symbols that aren't in that table.** If the table is empty, emit
   `[]`.
 
-  For each entry ask three questions — your `lesson` must answer them:
+  ### Two different lenses by `source`:
+
+  **`source="universe"` or `"both"`** — this is a symbol we already
+  track. The question is: **did we miss a trade?** We have the coverage,
+  so any miss points to a timing/sizing/thesis failure. Classify
+  aggressively:
+  - `trend_timing_miss` — TA flagged buy / News flagged HIGH and we
+    still didn't act (or acted too late).
+  - `fundamentals_mispricing` — earnings were strong / macro tailwind
+    positive and we didn't buy.
+  - `theme_blindspot` — news/macro didn't report the theme, so our
+    coverage agents failed to surface the signal despite the symbol
+    being in-universe.
+
+  **`source="top_mover"`** — this is a symbol NOT in our carefully
+  curated 77-symbol universe. The primary question is NOT "did we
+  miss a trade" (we don't trade outside universe). It is:
+  **what can we learn, and is this symbol exceptional enough to
+  consider adding to the universe?**
+
+  The bar for `universe_addition_recommendation != "no"` is very high.
+  Default to `"no"` unless ALL of the following hold simultaneously:
+  1. **`avg_dollar_volume_20d_m` ≥ $50M** — institutional-scale
+     liquidity (micro-caps don't belong in a medium-long-term book).
+  2. **`volume_confirmation_ratio` ≥ 1.5** — today's volume clearly
+     above the 20-day average, meaning real buyers showed up.
+  3. **`single_day_concentration_pct` < 60** — the move is distributed
+     across multiple days (a real trend), not a single-day event gap.
+  4. **There is an OBSERVABLE fundamental / theme anchor** — clear
+     `last_news_headline` or `recent_earnings_signal` or
+     `macro_sector_tailwind != "unknown"` pointing to a multi-quarter
+     thesis, not just "the chart ripped".
+
+  If all four hold → consider `"watch"`. Only if all four hold AND the
+  theme is already persistent in `theme_tags` (2+ distinct tags matching
+  a known secular theme) → `"add"`. For EVERY non-"no" recommendation,
+  fill `universe_addition_reason` with concrete citation of the
+  metric values that justified it.
+
+  A medium-long-term investor does NOT chase:
+  - Thin-volume moves (`avg_dollar_volume_20d_m < $50M`) → `noise_rally`.
+  - Single-day gap-ups (`single_day_concentration_pct > 70%`) → `noise_rally`.
+  - Moves with no news, no macro tailwind, no earnings — pure price
+    action → `noise_rally`, `universe_addition_recommendation="no"`.
+
+  ### Common `miss_category` for ALL sources:
+
+  For each entry, answer three questions (same for both sources):
 
   1. **Is this part of a secular theme?** (AI capex, nuclear/power, rare
      earth, re-shoring, sovereign AI, GLP-1, etc.) If yes, which one?
      Populate `theme_if_any` with a short canonical label ("AI-capex",
      "nuclear/power", etc.).
-  2. **Was the rally anchored in fundamentals?** Check `recent_earnings_signal`
-     and `macro_sector_tailwind` in the snapshot. If earnings were strong
-     and price was low → `fundamentals_mispricing`. If macro was positive
-     on the sector but we never bought → trend-timing miss.
-  3. **Which lens failed?** Was it (a) a trend we saw but didn't enter
-     (`trend_timing_miss` — cite the `TA rating` or `News` line that
-     already flagged it), (b) a theme we don't even scan for
-     (`theme_blindspot` — macro_sector_tailwind="unknown", no news
-     coverage in window), or (c) a fundamental mispricing we missed
-     (`fundamentals_mispricing` — earnings signal was there, nothing
-     acted)?
+  2. **Was the rally anchored in fundamentals or quality flow?** Check
+     `recent_earnings_signal`, `macro_sector_tailwind`, AND the quality
+     metrics (volume confirmation, single-day concentration). If
+     fundamentals were strong and price just started moving → a real
+     mispricing signal. If only price moved with no volume or story →
+     noise.
+  3. **Which lens failed or succeeded?** For universe/both sources:
+     attribute a real miss to tech/news/macro/earnings/PM. For
+     top_mover: the question is whether our universe itself needs
+     expanding (conservative bar above).
 
-  Escape hatches — use sparingly:
-  - `noise_rally` — no prior signal of any kind; move looks like noise.
-    Legitimate HOLD decision, not a real miss.
+  ### Escape hatches — use generously for top_mover, sparingly for universe:
+  - `noise_rally` — no prior signal of any kind AND/OR quality metrics
+    are weak (low volume, single-day gap). Legitimate skip. For
+    top_mover sources, this should be the **default classification
+    unless the quality-bar test above passes**.
   - `risk_disciplined` — RM or a hard rule specifically blocked this
     symbol (earnings-queued cap, correlation cluster). Not a real miss.
 
-  **The `lesson` field must reference an actual data point from the
+  ### Lesson-writing discipline:
+
+  The `lesson` field must reference an actual data point from the
   snapshot — the TA rating or its absence, the headline, the earnings
-  signal, the macro stance.** Do NOT write "stock went up, should have
-  bought" — that's pure price retrospection and adds nothing. Write
-  "News flagged nuclear-capex thesis 9 days ago (HIGH), macro sector
-  tailwind was 'unknown' — we don't track power / utilities; PM never
-  got a fresh TA signal on VST either".
+  signal, the macro stance, or the quality metrics. Do NOT write
+  "stock went up, should have bought" — that's pure price retrospection.
+
+  Good examples:
+  - Universe miss: "News flagged nuclear-capex thesis 9 days ago
+    (HIGH), macro sector tailwind was 'unknown' — we don't track
+    power/utilities; PM never got a fresh TA signal on VST either"
+  - Top-mover worth considering: "20d $vol $180M + vol_conf 2.1x +
+    distributed move (1d concentration 34%) + macro tailwind positive
+    on energy — genuine trend-quality candidate; recommend watch."
+  - Top-mover to ignore: "20d $vol $4M + single-day concentration 85%
+    — micro-cap gap-up with no volume confirmation; no interest for a
+    medium-term book."
 
 ## Example output shape
 

@@ -288,6 +288,11 @@ def test_missed_opportunity_snapshot_python_facts_only():
     )
     assert snap.symbol == "VST"
     assert "nuclear" in snap.theme_tags
+    # Quality fields default to None when digest couldn't compute them
+    assert snap.avg_dollar_volume_20d_m is None
+    assert snap.volume_confirmation_ratio is None
+    assert snap.single_day_concentration_pct is None
+
     # Normalization kicks in — uppercase symbols
     snap_lower = MissedOpportunitySnapshot(
         symbol="  vst ", move_pct=22.3, window_days=5,
@@ -296,6 +301,78 @@ def test_missed_opportunity_snapshot_python_facts_only():
         source="universe",
     )
     assert snap_lower.symbol == "VST"
+
+
+def test_missed_opportunity_snapshot_carries_quality_metrics():
+    """Volume + sustain metrics are optional but populated in real digests."""
+    from src.models import MissedOpportunitySnapshot
+
+    snap = MissedOpportunitySnapshot(
+        symbol="VST", move_pct=22.3, window_days=5,
+        held_during_window=False, had_ta_signal=True,
+        had_news_signal=True, had_earnings_signal=True,
+        source="both",
+        avg_dollar_volume_20d_m=180.5,
+        volume_confirmation_ratio=2.1,
+        single_day_concentration_pct=34.0,
+    )
+    assert snap.avg_dollar_volume_20d_m == 180.5
+    assert snap.volume_confirmation_ratio == 2.1
+    assert snap.single_day_concentration_pct == 34.0
+
+
+def test_missed_opportunity_addition_recommendation_no_by_default():
+    """High-bar recommendation — default MUST be "no" so a confused LLM
+    doesn't spray "add" at every top-mover. Field is optional; omitting
+    it behaves the same as explicit "no"."""
+    from src.models import MissedOpportunity
+
+    m = MissedOpportunity(
+        symbol="VST", move_pct=22.3, miss_category="noise_rally",
+        lesson="low volume top-mover, no fundamental anchor",
+    )
+    assert m.universe_addition_recommendation == "no"
+    assert m.universe_addition_reason == ""
+
+
+def test_missed_opportunity_addition_requires_reason_when_non_no():
+    """recommendation="add" or "watch" MUST cite concrete metrics — the
+    reason field exists precisely to force evidence-based decisions."""
+    from src.models import MissedOpportunity
+
+    # Missing reason when recommendation is "add" → reject
+    with pytest.raises(ValidationError, match="universe_addition_reason"):
+        MissedOpportunity(
+            symbol="VST", move_pct=22.3, miss_category="theme_blindspot",
+            theme_if_any="nuclear/power",
+            lesson="nuclear theme ran, we missed it",
+            universe_addition_recommendation="add",
+            # reason missing
+        )
+
+    # Missing reason when recommendation is "watch" → also reject
+    with pytest.raises(ValidationError, match="universe_addition_reason"):
+        MissedOpportunity(
+            symbol="VST", move_pct=22.3, miss_category="theme_blindspot",
+            theme_if_any="nuclear/power",
+            lesson="nuclear theme ran, we missed it",
+            universe_addition_recommendation="watch",
+            universe_addition_reason="   ",  # whitespace-only also rejected
+        )
+
+    # With proper reason → accept
+    m = MissedOpportunity(
+        symbol="VST", move_pct=22.3, miss_category="theme_blindspot",
+        theme_if_any="nuclear/power",
+        lesson="nuclear theme ran — universe had no coverage",
+        universe_addition_recommendation="watch",
+        universe_addition_reason=(
+            "20d $vol $180M · vol_conf 2.1x · 1d concentration 34% · macro "
+            "sector tailwind positive on energy — trend quality solid"
+        ),
+    )
+    assert m.universe_addition_recommendation == "watch"
+    assert "20d" in m.universe_addition_reason
 
 
 # === EveningReport with missed_opportunities ===

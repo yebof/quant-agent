@@ -18,15 +18,21 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 from datetime import date
 
-from src.pipeline import TradingPipeline
+from src.pipeline import TradingPipeline, _missed_ops_quality_metrics
 
 
-def _mk_ohlcv(sym_close_pairs: list[tuple[str, float]]):
-    """Helper: build the list[OHLCV] shape TradingPipeline expects from market."""
+def _mk_ohlcv(sym_close_pairs: list[tuple[str, float]], volume: float = 0):
+    """Helper: build the list[OHLCV] shape TradingPipeline expects from market.
+
+    Volume defaults to 0 so quality-metric helpers see "no data" (None)
+    instead of being fooled by MagicMock's __float__=1.0 leakage. Tests
+    that care about quality metrics pass an explicit volume.
+    """
     bars = []
     for i, (_sym, close) in enumerate(sym_close_pairs):
         b = MagicMock()
         b.close = close
+        b.volume = volume
         b.date = date(2026, 4, 14 + i)
         bars.append(b)
     return bars
@@ -898,3 +904,225 @@ def test_recent_buys_relative_move_none_when_spy_fetch_fails():
         assert len(out) == 1
         assert out[0]["symbol"] == "NVDA"
         assert out[0]["market_relative_move_pct"] is None
+
+
+# ---------------------------------------------------------------------------
+# Quality metrics helper — _missed_ops_quality_metrics
+# ---------------------------------------------------------------------------
+
+def _ohlcv_with_volume(closes, volumes):
+    """Build list[OHLCV-like] mocks with explicit close + volume per bar."""
+    assert len(closes) == len(volumes)
+    bars = []
+    for i, (c, v) in enumerate(zip(closes, volumes)):
+        b = MagicMock()
+        b.close = c
+        b.volume = v
+        b.date = date(2026, 4, 1 + i)
+        bars.append(b)
+    return bars
+
+
+def test_quality_metrics_all_none_when_bars_empty():
+    """Empty bars → every metric is None. Callers must handle None everywhere
+    that quality metrics flow."""
+    assert _missed_ops_quality_metrics([], 5) == (None, None, None)
+    assert _missed_ops_quality_metrics([MagicMock()], 5) == (None, None, None)
+
+
+def test_quality_metrics_dollar_volume_averaged_over_20_bars():
+    """Given 25 bars with close ~ $100 and volume ~ 1M, avg dollar volume
+    should be ~ $100M, rendered in millions as 100.0."""
+    bars = _ohlcv_with_volume(
+        closes=[100.0] * 25,
+        volumes=[1_000_000] * 25,
+    )
+    avg_m, vol_conf, conc = _missed_ops_quality_metrics(bars, lookback_days=5)
+    assert avg_m is not None and abs(avg_m - 100.0) < 0.1
+    # Today's vol == avg → ratio == 1.0
+    assert vol_conf is not None and abs(vol_conf - 1.0) < 0.01
+
+
+def test_quality_metrics_volume_confirmation_spike():
+    """Today's dollar volume elevated vs the trailing 20d average → vol_conf
+    > 1.5 (the CONFIRMED threshold the prompt uses). The ratio is computed
+    over the trailing 20 bars including today, so a 3x volume spike on
+    the last bar yields a ratio of ~2.7 (3M today / 1.1M avg of 19 quiet
+    + 1 spike day), not 3.0 flat."""
+    closes = [100.0] * 21
+    # First 20 bars at volume=1M, last bar at volume=3M.
+    volumes = [1_000_000] * 20 + [3_000_000]
+    bars = _ohlcv_with_volume(closes, volumes)
+    _, vol_conf, _ = _missed_ops_quality_metrics(bars, lookback_days=5)
+    # 3M / ((19*1M + 3M)/20) = 3M / 1.1M ≈ 2.73
+    assert vol_conf is not None and vol_conf >= 1.5
+    assert vol_conf < 3.0
+
+
+def test_quality_metrics_single_day_concentration_gap():
+    """One big day (+15%) with flat days around it → 1d concentration very
+    high (biggest-day move dominates the total window move)."""
+    bars = _ohlcv_with_volume(
+        # day 0: 100 → day 1: 100 → day 2: 115 (+15%) → day 3: 115 → day 4: 115 → day 5: 115
+        closes=[100, 100, 115, 115, 115, 115],
+        volumes=[1_000_000] * 6,
+    )
+    _, _, conc = _missed_ops_quality_metrics(bars, lookback_days=5)
+    # Total window return = 15%; biggest day = 15% → concentration = 100%
+    assert conc is not None and conc >= 90
+
+
+def test_quality_metrics_single_day_concentration_trend():
+    """Distributed move across all 5 days → concentration < 40%."""
+    bars = _ohlcv_with_volume(
+        closes=[100, 103, 106, 109, 112, 115],  # each day ~3%
+        volumes=[1_000_000] * 6,
+    )
+    _, _, conc = _missed_ops_quality_metrics(bars, lookback_days=5)
+    assert conc is not None and conc < 40
+
+
+def test_quality_metrics_insufficient_volume_bars_returns_none():
+    """Bars with no volume attribute (non-numeric) → avg_dvol_m = None.
+    Single-day concentration should still compute from close prices."""
+    bars = []
+    for close in [100, 103, 106, 109, 112, 115]:
+        b = MagicMock()
+        b.close = close
+        b.volume = None  # explicitly None, not MagicMock
+        b.date = date(2026, 4, 1)
+        bars.append(b)
+    avg_m, vol_conf, conc = _missed_ops_quality_metrics(bars, lookback_days=5)
+    assert avg_m is None
+    assert vol_conf is None
+    # Close-only metric should still work
+    assert conc is not None
+
+
+# ---------------------------------------------------------------------------
+# Liquidity pre-filter on top-movers
+# ---------------------------------------------------------------------------
+
+@patch("src.execution.broker._get_sector", return_value="Technology")
+def test_digest_drops_thin_liquidity_top_movers(_sec):
+    """Top-movers with 20d avg dollar volume below the threshold (default $5M)
+    must be filtered OUT before reaching the LLM. Medium-long-term investor
+    doesn't chase micro-cap gappers."""
+    p = _pipeline_with(
+        top_movers=[
+            {"symbol": "THIN", "percent_change": 25.0, "price": 5.0},
+            {"symbol": "LIQUID", "percent_change": 15.0, "price": 100.0},
+        ],
+    )
+    # Override ohlcv to return bars with distinct volume profiles.
+    # The digest uses the LAST `lookback_days + 1` bars for move%, so
+    # put the rally at the end of the 25-bar trailing window.
+    def _ohlcv(symbol, lookback_days=25):
+        if symbol == "THIN":
+            closes = [5.0] * 19 + [5.0, 5.2, 5.4, 5.5, 5.7, 6.25]  # +25% last 5 days
+            return _ohlcv_with_volume(
+                closes=closes, volumes=[100_000] * 25,  # $0.5M daily
+            )
+        if symbol == "LIQUID":
+            closes = [100.0] * 19 + [100, 103, 106, 109, 112, 115]  # +15%
+            return _ohlcv_with_volume(
+                closes=closes,
+                volumes=[1_000_000] * 25,  # ~$100M daily dollar vol
+            )
+        return []
+    p.market.get_ohlcv.side_effect = _ohlcv
+    out = p._build_missed_opportunities_digest(
+        lookback_days=5, move_threshold_pct=8.0,
+    )
+    syms = [s.symbol for s in out]
+    assert "LIQUID" in syms
+    assert "THIN" not in syms, (
+        f"thin top-mover should have been filtered; got {syms}"
+    )
+
+
+@patch("src.execution.broker._get_sector", return_value="Technology")
+def test_digest_never_drops_universe_symbols_for_liquidity(_sec):
+    """Universe symbols are curated — they bypass the liquidity filter
+    even if their 20d dollar volume is below the threshold. We trust
+    the human-vetted universe definition."""
+    p = _pipeline_with(
+        universe=["ILLIQUID_BUT_TRACKED"],
+    )
+    def _ohlcv(symbol, lookback_days=25):
+        if symbol == "ILLIQUID_BUT_TRACKED":
+            return _ohlcv_with_volume(
+                closes=[5, 5.2, 5.4, 5.5, 5.7, 5.9],  # +18% over window
+                volumes=[10_000] * 6,  # $50k daily — well under $5M
+            )
+        return []
+    p.market.get_ohlcv.side_effect = _ohlcv
+    out = p._build_missed_opportunities_digest(
+        lookback_days=5, move_threshold_pct=8.0,
+    )
+    syms = [s.symbol for s in out]
+    assert "ILLIQUID_BUT_TRACKED" in syms, (
+        "universe symbols must bypass the liquidity filter"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompt rendering — new quality line
+# ---------------------------------------------------------------------------
+
+def test_evening_prompt_renders_quality_line():
+    """The new quality metrics line must appear in the rendered section so
+    the LLM can read volume / sustain numbers and apply the medium-long-
+    term bar."""
+    from src.models import MissedOpportunitySnapshot
+    from unittest.mock import patch as _patch
+    from src.agents.evening_analyst import EveningAnalystAgent
+
+    with _patch("anthropic.Anthropic"):
+        agent = EveningAnalystAgent(api_key="k", model="claude-opus-4-6")
+
+    snap = MissedOpportunitySnapshot(
+        symbol="VST", move_pct=22.3, window_days=5,
+        held_during_window=False,
+        had_ta_signal=False, had_news_signal=True, had_earnings_signal=False,
+        source="top_mover",
+        avg_dollar_volume_20d_m=180.0,
+        volume_confirmation_ratio=2.1,
+        single_day_concentration_pct=34.0,
+    )
+    msg = agent.build_user_message(
+        positions=[], macro_summary={"vix": {"current": 18}},
+        total_value=100_000, daily_pnl=0, daily_return_pct=0.0,
+        missed_ops_snapshots=[snap],
+    )
+    assert "20d $vol 180.0M" in msg
+    assert "vol_conf 2.10x" in msg and "CONFIRMED" in msg
+    assert "34%" in msg and "distributed" in msg
+
+
+def test_evening_prompt_tags_low_quality_top_movers():
+    """Weak quality metrics render with explicit tags (weak / single-day
+    gap) so the LLM treats them as noise_rally candidates."""
+    from src.models import MissedOpportunitySnapshot
+    from unittest.mock import patch as _patch
+    from src.agents.evening_analyst import EveningAnalystAgent
+
+    with _patch("anthropic.Anthropic"):
+        agent = EveningAnalystAgent(api_key="k", model="claude-opus-4-6")
+
+    snap = MissedOpportunitySnapshot(
+        symbol="THIN", move_pct=22.3, window_days=5,
+        held_during_window=False,
+        had_ta_signal=False, had_news_signal=False, had_earnings_signal=False,
+        source="top_mover",
+        avg_dollar_volume_20d_m=3.5,  # thin
+        volume_confirmation_ratio=0.8,  # weak
+        single_day_concentration_pct=85.0,  # gap
+    )
+    msg = agent.build_user_message(
+        positions=[], macro_summary={"vix": {"current": 18}},
+        total_value=100_000, daily_pnl=0, daily_return_pct=0.0,
+        missed_ops_snapshots=[snap],
+    )
+    assert "weak" in msg  # volume_confirmation_ratio < 1.5
+    assert "single-day gap" in msg  # concentration >= 70
