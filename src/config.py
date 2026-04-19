@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.agents.base import _is_openai_model
 
@@ -142,6 +142,69 @@ class StorageConfig(BaseModel):
     db_path: str
 
 
+class EvolutionConfig(BaseModel):
+    """Quarterly meta-reflection prompt-evolution settings.
+
+    `enabled=False` is the safe default — PR3 (the meta_reflector) writes
+    reflection.json to disk but the editor never runs. Flip to True only
+    after reviewing a quarter or two of reflection.json contents by hand.
+    Every guard below is redundantly enforced in src/evolution/prompt_editor.py;
+    this block makes them tunable per deployment.
+    """
+    enabled: bool = False
+    """Master switch. PR4 default is False — the editor stays dormant
+    until explicitly flipped. Flipping back to False does not retract
+    already-applied learnings; use the retract path in the reflector."""
+
+    auto_commit: bool = True
+    """After successful prompt edits, `git add` + `git commit` each
+    modified prompt file so `git revert <hash>` provides a one-shot
+    rollback for a whole quarter's evolution."""
+
+    max_agents_per_cycle: int = 3
+    """Hard cap — at most N agents get edited per quarterly run even if
+    the meta-reflector proposes more. Schema cap on proposed_learnings
+    is already 3; this is the second belt."""
+
+    max_learnings_per_agent: int = 10
+    """FIFO buffer per agent prompt. When an append would push past the
+    cap, the oldest auto-added entry (by date-tag, not manual) is
+    rolled off before the new one is appended."""
+
+    max_learning_chars: int = 200
+    """Upper bound per entry. Schema enforces ≥20 already; this is the
+    ≤200 end. Prevents prompt bloat."""
+
+    min_justification_chars: int = 40
+    """Schema floor on PromptLearning.justification. Echoed here so a
+    deployment can tighten it (the schema's 40 is the loosest allowed)."""
+
+    jaccard_dedup_threshold: float = 0.6
+    """Token-level Jaccard similarity against EACH existing entry in
+    the target agent's Learnings section. If any pair exceeds this,
+    the new entry is treated as a near-duplicate and rejected.
+    0.6 tuned loose — catches paraphrases without rejecting legitimately
+    similar-topic learnings written differently."""
+
+    prohibited_words: list[str] = Field(
+        default_factory=lambda: [
+            "never", "always", "override", "ignore all",
+            "must always", "must never",
+        ],
+    )
+    """Case-insensitive word-boundary regex check on learning_text. These
+    directly conflict with invariant wording in the core prompts (e.g.
+    RM's 'ALWAYS require stop_loss'); letting an LLM append a 'never' rule
+    can flip the hard discipline."""
+
+    protected_agents: list[str] = Field(
+        default_factory=lambda: ["risk_manager", "position_reviewer"],
+    )
+    """Agents whose prompts the editor MUST NOT touch. The Pydantic
+    MetaReflectionAgentName literal already excludes these — this is
+    the second belt at the editor layer."""
+
+
 class AppConfig(BaseModel):
     api_keys: ApiKeysConfig
     alpaca: AlpacaConfig
@@ -149,6 +212,7 @@ class AppConfig(BaseModel):
     risk: RiskConfig
     trading: TradingConfig
     storage: StorageConfig
+    evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
 
     @model_validator(mode="after")
     def _check_llm_provider_keys(self):
