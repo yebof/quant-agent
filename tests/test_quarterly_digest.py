@@ -233,6 +233,67 @@ def test_loss_patterns_empty_when_no_wrong_buys():
 # agent_signal_activity
 # ---------------------------------------------------------------------------
 
+def test_agent_signal_activity_counts_tech_ratings_with_bare_list_shape():
+    """Production regression 2026-04: tech_analyst full_response is stored
+    as a BARE LIST (flat analyses), not ``{"analyses": [...]}``. Digest
+    must tolerate both shapes — a .get() on list would crash the whole
+    quarterly meta run."""
+    db = MagicMock()
+    db.get_daily_pnl.return_value = []
+    db.get_recent_insights.return_value = []
+
+    def _agent_outputs(agent_name, limit, before_date=None):
+        if agent_name != "tech_analyst":
+            return []
+        return [
+            {"timestamp": "2026-03-15 09:35:00",
+             # Bare list — the production shape that broke us
+             "full_response": json.dumps([
+                 {"symbol": "NVDA", "rating": "buy"},
+                 {"symbol": "MU", "rating": "strong_buy"},
+                 {"symbol": "HOLD1", "rating": "hold"},
+             ])},
+        ]
+    db.get_recent_agent_outputs.side_effect = _agent_outputs
+
+    digest = build_quarterly_digest(
+        db, market=None, period_end=date(2026, 3, 31), lookback_days=30,
+    )
+    tech = digest["agent_signal_activity"]["tech_analyst"]
+    assert tech["n_buy"] == 1
+    assert tech["n_strong_buy"] == 1
+    assert tech["n_hold"] == 1
+    assert tech["distinct_symbols_with_buy_call"] == 2  # NVDA + MU
+
+
+def test_agent_signal_activity_tolerates_symbol_keyed_dict():
+    """Another shape drift guard: some older runs emitted
+    ``{"NVDA": {"rating":"buy"}, "MU": {"rating":"hold"}}``. Digest must
+    flatten these too so historical rows don't cause a crash."""
+    db = MagicMock()
+    db.get_daily_pnl.return_value = []
+    db.get_recent_insights.return_value = []
+
+    def _agent_outputs(agent_name, limit, before_date=None):
+        if agent_name != "tech_analyst":
+            return []
+        return [
+            {"timestamp": "2026-03-15 09:35:00",
+             "full_response": json.dumps({
+                 "NVDA": {"rating": "buy"},
+                 "MU":   {"rating": "hold"},
+             })},
+        ]
+    db.get_recent_agent_outputs.side_effect = _agent_outputs
+
+    digest = build_quarterly_digest(
+        db, market=None, period_end=date(2026, 3, 31), lookback_days=30,
+    )
+    tech = digest["agent_signal_activity"]["tech_analyst"]
+    assert tech["n_buy"] == 1
+    assert tech["n_hold"] == 1
+
+
 def test_agent_signal_activity_counts_tech_ratings():
     """Tech analyst logs parsed: strong_buy / buy / hold / sell counts,
     distinct symbols that ever got a buy call."""
