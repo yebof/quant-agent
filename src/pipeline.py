@@ -1677,6 +1677,91 @@ class TradingPipeline:
             lines.append(line)
         return "\n".join(lines)
 
+    def _persist_evening_replay_inputs(
+        self,
+        *,
+        date_iso: str,
+        run_id: str,
+        positions,
+        macro_summary: dict,
+        total_value: float,
+        daily_pnl: float,
+        daily_return_pct: float,
+        today_trades: list,
+        prior_outlook,
+        recent_sells: list,
+        recent_buys: list,
+        news_intel,
+        earnings_analyses: list,
+        weekly_narrative: str,
+        active_state_changes: str,
+        outlook_calibration: dict,
+        missed_ops_snapshots: list,
+        thesis_health_context: dict,
+        root_dir: str = "data/evening_replays",
+    ) -> Path:
+        """Freeze the full evening-analyst input set as JSON so a candidate
+        prompt can be re-scored on the same inputs weeks later.
+
+        Pydantic objects (Position, NewsIntelligenceReport, MissedOpportunity
+        Snapshot) are serialized via model_dump; the replay script reverses
+        it. Plain dicts/strings pass through untouched. Writes atomically to
+        data/evening_replays/YYYY-MM-DD.json. Caller treats the whole call
+        as best-effort — a disk full or permission issue on the replay dir
+        should NOT break the live evening run.
+        """
+        from pathlib import Path as _Path
+        import json as _json
+        import os as _os
+
+        def _dump(obj):
+            """Recursively convert Pydantic → dict; leave plain JSON types."""
+            if obj is None or isinstance(obj, (bool, int, float, str)):
+                return obj
+            if hasattr(obj, "model_dump"):
+                return obj.model_dump(mode="json")
+            if isinstance(obj, list):
+                return [_dump(x) for x in obj]
+            if isinstance(obj, tuple):
+                return [_dump(x) for x in obj]
+            if isinstance(obj, dict):
+                return {str(k): _dump(v) for k, v in obj.items()}
+            # Fall-through: stringify — better than crashing the persist.
+            return str(obj)
+
+        payload = {
+            "schema_version": 1,
+            "date": date_iso,
+            "run_id": run_id,
+            "kwargs": {
+                "positions": [_dump(p) for p in (positions or [])],
+                "macro_summary": _dump(macro_summary),
+                "total_value": total_value,
+                "daily_pnl": daily_pnl,
+                "daily_return_pct": daily_return_pct,
+                "today_trades": _dump(today_trades),
+                "prior_outlook": _dump(prior_outlook),
+                "recent_sells": _dump(recent_sells),
+                "recent_buys": _dump(recent_buys),
+                "news_intel": _dump(news_intel),
+                "earnings_analyses": _dump(earnings_analyses),
+                "weekly_narrative": weekly_narrative,
+                "active_state_changes": active_state_changes,
+                "outlook_calibration": _dump(outlook_calibration),
+                "missed_ops_snapshots": [_dump(s) for s in (missed_ops_snapshots or [])],
+                "thesis_health_context": _dump(thesis_health_context),
+            },
+        }
+
+        out_dir = _Path(root_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{date_iso}.json"
+        tmp = out_path.with_suffix(".json.tmp")
+        tmp.write_text(_json.dumps(payload, indent=2, ensure_ascii=False))
+        _os.replace(str(tmp), str(out_path))
+        logger.info("Evening replay inputs frozen → %s", out_path)
+        return out_path
+
     def _build_thesis_health_context(
         self,
         positions,
@@ -3945,6 +4030,35 @@ class TradingPipeline:
                 "thesis_health_context failed (proceeding without it): %s", e,
             )
             thesis_health_context = {}
+
+        # Replay/shadow mechanism (2026-04 — P2 follow-up): persist the
+        # full evening-analyst input set so a candidate prompt can be
+        # re-scored on the same frozen inputs later via
+        # `scripts/replay_evening.py`. Doesn't affect the live run;
+        # failure here is non-fatal and only logged.
+        try:
+            self._persist_evening_replay_inputs(
+                date_iso=today_str,
+                run_id=run_id,
+                positions=positions,
+                macro_summary=macro_summary,
+                total_value=total_value,
+                daily_pnl=daily_pnl,
+                daily_return_pct=daily_return_pct,
+                today_trades=today_trades,
+                prior_outlook=prior_outlook,
+                recent_sells=recent_sells,
+                recent_buys=recent_buys,
+                news_intel=evening_news,
+                earnings_analyses=evening_earnings,
+                weekly_narrative=weekly_narrative,
+                active_state_changes=active_state_changes,
+                outlook_calibration=outlook_calibration,
+                missed_ops_snapshots=missed_ops_snapshots,
+                thesis_health_context=thesis_health_context,
+            )
+        except Exception as e:
+            logger.warning("evening replay input persistence failed: %s", e)
 
         analysis = None
         analysis_error = False
