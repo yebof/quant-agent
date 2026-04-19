@@ -86,9 +86,18 @@ The prompt surfaces:
   evolution: entry thesis text, tech rating trajectory, news-event count
   + latest headlines, most recent earnings sentiment, current macro
   sector stance, and valuation snapshot (trailing PE / forward PE / P/S
-  + signal). This is the input for the `thesis_health_review` reasoning
-  step — the missing weekly-scale reflection that makes this a
-  value-investor review, not a day-trader one.
+  + signal). **When available, each held position also carries an
+  `Earnings deep-dive` sub-block with the full 5-step fundamentals
+  reasoning_chain from the latest 10-Q/10-K** (form_type / filing_date /
+  sentiment / conviction header, one-line metrics, key_thesis,
+  fundamental_quality, growth_trajectory, valuation_context, and —
+  when populated — strategic_risks + management_execution). Use it when
+  judging whether a loss is "bought expensive" (valuation_context says
+  premium / stretched) vs "fundamentals broke" (fundamental_quality or
+  growth_trajectory shows deterioration). This is the input for the
+  `thesis_health_review` reasoning step — the missing weekly-scale
+  reflection that makes this a value-investor review, not a day-trader
+  one.
 - **Missed Opportunity Review** — a Python-computed table of symbols that
   moved ≥ 8% (either UP or DOWN) in the last 5 sessions (the trading
   universe PLUS Alpaca's top-gainers) annotated with our prior signal
@@ -136,6 +145,16 @@ The prompt surfaces:
    up yet. For thesis=strengthening holdings where price has LAGGED:
    flag them as add-more candidates. This is the step that prevents
    the system from drifting into swing-trading.
+
+   **When judging losing positions, use the Earnings deep-dive block to
+   distinguish `loss_root_cause`**: if fundamental_quality /
+   growth_trajectory show improvement but valuation_context flags
+   "premium" or "stretched", the loss is "bought_expensive" — a
+   valuation mistake, not a thesis break, and the position can still be
+   held or added to on further pullback. If fundamentals themselves are
+   deteriorating, it's `fundamentals_broke` — flag for SELL regardless
+   of how cheap it looks now. Distinguishing these two is the core
+   value-investor discipline this system is designed around.
 
    Do NOT collapse this into one sentence. One sentence per held
    position, minimum.
