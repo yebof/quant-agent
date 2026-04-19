@@ -1652,6 +1652,118 @@ class TradingPipeline:
             lines.append(line)
         return "\n".join(lines)
 
+    def _build_watchlist_candidates(
+        self, lookback_days: int = 30,
+    ) -> list[dict]:
+        """Symbols the evening analyst has repeatedly flagged as "add" or
+        "watch" to the trading universe — the surface the user reviews
+        when deciding whether to actually expand the 77-symbol universe.
+
+        Reads `insights.missed_opportunities_json` for the last N days,
+        filters entries with `universe_addition_recommendation != "no"`,
+        aggregates by symbol.
+
+        Returns a sorted list of dicts:
+          [
+            {
+              "symbol": "VST",
+              "add_count": int,
+              "watch_count": int,
+              "total_flags": int,
+              "dates": [ISO date, ...],   # newest first
+              "themes": [str, ...],        # distinct theme_if_any seen
+              "latest_reason": str,        # most recent universe_addition_reason
+              "latest_miss_category": str, # e.g. "theme_blindspot"
+            },
+            ...
+          ]
+
+        Sort: (add_count desc, watch_count desc, total_flags desc, symbol).
+        One "add" carries more weight than one "watch" — an "add" means
+        the LLM cleared ALL four quality bars (volume + sustain + theme
+        + fundamentals), a "watch" means most-but-not-all.
+
+        THIS FUNCTION DOES NOT MODIFY THE UNIVERSE. Universe expansion
+        is a human decision — edit config/settings.yaml manually after
+        reviewing this output. By design, so that the system can't
+        casually grow the curated list.
+        """
+        import json as _json
+        try:
+            rows = self.db.get_recent_insights(limit=lookback_days + 5)
+        except Exception as exc:
+            logger.warning(
+                "watchlist_candidates: insights fetch failed: %s", exc,
+            )
+            return []
+        if not rows:
+            return []
+
+        by_symbol: dict[str, dict] = {}
+        for row in rows[:lookback_days]:
+            row_date = row.get("date") or ""
+            raw = row.get("missed_opportunities_json")
+            if not raw:
+                continue
+            try:
+                items = _json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(items, list):
+                continue
+            for m in items:
+                if not isinstance(m, dict):
+                    continue
+                rec = (m.get("universe_addition_recommendation") or "no").strip()
+                if rec not in ("add", "watch"):
+                    continue
+                sym = (m.get("symbol") or "").strip().upper()
+                if not sym:
+                    continue
+                bucket = by_symbol.setdefault(sym, {
+                    "symbol": sym,
+                    "add_count": 0,
+                    "watch_count": 0,
+                    "dates": [],
+                    "themes": set(),
+                    "latest_reason": "",
+                    "latest_miss_category": "",
+                })
+                if rec == "add":
+                    bucket["add_count"] += 1
+                else:
+                    bucket["watch_count"] += 1
+                if row_date:
+                    bucket["dates"].append(row_date)
+                theme = (m.get("theme_if_any") or "").strip()
+                if theme:
+                    bucket["themes"].add(theme)
+                # Rows come newest-first from get_recent_insights, so the
+                # first non-empty reason/category we see is the freshest.
+                reason = (m.get("universe_addition_reason") or "").strip()
+                if reason and not bucket["latest_reason"]:
+                    bucket["latest_reason"] = reason[:240]
+                cat = (m.get("miss_category") or "").strip()
+                if cat and not bucket["latest_miss_category"]:
+                    bucket["latest_miss_category"] = cat
+
+        results: list[dict] = []
+        for sym, bucket in by_symbol.items():
+            bucket["themes"] = sorted(bucket["themes"])
+            bucket["total_flags"] = bucket["add_count"] + bucket["watch_count"]
+            # Dates were appended newest-first (rows iteration), but belt
+            # them by sorting desc in case the evening is ever replayed
+            # out of order.
+            bucket["dates"] = sorted(set(bucket["dates"]), reverse=True)
+            results.append(bucket)
+        results.sort(
+            key=lambda b: (
+                -b["add_count"], -b["watch_count"], -b["total_flags"],
+                b["symbol"],
+            ),
+        )
+        return results
+
     def _build_recent_loss_pits(self, lookback_days: int = 14) -> str:
         """PM L3f memory: repeat failure modes from losing BUYs.
 

@@ -1100,6 +1100,226 @@ def test_evening_prompt_renders_quality_line():
     assert "34%" in msg and "distributed" in msg
 
 
+def _pipeline_with_insights_rows_moj(rows: list[dict]):
+    """Mirror of _pipeline_with_insights_rows tuned for
+    `missed_opportunities_json` content."""
+    from src.pipeline import TradingPipeline
+    p = TradingPipeline.__new__(TradingPipeline)
+    p.db = MagicMock()
+    p.db.get_recent_insights.return_value = rows
+    return p
+
+
+# ---------------------------------------------------------------------------
+# PM helper: _build_watchlist_candidates — aggregate by symbol
+# ---------------------------------------------------------------------------
+
+def test_watchlist_candidates_empty_when_no_recommendations():
+    """Evening flagged everyone as 'no' (or there are no rows) → empty list.
+    Script treats empty as "nothing cleared the quality bar — normal."""
+    import json as _json
+    p = _pipeline_with_insights_rows_moj([
+        {"date": "2026-04-18",
+         "missed_opportunities_json": _json.dumps([
+             {"symbol": "VST", "miss_category": "noise_rally",
+              "universe_addition_recommendation": "no",
+              "lesson": "thin volume, no theme"},
+         ])},
+    ])
+    assert p._build_watchlist_candidates(lookback_days=30) == []
+
+
+def test_watchlist_candidates_aggregates_add_and_watch_counts():
+    """Same symbol flagged 'add' on day 1 and 'watch' on day 2 → bucket
+    has add_count=1, watch_count=1, total_flags=2."""
+    import json as _json
+    p = _pipeline_with_insights_rows_moj([
+        {"date": "2026-04-18",
+         "missed_opportunities_json": _json.dumps([
+             {"symbol": "VST", "miss_category": "theme_blindspot",
+              "theme_if_any": "nuclear/power",
+              "universe_addition_recommendation": "add",
+              "universe_addition_reason": "20d $vol $180M; vol_conf 2.1x",
+              "lesson": "x"},
+         ])},
+        {"date": "2026-04-17",
+         "missed_opportunities_json": _json.dumps([
+             {"symbol": "VST", "miss_category": "theme_blindspot",
+              "theme_if_any": "nuclear/power",
+              "universe_addition_recommendation": "watch",
+              "universe_addition_reason": "vol_conf 1.6x; 1d conc 45%",
+              "lesson": "x"},
+         ])},
+    ])
+    out = p._build_watchlist_candidates(lookback_days=30)
+    assert len(out) == 1
+    vst = out[0]
+    assert vst["symbol"] == "VST"
+    assert vst["add_count"] == 1
+    assert vst["watch_count"] == 1
+    assert vst["total_flags"] == 2
+    assert vst["themes"] == ["nuclear/power"]
+    # Dates sorted newest-first
+    assert vst["dates"] == ["2026-04-18", "2026-04-17"]
+    # Latest reason = from the newest-day entry
+    assert "$180M" in vst["latest_reason"]
+
+
+def test_watchlist_candidates_sorts_add_before_watch():
+    """An 'add' flag outranks a 'watch' flag in the sort order —
+    add clears all four quality bars, watch clears most-but-not-all."""
+    import json as _json
+    p = _pipeline_with_insights_rows_moj([
+        {"date": "2026-04-18",
+         "missed_opportunities_json": _json.dumps([
+             {"symbol": "A_ONLY_WATCH", "miss_category": "theme_blindspot",
+              "theme_if_any": "ai-capex",
+              "universe_addition_recommendation": "watch",
+              "universe_addition_reason": "vol_conf 1.5x; marginal",
+              "lesson": "x"},
+             {"symbol": "B_ONE_ADD", "miss_category": "theme_blindspot",
+              "theme_if_any": "nuclear/power",
+              "universe_addition_recommendation": "add",
+              "universe_addition_reason": "$180M · 2.1x · distributed",
+              "lesson": "x"},
+         ])},
+        {"date": "2026-04-17",
+         "missed_opportunities_json": _json.dumps([
+             {"symbol": "A_ONLY_WATCH", "miss_category": "theme_blindspot",
+              "theme_if_any": "ai-capex",
+              "universe_addition_recommendation": "watch",
+              "universe_addition_reason": "vol_conf 1.5x; marginal",
+              "lesson": "x"},
+             {"symbol": "A_ONLY_WATCH", "miss_category": "theme_blindspot",
+              "theme_if_any": "ai-capex",
+              "universe_addition_recommendation": "watch",
+              "universe_addition_reason": "vol_conf 1.5x; marginal",
+              "lesson": "x"},
+         ])},
+    ])
+    out = p._build_watchlist_candidates(lookback_days=30)
+    # B has 1 add (beats watch); A has 3 watch
+    assert [c["symbol"] for c in out] == ["B_ONE_ADD", "A_ONLY_WATCH"]
+
+
+def test_watchlist_candidates_ignores_no_recommendations():
+    """`no` recommendations don't contribute counts (prevent the table
+    from being flooded with every noise_rally entry)."""
+    import json as _json
+    p = _pipeline_with_insights_rows_moj([
+        {"date": "2026-04-18",
+         "missed_opportunities_json": _json.dumps([
+             {"symbol": "NOISE", "miss_category": "noise_rally",
+              "universe_addition_recommendation": "no",
+              "lesson": "thin"},
+             {"symbol": "GOOD", "miss_category": "theme_blindspot",
+              "theme_if_any": "nuclear/power",
+              "universe_addition_recommendation": "add",
+              "universe_addition_reason": "$180M · 2.1x",
+              "lesson": "x"},
+         ])},
+    ])
+    out = p._build_watchlist_candidates(lookback_days=30)
+    assert [c["symbol"] for c in out] == ["GOOD"]
+
+
+def test_watchlist_candidates_tolerates_malformed_json():
+    """Corrupt row → skip, don't crash. Other rows still counted."""
+    import json as _json
+    p = _pipeline_with_insights_rows_moj([
+        {"date": "2026-04-18",
+         "missed_opportunities_json": "{ not valid json"},
+        {"date": "2026-04-17",
+         "missed_opportunities_json": _json.dumps([
+             {"symbol": "VST", "miss_category": "theme_blindspot",
+              "theme_if_any": "nuclear/power",
+              "universe_addition_recommendation": "add",
+              "universe_addition_reason": "$180M · 2.1x",
+              "lesson": "x"},
+         ])},
+    ])
+    out = p._build_watchlist_candidates(lookback_days=30)
+    assert len(out) == 1
+    assert out[0]["symbol"] == "VST"
+
+
+# ---------------------------------------------------------------------------
+# Quarterly digest: watchlist_candidates section
+# ---------------------------------------------------------------------------
+
+def test_quarterly_digest_includes_watchlist_candidates():
+    """build_quarterly_digest returns a watchlist_candidates section with the
+    right shape: {window_days, candidates, high_conviction, total_candidates}."""
+    from datetime import date as _date
+    import json as _json
+    from src.evolution.quarterly_digest import build_quarterly_digest
+    from unittest.mock import MagicMock as _MM
+
+    db = _MM()
+    db.get_daily_pnl.return_value = []
+    db.get_recent_insights.return_value = [
+        {"date": "2026-04-18",
+         "missed_opportunities_json": _json.dumps([
+             {"symbol": "VST", "miss_category": "theme_blindspot",
+              "theme_if_any": "nuclear/power",
+              "universe_addition_recommendation": "add",
+              "universe_addition_reason": "$180M · 2.1x · distributed",
+              "lesson": "x"},
+         ])},
+        {"date": "2026-04-17",
+         "missed_opportunities_json": _json.dumps([
+             {"symbol": "VST", "miss_category": "theme_blindspot",
+              "theme_if_any": "nuclear/power",
+              "universe_addition_recommendation": "add",
+              "universe_addition_reason": "$180M · 2.1x · distributed",
+              "lesson": "x"},
+         ])},
+    ]
+    db.get_recent_agent_outputs.return_value = []
+    db.compute_trade_calibration.return_value = {"n_closed": 0}
+
+    digest = build_quarterly_digest(
+        db, market=None, period_end=_date(2026, 3, 31), lookback_days=90,
+    )
+    wlc = digest["watchlist_candidates"]
+    assert wlc["window_days"] == 90
+    assert wlc["total_candidates"] == 1
+    assert wlc["candidates"][0]["symbol"] == "VST"
+    assert wlc["candidates"][0]["add_count"] == 2
+    # add_count >= 2 → high conviction
+    assert "VST" in wlc["high_conviction"]
+
+
+def test_quarterly_digest_watchlist_high_conviction_threshold():
+    """A single 'add' flag does NOT put a symbol in high_conviction —
+    we need 2+ 'add's across distinct days to take it seriously."""
+    from datetime import date as _date
+    import json as _json
+    from src.evolution.quarterly_digest import build_quarterly_digest
+    from unittest.mock import MagicMock as _MM
+
+    db = _MM()
+    db.get_daily_pnl.return_value = []
+    db.get_recent_insights.return_value = [
+        {"date": "2026-04-18",
+         "missed_opportunities_json": _json.dumps([
+             {"symbol": "LONE", "miss_category": "theme_blindspot",
+              "theme_if_any": "ai-capex",
+              "universe_addition_recommendation": "add",
+              "universe_addition_reason": "single observation",
+              "lesson": "x"},
+         ])},
+    ]
+    db.get_recent_agent_outputs.return_value = []
+    db.compute_trade_calibration.return_value = {"n_closed": 0}
+    digest = build_quarterly_digest(
+        db, market=None, period_end=_date(2026, 3, 31), lookback_days=90,
+    )
+    wlc = digest["watchlist_candidates"]
+    assert wlc["total_candidates"] == 1
+    assert wlc["high_conviction"] == []  # single add isn't enough
+
+
 def test_evening_prompt_tags_low_quality_top_movers():
     """Weak quality metrics render with explicit tags (weak / single-day
     gap) so the LLM treats them as noise_rally candidates."""

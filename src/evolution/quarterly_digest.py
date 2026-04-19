@@ -83,6 +83,9 @@ def build_quarterly_digest(
     digest["agent_signal_activity"] = _agent_signal_activity(
         db, period_start, period_end,
     )
+    digest["watchlist_candidates"] = _watchlist_candidates_aggregated(
+        db, lookback_days,
+    )
 
     if prev_digest:
         digest["corrigibility_trend"] = _corrigibility_trend(digest, prev_digest)
@@ -472,6 +475,118 @@ def _loss_patterns_aggregated(db: "Database", lookback_days: int) -> dict:
         "by_cause": by_cause_sorted,
         "total_wrong_buys": total_wrong,
         "alpha_destruction_pct": alpha_destruction_pct,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Section: watchlist_candidates
+# ---------------------------------------------------------------------------
+
+def _watchlist_candidates_aggregated(
+    db: "Database", lookback_days: int,
+) -> dict:
+    """Symbols the evening analyst has repeatedly flagged as `add` / `watch`
+    over the quarter — candidates for universe expansion, surfaced for
+    human review. Schema deliberately identical to
+    `pipeline._build_watchlist_candidates` so the 30-day daily helper and
+    the 90-day quarterly view share the same shape, just different windows.
+
+    Output:
+      {
+        "window_days": int,                # lookback_days actually scanned
+        "candidates": [                    # sorted (add desc, watch desc)
+          {"symbol", "add_count", "watch_count", "total_flags",
+           "dates", "themes", "latest_reason", "latest_miss_category"},
+          ...
+        ],
+        "high_conviction": [str, ...],     # symbols with add_count >= 2
+        "total_candidates": int,
+      }
+
+    high_conviction threshold (`add_count >= 2`) is what the meta-reflector
+    should treat as "worth seriously considering adding to universe"; the
+    rest are watching, not deciding. Threshold is intentionally strict —
+    the user's universe is deliberately curated.
+    """
+    try:
+        rows = db.get_recent_insights(limit=lookback_days + 10)
+    except Exception as exc:
+        logger.warning(
+            "watchlist_candidates: insights fetch failed: %s", exc,
+        )
+        return {
+            "window_days": lookback_days,
+            "candidates": [],
+            "high_conviction": [],
+            "total_candidates": 0,
+        }
+
+    by_symbol: dict[str, dict] = {}
+    for row in rows[:lookback_days]:
+        row_date = row.get("date") or ""
+        raw = row.get("missed_opportunities_json")
+        if not raw:
+            continue
+        try:
+            items = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(items, list):
+            continue
+        for m in items:
+            if not isinstance(m, dict):
+                continue
+            rec = (m.get("universe_addition_recommendation") or "no").strip()
+            if rec not in ("add", "watch"):
+                continue
+            sym = (m.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            bucket = by_symbol.setdefault(sym, {
+                "symbol": sym,
+                "add_count": 0,
+                "watch_count": 0,
+                "dates": [],
+                "themes": set(),
+                "latest_reason": "",
+                "latest_miss_category": "",
+            })
+            if rec == "add":
+                bucket["add_count"] += 1
+            else:
+                bucket["watch_count"] += 1
+            if row_date:
+                bucket["dates"].append(row_date)
+            theme = (m.get("theme_if_any") or "").strip()
+            if theme:
+                bucket["themes"].add(theme)
+            reason = (m.get("universe_addition_reason") or "").strip()
+            if reason and not bucket["latest_reason"]:
+                bucket["latest_reason"] = reason[:240]
+            cat = (m.get("miss_category") or "").strip()
+            if cat and not bucket["latest_miss_category"]:
+                bucket["latest_miss_category"] = cat
+
+    candidates: list[dict] = []
+    for sym, bucket in by_symbol.items():
+        bucket["themes"] = sorted(bucket["themes"])
+        bucket["total_flags"] = bucket["add_count"] + bucket["watch_count"]
+        bucket["dates"] = sorted(set(bucket["dates"]), reverse=True)
+        candidates.append(bucket)
+    candidates.sort(
+        key=lambda b: (
+            -b["add_count"], -b["watch_count"], -b["total_flags"],
+            b["symbol"],
+        ),
+    )
+
+    high_conviction = [c["symbol"] for c in candidates if c["add_count"] >= 2]
+
+    return {
+        "window_days": lookback_days,
+        "candidates": candidates,
+        "high_conviction": high_conviction,
+        "total_candidates": len(candidates),
     }
 
 
