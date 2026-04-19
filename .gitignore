@@ -6,7 +6,7 @@ dist/
 build/
 .pytest_cache/
 .venv/
-data/
+/data/
 .env
 .DS_Store
 *.log

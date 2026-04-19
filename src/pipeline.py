@@ -1859,6 +1859,21 @@ class TradingPipeline:
                 pass
             valuation["signal"] = _valuation_signal_from(valuation["forward_pe"])
 
+            # Earnings deep-dive: full reasoning_chain + headline metrics
+            # from the canonical analysis_*.md for this symbol. Only
+            # surfaced for HELD positions (token-budget reasons); missed_ops
+            # still use the 140-char snippet via earnings_map.
+            from src.data.earnings_deep_dive import load_earnings_deep_dive
+            deep_dive = None
+            try:
+                manifest = getattr(self.earnings_provider, "manifest", {}) or {}
+                deep_dive = load_earnings_deep_dive(sym, manifest)
+            except Exception as exc:
+                logger.debug(
+                    "thesis_health earnings deep-dive failed for %s: %s",
+                    sym, exc,
+                )
+
             out[sym] = {
                 "symbol": sym,
                 "entry_date": entry_date,
@@ -1872,6 +1887,7 @@ class TradingPipeline:
                 "news_count_8w": news_count,
                 "latest_news_headlines": latest_news_headlines,
                 "recent_earnings_signal": earnings_map.get(sym),
+                "earnings_deep_dive": deep_dive,
                 "macro_sector_stance": macro_stance,
                 "valuation": valuation,
             }

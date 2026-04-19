@@ -29,7 +29,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 | portfolio_manager | 7 | 8 层 memory (L1-L8) 喂进来 |
 | risk_manager | 6 | rr_audit / signal_fidelity / correlation / event_risk / sizing / overall |
 | position_reviewer | 6 | midday + close 共用；`session_type` 切换 disposition |
-| evening_analyst | 6 | performance / retrospection / decision_quality / calibration_meta / regime / tomorrow_prep。**结构化 `sell_grades` / `buy_grades` 持久化到 `insights.sell_grades_json` / `buy_grades_json`（JSON 列），`_build_trade_grade_summary(lookback=14)` 聚合成 counts + repeat-offender 列表，传入 position_reviewer 形成 SELL 纪律闭环**。同时 `outlook_calibration` 元循环（自己看自己 bias hit rate）自学 |
+| evening_analyst | 7 | performance / retrospection / decision_quality / calibration_meta / regime / **thesis_health_review** / tomorrow_prep。**结构化 `sell_grades` / `buy_grades` 持久化到 `insights.sell_grades_json` / `buy_grades_json`（JSON 列），`_build_trade_grade_summary(lookback=14)` 聚合成 counts + repeat-offender 列表，传入 position_reviewer 形成 SELL 纪律闭环**。同时 `outlook_calibration` 元循环（自己看自己 bias hit rate）自学。**thesis_health_review 每个持仓都读 8 周 tech 轨迹 + 新闻 + 估值 + 最新 10-Q/10-K 的完整 reasoning_chain（src/data/earnings_deep_dive.py 从 `data/earnings/{SYMBOL}/analysis_*.md` 解析 JSON 块、truncate 到 500c/300c），输出 `thesis_trajectory: strengthening/intact/weakening/broken` + `loss_root_cause`——让 evening 能判断"亏损是估值贵买贵了还是基本面坏了"这种 value 投资核心问题** |
 
 详细设计见 `README.md`，agent 行为规则见 `config/prompts/*.md`。
 

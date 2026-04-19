@@ -117,6 +117,43 @@ def _fmt_thesis_health(context: dict) -> str:
         val_signal = val.get("signal", "no_data")
         val_str = f"{val_str} ({val_signal})"
 
+        # Earnings deep-dive (2026-04 upgrade) — full structured fundamentals
+        # section pulled from analysis_*.md for THIS held position. Only
+        # rendered when available (most universe symbols with a 10-Q/10-K
+        # on file will have one). Skipped silently when None.
+        deep = c.get("earnings_deep_dive")
+        deep_section = ""
+        if isinstance(deep, dict):
+            hl = deep.get("headline") or ""
+            fq = (deep.get("fundamental_quality") or "").strip()
+            gt = (deep.get("growth_trajectory") or "").strip()
+            vc = (deep.get("valuation_context") or "").strip()
+            sr = (deep.get("strategic_risks") or "").strip()
+            me = (deep.get("management_execution") or "").strip()
+            deep_lines = [
+                f"  --- Earnings deep-dive ({deep.get('form_type','?')} "
+                f"{deep.get('filing_date','?')}, "
+                f"{deep.get('sentiment','?')}/{deep.get('conviction','?')}) ---",
+            ]
+            if hl:
+                deep_lines.append(f"    Metrics: {hl}")
+            if deep.get("key_thesis"):
+                deep_lines.append(f"    Key thesis: {deep['key_thesis']}")
+            if fq:
+                deep_lines.append(f"    Fundamental quality: {fq}")
+            if gt:
+                deep_lines.append(f"    Growth trajectory: {gt}")
+            if vc:
+                deep_lines.append(f"    Valuation context: {vc}")
+            # Strategic risks + management execution rendered ONLY if non-
+            # empty — for the healthy-thesis majority these add noise; for
+            # weakening/broken ones they carry the key evidence.
+            if sr:
+                deep_lines.append(f"    Strategic risks: {sr}")
+            if me:
+                deep_lines.append(f"    Management execution: {me}")
+            deep_section = "\n" + "\n".join(deep_lines)
+
         lines.append(
             f"### {sym} (entry ${entry_px:.2f} → ${cur_px:.2f} {pnl_str}, {days_str}, sector {c.get('sector') or '?'})\n"
             f"  Entry thesis: {entry_reason}\n"
@@ -124,7 +161,7 @@ def _fmt_thesis_health(context: dict) -> str:
             f"  News (8w): {news_str}\n"
             f"  Earnings: {earnings_str}\n"
             f"  Macro sector stance: {macro}\n"
-            f"  Valuation: {val_str}"
+            f"  Valuation: {val_str}{deep_section}"
         )
     return "\n\n".join(lines)
 
