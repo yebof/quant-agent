@@ -525,6 +525,45 @@ def test_evening_reconciles_before_loading_trade_inputs():
     assert pipeline._reconcile_fills.call_count == 2
 
 
+def test_evening_persists_daily_pnl_when_analysis_raises():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+    pipeline.macro = MagicMock()
+    pipeline.evening_analyst = MagicMock()
+    pipeline.config = MagicMock()
+    pipeline.config.llm.evening_analyst_model = "test-model"
+    pipeline._run_news_update = MagicMock(return_value=None)
+    pipeline._load_earnings_analyses = MagicMock(return_value=([], []))
+    pipeline._build_recent_sells_for_grading = MagicMock(return_value=[])
+    pipeline._build_recent_buys_for_grading = MagicMock(return_value=[])
+    pipeline._build_recent_outlook_calibration = MagicMock(return_value={"samples": [], "n": 0})
+    pipeline._build_weekly_narrative = MagicMock(return_value="")
+    pipeline._build_active_state_changes = MagicMock(return_value="")
+    pipeline._reconcile_fills = MagicMock()
+
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.get_account.return_value = {
+        "portfolio_value": 10200.0, "last_equity": 10000.0,
+    }
+    pipeline.broker.get_positions.return_value = []
+    pipeline.db.get_trades.return_value = []
+    pipeline.db.get_latest_insights.return_value = None
+    pipeline.macro.get_macro_summary.return_value = {}
+    pipeline.evening_analyst.analyze.side_effect = RuntimeError("provider down")
+
+    result = pipeline.run_evening()
+
+    assert result["status"] == "analyzed"
+    assert result["analysis"] is None
+    pipeline.db.insert_daily_pnl.assert_called_once()
+    kwargs = pipeline.db.insert_daily_pnl.call_args.kwargs
+    assert kwargs["total_value"] == 10200.0
+    assert kwargs["daily_pnl"] == 200.0
+    assert kwargs["daily_return_pct"] == pytest.approx(2.0)
+    pipeline.db.save_evening_snapshot.assert_not_called()
+
+
 def test_recent_sells_builder_reads_only_executed_trades():
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.db = MagicMock()

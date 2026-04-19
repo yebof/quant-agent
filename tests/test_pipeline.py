@@ -489,6 +489,41 @@ def test_pipeline_midday_preserves_protective_orders():
     pipeline.broker.cancel_open_entry_orders.assert_not_called()
 
 
+def test_pipeline_midday_bypasses_reviewer_when_daily_loss_breached():
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    position = Position(
+        symbol="SPY", qty=10.0, avg_entry=500.0, current_price=480.0,
+        market_value=4800.0, unrealized_pnl=-200.0, sector="ETF",
+    )
+    pipeline.broker.get_account.return_value = {
+        "cash": 1000.0,
+        "portfolio_value": 9600.0,
+        "last_equity": 10000.0,
+    }
+    pipeline.broker.get_positions.return_value = [position]
+    pipeline.db = MagicMock()
+    pipeline.risk_engine = MagicMock()
+    loss_violation = MagicMock(message="Daily loss 4.0% exceeds max 3%")
+    pipeline.risk_engine.check_daily_loss.return_value = loss_violation
+    pipeline._midday_emergency_liquidate = MagicMock(return_value=[
+        {"id": "sell-1", "status": "accepted", "symbol": "SPY"}
+    ])
+    pipeline.position_reviewer = MagicMock()
+    pipeline._reconcile_fills = MagicMock()
+
+    result = pipeline.run_midday()
+
+    assert result["status"] == "emergency_sold"
+    assert result["orders"] == [{"id": "sell-1", "status": "accepted", "symbol": "SPY"}]
+    pipeline._midday_emergency_liquidate.assert_called_once_with(
+        [position], loss_violation, result["run_id"],
+    )
+    pipeline.position_reviewer.review.assert_not_called()
+    pipeline._reconcile_fills.assert_called_once()
+
+
 def test_pipeline_midday_fetches_only_executed_morning_trades():
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.broker = MagicMock()
