@@ -538,7 +538,7 @@ def test_build_quarterly_digest_populates_all_core_sections():
     db.get_daily_pnl.return_value = []
     db.get_recent_insights.return_value = []
     db.get_recent_agent_outputs.return_value = []
-    db.compute_trade_calibration.return_value = {"n_closed": 0}
+    db.compute_trade_calibration.return_value = {"n": 0}
 
     digest = build_quarterly_digest(
         db, market=None, period_end=date(2026, 3, 31), lookback_days=90,

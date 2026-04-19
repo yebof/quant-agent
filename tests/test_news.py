@@ -227,6 +227,63 @@ def test_filter_drops_some_keeps_others_in_mixed_batch():
     assert "Hurricane shuts Gulf refineries" not in events
 
 
+def test_filter_preserves_state_change_carried_from_prior_session():
+    """Midday/evening pass prior_session_report so the agent can carry a
+    morning event forward (or mark it resolved) even when fresh headlines
+    no longer repeat the phrasing verbatim. The filter must not drop the
+    carry-forward as "hallucinated" just because fresh news moved on."""
+    report = _make_news_intel_report([
+        {
+            "event": "Fed signals pause",
+            "previous_state": "cutting", "new_state": "paused",
+            "market_impact": "bearish rate-sensitive",
+            "affected_symbols": [], "conviction": "high",
+        }
+    ])
+    prior = {
+        "state_changes": [
+            {"event": "Fed signals pause in hikes",
+             "previous_state": "cutting", "new_state": "paused",
+             "market_impact": "bearish rate-sensitive",
+             "affected_symbols": [], "conviction": "high"}
+        ],
+    }
+    # Fresh midday headlines don't repeat the Fed language at all.
+    filtered = NewsAnalystAgent._filter_hallucinated_state_changes(
+        report,
+        news_text="Midday headlines: commodity prices drift, no policy news.",
+        prior_session_report=prior,
+    )
+    events = [sc.event for sc in filtered.state_changes]
+    assert "Fed signals pause" in events
+
+
+def test_filter_preserves_state_change_when_prior_symbol_matches():
+    """Same carry-forward semantics via affected_symbols match."""
+    report = _make_news_intel_report([
+        {
+            "event": "Regulatory probe ongoing",
+            "previous_state": "opened", "new_state": "ongoing",
+            "market_impact": "bearish",
+            "affected_symbols": ["NVDA"], "conviction": "medium",
+        }
+    ])
+    prior = {
+        "state_changes": [
+            {"event": "Regulatory probe opened",
+             "previous_state": "none", "new_state": "opened",
+             "market_impact": "bearish",
+             "affected_symbols": ["NVDA"], "conviction": "medium"}
+        ],
+    }
+    filtered = NewsAnalystAgent._filter_hallucinated_state_changes(
+        report,
+        news_text="Midday: indices drift on light volume. No chip news.",
+        prior_session_report=prior,
+    )
+    assert len(filtered.state_changes) == 1
+
+
 def test_filter_empty_news_text_keeps_all():
     """No news_text to verify against (unusual but possible) — err on keep
     rather than silently drop the LLM's whole state-change list."""

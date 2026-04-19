@@ -427,6 +427,63 @@ def test_force_delever_noop_on_empty_positions():
     pipeline.broker.submit_order.assert_not_called()
 
 
+def test_run_position_review_reconciles_after_force_delever():
+    """Regression: when _force_delever fires in run_position_review, fills
+    must be reconciled BEFORE the morning_trades query (executed_only=True)
+    is issued — otherwise the submitted FORCE_DELEVER rows never reach
+    position_reviewer's system_action_lines."""
+    import types
+    from src.pipeline import TradingPipeline
+    from src.pipeline_context import RunContext
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.config = MagicMock()
+    pipeline.config.risk.allow_margin = False
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+
+    call_log: list[str] = []
+    pipeline._force_delever = MagicMock(
+        side_effect=lambda ctx: (call_log.append("force"), [{"symbol": "NVDA"}])[1]
+    )
+    pipeline._reconcile_fills = MagicMock(
+        side_effect=lambda ctx=None: call_log.append("reconcile")
+    )
+
+    # Simulate just the 1a snippet of run_position_review
+    ctx = RunContext.start("midday")
+    forced_orders = pipeline._force_delever(ctx)
+    if forced_orders:
+        pipeline._reconcile_fills(ctx)
+
+    assert call_log == ["force", "reconcile"], (
+        "reconcile must follow force_delever in the 1a block"
+    )
+
+
+def test_run_position_review_skips_reconcile_when_nothing_delevered():
+    """Inverse: a clean session (no forced sells) should NOT pay for an
+    extra broker round-trip per midday/close tick."""
+    from src.pipeline import TradingPipeline
+    from src.pipeline_context import RunContext
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.config = MagicMock()
+    pipeline.config.risk.allow_margin = False
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+
+    pipeline._force_delever = MagicMock(return_value=[])
+    pipeline._reconcile_fills = MagicMock()
+
+    ctx = RunContext.start("midday")
+    forced_orders = pipeline._force_delever(ctx)
+    if forced_orders:
+        pipeline._reconcile_fills(ctx)
+
+    pipeline._reconcile_fills.assert_not_called()
+
+
 def test_midday_reviewer_surfaces_delever_when_cash_negative():
     from src.agents.position_reviewer import PositionReviewerAgent
 

@@ -41,7 +41,7 @@ def _min_digest(period: str = "2026-Q1") -> dict:
             "best_day_pct": 2.1,
             "worst_day_pct": -2.4,
         },
-        "calibration_by_size": {"n_closed": 0},
+        "calibration_by_size": {"n": 0},
         "missed_themes": {"by_theme": {}, "by_category": {}, "total_real_misses": 0},
         "loss_patterns": {
             "by_cause": {}, "total_wrong_buys": 0,
@@ -238,7 +238,7 @@ def test_prompt_handles_empty_digest_sections_gracefully():
     AttributeError — sections show informative 'no data yet' notes."""
     agent = _make_agent()
     msg = agent.build_user_message(digest=_min_digest())
-    assert "n_closed=0" in msg  # calibration placeholder
+    assert "n=0" in msg  # calibration placeholder
     assert "Total real misses: 0" in msg
     assert "Total wrong BUYs: 0" in msg
     assert "first meta-reflection" in msg  # no-corrigibility explanation

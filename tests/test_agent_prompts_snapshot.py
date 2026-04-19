@@ -340,7 +340,7 @@ def _digest_with_snapshot(snapshot_payload: dict | None = None) -> dict:
             "max_drawdown_pct": -5.2, "winning_days": 32, "losing_days": 28,
             "best_day_pct": 2.0, "worst_day_pct": -2.0,
         },
-        "calibration_by_size": {"n_closed": 0},
+        "calibration_by_size": {"n": 0},
         "missed_themes": {"by_theme": {}, "by_category": {}, "total_real_misses": 0},
         "loss_patterns": {
             "by_cause": {}, "total_wrong_buys": 0,
