@@ -13,9 +13,9 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 
 ## 架构速览
 
-- 8 个 LLM agent：tech / news / macro / earnings / portfolio_manager / risk_manager / position_reviewer / evening_analyst
+- 8 个日常 LLM agent：tech / news / macro / earnings / portfolio_manager / risk_manager / position_reviewer / evening_analyst。额外一个 **meta_reflector** 每季度末跑一次，负责对 6 个可编辑 agent（tech / news / macro / earnings / PM / evening）**自我画像 + prompt 审计 + 自动修订**。risk_manager 和 position_reviewer 被 **schema + prompt_editor 双层保护**，不允许被 auto-evolved 改动（硬纪律不能被稀释）
 - 双层风控：硬规则引擎（cash_only / 仓位 / 暴露 / 日损 / 板块 / 相关性 / earnings-queued） + LLM RiskManager 审核 + `_force_delever()` 硬兜底
-- **6 个 session**（ET Mon-Fri）：earnings_preprocess 08:00-09:15（唯一跑 earnings LLM）、morning 09:30-12:00（full team）、intra_check 09:30-16:00 每 30min tick（熔断器，零 LLM）、midday 13:00-14:30（position_reviewer patient）、close 15:30-15:55（position_reviewer act-on-trigger）、evening 20:00-22:00（report + outlook）
+- **6 个 session**（ET Mon-Fri）：earnings_preprocess 08:00-09:15（唯一跑 earnings LLM）、morning 09:30-12:00（full team）、intra_check 09:30-16:00 每 30min tick（熔断器，零 LLM）、midday 13:00-14:30（position_reviewer patient）、close 15:30-15:55（position_reviewer act-on-trigger）、evening 20:00-22:00（report + outlook）。**季度末额外一次 meta**：`--mode meta` / `run_quarterly_meta_reflection`，跑 `quarterly_digest` 聚合 90 天事实 + `meta_reflector` LLM 7 步 CoT + `prompt_editor` 4 道保险 apply
 - 数据源：yfinance、FRED、RSS、SEC EDGAR
 - 配置：`config/settings.yaml` + `.env`；按 agent 独立选 OpenAI / Anthropic 模型
 
@@ -29,6 +29,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 | portfolio_manager | 7 | 8 层 memory (L1-L8) 喂进来 |
 | risk_manager | 6 | rr_audit / signal_fidelity / correlation / event_risk / sizing / overall |
 | position_reviewer | 6 | midday + close 共用；`session_type` 切换 disposition |
+| meta_reflector | 7 | **facts→synthesis→diagnosis→prompt-audit→proposal** 顺序：performance / theme / loss (事实) → **self_portrait_synthesis**（5 维自画像：conviction_calibration / theme_breadth / loss_discipline / execution_style / agent_balance）→ **portrait_gap_diagnosis**（top 2-3 leverage gap + 归因到 agent）→ **existing_prompt_audit**（读 `agent_prompts_snapshot`——每个 target agent 的 persona + 关键 section + `## Learnings (system-evolved)`——检查 gap 对应的规则是否已存在 / 已失效 / 有冲突）→ prompt_edit_reasoning。**"先看自己是谁、再看哪里差、再看现有 prompt 有没有、最后才提修改"**——防止 LLM 凭记忆重复已有规则或和现有 invariant 冲突 |
 | evening_analyst | 7 | performance / retrospection / decision_quality / calibration_meta / regime / **thesis_health_review** / tomorrow_prep。**结构化 `sell_grades` / `buy_grades` 持久化到 `insights.sell_grades_json` / `buy_grades_json`（JSON 列），`_build_trade_grade_summary(lookback=14)` 聚合成 counts + repeat-offender 列表，传入 position_reviewer 形成 SELL 纪律闭环**。同时 `outlook_calibration` 元循环（自己看自己 bias hit rate）自学。**thesis_health_review 每个持仓都读 8 周 tech 轨迹 + 新闻 + 估值 + 最新 10-Q/10-K 的完整 reasoning_chain（src/data/earnings_deep_dive.py 从 `data/earnings/{SYMBOL}/analysis_*.md` 解析 JSON 块、truncate 到 500c/300c），输出 `thesis_trajectory: strengthening/intact/weakening/broken` + `loss_root_cause`——让 evening 能判断"亏损是估值贵买贵了还是基本面坏了"这种 value 投资核心问题** |
 
 详细设计见 `README.md`，agent 行为规则见 `config/prompts/*.md`。

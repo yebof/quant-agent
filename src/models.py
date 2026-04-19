@@ -1096,54 +1096,98 @@ class MetaReasoningChain(BaseModel):
 
     Parallel depth to morning PM's 7-step chain and position reviewer's
     6-step chain — empty strings fail validation so the LLM can't skip a
-    step. Anchoring design: `secular_theme_audit` and `loss_autopsy_audit`
-    are the two load-bearing sections (the user's core asks — trend
-    capture + pit avoidance); the others scaffold honest performance
-    accounting around them.
+    step.
+
+    **Ordering matters**: the LLM runs these in-order to avoid the
+    trap of proposing prompt edits without first understanding (a) its
+    own self-portrait across multiple axes, (b) where the self-portrait
+    falls short of the ideal, (c) what the target agent's prompt ALREADY
+    contains. Facts-first, synthesis-next, existing-design-audit,
+    proposal-last.
+
+    Design notes for anyone editing this chain:
+      - Steps 1-3 are FACTS. They each cite numbers from a specific
+        digest section. No interpretation allowed.
+      - Step 4 is SYNTHESIS. It's the first step that interprets the
+        facts, producing a multi-axis self-portrait. Replaces the old
+        single-axis `style_bias_identification` + absorbs the old
+        `agent_hit_rate_audit` (which was just another axis of self-
+        portrait anyway).
+      - Step 5 is DIAGNOSIS. It names 2-3 top leverage gaps between
+        the self-portrait and the idealized trader profile the user
+        wants the system to converge toward.
+      - Step 6 is PROMPT AUDIT. For each gap named in step 5, the LLM
+        consults `agent_prompts_snapshot` to understand what's already
+        in the target agent's prompt — preventing duplicate / redundant
+        / conflicting edits.
+      - Step 7 is PROPOSAL. Grounded in both the gaps (step 5) AND the
+        existing prompt state (step 6).
+
+    The old `missed_theme_diagnosis` step was folded into
+    `portrait_gap_diagnosis` — theme coverage IS one of the gap axes.
     """
     performance_vs_benchmark: str = Field(min_length=1)
-    """Where did this quarter's return land vs SPY? Alpha positive or
-    negative? Drawdown profile? Be specific about numbers from
-    period_performance — no "we did ok this quarter" hand-waving."""
+    """Step 1/FACT. Where did this quarter's return land vs SPY? Alpha
+    positive or negative? Drawdown profile? Be specific about numbers
+    from period_performance — no "we did ok this quarter" hand-waving."""
 
     secular_theme_audit: str = Field(min_length=1)
-    """Enumerate this quarter's real themes (AI capex, nuclear/power,
-    rare earth, reshoring, etc.). For each: did we participate? At
-    what entry position relative to the breakout? For how long? Name
-    themes_caught_early, themes_caught_late, themes_missed_entirely —
-    mirror the structured output fields."""
+    """Step 2/FACT. Enumerate this quarter's real themes (AI capex,
+    nuclear/power, rare earth, reshoring, etc.). For each: did we
+    participate? At what entry position relative to the breakout? For
+    how long? Name themes_caught_early, themes_caught_late,
+    themes_missed_entirely — mirror the structured output fields."""
 
     loss_autopsy_audit: str = Field(min_length=1)
-    """Enumerate the top 3-5 loss causes from loss_patterns.by_cause.
-    For each: count, alpha_destruction_pct, which agent owns it,
-    which prompt edit could have prevented a repeat. This feeds
-    loss_pattern_report and the proposed_learnings justified by
-    loss data."""
+    """Step 3/FACT. Enumerate the top 3-5 loss causes from
+    loss_patterns.by_cause. For each: count, alpha_destruction_pct,
+    which agent owns it. This feeds `loss_pattern_report`."""
 
-    agent_hit_rate_audit: str = Field(min_length=1)
-    """Did each agent actually DO its job this quarter? Read
-    agent_signal_activity — any agent gone silent (n_sessions far
-    below expected)? Any agent flooding with low-quality signals
-    (PM issuing many decisions that RM keeps scaling down)?"""
+    self_portrait_synthesis: str = Field(min_length=1)
+    """Step 4/SYNTHESIS. **Multi-axis self-portrait**, not a single-
+    line label. Synthesize facts from steps 1-3 + agent_signal_activity
+    into concrete dimensions: (a) conviction_calibration — does HIGH
+    conviction actually outperform LOW? (b) theme_breadth — do we
+    cover only tech/AI or also energy/materials/reshoring? (c)
+    loss_discipline — do we catch thesis breaks or ride losers? (d)
+    execution_style — average hold days, realized vs intended
+    timeframe. (e) agent_balance — any agent gone silent / any
+    flooding with low-quality signals. Each dimension should be one
+    sentence citing a specific digest number. This REPLACES the
+    prior `style_bias_identification` + `agent_hit_rate_audit`."""
 
-    missed_theme_diagnosis: str = Field(min_length=1)
-    """For the top themes in missed_themes.by_theme, WHERE did the
-    failure occur? News_analyst never reported it? Macro never
-    tagged the sector tailwind? Tech never issued a buy rating? PM
-    saw the signal but didn't size? Attribute specifically."""
+    portrait_gap_diagnosis: str = Field(min_length=1)
+    """Step 5/DIAGNOSIS. For each dimension in the self-portrait, name
+    the IDEAL state (what a medium-long-term value investor with broad
+    theme coverage would look like) and the ACTUAL state. Pick the
+    top 2-3 highest-leverage gaps — don't try to fix everything.
+    Explicitly call out where failures happened: if a theme was
+    missed, which agent layer (news vs macro vs tech vs PM) was
+    responsible? Attribution is specific, not collective."""
 
-    style_bias_identification: str = Field(min_length=1)
-    """Are we trend-identifiers or trend-followers? Fundamentals-
-    anchored or price-action momentum? Evidence from calibration
-    (win rate by size, avg hold days) + loss_patterns (greed_top_
-    chasing frequency). One-sentence self-portrait of current style."""
+    existing_prompt_audit: str = Field(min_length=1)
+    """Step 6/PROMPT AUDIT. For each of the top gaps named in step 5,
+    read `agent_prompts_snapshot[{target_agent}]` and enumerate: (a)
+    what rules ALREADY exist that address this gap (cite the section /
+    heading), (b) whether those existing rules are being followed
+    (check corrigibility_trend — are the losses / misses recurring
+    despite the rule?), (c) whether there's room for a new rule that
+    doesn't conflict with or duplicate existing content. If the
+    snapshot shows the target section is saturated with prior
+    Learnings, propose a retract-or-replace rather than another
+    append. **Do NOT propose a learning without citing what's already
+    in the target prompt.**"""
 
     prompt_edit_reasoning: str = Field(min_length=1)
-    """Why these specific `proposed_learnings` and not others?
-    Corrigibility is the key check — if a cause has been worsening
-    for 2 quarters, the existing prompt isn't preventing it; a new,
-    more direct learning is warranted. Conversely, if it's already
-    improving, don't add more noise."""
+    """Step 7/PROPOSAL. Given the gaps (step 5) and existing-prompt
+    state (step 6), why these specific `proposed_learnings` and not
+    others? Corrigibility is the key check: if a cause has been
+    worsening for 2 quarters AND the existing prompt has no rule for
+    it → append. If a cause has been worsening AND an existing rule
+    isn't being followed → DON'T append another (the issue is rule
+    adherence, not rule absence); log this as a
+    `persistent_blindspot` for the operator to review manually. If
+    improving → don't pile on."""
 
 
 class ThemeCoverage(BaseModel):
@@ -1276,7 +1320,7 @@ class QuarterlyMetaReflection(BaseModel):
     meta_reasoning_chain: MetaReasoningChain
     style_self_portrait: str = Field(default="", max_length=2000)
     """Multi-sentence honest self-description for ongoing audit. Optional:
-    `meta_reasoning_chain.style_bias_identification` carries the same
+    `meta_reasoning_chain.self_portrait_synthesis` carries the same
     content as part of the CoT, so some LLM outputs legitimately leave
     this top-level field empty rather than duplicating. When non-empty
     it's useful for downstream continuity rendering."""

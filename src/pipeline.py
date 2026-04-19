@@ -4248,6 +4248,7 @@ class TradingPipeline:
             self.db, self.market,
             period_end=today, lookback_days=lookback_days,
             prev_digest=prev_digest,
+            prompts_dir=prompts_dir,
         )
         digest_path = persist_digest(digest, root_dir=evolution_root)
         logger.info(

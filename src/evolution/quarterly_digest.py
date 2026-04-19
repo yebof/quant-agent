@@ -11,6 +11,12 @@ Sections:
   - loss_patterns             — aggregation of wrong-BUY loss_root_cause
   - calibration_by_size       — reuses db.compute_trade_calibration
   - agent_signal_activity     — counts of signals emitted by each agent
+  - watchlist_candidates      — symbols flagged for universe review
+  - agent_prompts_snapshot    — current prompt rules each target agent is
+                                running with (lets meta-reflector audit
+                                existing design before proposing edits
+                                rather than rediscovering rules that
+                                already exist)
   - corrigibility_trend       — comparison with prior quarter's digest
 
 All helpers are module-level pure functions: easy to test with mocked
@@ -24,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
@@ -34,6 +41,43 @@ if TYPE_CHECKING:
     from src.storage.db import Database
 
 logger = logging.getLogger(__name__)
+
+# Project root → config/prompts. Computed from this file's location so
+# tests don't need the cwd to be the repo root.
+_PROMPTS_DIR_DEFAULT = Path(__file__).resolve().parent.parent.parent / "config" / "prompts"
+
+# Agents the meta-reflector is allowed to propose edits to. Matches
+# MetaReflectionAgentName in src/models.py. risk_manager and
+# position_reviewer are deliberately excluded — they encode hard
+# invariants that auto-evolution could erode.
+_SNAPSHOT_AGENTS: tuple[str, ...] = (
+    "tech_analyst",
+    "news_analyst",
+    "macro_analyst",
+    "earnings_analyst",
+    "portfolio_manager",
+    "evening_analyst",
+)
+
+# Per-agent character budget for the snapshot. 6 agents × 3_000 = 18_000
+# chars ≈ ~5k tokens — bounded cost for quarterly call, leaves plenty of
+# room for facts + LLM output within context.
+_SNAPSHOT_PER_AGENT_CHAR_BUDGET = 3_000
+
+# Regex: section headers (## or ###) that are interesting for meta-
+# reflection. Keyword match is lowercase / word-boundary-ish.
+_INTERESTING_HEADING_KEYWORDS = (
+    "rule", "rules",
+    "discipline", "mandate",
+    "priority", "priorities",
+    "budget", "cap", "limit",
+    "output", "required output",
+    "memory", "layer",
+    "framework", "step-by-step", "decision framework",
+    "cheat sheet", "cheatsheet",
+    "learnings",  # The system-evolved section — critical to surface
+    "auto-evolved",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +91,7 @@ def build_quarterly_digest(
     period_end: date,
     lookback_days: int = 90,
     prev_digest: dict | None = None,
+    prompts_dir: Path | str | None = None,
 ) -> dict:
     """Compute the full digest for the quarter ending on `period_end`.
 
@@ -58,6 +103,10 @@ def build_quarterly_digest(
     from disk) enables the `corrigibility_trend` section which tracks whether
     known loss patterns are getting better or worse. None on the very first
     run.
+
+    `prompts_dir` overrides the default `config/prompts/` location used by
+    the `agent_prompts_snapshot` section. Tests pass a temporary directory
+    with fixture prompt files; production leaves it None.
 
     Returns a plain dict (JSON-serializable). Caller persists it via
     `persist_digest` so the next quarter can read it for corrigibility.
@@ -85,6 +134,9 @@ def build_quarterly_digest(
     )
     digest["watchlist_candidates"] = _watchlist_candidates_aggregated(
         db, lookback_days,
+    )
+    digest["agent_prompts_snapshot"] = _build_agent_prompts_snapshot(
+        prompts_dir=prompts_dir,
     )
 
     if prev_digest:
@@ -934,3 +986,257 @@ def _corrigibility_trend(digest: dict, prev: dict) -> dict:
         "themes_newly_emerging": themes_newly_emerging,
         "summary": summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Section: agent_prompts_snapshot
+# ---------------------------------------------------------------------------
+#
+# Rationale: the meta-reflector proposes prompt edits via
+# `proposed_learnings`. Without seeing what's already IN each target
+# agent's prompt, it reasons about edits by memory — which leads to
+# duplicating existing rules, proposing edits that conflict with hard
+# invariants, or missing the fact that the `## Learnings
+# (system-evolved)` section is already saturated with prior
+# auto-evolutions for the same root cause. Surfacing a compressed view
+# of each agent's current ruleset closes this gap.
+#
+# Selection strategy (not the whole file — a 470-line evening prompt
+# alone would blow context):
+#
+#   1. intro          — text before the first `##` heading (the persona
+#                       description); capped at 600 chars
+#   2. key_sections   — every `##` / `###` section whose heading
+#                       contains one of _INTERESTING_HEADING_KEYWORDS
+#                       (rule / discipline / priority / budget / output
+#                       / memory / framework / learnings / ...)
+#   3. learnings      — the full "## Learnings (system-evolved)" section
+#                       if present (prior auto-evolutions — the meta-
+#                       reflector MUST see these before proposing to
+#                       add duplicates)
+#
+# Per-agent char budget (_SNAPSHOT_PER_AGENT_CHAR_BUDGET = 3_000) caps
+# total size; longer selections are tail-truncated with an ellipsis
+# marker so the meta-reflector can tell the snapshot was cut.
+
+_HEADING_RE = re.compile(r"^(#{2,3})\s+(.+?)\s*$", re.MULTILINE)
+
+
+def _heading_is_interesting(heading: str) -> bool:
+    """Return True iff the heading text contains any keyword from
+    `_INTERESTING_HEADING_KEYWORDS`. Case-insensitive, substring match.
+
+    Intentionally permissive — false positives are cheap (a harmless
+    section ends up in the snapshot), false negatives are expensive (a
+    rule section is omitted and the meta-reflector re-proposes it)."""
+    h = heading.lower()
+    return any(kw in h for kw in _INTERESTING_HEADING_KEYWORDS)
+
+
+def _iter_sections(text: str) -> list[tuple[str, str, str]]:
+    """Split a markdown prompt into (level, heading, body) tuples.
+
+    Uses `## ` and `### ` as boundaries. Body is the text between a
+    heading and the next same-or-higher level heading. Leading `#`
+    (title) is ignored — the intro extractor handles that block
+    separately.
+    """
+    matches = list(_HEADING_RE.finditer(text))
+    if not matches:
+        return []
+
+    out: list[tuple[str, str, str]] = []
+    for i, m in enumerate(matches):
+        level = m.group(1)
+        heading = m.group(2).strip()
+        body_start = m.end()
+        body_end = (
+            matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        )
+        body = text[body_start:body_end].strip()
+        out.append((level, heading, body))
+    return out
+
+
+def _extract_intro(text: str, max_chars: int = 600) -> str:
+    """Grab everything before the first `##` heading (the persona /
+    mission statement). Skips the top-level `#` title line. Truncates
+    cleanly at sentence/paragraph boundary when over budget."""
+    # Strip the leading `# Title` line if present.
+    lines = text.splitlines()
+    start = 0
+    if lines and lines[0].startswith("# ") and not lines[0].startswith("## "):
+        start = 1
+    first_h2 = _HEADING_RE.search("\n".join(lines[start:]))
+    intro_text = (
+        "\n".join(lines[start:]) if first_h2 is None
+        else "\n".join(lines[start:])[: first_h2.start()]
+    )
+    intro_text = intro_text.strip()
+    if len(intro_text) <= max_chars:
+        return intro_text
+    cut = intro_text[: max_chars - 1].rsplit(". ", 1)[0]
+    if not cut:
+        cut = intro_text[: max_chars - 1]
+    return cut.rstrip() + "…"
+
+
+def _extract_agent_prompt_snapshot(
+    prompt_text: str,
+    *,
+    char_budget: int = _SNAPSHOT_PER_AGENT_CHAR_BUDGET,
+) -> dict:
+    """Compress one agent's prompt into a meta-reflection-ready summary.
+
+    Output shape:
+      {
+        "intro":        str,            # persona paragraph, ≤600 chars
+        "key_sections": [               # rule/memory/output/framework
+            {"heading": str, "body": str, "level": "##"|"###"},
+            ...
+        ],
+        "learnings":    str,            # "## Learnings" body (maybe "")
+        "total_chars":  int,            # actual compressed size
+        "truncated":    bool,           # True iff budget was hit
+      }
+
+    Always returns a dict even on empty/weird inputs — callers don't need
+    None-guards. If `char_budget` is exceeded, trailing sections are
+    dropped (rather than mid-body-cut) so each surfaced section is
+    complete; the last dropped position triggers `truncated=True`.
+    """
+    out: dict[str, Any] = {
+        "intro": "",
+        "key_sections": [],
+        "learnings": "",
+        "total_chars": 0,
+        "truncated": False,
+    }
+    if not prompt_text or not prompt_text.strip():
+        return out
+
+    intro = _extract_intro(prompt_text)
+    out["intro"] = intro
+    running_chars = len(intro)
+
+    sections = _iter_sections(prompt_text)
+    # Splits a body at the level-below headings inline — we want the full
+    # body including its `###` subheadings as a single chunk, but we also
+    # want the `##` parent to be the primary node. The simpler approach:
+    # iterate _iter_sections output, but skip `###` entries whose body is
+    # already captured by their enclosing `##` section. Our _iter_sections
+    # treats them as independent though, so we need to fix-up by re-
+    # grouping: for every `##`, the body should extend until the next
+    # `##` (not next `###`). Rebuild that way.
+    grouped: list[tuple[str, str]] = []
+    i = 0
+    while i < len(sections):
+        level, heading, body = sections[i]
+        if level == "##":
+            # Consume any following `###` sections as part of THIS `##`.
+            j = i + 1
+            tail_parts: list[str] = [body] if body else []
+            while j < len(sections) and sections[j][0] == "###":
+                sub_level, sub_heading, sub_body = sections[j]
+                tail_parts.append(
+                    f"{sub_level} {sub_heading}\n\n{sub_body}"
+                    if sub_body else f"{sub_level} {sub_heading}"
+                )
+                j += 1
+            combined_body = "\n\n".join(p for p in tail_parts if p).strip()
+            grouped.append((heading, combined_body))
+            i = j
+        else:
+            # Stray `###` without parent (rare) — treat as own section.
+            grouped.append((heading, body))
+            i += 1
+
+    learnings_body: str = ""
+    key_sections: list[dict] = []
+
+    for heading, body in grouped:
+        h_lower = heading.lower()
+        # Learnings gets its own slot, separately surfaced to the LLM.
+        if "learnings" in h_lower and (
+            "system-evolved" in h_lower or "auto-evolved" in h_lower
+            or h_lower.strip() in {"learnings", "learnings (system-evolved)"}
+        ):
+            learnings_body = body
+            continue
+        if not _heading_is_interesting(heading):
+            continue
+
+        candidate_chunk = f"## {heading}\n\n{body}".strip()
+        if running_chars + len(candidate_chunk) > char_budget:
+            out["truncated"] = True
+            break
+        key_sections.append({
+            "heading": heading,
+            "body": body,
+            "level": "##",
+        })
+        running_chars += len(candidate_chunk)
+
+    # Learnings is high-priority — reserve space even if budget tight,
+    # since "what we've already learned" is the meta-reflector's primary
+    # need. Truncate the body (not drop the section) when needed.
+    if learnings_body:
+        remaining = max(char_budget - running_chars, 400)
+        rendered_learnings = learnings_body
+        if len(rendered_learnings) > remaining:
+            rendered_learnings = rendered_learnings[: remaining - 1].rstrip() + "…"
+            out["truncated"] = True
+        out["learnings"] = rendered_learnings
+        running_chars += len(rendered_learnings)
+
+    out["key_sections"] = key_sections
+    out["total_chars"] = running_chars
+    return out
+
+
+def _build_agent_prompts_snapshot(
+    prompts_dir: Path | str | None = None,
+) -> dict:
+    """Load every snapshot-eligible agent's prompt from `prompts_dir` and
+    return a mapping {agent_name: snapshot_dict}.
+
+    Defaults to the project's `config/prompts/` directory. Missing files
+    produce an entry with `error` set rather than crashing the whole
+    digest — one agent's prompt being absent (dev scratch, pre-install
+    state) shouldn't break quarterly meta-reflection for the other five.
+    """
+    root = Path(prompts_dir) if prompts_dir else _PROMPTS_DIR_DEFAULT
+    out: dict[str, dict] = {}
+    for agent in _SNAPSHOT_AGENTS:
+        path = root / f"{agent}.md"
+        if not path.exists():
+            logger.warning(
+                "agent_prompts_snapshot: prompt file missing for %s (%s)",
+                agent, path,
+            )
+            out[agent] = {
+                "intro": "",
+                "key_sections": [],
+                "learnings": "",
+                "total_chars": 0,
+                "truncated": False,
+                "error": "prompt_file_missing",
+            }
+            continue
+        try:
+            text = path.read_text()
+        except OSError as exc:
+            logger.warning(
+                "agent_prompts_snapshot: read failed for %s: %s", path, exc,
+            )
+            out[agent] = {
+                "intro": "",
+                "key_sections": [],
+                "learnings": "",
+                "total_chars": 0,
+                "truncated": False,
+                "error": f"read_failed: {exc}",
+            }
+            continue
+        out[agent] = _extract_agent_prompt_snapshot(text)
+    return out
