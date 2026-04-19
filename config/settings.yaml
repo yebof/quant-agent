@@ -157,3 +157,28 @@ trading:
 
 storage:
   db_path: "data/quant_agent.db"
+
+evolution:
+  # Quarterly meta-reflection can auto-append "Learnings" bullets to the six
+  # non-discipline prompts (tech / news / macro / earnings / portfolio_manager
+  # / evening_analyst). `enabled=false` keeps the editor dormant — the
+  # reflector still writes reflection.json for manual review, but no prompt
+  # file is touched. Flip to true only after eyeballing a quarter of LLM
+  # outputs and being satisfied with the proposal quality.
+  enabled: false
+  auto_commit: true
+  max_agents_per_cycle: 3
+  max_learnings_per_agent: 10
+  max_learning_chars: 200
+  min_justification_chars: 40
+  jaccard_dedup_threshold: 0.6
+  prohibited_words:
+    - "never"
+    - "always"
+    - "override"
+    - "ignore all"
+    - "must always"
+    - "must never"
+  protected_agents:
+    - "risk_manager"
+    - "position_reviewer"

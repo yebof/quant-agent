@@ -1,6 +1,7 @@
 import logging
 import uuid
 from datetime import date
+from pathlib import Path
 from src.trading_calendar import et_now, et_today, session_date_key
 
 from pydantic import ValidationError
@@ -3572,6 +3573,7 @@ class TradingPipeline:
         period_end=None,
         lookback_days: int = 90,
         evolution_root: str = "data/evolution",
+        prompts_dir: str | Path | None = None,
     ) -> dict:
         """Build the quarterly digest, run the meta-reflector, persist both.
 
@@ -3672,10 +3674,56 @@ class TradingPipeline:
 
         reflection_path = persist_reflection(reflection, root_dir=evolution_root)
         logger.info(
-            "Quarterly meta-reflection complete: %s · %d proposed learnings "
-            "(observe-only; PR4 will enable prompt editing)",
+            "Quarterly meta-reflection complete: %s · %d proposed learnings",
             digest["period"], len(reflection.proposed_learnings),
         )
+
+        # 3. Prompt editor — only runs when evolution.enabled. When off
+        # (default until a deployment has reviewed a quarter or two of
+        # reflection.json contents by hand), we return without touching any
+        # prompt file. The editor itself short-circuits to a full-rejection
+        # report; we still persist the attempt log for audit continuity.
+        editor_report: dict | None = None
+        try:
+            from src.config import EvolutionConfig
+            evolution_cfg = getattr(self.config, "evolution", None)
+            if evolution_cfg is None:
+                evolution_cfg = EvolutionConfig()
+        except Exception:
+            from src.config import EvolutionConfig
+            evolution_cfg = EvolutionConfig()
+
+        try:
+            from src.evolution.prompt_editor import PromptEditor
+            resolved_prompts_dir = (
+                Path(prompts_dir) if prompts_dir is not None
+                else Path(__file__).resolve().parent.parent / "config" / "prompts"
+            )
+            editor = PromptEditor(
+                config=evolution_cfg,
+                prompts_dir=resolved_prompts_dir,
+                evolution_dir=evolution_root,
+            )
+            result_obj = editor.apply_reflection(reflection)
+            editor_report = result_obj.to_dict()
+            if result_obj.applied:
+                logger.info(
+                    "Prompt editor applied %d learning(s) across %d agent(s); "
+                    "git_commit=%s",
+                    len(result_obj.applied),
+                    result_obj.agents_edited,
+                    result_obj.git_commit,
+                )
+            elif result_obj.rejected:
+                # Most common: evolution.enabled=false (observe-only). Log
+                # at INFO so operators see why nothing was applied.
+                logger.info(
+                    "Prompt editor did not apply any learnings (%d rejected). "
+                    "First reason: %s",
+                    len(result_obj.rejected), result_obj.rejected[0].reason,
+                )
+        except Exception as exc:
+            logger.error("Prompt editor invocation failed: %s", exc, exc_info=True)
 
         return {
             "status": "reflected",
@@ -3684,4 +3732,5 @@ class TradingPipeline:
             "reflection_path": str(reflection_path),
             "reflection": reflection.model_dump(),
             "proposed_learnings_count": len(reflection.proposed_learnings),
+            "editor_report": editor_report,
         }
