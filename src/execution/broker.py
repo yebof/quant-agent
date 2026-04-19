@@ -158,6 +158,52 @@ class AlpacaBroker:
             )
             return False
 
+    def is_last_trading_day_of_quarter(self, on_date: date | None = None) -> bool:
+        """True when `on_date` (default today-ET) is the last OPEN session
+        of the current quarter — respects holidays and early closes.
+
+        Uses Alpaca's calendar. For Mar/Jun/Sep/Dec only (other months
+        short-circuit to False, saving the API call). Queries the
+        calendar from today through month-end; we're the last trading
+        day iff no later entry exists.
+
+        The quarterly meta-reflector launchd wrapper relies on this:
+        Dec 31 is often Sunday, and the real "last trading day" can be
+        Dec 29 or Dec 30 depending on the calendar. Weekday heuristic
+        alone gets this wrong.
+        """
+        from src.trading_calendar import _QUARTER_END_MONTHS, et_today
+        from datetime import date as _date, timedelta as _td
+        target = on_date or et_today()
+        if target.month not in _QUARTER_END_MONTHS:
+            return False
+        # Build month-end date for range query (last day of target.month).
+        if target.month == 12:
+            next_month_start = _date(target.year + 1, 1, 1)
+        else:
+            next_month_start = _date(target.year, target.month + 1, 1)
+        month_end = next_month_start - _td(days=1)
+        try:
+            from alpaca.trading.requests import GetCalendarRequest
+            calendar = self.client.get_calendar(
+                GetCalendarRequest(start=target, end=month_end)
+            ) or []
+        except Exception as exc:
+            logger.warning(
+                "is_last_trading_day_of_quarter: calendar query failed (%s → %s): %s",
+                target, month_end, exc,
+            )
+            return False
+        if not calendar:
+            return False
+        # Alpaca returns one entry per trading day in [start, end]. We are the
+        # last iff the LAST entry's date equals target.
+        last_entry = calendar[-1]
+        last_date = getattr(last_entry, "date", None)
+        if last_date is None:
+            return False
+        return last_date == target
+
     def get_session_close(self, on_date: date | None = None):
         """Return the ET-aware datetime when the regular cash session closes
         today, or None if today is not a trading day (weekend / holiday) or

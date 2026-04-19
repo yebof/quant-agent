@@ -189,6 +189,66 @@ def test_get_top_movers_returns_empty_on_api_error(mock_tc_cls, mock_screener_cl
 
 
 @patch("src.execution.broker.TradingClient")
+def test_is_last_trading_day_of_quarter_queries_calendar_for_month_end(mock_tc_cls):
+    """When today is in a quarter-end month, broker asks the Alpaca calendar
+    for today→month-end. We're the last iff the API's last entry is today."""
+    from datetime import date as _date
+
+    # March 31, 2026 is a Tuesday — last trading day of Q1
+    today = _date(2026, 3, 31)
+    entry = MagicMock()
+    entry.date = today
+    mock_client = MagicMock()
+    mock_client.get_calendar.return_value = [entry]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
+    assert broker.is_last_trading_day_of_quarter(on_date=today) is True
+
+
+@patch("src.execution.broker.TradingClient")
+def test_is_last_trading_day_of_quarter_false_when_later_sessions_exist(mock_tc_cls):
+    """If Alpaca returns multiple remaining sessions, today isn't last."""
+    from datetime import date as _date
+
+    today = _date(2026, 3, 27)  # Friday — more sessions remain in March
+    e1 = MagicMock(); e1.date = _date(2026, 3, 27)
+    e2 = MagicMock(); e2.date = _date(2026, 3, 30)
+    e3 = MagicMock(); e3.date = _date(2026, 3, 31)
+    mock_client = MagicMock()
+    mock_client.get_calendar.return_value = [e1, e2, e3]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
+    assert broker.is_last_trading_day_of_quarter(on_date=today) is False
+
+
+@patch("src.execution.broker.TradingClient")
+def test_is_last_trading_day_of_quarter_short_circuits_non_quarter_month(mock_tc_cls):
+    """Non-Mar/Jun/Sep/Dec months skip the API call entirely."""
+    from datetime import date as _date
+    mock_client = MagicMock()
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
+    assert broker.is_last_trading_day_of_quarter(on_date=_date(2026, 2, 28)) is False
+    mock_client.get_calendar.assert_not_called()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_is_last_trading_day_of_quarter_false_on_api_error(mock_tc_cls):
+    """Calendar API failure → False (fail-safe: don't trigger the heavy
+    meta-reflection on an incorrect guess)."""
+    from datetime import date as _date
+    mock_client = MagicMock()
+    mock_client.get_calendar.side_effect = RuntimeError("calendar 500")
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
+    assert broker.is_last_trading_day_of_quarter(on_date=_date(2026, 3, 31)) is False
+
+
+@patch("src.execution.broker.TradingClient")
 def test_get_top_movers_with_non_positive_n_returns_empty(mock_tc_cls):
     """Pipeline can disable top-movers augmentation by passing n=0; must not
     even hit the SDK in that case."""
