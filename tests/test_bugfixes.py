@@ -22,10 +22,11 @@ from src.models import (
 
 
 def _valid_evening_rc() -> EveningReasoningChain:
-    """Test helper — minimal valid 6-step evening reasoning chain."""
+    """Test helper — minimal valid 7-step evening reasoning chain."""
     return EveningReasoningChain(
         performance_attribution="flat day, no major attribution",
         outlook_retrospection="n/a (no prior)",
+        thesis_health_review="no theses to review (empty book)",
         decision_quality_review="no trades today",
         calibration_meta="insufficient history",
         market_regime_read="regime stable",

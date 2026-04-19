@@ -65,6 +65,70 @@ def _fmt_earnings_for_evening(earnings_analyses: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_thesis_health(context: dict) -> str:
+    """Render per-position 8-week fundamentals evolution for the LLM's
+    thesis_health_review reasoning step. One block per symbol.
+
+    Empty context → friendly note so the LLM doesn't fabricate a
+    trend review on an empty book.
+    """
+    if not context:
+        return (
+            "(no open positions — thesis_health_review should be a short "
+            "note saying the book is empty; no positions to review)"
+        )
+    lines: list[str] = []
+    for sym, c in context.items():
+        pnl = c.get("pnl_pct")
+        pnl_str = f"{pnl:+.1f}%" if pnl is not None else "n/a"
+        entry_px = c.get("entry_price") or 0
+        cur_px = c.get("current_price") or 0
+        days = c.get("days_held")
+        days_str = f"{days}d held" if days is not None else "n/a"
+        entry_reason = (c.get("entry_reasoning") or "(no thesis captured)")[:220]
+
+        tech = c.get("tech_trajectory") or []
+        tech_str = " → ".join(tech) if tech else "no tech history in window"
+
+        news_count = c.get("news_count_8w", 0)
+        news_hls = c.get("latest_news_headlines") or []
+        if news_hls:
+            news_str = f"{news_count} events; latest: \"{news_hls[0]}\""
+            if len(news_hls) > 1:
+                news_str += f"; prior: \"{news_hls[1]}\""
+        else:
+            news_str = f"{news_count} news events in 8w (no headlines captured)"
+
+        earnings = c.get("recent_earnings_signal")
+        earnings_str = (
+            earnings[:140] if earnings else "no recent earnings analysis"
+        )
+        macro = c.get("macro_sector_stance", "unknown")
+
+        val = c.get("valuation") or {}
+        val_bits = []
+        if val.get("trailing_pe") is not None:
+            val_bits.append(f"trailing PE {val['trailing_pe']}")
+        if val.get("forward_pe") is not None:
+            val_bits.append(f"forward PE {val['forward_pe']}")
+        if val.get("ps_ratio") is not None:
+            val_bits.append(f"P/S {val['ps_ratio']}")
+        val_str = " · ".join(val_bits) if val_bits else "no valuation data"
+        val_signal = val.get("signal", "no_data")
+        val_str = f"{val_str} ({val_signal})"
+
+        lines.append(
+            f"### {sym} (entry ${entry_px:.2f} → ${cur_px:.2f} {pnl_str}, {days_str}, sector {c.get('sector') or '?'})\n"
+            f"  Entry thesis: {entry_reason}\n"
+            f"  Tech trajectory (newest → oldest): {tech_str}\n"
+            f"  News (8w): {news_str}\n"
+            f"  Earnings: {earnings_str}\n"
+            f"  Macro sector stance: {macro}\n"
+            f"  Valuation: {val_str}"
+        )
+    return "\n\n".join(lines)
+
+
 def _fmt_missed_opportunities(snapshots: list) -> str:
     """Render the digest rows as a prompt table the LLM can reason over.
 
@@ -127,15 +191,40 @@ def _fmt_missed_opportunities(snapshots: list) -> str:
             "    Quality: (insufficient bars for metrics)"
         )
 
-        lines.append(
-            f"- **{s.symbol}** [{s.source}] {s.move_pct:+.1f}% over {s.window_days}d · {held_bit}\n"
-            f"    {ta_bit}\n"
-            f"    {news_bit}\n"
-            f"    {earn_bit}\n"
-            f"    Macro sector stance: {s.macro_sector_tailwind}\n"
-            f"    Theme tags (raw): {tags}\n"
-            f"{qual_line}"
+        # Valuation line — cue for value-lens classification. Don't chase
+        # stretched multiples; cheap + intact fundamentals is the dip.
+        val_bits: list[str] = []
+        if s.trailing_pe is not None:
+            val_bits.append(f"trailing PE {s.trailing_pe}")
+        if s.forward_pe is not None:
+            val_bits.append(f"forward PE {s.forward_pe}")
+        if s.ps_ratio is not None:
+            val_bits.append(f"P/S {s.ps_ratio}")
+        val_str = " · ".join(val_bits) if val_bits else "no valuation data"
+        val_line = f"    Valuation: {val_str} ({s.valuation_signal})"
+
+        # Value-entry flag rendered prominently — this is where the LLM
+        # should lean into value_entry_missed classification instead of
+        # treating the row as noise.
+        value_flag = (
+            "    ⚠ VALUE_ENTRY_CANDIDATE: move is DOWN and fundamentals "
+            "signal intact — check for value_entry_missed classification"
+            if s.value_entry_candidate else ""
         )
+
+        row_parts = [
+            f"- **{s.symbol}** [{s.source}] {s.move_pct:+.1f}% over {s.window_days}d · {held_bit}",
+            f"    {ta_bit}",
+            f"    {news_bit}",
+            f"    {earn_bit}",
+            f"    Macro sector stance: {s.macro_sector_tailwind}",
+            f"    Theme tags (raw): {tags}",
+            qual_line,
+            val_line,
+        ]
+        if value_flag:
+            row_parts.append(value_flag)
+        lines.append("\n".join(row_parts))
     return "\n".join(lines)
 
 
@@ -204,6 +293,11 @@ class EveningAnalystAgent(BaseAgent):
         # Phase-1 evening-upgrade: Python-computed notable movers we didn't own.
         # LLM classifies each into miss_category + writes a lesson.
         missed_ops_snapshots: list = kwargs.get("missed_ops_snapshots") or []
+        # Value-lens upgrade (2026-04): per-position 8-week fundamentals
+        # evolution. LLM uses this in the thesis_health_review step to
+        # judge whether each holding's thesis is strengthening / intact /
+        # weakening / broken — the missing medium-long-term reflection step.
+        thesis_health_context: dict = kwargs.get("thesis_health_context") or {}
 
         positions_text = "\n".join(
             f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Close: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} | Sector: {p.sector}"
@@ -300,6 +394,7 @@ class EveningAnalystAgent(BaseAgent):
         )
 
         missed_ops_section = _fmt_missed_opportunities(missed_ops_snapshots)
+        thesis_health_section = _fmt_thesis_health(thesis_health_context)
 
         return f"""## End-of-Day Review
 
@@ -334,16 +429,23 @@ class EveningAnalystAgent(BaseAgent):
 ## Today's Earnings Filings
 {_fmt_earnings_for_evening(earnings_analyses)}
 
+## Thesis Health Review — each held position over the last ~8 weeks
+{thesis_health_section}
+
 ## Missed Opportunity Review — universe + Alpaca top gainers (|move|≥8%, 5-day)
 {missed_ops_section}
 
-Fill the 6-step `reasoning_chain` before the per-field output. Each field must
+Fill the 7-step `reasoning_chain` before the per-field output. Each field must
 be non-empty. Grade every recent SELL and BUY into the structured
-`sell_grades` / `buy_grades` lists (mirror the prose assessments for
-continuity). For each row in the Missed Opportunity Review, emit one
-`missed_opportunities` entry classifying `miss_category` and writing a
-concrete `lesson` that cites the signal state above — no pure price
-retrospection. Respond as JSON matching `EveningReport`."""
+`sell_grades` / `buy_grades` lists — each grade MUST include a
+`thesis_trajectory` judgment (strengthening / intact / weakening / broken)
+not just price-action. For each row in the Missed Opportunity Review, emit
+one `missed_opportunities` entry classifying `miss_category` (including the
+new `value_entry_missed` for down-move rows with intact fundamentals),
+pick a `theme_durability` when a theme is named, and cite observable
+evidence in `lesson`. Populate `this_week_thesis_catalysts` with concrete
+upcoming events that bear on held theses. Respond as JSON matching
+`EveningReport`."""
 
     def analyze(self, positions: list[Position], macro_summary: dict,
                 total_value: float, daily_pnl: float, daily_return_pct: float,
@@ -357,6 +459,7 @@ retrospection. Respond as JSON matching `EveningReport`."""
                 active_state_changes: str = "",
                 outlook_calibration: dict | None = None,
                 missed_ops_snapshots: list | None = None,
+                thesis_health_context: dict | None = None,
                 ) -> tuple[EveningReport | None, "AgentResult"]:
         result = self.run(
             positions=positions,
@@ -374,6 +477,7 @@ retrospection. Respond as JSON matching `EveningReport`."""
             active_state_changes=active_state_changes,
             outlook_calibration=outlook_calibration or {},
             missed_ops_snapshots=missed_ops_snapshots or [],
+            thesis_health_context=thesis_health_context or {},
         )
         parsed = result.parse_json()
         if parsed is None:

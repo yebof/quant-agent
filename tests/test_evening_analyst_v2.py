@@ -24,6 +24,7 @@ from src.pipeline import TradingPipeline
 def _valid_rc() -> EveningReasoningChain:
     return EveningReasoningChain(
         performance_attribution="x", outlook_retrospection="x",
+        thesis_health_review="x",
         decision_quality_review="x", calibration_meta="x",
         market_regime_read="x", tomorrow_preparation="x",
     )

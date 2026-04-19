@@ -335,6 +335,197 @@ def test_missed_opportunity_addition_recommendation_no_by_default():
     assert m.universe_addition_reason == ""
 
 
+def test_evening_reasoning_chain_has_seven_required_steps():
+    """Value-lens upgrade: chain grew from 6 to 7. thesis_health_review
+    is the new mandatory step — empty string rejected."""
+    from src.models import EveningReasoningChain
+
+    with pytest.raises(ValidationError, match="thesis_health_review"):
+        EveningReasoningChain(
+            performance_attribution="a", outlook_retrospection="b",
+            # thesis_health_review omitted
+            decision_quality_review="c", calibration_meta="d",
+            market_regime_read="e", tomorrow_preparation="f",
+        )
+
+    # Empty string also rejected
+    with pytest.raises(ValidationError):
+        EveningReasoningChain(
+            performance_attribution="a", outlook_retrospection="b",
+            thesis_health_review="",  # empty
+            decision_quality_review="c", calibration_meta="d",
+            market_regime_read="e", tomorrow_preparation="f",
+        )
+
+
+def test_buy_grade_thesis_trajectory_optional_for_back_compat():
+    """Existing buy_grades rows in DB don't carry thesis_trajectory;
+    schema must accept None so reads don't crash during migration window."""
+    from src.models import BuyGrade
+
+    # No trajectory — still valid
+    bg = BuyGrade(
+        symbol="NVDA", buy_date="2026-04-15", buy_price=200, current_price=215,
+        pct_move_since_buy=7.5, grade="correct", reason="thesis playing out",
+    )
+    assert bg.thesis_trajectory is None
+
+    # With trajectory — the value-lens path
+    bg_v = BuyGrade(
+        symbol="NVDA", buy_date="2026-04-15", buy_price=200, current_price=180,
+        pct_move_since_buy=-10.0, grade="correct",  # correct DESPITE price
+        reason="price noise, thesis intact per Q1 capex +18%",
+        thesis_trajectory="strengthening",
+    )
+    assert bg_v.thesis_trajectory == "strengthening"
+
+
+def test_sell_grade_thesis_trajectory_optional():
+    """Same back-compat pattern on SellGrade."""
+    from src.models import SellGrade
+
+    sg = SellGrade(
+        symbol="GOOGL", sell_date="2026-04-18", sell_price=320,
+        current_price=335, pct_move_since_sell=4.7,
+        grade="premature", reason="left on table",
+    )
+    assert sg.thesis_trajectory_at_sell is None
+
+    sg_v = SellGrade(
+        symbol="GOOGL", sell_date="2026-04-18", sell_price=320,
+        current_price=335, pct_move_since_sell=4.7,
+        grade="correct",  # correct SELL despite price going up
+        reason="exited on thesis break — ad-rev guidance cut",
+        thesis_trajectory_at_sell="broken",
+    )
+    assert sg_v.thesis_trajectory_at_sell == "broken"
+
+
+def test_missed_opportunity_value_entry_missed_requires_theme():
+    """value_entry_missed shares the theme-required discipline with the
+    other real-miss categories."""
+    from src.models import MissedOpportunity
+
+    with pytest.raises(ValidationError, match="theme_if_any"):
+        MissedOpportunity(
+            symbol="MU", move_pct=-18.2, miss_category="value_entry_missed",
+            lesson="memory cycle dip, fundamentals intact",
+            # theme_if_any omitted
+        )
+
+    m = MissedOpportunity(
+        symbol="MU", move_pct=-18.2, miss_category="value_entry_missed",
+        theme_if_any="memory-cycle",
+        theme_durability="1_3_year_cycle",
+        lesson="DRAM ASPs bottoming per Q1 print — classic cyclical entry we skipped",
+    )
+    assert m.miss_category == "value_entry_missed"
+
+
+def test_missed_opportunity_theme_durability_required_with_theme():
+    """If theme_if_any is set, LLM must judge durability — fad vs secular
+    is the discriminator user cares about."""
+    from src.models import MissedOpportunity
+
+    # Default "unknown" still counts as set — validator only rejects None
+    m = MissedOpportunity(
+        symbol="VST", move_pct=22.3, miss_category="theme_blindspot",
+        theme_if_any="nuclear/power",
+        lesson="nuclear capex never entered our news tracker",
+    )
+    assert m.theme_durability == "unknown"
+
+    # Explicit secular — the kind that should trigger universe add
+    m_secular = MissedOpportunity(
+        symbol="VST", move_pct=22.3, miss_category="theme_blindspot",
+        theme_if_any="nuclear/power",
+        theme_durability="multi_year_secular",
+        lesson="datacenter-driven power demand is multi-year",
+    )
+    assert m_secular.theme_durability == "multi_year_secular"
+
+
+def test_missed_opportunity_snapshot_carries_valuation():
+    """Snapshot now also carries PE / PS / valuation_signal so the LLM
+    doesn't need to infer valuation from prose."""
+    from src.models import MissedOpportunitySnapshot
+
+    snap = MissedOpportunitySnapshot(
+        symbol="VST", move_pct=22.3, window_days=5,
+        held_during_window=False,
+        had_ta_signal=True, had_news_signal=True, had_earnings_signal=True,
+        source="top_mover",
+        trailing_pe=18.5, forward_pe=15.2, ps_ratio=2.1,
+        valuation_signal="fair",
+    )
+    assert snap.valuation_signal == "fair"
+    assert snap.forward_pe == 15.2
+
+
+def test_missed_opportunity_snapshot_value_entry_candidate_flag():
+    """Python digest sets value_entry_candidate=True when move is negative
+    AND there's an intact fundamental signal — schema just carries the
+    flag through to the LLM."""
+    from src.models import MissedOpportunitySnapshot
+
+    snap = MissedOpportunitySnapshot(
+        symbol="MU", move_pct=-18.0, window_days=5,
+        held_during_window=False,
+        had_ta_signal=False, had_news_signal=True, had_earnings_signal=True,
+        source="universe",
+        valuation_signal="cheap",
+        value_entry_candidate=True,
+    )
+    assert snap.value_entry_candidate is True
+    # Default is False
+    snap2 = MissedOpportunitySnapshot(
+        symbol="X", move_pct=22.0, window_days=5,
+        held_during_window=False,
+        had_ta_signal=False, had_news_signal=False, had_earnings_signal=False,
+        source="top_mover",
+    )
+    assert snap2.value_entry_candidate is False
+
+
+def test_evening_report_has_new_structured_fields():
+    """this_week_thesis_catalysts + thesis_updates / selection_rules /
+    discipline_notes are all optional with [] defaults — pre-upgrade
+    payloads still parse."""
+    from src.models import (
+        EveningReasoningChain, EveningReport,
+    )
+
+    rc = EveningReasoningChain(
+        performance_attribution="a", outlook_retrospection="b",
+        thesis_health_review="h",
+        decision_quality_review="c", calibration_meta="d",
+        market_regime_read="e", tomorrow_preparation="f",
+    )
+    r = EveningReport(
+        reasoning_chain=rc, daily_summary="x", lessons="y",
+        tomorrow_outlook="z", risk_rating="low",
+    )
+    assert r.this_week_thesis_catalysts == []
+    assert r.thesis_updates == []
+    assert r.selection_rules == []
+    assert r.discipline_notes == []
+
+    # Populated path
+    r2 = EveningReport(
+        reasoning_chain=rc, daily_summary="x", lessons="y",
+        tomorrow_outlook="z", risk_rating="low",
+        this_week_thesis_catalysts=[
+            "NVDA Q1 earnings Thu after close — AI capex guide",
+            "FOMC minutes Wed — rate-sensitive REITs at risk",
+        ],
+        thesis_updates=["NVDA thesis strengthening: data-center capex +18% QoQ"],
+        selection_rules=["require ≥2 fundamental prints before theme sizing"],
+        discipline_notes=["stop cutting GOOGL on -2% wobbles"],
+    )
+    assert len(r2.this_week_thesis_catalysts) == 2
+    assert "NVDA" in r2.thesis_updates[0]
+
+
 def test_missed_opportunity_addition_requires_reason_when_non_no():
     """recommendation="add" or "watch" MUST cite concrete metrics — the
     reason field exists precisely to force evidence-based decisions."""
@@ -387,6 +578,7 @@ def test_evening_report_missed_opportunities_default_empty():
 
     rc = EveningReasoningChain(
         performance_attribution="a", outlook_retrospection="b",
+        thesis_health_review="health",
         decision_quality_review="c", calibration_meta="d",
         market_regime_read="e", tomorrow_preparation="f",
     )
