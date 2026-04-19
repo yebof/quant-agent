@@ -59,6 +59,93 @@ HARD_BLOCK_RULES = {
 }
 
 
+def _missed_ops_quality_metrics(
+    bars: list, lookback_days: int
+) -> tuple[float | None, float | None, float | None]:
+    """Compute (avg_dollar_volume_20d_m, volume_confirmation_ratio,
+    single_day_concentration_pct) from a list[OHLCV]-like. All three are
+    independent — a symbol with only a few bars may return None for
+    dollar-volume while still having a valid single-day concentration.
+
+    Designed for the missed_opportunities digest: thin-liquidity top-
+    mover symbols (dollar_vol < $5M) and single-day-gap rallies
+    (concentration > 70%) shouldn't dominate the evening LLM's attention.
+
+    Returns (None, None, None) when bars is empty or malformed.
+    """
+    if not bars or len(bars) < 2:
+        return None, None, None
+
+    # Isolate trailing 20 bars for the 20-day volume stats. Insufficient
+    # history → None for that metric only.
+    trailing_20 = bars[-20:] if len(bars) >= 20 else bars
+    avg_dvol_m: float | None = None
+    vol_conf_ratio: float | None = None
+    try:
+        dollar_vols: list[float] = []
+        for b in trailing_20:
+            close_attr = getattr(b, "close", None)
+            vol_attr = getattr(b, "volume", None)
+            # Strict type check — production OHLCV carries int/float, but
+            # MagicMock objects in tests respond to float() with 1.0 via
+            # __float__, which would smuggle phantom volume into the
+            # dollar-vol math. Require real numerics.
+            if not isinstance(close_attr, (int, float)):
+                continue
+            if not isinstance(vol_attr, (int, float)):
+                continue
+            close = float(close_attr)
+            vol = float(vol_attr)
+            if close > 0 and vol > 0:
+                dollar_vols.append(close * vol)
+        if len(dollar_vols) >= 5:
+            avg_dvol = sum(dollar_vols) / len(dollar_vols)
+            avg_dvol_m = round(avg_dvol / 1_000_000, 2)
+            # Today's dollar volume vs the average. >1.5 = buyers showed up.
+            if dollar_vols and avg_dvol > 0:
+                today_dvol = dollar_vols[-1]
+                vol_conf_ratio = round(today_dvol / avg_dvol, 2)
+    except (TypeError, ValueError, AttributeError):
+        avg_dvol_m = None
+        vol_conf_ratio = None
+
+    # Single-day concentration — what fraction of the window's total return
+    # came from the biggest single day? > 70% = gap-up day (event/squeeze);
+    # < 50% = distributed (trend). Needs ≥ 3 bars in the window to be
+    # meaningful (2 bars = one daily return = always 100%).
+    window = (bars[-(lookback_days + 1):]
+              if len(bars) > lookback_days else bars)
+    single_day_conc: float | None = None
+    try:
+        if len(window) >= 3:
+            daily_returns: list[float] = []
+            for prev, cur in zip(window[:-1], window[1:]):
+                pc_attr = getattr(prev, "close", None)
+                cc_attr = getattr(cur, "close", None)
+                if not (isinstance(pc_attr, (int, float))
+                        and isinstance(cc_attr, (int, float))):
+                    continue
+                pc = float(pc_attr)
+                cc = float(cc_attr)
+                if pc > 0:
+                    daily_returns.append((cc - pc) / pc * 100.0)
+            if daily_returns:
+                total = sum(daily_returns)
+                max_abs = max((abs(r) for r in daily_returns), default=0.0)
+                # Use absolute totals to avoid sign flips when the window
+                # has both up and down days.
+                if abs(total) > 0.01:
+                    # Percentage of the biggest-day move against total
+                    # directional move. Cap at 200 — biggest-day move can
+                    # exceed total when subsequent days partially reverse.
+                    conc = min(max_abs / abs(total) * 100.0, 200.0)
+                    single_day_conc = round(conc, 1)
+    except (TypeError, ValueError, AttributeError):
+        single_day_conc = None
+
+    return avg_dvol_m, vol_conf_ratio, single_day_conc
+
+
 class TradingPipeline:
     def __init__(self, config: AppConfig):
         self.config = config
@@ -1642,6 +1729,7 @@ class TradingPipeline:
         top_n: int = 15,
         top_movers_count: int = 15,
         current_position_symbols: set[str] | None = None,
+        min_top_mover_dollar_volume_m: float = 5.0,
     ) -> list:
         """Notable movers we did NOT own — input for evening's missed-op review.
 
@@ -1651,6 +1739,13 @@ class TradingPipeline:
         was visible at the time (prior TA rating, news headline, earnings
         sentiment, macro sector stance) so the LLM's miss classification has
         to cite observable evidence, not retro-rationalize price.
+
+        Quality filter for TOP-MOVER symbols only (universe symbols always
+        pass — they're curated): if 20-day avg dollar volume is below
+        `min_top_mover_dollar_volume_m` (default $5M), the symbol is
+        dropped before reaching the LLM. Thin-liquidity gappers aren't
+        interesting to a medium-long-term investor and flooding the prompt
+        with them dilutes the real misses.
 
         Returns a list[MissedOpportunitySnapshot]. Empty when no symbol
         crosses the threshold. Sort order within the list:
@@ -1676,17 +1771,22 @@ class TradingPipeline:
         if not all_syms:
             return []
 
-        # Per-symbol window return. Pad lookback for weekends / gaps; if we
-        # can't get bars for a symbol, skip it quietly.
-        symbol_moves: dict[str, float] = {}
-        bars_pad = max(lookback_days + 3, 10)
+        # Fetch bars once per symbol. Cache for reuse across move + quality
+        # metric computation. Need ≥ 25 bars for a 20-day average volume
+        # calculation, so we pad to that even if lookback_days is tight.
+        bars_pad = max(lookback_days + 3, 25)
+        bars_cache: dict[str, list] = {}
         for sym in all_syms:
             try:
                 bars = self.market.get_ohlcv(sym, lookback_days=bars_pad)
             except Exception:
                 continue
-            if not bars or len(bars) < 2:
-                continue
+            if bars and len(bars) >= 2:
+                bars_cache[sym] = bars
+
+        # Per-symbol window return.
+        symbol_moves: dict[str, float] = {}
+        for sym, bars in bars_cache.items():
             window = bars[-(lookback_days + 1):] if len(bars) > lookback_days else bars
             if len(window) < 2:
                 continue
@@ -1724,6 +1824,22 @@ class TradingPipeline:
             else:
                 source = "universe"
 
+            bars = bars_cache.get(sym) or []
+            avg_dvol_m, vol_conf_ratio, single_day_conc = _missed_ops_quality_metrics(
+                bars, lookback_days,
+            )
+
+            # Liquidity pre-filter: thin TOP-MOVER-only symbols drop out here.
+            # Universe symbols bypass — they're already curated for quality.
+            if (source == "top_mover"
+                    and avg_dvol_m is not None
+                    and avg_dvol_m < min_top_mover_dollar_volume_m):
+                logger.debug(
+                    "missed_ops: dropping thin top-mover %s (avg $vol %.1fM < %.1fM)",
+                    sym, avg_dvol_m, min_top_mover_dollar_volume_m,
+                )
+                continue
+
             ta_rating, ta_date = tech_map.get(sym, (None, None))
             had_ta = ta_rating in ("buy", "strong_buy")
             news_headline = news_map.get(sym)
@@ -1753,6 +1869,9 @@ class TradingPipeline:
                 theme_tags=theme_map.get(sym, [])[:4],
                 recent_earnings_signal=earnings_signal,
                 macro_sector_tailwind=sector_stance,  # type: ignore[arg-type]
+                avg_dollar_volume_20d_m=avg_dvol_m,
+                volume_confirmation_ratio=vol_conf_ratio,
+                single_day_concentration_pct=single_day_conc,
             ))
 
         def _priority_key(s) -> tuple:

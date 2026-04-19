@@ -768,6 +768,13 @@ class MissedOpportunitySnapshot(BaseModel):
     headline, earnings signal, macro sector stance) that the LLM's miss
     classification has to be grounded in observable prior evidence rather
     than price retro-rationalization.
+
+    For symbols sourced from Alpaca's top-mover screener (not in our
+    trading universe), the quality fields (avg_dollar_volume_20d_m,
+    volume_confirmation_ratio, single_day_concentration_pct) are the
+    main filter for "worth considering adding to universe" vs "low-
+    volume squeeze we should ignore". A medium-long-term investor
+    doesn't chase thin moves.
     """
     symbol: str
     move_pct: float
@@ -792,6 +799,25 @@ class MissedOpportunitySnapshot(BaseModel):
     # "unknown" = macro never covered the sector (itself a signal — blindspot).
     macro_sector_tailwind: Literal["bullish", "neutral", "bearish", "unknown"] = "unknown"
 
+    # Quality metrics — primary lens for whether a top-mover deserves
+    # watchlist consideration. Filled by Python from bar data; None when
+    # insufficient bars to compute reliably.
+    avg_dollar_volume_20d_m: float | None = None
+    """20-day average daily dollar volume in MILLIONS of USD. Low numbers
+    (< ~5M) indicate thin liquidity — easy to squeeze, dangerous for a
+    medium-long-term position. Used to pre-filter very illiquid movers
+    upstream; the LLM also sees it to reason about "real institutional
+    interest vs low-volume drift"."""
+    volume_confirmation_ratio: float | None = None
+    """Today's dollar volume / 20-day avg. > ~1.5 indicates buyers
+    showed up in size (real interest). < 1.0 = move happened on
+    normal-or-less flow; unlikely to sustain."""
+    single_day_concentration_pct: float | None = None
+    """Percent of the window's total return that came from the BIGGEST
+    single day. 0-100. > 70 = gap-up day (event / squeeze); < 50 =
+    distributed move (trend). For a medium-long-term investor, a
+    distributed trend is far more interesting than a single gap."""
+
     @field_validator("symbol")
     @classmethod
     def _sym(cls, v: str) -> str:
@@ -799,13 +825,21 @@ class MissedOpportunitySnapshot(BaseModel):
 
 
 class MissedOpportunity(BaseModel):
-    """Evening-analyst OUTPUT for one snapshot: classified miss + lesson.
+    """Evening-analyst OUTPUT for one snapshot: classified miss + lesson +
+    (for non-universe symbols) watchlist-addition recommendation.
 
     `miss_category` frames the miss through the three lenses the user cares
     about: catching trends, not missing themes, spotting fundamental
     mispricing. `noise_rally` and `risk_disciplined` are escape hatches so
     the LLM isn't forced to label every price move as a miss — but the
     prompt has to push back when they're overused.
+
+    For symbols sourced from the top-mover screener (not in the trading
+    universe), `universe_addition_recommendation` is the high-bar answer
+    to "should we add this to the 77-symbol universe we carefully curated?"
+    Default is "no" — the universe is deliberately small; thin or
+    one-day-gap moves should not expand it. "add" only when volume,
+    sustain, theme, and fundamentals all point in the right direction.
     """
     symbol: str
     move_pct: float
@@ -822,6 +856,16 @@ class MissedOpportunity(BaseModel):
     # is noise_rally / risk_disciplined.
     theme_if_any: str | None = None
     lesson: str = Field(min_length=1, max_length=240)
+    # Watchlist-addition recommendation (only meaningful for top-mover sources;
+    # default "no" for universe symbols since they're already tracked).
+    # High bar: "add" requires documented, multi-factor justification —
+    # volume confirmation + multi-day sustain + theme/fundamental anchor.
+    universe_addition_recommendation: Literal["add", "watch", "no"] = "no"
+    universe_addition_reason: str = Field(default="", max_length=240)
+    """1-2 sentences citing the QUALITY metrics (volume, sustain, theme,
+    fundamentals) that justify a non-'no' recommendation. Required when
+    recommendation is "add" or "watch"; must stay empty when "no" so the
+    reason field doesn't drift into wishful thinking."""
 
     @field_validator("symbol")
     @classmethod
@@ -838,6 +882,20 @@ class MissedOpportunity(BaseModel):
                 raise ValueError(
                     f"MissedOpportunity miss_category='{self.miss_category}' "
                     f"requires theme_if_any so quarterly aggregation can group by theme"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _addition_recommendation_consistency(self) -> "MissedOpportunity":
+        # "add" / "watch" require a concrete reason; "no" forbids one so
+        # the field doesn't become a dumping ground for weak opinions.
+        if self.universe_addition_recommendation in ("add", "watch"):
+            if not (self.universe_addition_reason or "").strip():
+                raise ValueError(
+                    f"universe_addition_recommendation="
+                    f"'{self.universe_addition_recommendation}' requires "
+                    f"universe_addition_reason citing volume, sustain, or "
+                    f"theme quality — bar is high, evidence must be concrete"
                 )
         return self
 

@@ -68,10 +68,13 @@ def _fmt_earnings_for_evening(earnings_analyses: list[dict]) -> str:
 def _fmt_missed_opportunities(snapshots: list) -> str:
     """Render the digest rows as a prompt table the LLM can reason over.
 
-    Each row surfaces: symbol, window return, source (universe vs top_mover),
-    whether we held it, and the signal state at the time (prior TA rating,
-    news headline, earnings signal, macro sector stance). Theme tags (if
-    any) are listed to help the LLM pick the canonical `theme_if_any`.
+    Each row surfaces: symbol, window return, source (universe vs
+    top_mover), whether we held it, the signal state at the time (prior
+    TA rating, news headline, earnings signal, macro sector stance),
+    and critically the QUALITY metrics (20d avg dollar volume,
+    today-vs-avg volume ratio, single-day concentration) — the LLM
+    needs these to decide whether a move is a trend we missed vs a
+    thin one-day squeeze to ignore.
 
     Empty snapshot list → a short note; LLM should emit
     `missed_opportunities: []` in that case.
@@ -97,13 +100,41 @@ def _fmt_missed_opportunities(snapshots: list) -> str:
             if s.recent_earnings_signal else "Earnings: no recent filing"
         )
         held_bit = "HELD" if s.held_during_window else "not held"
+
+        # Quality line — read these before deciding whether a top_mover
+        # row is worth anything more than a "noise_rally" tag.
+        qual_bits: list[str] = []
+        if s.avg_dollar_volume_20d_m is not None:
+            qual_bits.append(f"20d $vol {s.avg_dollar_volume_20d_m:.1f}M")
+        if s.volume_confirmation_ratio is not None:
+            qual_bits.append(
+                f"vol_conf {s.volume_confirmation_ratio:.2f}x "
+                f"({'CONFIRMED' if s.volume_confirmation_ratio >= 1.5 else 'weak'})"
+            )
+        if s.single_day_concentration_pct is not None:
+            tag = (
+                "single-day gap" if s.single_day_concentration_pct >= 70
+                else ("distributed" if s.single_day_concentration_pct < 50
+                      else "mixed")
+            )
+            qual_bits.append(
+                f"1d concentration {s.single_day_concentration_pct:.0f}% "
+                f"({tag})"
+            )
+        qual_line = (
+            f"    Quality: {' · '.join(qual_bits)}"
+            if qual_bits else
+            "    Quality: (insufficient bars for metrics)"
+        )
+
         lines.append(
             f"- **{s.symbol}** [{s.source}] {s.move_pct:+.1f}% over {s.window_days}d · {held_bit}\n"
             f"    {ta_bit}\n"
             f"    {news_bit}\n"
             f"    {earn_bit}\n"
             f"    Macro sector stance: {s.macro_sector_tailwind}\n"
-            f"    Theme tags (raw): {tags}"
+            f"    Theme tags (raw): {tags}\n"
+            f"{qual_line}"
         )
     return "\n".join(lines)
 
