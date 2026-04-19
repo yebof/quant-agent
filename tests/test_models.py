@@ -318,3 +318,227 @@ def test_evening_report_missed_opportunities_default_empty():
         tomorrow_outlook="z", risk_rating="low",
     )
     assert rep.missed_opportunities == []
+
+
+# === Meta-reflection schema (PR3) ===
+
+def _valid_meta_chain():
+    from src.models import MetaReasoningChain
+    return MetaReasoningChain(
+        performance_vs_benchmark="SPY +4%, we +1.5%, alpha -2.5%",
+        secular_theme_audit="Nuclear theme ran +45% in Q1, we held 0% of it",
+        loss_autopsy_audit="greed_top_chasing 3× (MU/NVDA/AVGO), alpha -8%",
+        agent_hit_rate_audit="macro_analyst emitted 12 regime calls",
+        missed_theme_diagnosis="nuclear theme: news never reported it",
+        style_bias_identification="We're trend-followers, not identifiers",
+        prompt_edit_reasoning="tech prompt lacks ATR-upper-band guard",
+    )
+
+
+def _valid_theme_coverage():
+    from src.models import ThemeCoverage
+    return ThemeCoverage(
+        themes_missed_entirely=["nuclear/power"],
+    )
+
+
+def _valid_loss_pattern():
+    from src.models import LossPattern
+    return LossPattern(
+        root_cause="greed_top_chasing",
+        occurrences=3,
+        total_loss_pct=-36.0,
+        example_trades=["MU 2026-01-15 -15%", "NVDA 2026-02-03 -12%",
+                         "AVGO 2026-02-20 -9%"],
+        attributable_agent="tech_analyst",
+        proposed_guard=(
+            "Before issuing a buy rating on a stock trading within 2% of "
+            "its 20-day high, require confirming volume expansion in the CoT."
+        ),
+    )
+
+
+def _valid_loss_report(patterns=None):
+    from src.models import LossPatternReport
+    return LossPatternReport(
+        top_patterns=patterns or [],
+        systemic_vs_alpha_split="72% alpha-destruction, 28% systemic",
+        worst_single_trade="MU 2026-02 -15% (greed_top_chasing)",
+        corrigibility_score="degrading",
+    )
+
+
+def test_meta_reasoning_chain_rejects_empty_steps():
+    """Every step must be non-empty — 7-step discipline mirrors PM / EA."""
+    from src.models import MetaReasoningChain
+
+    with pytest.raises(ValidationError):
+        MetaReasoningChain(
+            performance_vs_benchmark="",   # ← empty
+            secular_theme_audit="x", loss_autopsy_audit="x",
+            agent_hit_rate_audit="x", missed_theme_diagnosis="x",
+            style_bias_identification="x", prompt_edit_reasoning="x",
+        )
+
+
+def test_prompt_learning_requires_numeric_fact_in_justification():
+    """Every proposed learning must cite an actual digest number — no
+    vibes-only edits."""
+    from src.models import PromptLearning
+
+    # No digits → reject
+    with pytest.raises(ValidationError, match="number"):
+        PromptLearning(
+            agent_name="tech_analyst", operation="append",
+            learning_text="Pay closer attention to valuation before buying.",
+            justification="We've been too aggressive lately on entries.",
+        )
+
+    # With digits → ok
+    ok = PromptLearning(
+        agent_name="tech_analyst", operation="append",
+        learning_text="Flag stretched valuations above 40x forward PE.",
+        justification=(
+            "Q1 2026 showed 3 of 5 wrongs were greed_top_chasing; "
+            "alpha destruction -22%."
+        ),
+    )
+    assert ok.agent_name == "tech_analyst"
+
+
+def test_prompt_learning_retract_requires_target_hash():
+    """`retract` ops can't be issued without pointing at the prior learning
+    being withdrawn — enforces audit trail."""
+    from src.models import PromptLearning
+
+    with pytest.raises(ValidationError, match="retract_target_hash"):
+        PromptLearning(
+            agent_name="tech_analyst", operation="retract",
+            learning_text="Withdraw the prior rule — it didn't help.",
+            justification="Q2 still saw 4 greed_top_chasing despite Q1 learning.",
+        )
+
+    ok = PromptLearning(
+        agent_name="tech_analyst", operation="retract",
+        learning_text="Withdraw the prior rule — it didn't help.",
+        justification="Q2 still saw 4 greed_top_chasing despite Q1 learning.",
+        retract_target_hash="abc123",
+    )
+    assert ok.retract_target_hash == "abc123"
+
+
+def test_prompt_learning_rejects_protected_agents_via_literal():
+    """risk_manager and position_reviewer are NOT in the allowed literal —
+    Pydantic will reject them before PR 4's editor even runs."""
+    from src.models import PromptLearning
+
+    with pytest.raises(ValidationError):
+        PromptLearning(
+            agent_name="risk_manager",  # protected
+            operation="append",
+            learning_text="Be more lenient on R/R below 1.5 sometimes.",
+            justification="Q1 saw 3 trades rejected with R/R 1.4 that later won.",
+        )
+
+
+def test_prompt_learning_length_bounded():
+    """learning_text must be ≥20 and ≤200 chars — forces concise, useful edits."""
+    from src.models import PromptLearning
+
+    with pytest.raises(ValidationError):
+        PromptLearning(
+            agent_name="tech_analyst", operation="append",
+            learning_text="x" * 5,  # too short
+            justification="Q1 2026 showed issues" + "x" * 30,
+        )
+    with pytest.raises(ValidationError):
+        PromptLearning(
+            agent_name="tech_analyst", operation="append",
+            learning_text="y" * 250,  # too long
+            justification="Q1 2026 showed issues" + "y" * 30,
+        )
+
+
+def test_loss_pattern_requires_proposed_guard():
+    """Every loss pattern the meta-reflector flags must come with a
+    candidate prompt guard — "here's the problem, no fix" is useless."""
+    from src.models import LossPattern
+
+    with pytest.raises(ValidationError):
+        LossPattern(
+            root_cause="greed_top_chasing", occurrences=3,
+            total_loss_pct=-36.0,
+            example_trades=["MU 2026-01-15 -15%"],
+            attributable_agent="tech_analyst",
+            proposed_guard="",   # empty
+        )
+
+
+def test_loss_pattern_example_trades_bounded():
+    """Examples bounded so report doesn't balloon; 1-8 entries."""
+    from src.models import LossPattern
+
+    with pytest.raises(ValidationError):
+        LossPattern(
+            root_cause="greed_top_chasing", occurrences=3,
+            total_loss_pct=-36.0,
+            example_trades=[],  # must have at least 1
+            attributable_agent="tech_analyst",
+            proposed_guard="Flag stretched entries.",
+        )
+
+
+def test_quarterly_meta_reflection_composes_and_caps_learnings():
+    """Top-level object accepts all sub-parts; enforces max 3 learnings
+    (PR 4's single-quarter cap is echoed in the schema)."""
+    from src.models import PromptLearning, QuarterlyMetaReflection
+
+    good_learning = PromptLearning(
+        agent_name="tech_analyst", operation="append",
+        learning_text="Flag stretched valuations above 40x forward PE.",
+        justification="Q1 2026: 3 of 5 wrongs were greed_top_chasing.",
+    )
+
+    # 3 learnings = OK
+    report = QuarterlyMetaReflection(
+        period="2026-Q1",
+        meta_reasoning_chain=_valid_meta_chain(),
+        style_self_portrait=(
+            "We are currently trend-followers more than trend-identifiers. "
+            "Short average hold days, concentrated in tech. Greed-driven "
+            "entries dominate our losses, suggesting a discipline gap."
+        ),
+        persistent_blindspots=["nuclear/power"],
+        root_cause_hypotheses=["news never covered energy"],
+        theme_coverage_report=_valid_theme_coverage(),
+        loss_pattern_report=_valid_loss_report([_valid_loss_pattern()]),
+        proposed_learnings=[good_learning, good_learning, good_learning],
+        confidence="medium",
+    )
+    assert report.period == "2026-Q1"
+    assert len(report.proposed_learnings) == 3
+
+    # 4 learnings → reject (schema cap before editor's per-quarter 3-agent cap)
+    with pytest.raises(ValidationError):
+        QuarterlyMetaReflection(
+            period="2026-Q1",
+            meta_reasoning_chain=_valid_meta_chain(),
+            style_self_portrait="x" * 120,
+            theme_coverage_report=_valid_theme_coverage(),
+            loss_pattern_report=_valid_loss_report(),
+            proposed_learnings=[good_learning] * 4,  # too many
+        )
+
+
+def test_quarterly_meta_reflection_style_self_portrait_non_trivial():
+    """style_self_portrait min_length=100 — one-word portraits fail."""
+    from src.models import QuarterlyMetaReflection
+
+    with pytest.raises(ValidationError):
+        QuarterlyMetaReflection(
+            period="2026-Q1",
+            meta_reasoning_chain=_valid_meta_chain(),
+            style_self_portrait="short",   # too short
+            theme_coverage_report=_valid_theme_coverage(),
+            loss_pattern_report=_valid_loss_report(),
+        )

@@ -1,0 +1,332 @@
+"""Quarterly meta-reflector — strategic self-audit.
+
+Runs once per quarter. Reads a deterministic digest (see
+`src.evolution.quarterly_digest.build_quarterly_digest`) + an optional
+previous-quarter reflection for continuity + corrigibility tracking.
+Emits a `QuarterlyMetaReflection` whose `proposed_learnings` is the
+handoff to PR4's prompt_editor (which in turn writes to each target
+agent's prompt file with hard guards on length / dedup / prohibited
+words).
+
+In PR3 this agent's output is persisted to
+`data/evolution/{period}/reflection.json` **without** being applied to
+any prompt file. Safe-mode observation pass so we can review the LLM's
+proposed edits for 1-2 quarters before enabling the auto-apply path.
+"""
+
+import json
+import logging
+from pathlib import Path
+
+from pydantic import ValidationError
+
+from src.agents.base import AgentResult, BaseAgent
+from src.models import QuarterlyMetaReflection
+
+logger = logging.getLogger(__name__)
+
+PROMPT_PATH = Path(__file__).parent.parent.parent / "config" / "prompts" / "meta_reflector.md"
+
+
+def _fmt_period_performance(perf: dict | None) -> str:
+    if not perf:
+        return "(no period_performance data)"
+    return (
+        f"- Total return: {perf.get('total_return_pct', 'n/a')}% over "
+        f"{perf.get('n_days', 0)} days\n"
+        f"- SPY return:   {perf.get('spy_return_pct', 'n/a')}%\n"
+        f"- Alpha vs SPY: {perf.get('alpha_vs_spy_pct', 'n/a')}%\n"
+        f"- Max drawdown: {perf.get('max_drawdown_pct', 'n/a')}%\n"
+        f"- Winning days / losing days: "
+        f"{perf.get('winning_days', 0)} / {perf.get('losing_days', 0)}\n"
+        f"- Best day: {perf.get('best_day_pct', 'n/a')}% · "
+        f"Worst day: {perf.get('worst_day_pct', 'n/a')}%"
+    )
+
+
+def _fmt_calibration(calib: dict | None) -> str:
+    if not calib:
+        return "(no closed-trade calibration available this quarter)"
+    if calib.get("n_closed", 0) == 0:
+        return "(n_closed=0 — no round-trips to calibrate on)"
+    lines = [
+        f"- Total closed trades: {calib.get('n', 0)}",
+        f"- Overall win rate: {calib.get('win_rate_pct', 'n/a')}%",
+        f"- Average return: {calib.get('avg_return_pct', 'n/a')}%",
+        f"- Average hold days: {calib.get('avg_hold_days', 'n/a')}",
+    ]
+    by_size = calib.get("by_size") or {}
+    for bucket_name, stats in by_size.items():
+        if not stats or stats.get("n", 0) == 0:
+            continue
+        lines.append(
+            f"  - {bucket_name}: n={stats.get('n', 0)}, "
+            f"win {stats.get('win_rate_pct', 'n/a')}%, "
+            f"avg ret {stats.get('avg_return_pct', 'n/a')}%, "
+            f"hold {stats.get('avg_hold_days', 'n/a')}d"
+        )
+    return "\n".join(lines)
+
+
+def _fmt_missed_themes(missed: dict | None) -> str:
+    if not missed:
+        return "(no missed_themes data)"
+    by_theme = missed.get("by_theme") or {}
+    by_category = missed.get("by_category") or {}
+    lines = [
+        f"- Total real misses: {missed.get('total_real_misses', 0)}",
+        f"- By miss_category: {by_category}",
+    ]
+    if by_theme:
+        lines.append("- Themes (sorted by occurrence):")
+        for theme, bucket in list(by_theme.items())[:12]:
+            syms = ", ".join(bucket.get("symbols_seen", [])[:8])
+            cats = ", ".join(bucket.get("categories_seen", []))
+            examples = bucket.get("example_lessons", [])
+            ex_str = ""
+            if examples:
+                ex_str = f"\n    Example lesson: {examples[0][:160]}"
+            lines.append(
+                f"  - {theme}: {bucket.get('occurrences', 0)} occurrences, "
+                f"symbols [{syms}], categories [{cats}]{ex_str}"
+            )
+    else:
+        lines.append("- No themes reached threshold.")
+    return "\n".join(lines)
+
+
+def _fmt_loss_patterns(lp: dict | None) -> str:
+    if not lp:
+        return "(no loss_patterns data)"
+    lines = [
+        f"- Total wrong BUYs: {lp.get('total_wrong_buys', 0)}",
+        f"- Alpha destruction (sum market-relative losses): "
+        f"{lp.get('alpha_destruction_pct', 'n/a')}%",
+    ]
+    by_cause = lp.get("by_cause") or {}
+    if not by_cause:
+        lines.append("- No losing BUYs with classified root cause.")
+        return "\n".join(lines)
+    lines.append("- By root cause (sorted by count):")
+    for cause, stats in by_cause.items():
+        syms = ", ".join(stats.get("symbols", [])[:8])
+        line = (
+            f"  - {cause}: count={stats.get('count', 0)}, "
+            f"avg_loss={stats.get('avg_loss_pct', 'n/a')}%, "
+            f"total_relative_loss={stats.get('total_relative_loss_pct', 'n/a')}%, "
+            f"symbols [{syms}]"
+        )
+        warnings = stats.get("example_warnings") or []
+        if warnings:
+            line += f"\n    Ignored warning: {warnings[0][:160]}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _fmt_agent_activity(activity: dict | None) -> str:
+    if not activity:
+        return "(no agent_signal_activity data)"
+    lines = []
+    for agent_name in (
+        "tech_analyst", "news_analyst", "macro_analyst",
+        "earnings_analyst", "portfolio_manager", "risk_manager",
+    ):
+        stats = activity.get(agent_name) or {}
+        if not stats:
+            lines.append(f"- {agent_name}: (no data)")
+            continue
+        key_bits = ", ".join(
+            f"{k}={v}" for k, v in stats.items()
+            if not isinstance(v, (dict, list))
+        )
+        lines.append(f"- {agent_name}: {key_bits}")
+        for k, v in stats.items():
+            if isinstance(v, dict) and v:
+                lines.append(f"    {k}: {v}")
+    return "\n".join(lines)
+
+
+def _fmt_corrigibility(corr: dict | None) -> str:
+    if not corr:
+        return (
+            "(no prior-quarter digest available — this is the first "
+            "meta-reflection, or the previous quarter's digest is missing. "
+            "`corrigibility_score` should default to 'stable', `confidence` "
+            "should be 'low'.)"
+        )
+    return (
+        f"- Summary: {corr.get('summary', 'n/a')}\n"
+        f"- Loss causes improved: {corr.get('loss_causes_improved', [])}\n"
+        f"- Loss causes worsened: {corr.get('loss_causes_worsened', [])}\n"
+        f"- Loss causes stable:   {corr.get('loss_causes_stable', [])}\n"
+        f"- Themes resolved:      {corr.get('themes_resolved', [])}\n"
+        f"- Themes persistent:    {corr.get('themes_persistent', [])}\n"
+        f"- Themes newly emerging:{corr.get('themes_newly_emerging', [])}"
+    )
+
+
+class MetaReflectorAgent(BaseAgent):
+    @property
+    def name(self) -> str:
+        return "meta_reflector"
+
+    @property
+    def system_prompt(self) -> str:
+        if PROMPT_PATH.exists():
+            return PROMPT_PATH.read_text()
+        return (
+            "You are a quarterly meta-reflector. Produce a "
+            "QuarterlyMetaReflection JSON object."
+        )
+
+    def build_user_message(self, **kwargs) -> str:
+        digest: dict = kwargs["digest"]
+        prev_reflection: dict | None = kwargs.get("prev_reflection")
+
+        period = digest.get("period", "unknown")
+        period_start = digest.get("period_start", "?")
+        period_end = digest.get("period_end", "?")
+        lookback_days = digest.get("lookback_days", "?")
+
+        perf_section = _fmt_period_performance(digest.get("period_performance"))
+        calib_section = _fmt_calibration(digest.get("calibration_by_size"))
+        themes_section = _fmt_missed_themes(digest.get("missed_themes"))
+        losses_section = _fmt_loss_patterns(digest.get("loss_patterns"))
+        activity_section = _fmt_agent_activity(digest.get("agent_signal_activity"))
+        corrigibility_section = _fmt_corrigibility(digest.get("corrigibility_trend"))
+
+        # Prior reflection (if any) is included as lightweight reference so
+        # the LLM can continue its own style/blindspot narrative — NOT as
+        # a source of facts (those come from the digest).
+        if prev_reflection:
+            prior_bits = [
+                f"- Prior period: {prev_reflection.get('period', '?')}",
+                f"- Prior style_self_portrait: "
+                f"{(prev_reflection.get('style_self_portrait') or '')[:400]}",
+                f"- Prior persistent_blindspots: "
+                f"{prev_reflection.get('persistent_blindspots', [])}",
+            ]
+            prior_learnings = prev_reflection.get("proposed_learnings") or []
+            if prior_learnings:
+                prior_bits.append("- Prior proposed_learnings (for continuity):")
+                for pl in prior_learnings[:3]:
+                    prior_bits.append(
+                        f"  - [{pl.get('agent_name', '?')}] "
+                        f"{(pl.get('learning_text') or '')[:160]}"
+                    )
+            prior_section = "\n".join(prior_bits)
+        else:
+            prior_section = "(no prior reflection — first meta-reflection run)"
+
+        return f"""## Quarterly Meta-Reflection — {period}
+Window: {period_start} → {period_end} ({lookback_days} days)
+
+## DIGEST (deterministic facts — all numbers below are citable in your justification)
+
+### Period Performance
+{perf_section}
+
+### Closed-Trade Calibration (realized outcomes by entry size)
+{calib_section}
+
+### Missed Themes (aggregated daily missed_opportunities)
+{themes_section}
+
+### Loss Patterns (aggregated wrong-BUY root causes)
+{losses_section}
+
+### Agent Signal Activity (volume, not hit rates)
+{activity_section}
+
+### Corrigibility Trend (vs prior quarter)
+{corrigibility_section}
+
+## PRIOR REFLECTION (continuity reference; not a source of facts)
+{prior_section}
+
+---
+Fill the 7-step `meta_reasoning_chain`, the structured
+`theme_coverage_report` and `loss_pattern_report`, plus 0-3
+`proposed_learnings` — every learning MUST cite specific numbers from
+the digest above in its `justification`, and MUST NOT target
+risk_manager or position_reviewer.
+
+Respond as JSON matching `QuarterlyMetaReflection`. Be conservative;
+the edits compound forward."""
+
+    def analyze(
+        self,
+        digest: dict,
+        prev_reflection: dict | None = None,
+    ) -> tuple[QuarterlyMetaReflection | None, AgentResult]:
+        """Run the agent over one quarterly digest.
+
+        Returns the parsed reflection or None on parse / validation
+        failure. The `AgentResult` is always returned so the caller can
+        persist the raw response for auditing even on failure.
+        """
+        result = self.run(digest=digest, prev_reflection=prev_reflection)
+        parsed = result.parse_json()
+        if parsed is None:
+            logger.error("Meta-reflector returned non-JSON response")
+            return None, result
+        if not isinstance(parsed, dict):
+            logger.error(
+                "Meta-reflector expected object, got %s",
+                type(parsed).__name__,
+            )
+            return None, result
+        try:
+            return QuarterlyMetaReflection(**parsed), result
+        except ValidationError as e:
+            logger.error("Meta-reflection failed schema validation: %s", e)
+            return None, result
+
+
+def persist_reflection(
+    reflection: QuarterlyMetaReflection,
+    *,
+    root_dir: str | Path = "data/evolution",
+) -> Path:
+    """Write reflection.json next to the quarter's digest.json.
+
+    Atomic write (tmp + os.replace). PR4's prompt_editor will eventually
+    read this to drive prompt edits; PR3 leaves it as observe-only.
+    """
+    import os
+    out_dir = Path(root_dir) / reflection.period
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "reflection.json"
+    tmp = out_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(reflection.model_dump(), indent=2, ensure_ascii=False))
+    os.replace(str(tmp), str(out_path))
+    logger.info("Quarterly meta-reflection persisted → %s", out_path)
+    return out_path
+
+
+def load_previous_reflection(
+    current_period_end,
+    *,
+    root_dir: str | Path = "data/evolution",
+) -> dict | None:
+    """Load the prior quarter's reflection.json, if any. Returns a plain
+    dict (parsed JSON) — the agent only uses it for continuity framing,
+    not for structural decisions, so we don't re-validate schema here."""
+    from src.trading_calendar import quarter_of
+    year = current_period_end.year
+    q = quarter_of(current_period_end)
+    prev_q = q - 1
+    if prev_q == 0:
+        prev_q = 4
+        year -= 1
+    prev_period = f"{year}-Q{prev_q}"
+    path = Path(root_dir) / prev_period / "reflection.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning(
+            "load_previous_reflection: failed to parse %s: %s", path, exc,
+        )
+        return None
