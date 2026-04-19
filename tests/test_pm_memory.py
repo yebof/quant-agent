@@ -541,6 +541,7 @@ def test_evening_report_parses_structured_fields():
 
     rc = EveningReasoningChain(
         performance_attribution="x", outlook_retrospection="x",
+        thesis_health_review="x",
         decision_quality_review="x", calibration_meta="x",
         market_regime_read="x", tomorrow_preparation="x",
     )

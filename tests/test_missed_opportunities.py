@@ -1320,6 +1320,348 @@ def test_quarterly_digest_watchlist_high_conviction_threshold():
     assert wlc["high_conviction"] == []  # single add isn't enough
 
 
+# ---------------------------------------------------------------------------
+# Value-lens additions: valuation + value_entry_candidate + thesis_health
+# ---------------------------------------------------------------------------
+
+def test_valuation_signal_buckets_forward_pe_correctly():
+    """_valuation_signal_from: < 12 cheap, 12-25 fair, >= 25 stretched,
+    None/<=0/non-numeric → no_data."""
+    from src.pipeline import _valuation_signal_from
+    assert _valuation_signal_from(8.5) == "cheap"
+    assert _valuation_signal_from(11.99) == "cheap"
+    assert _valuation_signal_from(12.0) == "fair"
+    assert _valuation_signal_from(18.0) == "fair"
+    assert _valuation_signal_from(24.99) == "fair"
+    assert _valuation_signal_from(25.0) == "stretched"
+    assert _valuation_signal_from(50.0) == "stretched"
+    assert _valuation_signal_from(None) == "no_data"
+    assert _valuation_signal_from(0) == "no_data"       # loss-making
+    assert _valuation_signal_from(-3.0) == "no_data"    # negative PE
+    assert _valuation_signal_from("n/a") == "no_data"   # non-numeric
+
+
+@patch("src.execution.broker._get_sector", return_value="Technology")
+def test_digest_injects_valuation_and_flag_value_entry_on_down_move(_sec):
+    """Regression: a universe symbol down 10% with intact news_signal gets
+    `value_entry_candidate=True` and valuation fields populated."""
+    p = _pipeline_with(
+        universe=["VAL"],
+        market_closes_by_symbol={
+            "VAL": [100, 97, 95, 93, 91, 89],  # ~-11% over 5 days
+        },
+        news_dir_path=None,
+    )
+    # Inject valuation via mock
+    p.market.get_valuation_metrics.return_value = {
+        "trailing_pe": 10.5, "forward_pe": 9.0, "ps_ratio": 1.2,
+    }
+    # Patch news signal to return something for VAL
+    import json as _json
+    from pathlib import Path as _Path
+    import tempfile as _tmp
+    with _tmp.TemporaryDirectory() as td:
+        news_dir = _Path(td) / "news"
+        news_dir.mkdir()
+        from src.trading_calendar import et_today
+        day_dir = news_dir / str(et_today())
+        day_dir.mkdir()
+        (day_dir / "full_report.json").write_text(_json.dumps({
+            "state_changes": [{
+                "event": "Sector-wide overreaction to Fed presser",
+                "affected_symbols": ["VAL"],
+            }],
+        }))
+        p.news_store.data_dir = news_dir
+        out = p._build_missed_opportunities_digest(
+            lookback_days=5, move_threshold_pct=8.0,
+        )
+
+    assert len(out) == 1
+    snap = out[0]
+    assert snap.symbol == "VAL"
+    assert snap.move_pct < -8
+    assert snap.had_news_signal is True
+    assert snap.trailing_pe == 10.5
+    assert snap.forward_pe == 9.0
+    assert snap.valuation_signal == "cheap"
+    assert snap.value_entry_candidate is True
+
+
+@patch("src.execution.broker._get_sector", return_value="Technology")
+def test_digest_value_entry_false_when_down_move_no_fundamentals(_sec):
+    """A -10% drop with NO news/earnings signal is not a value entry —
+    it's noise. value_entry_candidate must stay False."""
+    p = _pipeline_with(
+        universe=["NOISY"],
+        market_closes_by_symbol={
+            "NOISY": [100, 97, 95, 93, 91, 89],
+        },
+    )
+    p.market.get_valuation_metrics.return_value = {
+        "trailing_pe": 22, "forward_pe": 18, "ps_ratio": 3,
+    }
+    out = p._build_missed_opportunities_digest(
+        lookback_days=5, move_threshold_pct=8.0,
+    )
+    assert len(out) == 1
+    assert out[0].value_entry_candidate is False
+
+
+@patch("src.execution.broker._get_sector", return_value="Technology")
+def test_digest_value_entry_false_on_up_moves(_sec):
+    """UP move with intact signals is not value_entry_candidate — it's a
+    trend-capture question, not a value-entry question."""
+    import json as _json
+    import tempfile as _tmp
+    from pathlib import Path as _Path
+    from src.trading_calendar import et_today
+
+    p = _pipeline_with(
+        universe=["UP"],
+        market_closes_by_symbol={
+            "UP": [100, 105, 110, 113, 116, 118],  # +18%
+        },
+    )
+    p.market.get_valuation_metrics.return_value = {
+        "trailing_pe": 15, "forward_pe": 14, "ps_ratio": 2,
+    }
+    with _tmp.TemporaryDirectory() as td:
+        news_dir = _Path(td) / "news"
+        news_dir.mkdir()
+        day_dir = news_dir / str(et_today())
+        day_dir.mkdir()
+        (day_dir / "full_report.json").write_text(_json.dumps({
+            "state_changes": [{"event": "Event", "affected_symbols": ["UP"]}],
+        }))
+        p.news_store.data_dir = news_dir
+        out = p._build_missed_opportunities_digest(
+            lookback_days=5, move_threshold_pct=8.0,
+        )
+    assert out[0].value_entry_candidate is False
+
+
+# ---------------------------------------------------------------------------
+# thesis_health_context
+# ---------------------------------------------------------------------------
+
+def test_build_thesis_health_context_empty_for_no_positions():
+    from src.pipeline import TradingPipeline
+    p = TradingPipeline.__new__(TradingPipeline)
+    out = p._build_thesis_health_context(positions=[], lookback_weeks=8)
+    assert out == {}
+
+
+def test_build_thesis_health_context_assembles_per_symbol(tmp_path):
+    """Full shape: entry context + tech trajectory + news count +
+    earnings + valuation + sector stance. Uses real Database + mocked
+    market/news_store/earnings_provider/macro_store."""
+    import json as _json
+    from datetime import timedelta
+    from src.models import Position
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+    from src.trading_calendar import et_today
+
+    p = TradingPipeline.__new__(TradingPipeline)
+    p.db = Database(str(tmp_path / "t.db"))
+    p.db.initialize()
+    # Insert an executed BUY so entry context is populated
+    entry_d = et_today() - timedelta(days=20)
+    p.db.conn.execute(
+        "INSERT INTO trades (symbol, action, qty, price, reasoning, "
+        "run_id, fill_status, fill_qty, fill_price, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("NVDA", "BUY", 10, 196.0,
+         "AI capex thesis: datacenter spend +20% YoY", "r1",
+         "filled", 10, 196.0, f"{entry_d.isoformat()} 09:35:00"),
+    )
+    p.db.conn.commit()
+    # Tech log with NVDA rating in window
+    p.db.conn.execute(
+        "INSERT INTO agent_logs (agent_name, run_id, timestamp, "
+        "input_summary, output_summary, full_response, model, tokens_used) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("tech_analyst", "tr1",
+         (et_today() - timedelta(days=1)).isoformat() + " 09:35:00",
+         "", "", _json.dumps([{"symbol": "NVDA", "rating": "strong_buy"}]),
+         "m", 0),
+    )
+    p.db.conn.commit()
+
+    p.market = MagicMock()
+    p.market.get_valuation_metrics.return_value = {
+        "trailing_pe": 72.0, "forward_pe": 38.5, "ps_ratio": 27.1,
+    }
+    p.news_store = MagicMock()
+    # Build a news report in window so _thesis_news_events_map picks it up
+    news_root = tmp_path / "news"
+    news_root.mkdir()
+    day_dir = news_root / str(et_today())
+    day_dir.mkdir()
+    (day_dir / "full_report.json").write_text(_json.dumps({
+        "state_changes": [{
+            "event": "NVDA Q1 guide raised on AI capex",
+            "conviction": "high",
+            "affected_symbols": ["NVDA"],
+        }],
+    }))
+    p.news_store.data_dir = news_root
+    p.earnings_provider = MagicMock()
+    p.earnings_provider.manifest = {}
+    p.macro_store = MagicMock()
+    p.macro_store.load_last_state.return_value = {
+        "sector_guidance": {"Technology": "bullish"},
+    }
+
+    nvda = Position(
+        symbol="NVDA", qty=10, avg_entry=196.0, current_price=210.0,
+        market_value=2100, unrealized_pnl=140, sector="Technology",
+    )
+    with patch("src.execution.broker._get_sector", return_value="Technology"):
+        out = p._build_thesis_health_context([nvda], lookback_weeks=8)
+    assert "NVDA" in out
+    ctx = out["NVDA"]
+    assert ctx["symbol"] == "NVDA"
+    assert ctx["days_held"] >= 19 and ctx["days_held"] <= 22
+    assert "AI capex thesis" in ctx["entry_reasoning"]
+    assert ctx["tech_trajectory"] == ["strong_buy"]
+    assert ctx["news_count_8w"] >= 1
+    assert any("AI capex" in h for h in ctx["latest_news_headlines"])
+    assert ctx["macro_sector_stance"] == "bullish"
+    assert ctx["valuation"]["forward_pe"] == 38.5
+    assert ctx["valuation"]["signal"] == "stretched"
+    assert ctx["pnl_pct"] is not None
+
+
+def test_build_thesis_health_context_tolerates_missing_data(tmp_path):
+    """All data sources failing → symbol entry still exists with defaults.
+    The helper must never raise."""
+    from src.models import Position
+    from src.pipeline import TradingPipeline
+    from src.storage.db import Database
+
+    p = TradingPipeline.__new__(TradingPipeline)
+    p.db = Database(str(tmp_path / "t.db"))
+    p.db.initialize()
+    p.market = MagicMock()
+    p.market.get_valuation_metrics.side_effect = RuntimeError("no yfinance")
+    p.news_store = MagicMock()
+    p.news_store.data_dir = None  # skip news map
+    p.earnings_provider = MagicMock()
+    p.earnings_provider.manifest = {}
+    p.macro_store = MagicMock()
+    p.macro_store.load_last_state.return_value = None
+
+    pos = Position(
+        symbol="NEW", qty=1, avg_entry=10, current_price=11,
+        market_value=11, unrealized_pnl=1, sector="Technology",
+    )
+    with patch("src.execution.broker._get_sector", return_value="Technology"):
+        out = p._build_thesis_health_context([pos], lookback_weeks=8)
+    assert "NEW" in out
+    ctx = out["NEW"]
+    assert ctx["entry_date"] is None  # no BUY row
+    assert ctx["tech_trajectory"] == []
+    assert ctx["news_count_8w"] == 0
+    assert ctx["valuation"]["signal"] == "no_data"
+
+
+# ---------------------------------------------------------------------------
+# Evening prompt renders thesis_health + valuation + value_entry_candidate
+# ---------------------------------------------------------------------------
+
+def test_evening_prompt_renders_thesis_health_section():
+    """Non-empty thesis_health_context → section with per-symbol block."""
+    from unittest.mock import patch as _patch
+    from src.agents.evening_analyst import EveningAnalystAgent
+
+    with _patch("anthropic.Anthropic"):
+        agent = EveningAnalystAgent(api_key="k", model="claude-opus-4-6")
+
+    ctx = {
+        "NVDA": {
+            "symbol": "NVDA",
+            "entry_date": "2026-03-26",
+            "entry_reasoning": "AI capex cycle thesis",
+            "days_held": 24,
+            "entry_price": 196.0,
+            "current_price": 210.0,
+            "pnl_pct": 7.1,
+            "sector": "Technology",
+            "tech_trajectory": ["strong_buy", "buy", "buy", "hold"],
+            "news_count_8w": 3,
+            "latest_news_headlines": ["AI capex Q1 raised"],
+            "recent_earnings_signal": "bullish conviction high — revenue +45%",
+            "macro_sector_stance": "bullish",
+            "valuation": {
+                "trailing_pe": 72.0, "forward_pe": 38.5,
+                "ps_ratio": 27.1, "signal": "stretched",
+            },
+        },
+    }
+    msg = agent.build_user_message(
+        positions=[], macro_summary={"vix": {"current": 18}},
+        total_value=100_000, daily_pnl=0, daily_return_pct=0.0,
+        thesis_health_context=ctx,
+    )
+    assert "Thesis Health Review" in msg
+    assert "NVDA" in msg
+    assert "AI capex cycle thesis" in msg
+    assert "strong_buy" in msg
+    assert "AI capex Q1 raised" in msg
+    assert "bullish" in msg
+    assert "forward PE 38.5" in msg
+    assert "stretched" in msg
+
+
+def test_evening_prompt_thesis_health_empty_note():
+    """Empty ctx → friendly note instructing LLM not to fabricate."""
+    from unittest.mock import patch as _patch
+    from src.agents.evening_analyst import EveningAnalystAgent
+
+    with _patch("anthropic.Anthropic"):
+        agent = EveningAnalystAgent(api_key="k", model="claude-opus-4-6")
+    msg = agent.build_user_message(
+        positions=[], macro_summary={"vix": {"current": 18}},
+        total_value=100_000, daily_pnl=0, daily_return_pct=0.0,
+        thesis_health_context={},
+    )
+    assert "Thesis Health Review" in msg
+    assert "no open positions" in msg or "empty" in msg
+
+
+def test_evening_prompt_renders_value_entry_flag_and_valuation():
+    """value_entry_candidate=True + valuation fields render in the
+    missed-ops section so the LLM picks value_entry_missed not noise."""
+    from unittest.mock import patch as _patch
+    from src.models import MissedOpportunitySnapshot
+    from src.agents.evening_analyst import EveningAnalystAgent
+
+    with _patch("anthropic.Anthropic"):
+        agent = EveningAnalystAgent(api_key="k", model="claude-opus-4-6")
+
+    snap = MissedOpportunitySnapshot(
+        symbol="MU", move_pct=-18.2, window_days=5,
+        held_during_window=False,
+        had_ta_signal=False, had_news_signal=True, had_earnings_signal=True,
+        source="universe",
+        last_news_headline="Memory ASP panic drop",
+        trailing_pe=10.1, forward_pe=9.0, ps_ratio=1.5,
+        valuation_signal="cheap",
+        value_entry_candidate=True,
+    )
+    msg = agent.build_user_message(
+        positions=[], macro_summary={"vix": {"current": 18}},
+        total_value=100_000, daily_pnl=0, daily_return_pct=0.0,
+        missed_ops_snapshots=[snap],
+    )
+    assert "VALUE_ENTRY_CANDIDATE" in msg
+    assert "forward PE 9.0" in msg
+    assert "cheap" in msg
+    assert "-18.2%" in msg
+
+
 def test_evening_prompt_tags_low_quality_top_movers():
     """Weak quality metrics render with explicit tags (weak / single-day
     gap) so the LLM treats them as noise_rally candidates."""

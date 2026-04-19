@@ -59,6 +59,31 @@ HARD_BLOCK_RULES = {
 }
 
 
+def _valuation_signal_from(forward_pe: float | None) -> str:
+    """Coarse valuation bucket from forward PE. Conservative thresholds:
+    anything < 12 is cheap even for growth names; >= 25 is stretched for
+    anything that isn't hyper-growth / secular-leader; 12-25 is fair.
+    None → no_data (ETFs, newly-listed, yfinance gap). LLM reads this
+    AND the raw PE/PS numbers so it can sector-adjust; the enum is the
+    fast first cut that prevents obvious hype-chasing on stretched names.
+    """
+    if forward_pe is None:
+        return "no_data"
+    try:
+        pe = float(forward_pe)
+    except (TypeError, ValueError):
+        return "no_data"
+    if pe <= 0:
+        # Negative / zero forward PE → loss-making; can't judge from PE
+        # alone. Treat as no_data so the LLM reasons from other signals.
+        return "no_data"
+    if pe < 12:
+        return "cheap"
+    if pe >= 25:
+        return "stretched"
+    return "fair"
+
+
 def _missed_ops_quality_metrics(
     bars: list, lookback_days: int
 ) -> tuple[float | None, float | None, float | None]:
@@ -1652,6 +1677,198 @@ class TradingPipeline:
             lines.append(line)
         return "\n".join(lines)
 
+    def _build_thesis_health_context(
+        self,
+        positions,
+        lookback_weeks: int = 8,
+    ) -> dict[str, dict]:
+        """Per-position fundamental-evolution snapshot for the evening
+        thesis_health_review step.
+
+        For each held symbol, gather:
+          - Entry context (date, price, days_held, original thesis text)
+          - Tech rating trajectory (last 4 ratings as a list)
+          - News mentions count + 2 latest headlines (8-week window)
+          - Most recent earnings sentiment + key_thesis
+          - Current macro sector stance
+          - Valuation snapshot (trailing PE / forward PE / P/S / signal)
+
+        Shape designed so the evening LLM can answer
+        "strengthening / intact / weakening / broken" per holding,
+        not just aggregate-level "bullish / bearish". That step is
+        what separates a swing-trader feedback bot from a value-
+        investor strategic reflection.
+
+        Returns {symbol: dict}. Empty dict when there are no positions.
+        Exceptions during data fetch degrade gracefully — a missing
+        field is None or [], the helper does not raise.
+        """
+        if not positions:
+            return {}
+
+        from datetime import timedelta
+        lookback_days = lookback_weeks * 7
+        tech_map_multi = self._thesis_tech_trajectory_map(lookback_days)
+        news_events_map = self._thesis_news_events_map(lookback_days)
+        earnings_map = self._missed_ops_earnings_signal()
+        macro_map = self._missed_ops_macro_sector_map()
+
+        out: dict[str, dict] = {}
+        for p in positions:
+            sym = p.symbol
+
+            # Entry context
+            entry_date: str | None = None
+            entry_reasoning = ""
+            days_held: int | None = None
+            try:
+                buy_row = self.db.get_symbol_last_buy(sym)
+            except Exception:
+                buy_row = None
+            if buy_row:
+                ts = (buy_row.get("timestamp") or "")[:10]
+                if ts:
+                    entry_date = ts
+                    try:
+                        from datetime import date as _d
+                        entry_d = _d.fromisoformat(ts)
+                        days_held = max(0, (et_today() - entry_d).days)
+                    except (ValueError, TypeError):
+                        days_held = None
+                entry_reasoning = (buy_row.get("reasoning") or "")[:300]
+
+            # P&L% (defensive — avg_entry could be zero for fresh positions)
+            pnl_pct = None
+            if p.avg_entry and p.qty:
+                cost = p.avg_entry * p.qty
+                if cost > 0:
+                    pnl_pct = round(p.unrealized_pnl / cost * 100, 2)
+
+            # Tech trajectory — last 4 ratings for this symbol
+            tech_trajectory = tech_map_multi.get(sym, [])[:4]
+
+            # News — total count in window + latest 2 headlines
+            news_events = news_events_map.get(sym, [])
+            news_count = len(news_events)
+            latest_news_headlines = [e["event"] for e in news_events[:2]]
+
+            # Sector stance
+            sector = ""
+            try:
+                from src.execution.broker import _get_sector
+                sector = _get_sector(sym) or ""
+            except Exception:
+                sector = ""
+            macro_stance = macro_map.get(sector, "unknown") if sector else "unknown"
+
+            # Valuation — bounded per-symbol yfinance call
+            valuation = {
+                "trailing_pe": None, "forward_pe": None, "ps_ratio": None,
+            }
+            try:
+                v = self.market.get_valuation_metrics(sym) or {}
+                valuation["trailing_pe"] = v.get("trailing_pe")
+                valuation["forward_pe"] = v.get("forward_pe")
+                valuation["ps_ratio"] = v.get("ps_ratio")
+            except Exception:
+                pass
+            valuation["signal"] = _valuation_signal_from(valuation["forward_pe"])
+
+            out[sym] = {
+                "symbol": sym,
+                "entry_date": entry_date,
+                "entry_reasoning": entry_reasoning,
+                "days_held": days_held,
+                "entry_price": p.avg_entry,
+                "current_price": p.current_price,
+                "pnl_pct": pnl_pct,
+                "sector": sector,
+                "tech_trajectory": tech_trajectory,
+                "news_count_8w": news_count,
+                "latest_news_headlines": latest_news_headlines,
+                "recent_earnings_signal": earnings_map.get(sym),
+                "macro_sector_stance": macro_stance,
+                "valuation": valuation,
+            }
+        return out
+
+    def _thesis_tech_trajectory_map(
+        self, lookback_days: int,
+    ) -> dict[str, list[str]]:
+        """For each symbol, extract chronological tech ratings from the last
+        `lookback_days` of tech_analyst logs. Returns {sym: ["buy","hold",
+        "buy","strong_buy"]} newest-first. Uses the same shape-normalizer
+        as the missed_ops digest so bare-list / dict-wrapped / symbol-keyed
+        shapes all work. Empty dict on failure."""
+        import json as _json
+        from src.evolution.quarterly_digest import _tech_analyses_from_data
+        try:
+            rows = self.db.get_recent_agent_outputs(
+                agent_name="tech_analyst",
+                limit=lookback_days,
+                before_date=None,
+            )
+        except Exception as exc:
+            logger.warning("thesis_tech_trajectory: logs fetch failed: %s", exc)
+            return {}
+        by_sym: dict[str, list[str]] = {}
+        for row in rows:
+            try:
+                data = _json.loads(row.get("full_response") or "{}")
+            except (_json.JSONDecodeError, TypeError):
+                continue
+            for a in _tech_analyses_from_data(data):
+                sym = (a.get("symbol") or "").upper()
+                rating = a.get("rating")
+                if sym and rating:
+                    by_sym.setdefault(sym, []).append(str(rating))
+        return by_sym
+
+    def _thesis_news_events_map(
+        self, lookback_days: int,
+    ) -> dict[str, list[dict]]:
+        """Per-symbol news events over the lookback window. Returns
+        {sym: [{event, conviction, date}, ...]} newest-first.
+
+        Walks dated full_report.json files. Every state_change with the
+        symbol in affected_symbols is collected. Wider than the 5-day
+        window _missed_ops_news_signal uses because the thesis health
+        review needs to see the full 8-week arc, not just recent days.
+        """
+        import json as _json
+        from datetime import timedelta
+        from pathlib import Path
+        news_dir = getattr(self.news_store, "data_dir", None)
+        if news_dir is None:
+            return {}
+        out: dict[str, list[dict]] = {}
+        today = et_today()
+        for days_ago in range(lookback_days + 1):
+            day = today - timedelta(days=days_ago)
+            report_path = Path(news_dir) / str(day) / "full_report.json"
+            if not report_path.exists():
+                continue
+            try:
+                report = _json.loads(report_path.read_text())
+            except (_json.JSONDecodeError, OSError):
+                continue
+            for ch in report.get("state_changes", []) or []:
+                event = (ch.get("event") or "").strip()
+                if not event:
+                    continue
+                affected = ch.get("affected_symbols", []) or []
+                conviction = (ch.get("conviction") or "").lower()
+                for sym in affected:
+                    sym_u = str(sym).upper()
+                    if not sym_u:
+                        continue
+                    out.setdefault(sym_u, []).append({
+                        "event": event[:140],
+                        "conviction": conviction,
+                        "date": str(day),
+                    })
+        return out
+
     def _build_watchlist_candidates(
         self, lookback_days: int = 30,
     ) -> list[dict]:
@@ -1966,6 +2183,35 @@ class TradingPipeline:
             if sector and sector in macro_sector_map:
                 sector_stance = macro_sector_map[sector]
 
+            # Valuation (done per-candidate after threshold filter → only
+            # ~5-15 yfinance calls, not 90+). Defaults to all-None on
+            # error / ETF / data gap.
+            trailing_pe = None
+            forward_pe = None
+            ps_ratio = None
+            try:
+                val_info = self.market.get_valuation_metrics(sym) or {}
+                trailing_pe = val_info.get("trailing_pe")
+                forward_pe = val_info.get("forward_pe")
+                ps_ratio = val_info.get("ps_ratio")
+            except Exception as exc:
+                logger.debug(
+                    "missed_ops valuation fetch failed for %s: %s", sym, exc,
+                )
+            valuation_signal = _valuation_signal_from(forward_pe)
+
+            # Bidirectional opportunity framing: a DOWN move with an
+            # intact fundamental signal is the classic value-dip the
+            # medium-long-term investor wants to catch. Flag it at the
+            # snapshot level so the evening LLM's value_entry_missed
+            # classification is grounded, not just vibes.
+            has_fundamental_signal = (
+                news_headline is not None or earnings_signal is not None
+            )
+            value_entry_candidate = (
+                move_pct <= -8.0 and has_fundamental_signal
+            )
+
             snapshots.append(MissedOpportunitySnapshot(
                 symbol=sym,
                 move_pct=move_pct,
@@ -1984,6 +2230,11 @@ class TradingPipeline:
                 avg_dollar_volume_20d_m=avg_dvol_m,
                 volume_confirmation_ratio=vol_conf_ratio,
                 single_day_concentration_pct=single_day_conc,
+                trailing_pe=trailing_pe,
+                forward_pe=forward_pe,
+                ps_ratio=ps_ratio,
+                valuation_signal=valuation_signal,  # type: ignore[arg-type]
+                value_entry_candidate=value_entry_candidate,
             ))
 
         def _priority_key(s) -> tuple:
@@ -3685,6 +3936,16 @@ class TradingPipeline:
             logger.warning("missed_ops digest failed (proceeding without it): %s", e)
             missed_ops_snapshots = []
 
+        # Value-lens upgrade (2026-04): per-position 8-week fundamentals
+        # evolution — feeds the new thesis_health_review reasoning step.
+        try:
+            thesis_health_context = self._build_thesis_health_context(positions)
+        except Exception as e:
+            logger.warning(
+                "thesis_health_context failed (proceeding without it): %s", e,
+            )
+            thesis_health_context = {}
+
         analysis = None
         analysis_error = False
         try:
@@ -3704,6 +3965,7 @@ class TradingPipeline:
                 active_state_changes=active_state_changes,
                 outlook_calibration=outlook_calibration,
                 missed_ops_snapshots=missed_ops_snapshots,
+                thesis_health_context=thesis_health_context,
             )
         except Exception as e:
             from src.agents.base import AgentResult

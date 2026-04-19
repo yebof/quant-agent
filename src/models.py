@@ -638,12 +638,20 @@ class PositionReview(BaseModel):
 
 
 class EveningReasoningChain(BaseModel):
-    """Six-step chain evening analyst must fill before emitting the report.
+    """Seven-step chain evening analyst must fill before emitting the report.
 
-    Parallel to morning PM's 7-step and position_reviewer's 6-step chains.
+    Depth parallel to PM's 7-step and position_reviewer's 6-step chains.
     Empty strings fail validation — the agent cannot skip a step. Gives
     evening the same thought-depth structure as other LLM agents so its
     decisions are auditable, not just narrative.
+
+    Design note (2026-04 upgrade): the previous 6-step chain was
+    structurally anchored on DAILY cycles (yesterday's outlook, today's
+    tape, tomorrow's preparation). For a medium-long-term investor, the
+    most important question — "how is each held thesis playing out over
+    the past 6-8 weeks?" — wasn't being asked anywhere. `thesis_health_
+    review` is that missing step, and it sits between the retrospective
+    (what happened) and the decision-quality review (how did we react).
     """
     performance_attribution: str = Field(min_length=1)
     """What drove today's P&L? Which positions contributed + / −, which macro /
@@ -653,6 +661,18 @@ class EveningReasoningChain(BaseModel):
     """Honest grade of yesterday's tomorrow_outlook vs today's actual. If
     yesterday said bullish and today ripped down, say so. Calibration > saving
     face. Cross-reference specific predictions to specific outcomes."""
+
+    thesis_health_review: str = Field(min_length=1)
+    """For each held position: given 6-8 weeks of fundamentals evolution
+    (earnings trajectory, macro sector stance, news flow, tech rating
+    history), is the ORIGINAL entry thesis strengthening, still intact,
+    weakening, or broken? This is the step that makes the agent a value
+    investor not a swing trader. For holdings where the thesis is
+    broken — flag them for SELL consideration tomorrow even if price
+    hasn't yet moved. For holdings where the thesis is strengthening
+    but price hasn't caught up — flag them as add-more candidates.
+    Price noise is not thesis noise; conflating them is the main way
+    medium-long-term strategies go wrong."""
 
     decision_quality_review: str = Field(min_length=1)
     """BUY / SELL / HOLD decisions today + the last few days. Pattern check:
@@ -674,10 +694,32 @@ class EveningReasoningChain(BaseModel):
     today's action shapes tomorrow's posture. What PM needs to know at 09:30."""
 
 
+# Thesis-trajectory classifier for trade grading — the 2nd dimension that
+# separates "swing trader" feedback from "value investor" feedback. A buy
+# can be down 10% with the thesis still intact (noise); a buy can be up 10%
+# with the thesis broken (momentum, not value). Grade must weigh BOTH
+# price AND thesis; this enum carries the latter.
+ThesisTrajectory = Literal[
+    "strengthening",   # new data since entry reinforces the thesis
+    "intact",          # no new negative information, reasons still valid
+    "weakening",       # some contrary data but thesis isn't yet broken
+    "broken",          # thesis invalidated by hard data (earnings miss,
+                       # guidance cut, regulatory action, etc.)
+]
+
+
 class SellGrade(BaseModel):
     """Structured grade of a single recent SELL — what evening judged right or
     wrong. PM / position reviewer can read aggregate counts to feed back into
-    their SELL discretion."""
+    their SELL discretion.
+
+    Grading is dual-axis: `grade` aggregates `price_outcome` (what the tape
+    did since we sold) and `thesis_trajectory_at_sell` (whether we sold
+    with thesis-justification or on nerves / noise). A defensible SELL
+    is one where we exited a weakening/broken thesis, even if price
+    subsequently bounced — we kept discipline. A `wrong` SELL is one
+    where we exited an intact/strengthening thesis AND price ran.
+    """
     symbol: str
     sell_date: str   # "YYYY-MM-DD"
     sell_price: float
@@ -685,6 +727,10 @@ class SellGrade(BaseModel):
     pct_move_since_sell: float
     grade: Literal["correct", "premature", "wrong"]
     reason: str = Field(min_length=1)
+    # 2nd dimension added 2026-04 (value-lens upgrade). Optional so
+    # pre-upgrade rows still parse, but the evening prompt now requires
+    # LLM to fill it for every new grade it emits.
+    thesis_trajectory_at_sell: ThesisTrajectory | None = None
 
     @field_validator("symbol")
     @classmethod
@@ -714,7 +760,14 @@ BuyLossRootCause = Literal[
 
 class BuyGrade(BaseModel):
     """Structured grade of a recent BUY — did the entry play out?
-    Mirrors SellGrade so the feedback loop is symmetric."""
+    Mirrors SellGrade so the feedback loop is symmetric.
+
+    Like SellGrade, grading is dual-axis. `grade` aggregates price
+    action AND `thesis_trajectory` (how the underlying fundamentals /
+    theme have evolved since entry). A buy can be down 8% with thesis
+    strengthening — that's NOT wrong, that's value entry being tested
+    by noise. A buy can be up 10% with thesis broken — that's NOT
+    correct, that's momentum masking a real failure."""
     symbol: str
     buy_date: str
     buy_price: float
@@ -722,6 +775,9 @@ class BuyGrade(BaseModel):
     pct_move_since_buy: float
     grade: Literal["correct", "premature", "wrong"]
     reason: str = Field(min_length=1)
+    # 2nd grading dimension. Optional for back-compat; prompt requires it
+    # on all new grades.
+    thesis_trajectory: ThesisTrajectory | None = None
     # Loss-autopsy fields: required only when grade == "wrong". Evening analyst
     # must classify WHY a losing BUY lost so quarterly meta-reflection can
     # aggregate patterns and propose targeted prompt edits. Optional on
@@ -818,6 +874,25 @@ class MissedOpportunitySnapshot(BaseModel):
     distributed move (trend). For a medium-long-term investor, a
     distributed trend is far more interesting than a single gap."""
 
+    # Valuation context (2026-04 upgrade — value-lens). Yahoo data via
+    # MarketDataProvider.get_valuation_metrics. None when ETF / not
+    # available. The LLM should not chase stretched-PE symbols even if
+    # they pass the quality bars.
+    trailing_pe: float | None = None
+    forward_pe: float | None = None
+    ps_ratio: float | None = None
+    valuation_signal: Literal["cheap", "fair", "stretched", "no_data"] = "no_data"
+    """Rough forward-PE-based classifier filled by Python upstream.
+    < 12 → cheap, 12-25 → fair, >= 25 → stretched, None → no_data.
+    Thresholds are deliberately crude — the LLM reads raw PE numbers
+    too and makes sector-adjusted judgments. `valuation_signal` is
+    just a fast first cut that prevents obvious hype chasing."""
+
+    # Bidirectional opportunity framing. Default False; set True by
+    # digest when move_pct < -8% AND there is intact fundamental/theme
+    # signal — classic "price panicked, thesis didn't" value dip.
+    value_entry_candidate: bool = False
+
     @field_validator("symbol")
     @classmethod
     def _sym(cls, v: str) -> str:
@@ -847,25 +922,41 @@ class MissedOpportunity(BaseModel):
         "trend_timing_miss",        # trend visible, entry late or absent
         "theme_blindspot",          # entire theme/sector uncovered by our agents
         "fundamentals_mispricing",  # hard earnings numbers, price not yet reacting
+        "value_entry_missed",       # stock DOWN >=8% with thesis intact, we
+                                    # didn't add — classic value dip missed
         "noise_rally",              # no signal, legitimate HOLD — not a real miss
         "risk_disciplined",         # RM / hard-rule blocked, accepted — not a real miss
     ]
     # Free-form theme label the LLM picks (e.g. "AI-capex", "nuclear/power",
-    # "rare-earth", "reshoring"). Required for trend / theme / mispricing
-    # categories so the quarterly digest can aggregate. None when miss_category
-    # is noise_rally / risk_disciplined.
+    # "rare-earth", "reshoring"). Required for trend / theme / mispricing /
+    # value categories so the quarterly digest can aggregate. None when
+    # miss_category is noise_rally / risk_disciplined.
     theme_if_any: str | None = None
+    # Theme duration classifier — "looks excellent" is not enough for the
+    # user's 77-symbol universe; we want to distinguish a 2-month hype
+    # cycle from a decade-long secular trend. Required when theme_if_any
+    # is set; optional otherwise.
+    theme_durability: Literal[
+        "multi_year_secular",   # decade+ structural trend (AI capex, energy
+                                # transition, aging demographics)
+        "1_3_year_cycle",       # cyclical opportunity (rate cuts, capex
+                                # cycle, inventory correction)
+        "months_fad",           # short-lived hype (meme, single-event pop,
+                                # narrative rotation)
+        "unknown",              # not enough information to classify
+    ] = "unknown"
     lesson: str = Field(min_length=1, max_length=240)
     # Watchlist-addition recommendation (only meaningful for top-mover sources;
     # default "no" for universe symbols since they're already tracked).
     # High bar: "add" requires documented, multi-factor justification —
-    # volume confirmation + multi-day sustain + theme/fundamental anchor.
+    # volume confirmation + multi-day sustain + theme/fundamental anchor +
+    # reasonable valuation.
     universe_addition_recommendation: Literal["add", "watch", "no"] = "no"
     universe_addition_reason: str = Field(default="", max_length=240)
     """1-2 sentences citing the QUALITY metrics (volume, sustain, theme,
-    fundamentals) that justify a non-'no' recommendation. Required when
-    recommendation is "add" or "watch"; must stay empty when "no" so the
-    reason field doesn't drift into wishful thinking."""
+    fundamentals, valuation) that justify a non-'no' recommendation.
+    Required when recommendation is "add" or "watch"; must stay empty
+    when "no" so the reason field doesn't drift into wishful thinking."""
 
     @field_validator("symbol")
     @classmethod
@@ -875,13 +966,28 @@ class MissedOpportunity(BaseModel):
     @model_validator(mode="after")
     def _theme_required_for_real_misses(self) -> "MissedOpportunity":
         real_miss_categories = {
-            "trend_timing_miss", "theme_blindspot", "fundamentals_mispricing"
+            "trend_timing_miss", "theme_blindspot",
+            "fundamentals_mispricing", "value_entry_missed",
         }
         if self.miss_category in real_miss_categories:
             if not (self.theme_if_any or "").strip():
                 raise ValueError(
                     f"MissedOpportunity miss_category='{self.miss_category}' "
                     f"requires theme_if_any so quarterly aggregation can group by theme"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _theme_durability_required_when_themed(self) -> "MissedOpportunity":
+        # If theme_if_any is set, the LLM must commit to a durability
+        # judgment — "is this a 2-month fad or a decade trend?" is what
+        # distinguishes a value-investor "add" from a momentum chase.
+        # "unknown" is allowed but should be rare when a theme name exists.
+        if (self.theme_if_any or "").strip():
+            if self.theme_durability is None:
+                raise ValueError(
+                    "theme_if_any is set but theme_durability is None; pick "
+                    "multi_year_secular / 1_3_year_cycle / months_fad / unknown"
                 )
         return self
 
@@ -930,6 +1036,29 @@ class EveningReport(BaseModel):
     # crossed the move_threshold_pct. Feeds next-day PM's L3d memory and
     # the quarterly meta-reflector's theme_coverage_report.
     missed_opportunities: list[MissedOpportunity] = []
+
+    # Medium-term thesis catalysts (2026-04 value-lens upgrade) —
+    # complements `tomorrow_key_risks` with a this-week / next-week view
+    # on events that would confirm or break held theses. Examples:
+    # "NVDA reports Q1 earnings Thu after close", "FOMC minutes next Wed
+    # — rate-sensitive sleeves at risk", "MU guidance cut window if
+    # memory ASP data disappoints". 0-6 entries, each specific.
+    this_week_thesis_catalysts: list[str] = []
+
+    # Structured lesson categories (2026-04 value-lens upgrade). The
+    # prose `lessons` field is retained for back-compat / continuity,
+    # but downstream agents prefer these three lists when they exist:
+    # - thesis_updates: specific held-position thesis changes ("NVDA
+    #   thesis strengthening — data-center capex Q1 guide +18%").
+    # - selection_rules: new stock-selection insights ("on theme plays,
+    #   require ≥2 confirming fundamental prints before sizing >5%").
+    # - discipline_notes: behavioral / process reminders ("stop cutting
+    #   GOOGL on single-day -2% wobbles; 5 of 7 recent sells premature").
+    # All optional; LLM may fill one, two, or all three depending on
+    # the day.
+    thesis_updates: list[str] = []
+    selection_rules: list[str] = []
+    discipline_notes: list[str] = []
 
 
 class AgentLog(BaseModel):
