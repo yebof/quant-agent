@@ -883,3 +883,224 @@ class AgentLog(BaseModel):
     full_response: str
     model: str
     tokens_used: int
+
+
+# ---------------------------------------------------------------------------
+# Quarterly Meta-Reflection schema (PR3+ — strategic self-audit)
+# ---------------------------------------------------------------------------
+
+# Agents that meta-reflection is ALLOWED to propose prompt edits to. The two
+# excluded agents (risk_manager, position_reviewer) encode hard discipline
+# (R/R ≥ 1.5, SELL triggers, cash-only); letting auto-evolution append
+# "learnings" there risks diluting invariants. Explicit allow-list is safer
+# than a deny-list.
+MetaReflectionAgentName = Literal[
+    "tech_analyst",
+    "news_analyst",
+    "macro_analyst",
+    "earnings_analyst",
+    "portfolio_manager",
+    "evening_analyst",
+]
+
+
+class MetaReasoningChain(BaseModel):
+    """7-step chain the meta-reflector must fill before emitting the report.
+
+    Parallel depth to morning PM's 7-step chain and position reviewer's
+    6-step chain — empty strings fail validation so the LLM can't skip a
+    step. Anchoring design: `secular_theme_audit` and `loss_autopsy_audit`
+    are the two load-bearing sections (the user's core asks — trend
+    capture + pit avoidance); the others scaffold honest performance
+    accounting around them.
+    """
+    performance_vs_benchmark: str = Field(min_length=1)
+    """Where did this quarter's return land vs SPY? Alpha positive or
+    negative? Drawdown profile? Be specific about numbers from
+    period_performance — no "we did ok this quarter" hand-waving."""
+
+    secular_theme_audit: str = Field(min_length=1)
+    """Enumerate this quarter's real themes (AI capex, nuclear/power,
+    rare earth, reshoring, etc.). For each: did we participate? At
+    what entry position relative to the breakout? For how long? Name
+    themes_caught_early, themes_caught_late, themes_missed_entirely —
+    mirror the structured output fields."""
+
+    loss_autopsy_audit: str = Field(min_length=1)
+    """Enumerate the top 3-5 loss causes from loss_patterns.by_cause.
+    For each: count, alpha_destruction_pct, which agent owns it,
+    which prompt edit could have prevented a repeat. This feeds
+    loss_pattern_report and the proposed_learnings justified by
+    loss data."""
+
+    agent_hit_rate_audit: str = Field(min_length=1)
+    """Did each agent actually DO its job this quarter? Read
+    agent_signal_activity — any agent gone silent (n_sessions far
+    below expected)? Any agent flooding with low-quality signals
+    (PM issuing many decisions that RM keeps scaling down)?"""
+
+    missed_theme_diagnosis: str = Field(min_length=1)
+    """For the top themes in missed_themes.by_theme, WHERE did the
+    failure occur? News_analyst never reported it? Macro never
+    tagged the sector tailwind? Tech never issued a buy rating? PM
+    saw the signal but didn't size? Attribute specifically."""
+
+    style_bias_identification: str = Field(min_length=1)
+    """Are we trend-identifiers or trend-followers? Fundamentals-
+    anchored or price-action momentum? Evidence from calibration
+    (win rate by size, avg hold days) + loss_patterns (greed_top_
+    chasing frequency). One-sentence self-portrait of current style."""
+
+    prompt_edit_reasoning: str = Field(min_length=1)
+    """Why these specific `proposed_learnings` and not others?
+    Corrigibility is the key check — if a cause has been worsening
+    for 2 quarters, the existing prompt isn't preventing it; a new,
+    more direct learning is warranted. Conversely, if it's already
+    improving, don't add more noise."""
+
+
+class ThemeCoverage(BaseModel):
+    """Quarter-level theme participation — the core "trend capture" metric.
+
+    All four lists may be empty. The meta-reflector populates them from its
+    reading of missed_themes + holdings activity during the quarter. Not
+    every theme has to appear in every bucket — a theme can be both
+    "caught late" and "fully exited", those nuances are in the audit text.
+    """
+    themes_caught_early: list[str] = []
+    """Themes we bought before the move was obvious (entry < 30% of the
+    quarter's total move for that theme). The system's genuine alpha."""
+    themes_caught_late: list[str] = []
+    """Themes we bought after the trend was already priced (entry > 50%
+    of total move). Trend-follower rather than trend-identifier
+    behavior — ok occasionally, systematically problematic."""
+    themes_missed_entirely: list[str] = []
+    """Themes that ran ≥20% in the quarter and we never held any symbol
+    within. Pure coverage / blindspot failures — the highest-value
+    signal for where the system needs to look."""
+    emerging_themes_to_watch: list[str] = []
+    """Themes forming late in the quarter that didn't run enough to
+    show in the caught/missed categories yet. Prior knowledge PM
+    should carry into next quarter."""
+    mispricing_patterns: list[str] = []
+    """Concrete examples where earnings_analyst said bullish+high but
+    PM didn't buy, or where macro_analyst tagged a sector tailwind
+    and we had no coverage. 1-5 entries, each specific."""
+
+
+# Mirror of src.models.BuyLossRootCause — quarterly reflector reuses the
+# same taxonomy so downstream corrigibility comparisons line up.
+MetaLossRootCause = BuyLossRootCause
+
+
+class LossPattern(BaseModel):
+    """One row of loss_pattern_report.top_patterns — cause + attribution +
+    proposed guard. Agent attribution drives which prompt gets the
+    `proposed_guard` as a candidate learning."""
+    root_cause: MetaLossRootCause
+    occurrences: int = Field(ge=1)
+    total_loss_pct: float
+    """Signed sum of pct_move_since_buy for wrongs in this bucket — sign
+    preserved so a mix of small/large isn't hidden in absolute values."""
+    example_trades: list[str] = Field(min_length=1, max_length=8)
+    """Concrete trades "SYMBOL YYYY-MM-DD -X%" so the prompt edit
+    justification has anchors, not abstractions."""
+    attributable_agent: Literal[
+        "tech_analyst", "news_analyst", "macro_analyst",
+        "earnings_analyst", "portfolio_manager", "evening_analyst",
+        "execution", "no_agent",
+    ]
+    """`no_agent` when the failure is pure discipline (PM / evening's
+    discipline — nothing any individual agent's prompt could have
+    caught). `execution` when the issue was broker-side, not LLM."""
+    proposed_guard: str = Field(min_length=1, max_length=240)
+    """One-sentence candidate prompt addition that would have caught
+    this pattern. Empty strings / vague hedges fail validation."""
+
+
+class LossPatternReport(BaseModel):
+    """Quarterly loss autopsy. Parallel structure to ThemeCoverage so the
+    meta-reflector's ups/downs analysis stays symmetric."""
+    top_patterns: list[LossPattern] = Field(default_factory=list, max_length=5)
+    systemic_vs_alpha_split: str = Field(default="")
+    """Prose one-liner decomposing losses: "72% alpha-destruction (we
+    under-performed the tape), 28% systemic (market also fell)"."""
+    worst_single_trade: str | None = None
+    """Most painful single wrong BUY this quarter + its root cause +
+    whether the pattern is likely to recur. None when no wrongs."""
+    corrigibility_score: Literal["improving", "stable", "degrading"] = "stable"
+    """Compared to last quarter's report — are the same causes getting
+    better, holding, or worse? Drives whether to add more learnings
+    (degrading) or give existing ones time to work (improving)."""
+
+
+class PromptLearning(BaseModel):
+    """A proposed edit to one agent's prompt. Append-only for safety —
+    never delete existing rules, never rewrite core sections. PR 4's
+    prompt_editor enforces additional guards (length, dedup, prohibited
+    words, single-quarter rate limits) on top of this schema.
+
+    `retract` is the sole exception to append-only: used in later
+    quarters to remove a learning THIS system previously added if the
+    subsequent data showed it didn't help.
+    """
+    agent_name: MetaReflectionAgentName
+    operation: Literal["append", "retract"]
+    learning_text: str = Field(min_length=20, max_length=200)
+    """1-2 concrete sentences. The PR 4 editor rejects entries containing
+    "always"/"never"/"override"/"must always"/"must never" as these
+    directly conflict with the hard-invariant wording in core prompts."""
+    justification: str = Field(min_length=40)
+    """Must cite specific digest facts: agent hit-rate numbers, theme
+    occurrence counts, loss-cause frequencies, corrigibility deltas.
+    A post-hoc model_validator enforces at least one number or '%'
+    appears — no vibes-only learnings."""
+    retract_target_hash: str | None = None
+    """Only set when operation='retract'. Content-hash of the prior
+    PromptLearning.learning_text being withdrawn. PR 4 verifies the
+    hash matches an actual prior auto-append before deleting."""
+
+    @model_validator(mode="after")
+    def _justification_cites_facts(self) -> "PromptLearning":
+        # Cheap heuristic — real validator (jaccard / forbidden-word check)
+        # lives in the PR 4 prompt_editor. Here we just make sure the LLM
+        # didn't emit a justification that's pure adjectives. At minimum
+        # some numeric/percent anchor must appear.
+        has_digit = any(ch.isdigit() for ch in self.justification)
+        if not has_digit:
+            raise ValueError(
+                "PromptLearning.justification must cite at least one digest "
+                "fact with a number (count, %, or quarter period). Got: "
+                f"{self.justification[:80]!r}"
+            )
+        if self.operation == "retract" and not self.retract_target_hash:
+            raise ValueError(
+                "operation='retract' requires retract_target_hash pointing "
+                "to the prior auto-appended learning being withdrawn"
+            )
+        return self
+
+
+class QuarterlyMetaReflection(BaseModel):
+    """Top-level meta-reflector output. Persisted to
+    data/evolution/{period}/reflection.json alongside the digest."""
+    period: str
+    """e.g. '2026-Q1' — matches the digest's period label."""
+    meta_reasoning_chain: MetaReasoningChain
+    style_self_portrait: str = Field(min_length=100)
+    """Multi-sentence honest self-description for ongoing audit. Min-length
+    guards against a one-word 'style assessment' that adds no value."""
+    persistent_blindspots: list[str] = Field(default_factory=list, max_length=5)
+    root_cause_hypotheses: list[str] = Field(default_factory=list, max_length=5)
+    theme_coverage_report: ThemeCoverage
+    loss_pattern_report: LossPatternReport
+    proposed_learnings: list[PromptLearning] = Field(
+        default_factory=list, max_length=3,
+    )
+    """System enforces max 3 agents edited per quarter AFTER schema
+    validation — see PR 4's prompt_editor for the enforcement layer.
+    This schema max is the upper bound the LLM sees."""
+    confidence: Literal["high", "medium", "low"] = "medium"
+    """Meta-confidence — with only 1-2 quarters of data the LLM should
+    self-report 'low' and propose at most 1 learning. PR 4's editor
+    uses this to scale down edit rates."""

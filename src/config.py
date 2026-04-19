@@ -39,6 +39,10 @@ class LLMConfig(BaseModel):
     risk_manager_model: str = "claude-opus-4-6"
     position_reviewer_model: str = "claude-opus-4-6"
     evening_analyst_model: str = "claude-opus-4-6"
+    # Quarterly meta-reflector — strategic self-audit agent. Opus by default
+    # because the input (deterministic digest) is dense and the output must
+    # cite numbers precisely; a weaker model tends to vibe-reason.
+    meta_reflector_model: str = "claude-opus-4-6"
     # Global fallback — used by any agent without an explicit override below.
     max_tokens: int
     # Per-agent overrides. Each agent emits a different output shape; the PM
@@ -54,6 +58,7 @@ class LLMConfig(BaseModel):
     risk_manager_max_tokens: int | None = None
     position_reviewer_max_tokens: int | None = None
     evening_analyst_max_tokens: int | None = None
+    meta_reflector_max_tokens: int | None = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -75,6 +80,7 @@ class LLMConfig(BaseModel):
         "risk_manager_max_tokens",
         "position_reviewer_max_tokens",
         "evening_analyst_max_tokens",
+        "meta_reflector_max_tokens",
     )
     @classmethod
     def _per_agent_max_tokens_sane(cls, v: int | None) -> int | None:

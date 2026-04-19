@@ -32,9 +32,18 @@ def main():
         "--mode",
         choices=[
             "live", "once", "morning", "midday", "close", "evening",
-            "intra_check", "earnings_preprocess",
+            "intra_check", "earnings_preprocess", "meta",
         ],
         default="once", help="Run mode",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "For --mode meta: run the quarterly meta-reflection even when "
+            "today isn't the last trading day of the quarter. Useful for "
+            "manual invocation / dry runs."
+        ),
     )
     args = parser.parse_args()
 
@@ -66,6 +75,8 @@ def main():
             result = pipeline.run_intra_check()
         elif args.mode == "earnings_preprocess":
             result = pipeline.run_earnings_preprocess()
+        elif args.mode == "meta":
+            result = pipeline.run_quarterly_meta_reflection(force=args.force)
         logger.info("Result: %s", result)
 
 

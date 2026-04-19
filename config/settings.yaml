@@ -31,6 +31,10 @@ llm:
   risk_manager_max_tokens: 128000
   position_reviewer_max_tokens: 128000
   evening_analyst_max_tokens: 128000
+  # Meta-reflector runs once per quarter (--mode meta). Dense digest input
+  # + structured QuarterlyMetaReflection output; Opus by default.
+  meta_reflector_model: "gpt-5.4"
+  meta_reflector_max_tokens: 128000
 
 risk:
   max_position_pct: 20

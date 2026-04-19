@@ -179,6 +179,7 @@ llm:
   risk_manager_model: "gpt-5.4"
   position_reviewer_model: "gpt-5.4"
   evening_analyst_model: "gpt-5.4"
+  meta_reflector_model: "gpt-5.4"
   max_tokens: 4096
 risk:
   max_position_pct: 20

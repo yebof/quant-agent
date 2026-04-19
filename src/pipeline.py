@@ -23,6 +23,7 @@ from src.agents.evening_analyst import EveningAnalystAgent
 from src.agents.news_analyst import NewsAnalystAgent
 from src.agents.macro_analyst import MacroAnalystAgent
 from src.agents.earnings_analyst import EarningsAnalystAgent
+from src.agents.meta_reflector import MetaReflectorAgent
 from src.data.earnings import EarningsDataProvider
 from src.risk.rules import RiskRuleEngine
 from src.execution.broker import AlpacaBroker, _get_sector
@@ -120,6 +121,11 @@ class TradingPipeline:
             api_key=_key_for(config.llm.earnings_analyst_model),
             model=config.llm.earnings_analyst_model,
             max_tokens=config.llm.get_max_tokens("earnings_analyst"),
+        )
+        self.meta_reflector = MetaReflectorAgent(
+            api_key=_key_for(config.llm.meta_reflector_model),
+            model=config.llm.meta_reflector_model,
+            max_tokens=config.llm.get_max_tokens("meta_reflector"),
         )
         self.earnings_provider = EarningsDataProvider()
         self.broker = AlpacaBroker(
@@ -3557,4 +3563,125 @@ class TradingPipeline:
             "daily_return_pct": daily_return_pct,
             "analysis": analysis.model_dump() if analysis else None,
             "run_id": run_id,
+        }
+
+    def run_quarterly_meta_reflection(
+        self,
+        *,
+        force: bool = False,
+        period_end=None,
+        lookback_days: int = 90,
+        evolution_root: str = "data/evolution",
+    ) -> dict:
+        """Build the quarterly digest, run the meta-reflector, persist both.
+
+        Cadence: normally this is a NOP unless today is the last trading day
+        of the current quarter (`broker.is_last_trading_day_of_quarter`).
+        Pass `force=True` to override — used by CLI `--mode meta --force`
+        for ad-hoc runs and by tests.
+
+        Output always includes `digest_path` (persisted) and, when the LLM
+        succeeded, `reflection_path`. PR3 intentionally stops here — it
+        does NOT edit any prompt files. PR4 will pick up reflection.json
+        from disk and apply proposed_learnings through prompt_editor.
+        """
+        from src.evolution.quarterly_digest import (
+            build_quarterly_digest,
+            load_previous_digest,
+            persist_digest,
+        )
+        from src.agents.meta_reflector import (
+            load_previous_reflection,
+            persist_reflection,
+        )
+
+        today = period_end or et_today()
+        if not force:
+            try:
+                is_last = self.broker.is_last_trading_day_of_quarter(on_date=today)
+            except Exception as exc:
+                logger.warning(
+                    "meta reflection skipped: quarter-end check failed (%s); "
+                    "pass --force to override", exc,
+                )
+                return {"status": "skipped", "reason": "quarter_end_check_failed"}
+            if not is_last:
+                logger.info(
+                    "meta reflection skipped: %s is not the last trading "
+                    "day of the quarter. Pass --force to run anyway.",
+                    today,
+                )
+                return {"status": "skipped", "reason": "not_quarter_end"}
+
+        logger.info("=== Quarterly meta-reflection: %s ===", today)
+
+        # 1. Build digest — deterministic facts layer.
+        prev_digest = load_previous_digest(today, root_dir=evolution_root)
+        digest = build_quarterly_digest(
+            self.db, self.market,
+            period_end=today, lookback_days=lookback_days,
+            prev_digest=prev_digest,
+        )
+        digest_path = persist_digest(digest, root_dir=evolution_root)
+        logger.info(
+            "Quarterly digest built for %s: alpha=%s, total_real_misses=%s, "
+            "total_wrong_buys=%s",
+            digest["period"],
+            (digest.get("period_performance") or {}).get("alpha_vs_spy_pct"),
+            (digest.get("missed_themes") or {}).get("total_real_misses"),
+            (digest.get("loss_patterns") or {}).get("total_wrong_buys"),
+        )
+
+        # 2. Meta-reflector LLM — observe-only in PR3 (no prompt edits).
+        prev_reflection = load_previous_reflection(today, root_dir=evolution_root)
+        reflection, ev_result = self.meta_reflector.analyze(
+            digest=digest, prev_reflection=prev_reflection,
+        )
+
+        # Always log the agent's raw output for audit, even on failure.
+        try:
+            self.db.insert_agent_log(
+                agent_name="meta_reflector",
+                run_id=f"meta-{digest['period']}",
+                input_summary=(
+                    f"{digest['period']} · "
+                    f"alpha={(digest.get('period_performance') or {}).get('alpha_vs_spy_pct')}"
+                ),
+                input_message=ev_result.user_message,
+                output_summary=(
+                    reflection.style_self_portrait[:200]
+                    if reflection else "parse_error"
+                ),
+                full_response=ev_result.raw_text,
+                model=self.config.llm.meta_reflector_model,
+                tokens_used=ev_result.tokens_used,
+            )
+        except Exception as exc:
+            logger.warning("meta_reflector agent_log insert failed: %s", exc)
+
+        if reflection is None:
+            logger.error("Meta-reflector returned no valid reflection; "
+                         "digest persisted, reflection missing.")
+            return {
+                "status": "digest_only",
+                "period": digest["period"],
+                "digest_path": str(digest_path),
+                "reflection_path": None,
+                "reflection": None,
+            }
+
+        reflection_path = persist_reflection(reflection, root_dir=evolution_root)
+        logger.info(
+            "Quarterly meta-reflection complete: %s · %d proposed learnings "
+            "(observe-only; PR4 will enable prompt editing)",
+            digest["period"], len(reflection.proposed_learnings),
+        )
+
+        return {
+            "status": "reflected",
+            "period": digest["period"],
+            "digest_path": str(digest_path),
+            "reflection_path": str(reflection_path),
+            "reflection": reflection.model_dump(),
+            "proposed_learnings_count": len(reflection.proposed_learnings),
         }
