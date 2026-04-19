@@ -1,4 +1,6 @@
 from datetime import datetime, date
+import pytest
+from pydantic import ValidationError
 from src.models import (
     OHLCV,
     TechnicalIndicators,
@@ -55,6 +57,32 @@ def test_trade_decision():
     )
     assert td.action == "BUY"
     assert td.stop_loss == 810.0
+
+
+def test_trade_decision_rejects_buy_stop_loss_above_entry():
+    with pytest.raises(ValidationError):
+        TradeDecision(
+            action="BUY",
+            symbol="NVDA",
+            allocation_pct=15.0,
+            entry_price=850.0,
+            stop_loss=860.0,
+            take_profit=920.0,
+            reasoning="Invalid stop",
+        )
+
+
+def test_trade_decision_rejects_buy_take_profit_at_or_below_entry():
+    with pytest.raises(ValidationError):
+        TradeDecision(
+            action="BUY",
+            symbol="NVDA",
+            allocation_pct=15.0,
+            entry_price=850.0,
+            stop_loss=810.0,
+            take_profit=850.0,
+            reasoning="Invalid target",
+        )
 
 
 def test_portfolio_decision():

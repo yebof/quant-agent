@@ -2424,6 +2424,33 @@ class TradingPipeline:
         total_value = ctx.total_value
         last_equity = ctx.last_equity
 
+        # Hard circuit breaker: if the session is already through the daily-loss
+        # limit, bypass all LLM/news/earnings work and force-liquidate
+        # immediately. This keeps the deterministic safety path alive even when
+        # the reviewer model/provider is unavailable.
+        daily_pnl = total_value - last_equity
+        risk_engine = getattr(self, "risk_engine", None)
+        loss_violation = (
+            risk_engine.check_daily_loss(last_equity, daily_pnl)
+            if risk_engine is not None else None
+        )
+        if loss_violation and positions:
+            logger.warning(
+                "%s risk alert before LLM review: %s — bypassing reviewer and force-closing all positions",
+                session_type.capitalize(),
+                loss_violation.message,
+            )
+            orders = self._midday_emergency_liquidate(positions, loss_violation, run_id)
+            self._reconcile_fills()
+            return {
+                "status": "emergency_sold",
+                "session": session_type,
+                "positions": len(positions),
+                "review": None,
+                "orders": orders,
+                "run_id": run_id,
+            }
+
         # 1b. Auto take-profit (midday only — close is too near EOD to start
         # a partial-trim cycle that won't finish). At close, LLM handles trims
         # explicitly via the reasoning chain.
@@ -2540,7 +2567,10 @@ class TradingPipeline:
             # Risk check: if daily loss limit breached, force-sell all. Else:
             # dispatch the LLM's per-position action list.
             daily_pnl = total_value - last_equity
-            loss_violation = self.risk_engine.check_daily_loss(last_equity, daily_pnl)
+            loss_violation = (
+                risk_engine.check_daily_loss(last_equity, daily_pnl)
+                if risk_engine is not None else None
+            )
             if loss_violation:
                 orders.extend(self._midday_emergency_liquidate(
                     positions, loss_violation, run_id,
@@ -2848,28 +2878,46 @@ class TradingPipeline:
         weekly_narrative = self._build_weekly_narrative()
         active_state_changes = self._build_active_state_changes()
 
-        analysis, ev_result = self.evening_analyst.analyze(
-            positions=positions,
-            macro_summary=macro_summary,
-            total_value=total_value,
-            daily_pnl=daily_pnl,
-            daily_return_pct=daily_return_pct,
-            today_trades=today_trades,
-            prior_outlook=prior_outlook,
-            recent_sells=recent_sells,
-            recent_buys=recent_buys,
-            news_intel=evening_news,
-            earnings_analyses=evening_earnings,
-            weekly_narrative=weekly_narrative,
-            active_state_changes=active_state_changes,
-            outlook_calibration=outlook_calibration,
-        )
+        analysis = None
+        analysis_error = False
+        try:
+            analysis, ev_result = self.evening_analyst.analyze(
+                positions=positions,
+                macro_summary=macro_summary,
+                total_value=total_value,
+                daily_pnl=daily_pnl,
+                daily_return_pct=daily_return_pct,
+                today_trades=today_trades,
+                prior_outlook=prior_outlook,
+                recent_sells=recent_sells,
+                recent_buys=recent_buys,
+                news_intel=evening_news,
+                earnings_analyses=evening_earnings,
+                weekly_narrative=weekly_narrative,
+                active_state_changes=active_state_changes,
+                outlook_calibration=outlook_calibration,
+            )
+        except Exception as e:
+            from src.agents.base import AgentResult
+
+            analysis_error = True
+            logger.error("Evening analyst failed: %s", e, exc_info=True)
+            ev_result = AgentResult(
+                raw_text=f"[exception] {e}",
+                tokens_used=0,
+                model=self.config.llm.evening_analyst_model,
+                user_message="",
+            )
 
         self.db.insert_agent_log(
             agent_name="evening_analyst", run_id=run_id,
             input_summary=f"${total_value:.0f} total, PnL ${daily_pnl:.2f}",
             input_message=ev_result.user_message,
-            output_summary=analysis.daily_summary if analysis else "parse_error",
+            output_summary=(
+                analysis.daily_summary
+                if analysis
+                else ("analysis_error" if analysis_error else "parse_error")
+            ),
             full_response=ev_result.raw_text,
             model=self.config.llm.evening_analyst_model,
             tokens_used=ev_result.tokens_used,

@@ -158,6 +158,14 @@ class TradeDecision(BaseModel):
                 raise ValueError("BUY decisions require stop_loss >= 0")
             if self.take_profit <= 0:
                 raise ValueError("BUY decisions require take_profit > 0")
+            if self.stop_loss > 0 and self.stop_loss >= self.entry_price:
+                raise ValueError(
+                    "BUY decisions require stop_loss to stay below entry_price"
+                )
+            if self.take_profit <= self.entry_price:
+                raise ValueError(
+                    "BUY decisions require take_profit to stay above entry_price"
+                )
         return self
 
 
