@@ -142,6 +142,15 @@ class Database:
         # without parsing prose. NULL for pre-v2 rows → treated as [].
         _ensure_column("insights", "sell_grades_json", "sell_grades_json TEXT")
         _ensure_column("insights", "buy_grades_json", "buy_grades_json TEXT")
+        # Phase-1 evening-upgrade: structured missed_opportunities persist
+        # here so next-day PM's L3d memory + quarterly meta-reflection's
+        # theme_coverage_report can aggregate without re-running the LLM.
+        # NULL for pre-upgrade rows → downstream readers default to [].
+        _ensure_column(
+            "insights",
+            "missed_opportunities_json",
+            "missed_opportunities_json TEXT DEFAULT '[]'",
+        )
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
@@ -164,6 +173,7 @@ class Database:
         sell_decisions_assessment: str = "",
         sell_grades=(),
         buy_grades=(),
+        missed_opportunities=(),
     ) -> None:
         """Atomically write the evening's daily_pnl + insights rows.
 
@@ -206,6 +216,7 @@ class Database:
         )
         sell_grades_json = _to_json_list(sell_grades)
         buy_grades_json = _to_json_list(buy_grades)
+        missed_opportunities_json = _to_json_list(missed_opportunities)
         with self._lock:
             try:
                 self.conn.execute("BEGIN")
@@ -219,12 +230,14 @@ class Database:
                     "INSERT OR REPLACE INTO insights "
                     "(date, tomorrow_outlook, lessons, suggested_actions, risk_rating, "
                     "tomorrow_bias, tomorrow_conviction, tomorrow_key_risks, "
-                    "sell_decisions_assessment, sell_grades_json, buy_grades_json) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "sell_decisions_assessment, sell_grades_json, buy_grades_json, "
+                    "missed_opportunities_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (date, tomorrow_outlook, lessons, actions_json, risk_rating,
                      tomorrow_bias, tomorrow_conviction, risks_json,
                      sell_decisions_assessment or "",
-                     sell_grades_json, buy_grades_json),
+                     sell_grades_json, buy_grades_json,
+                     missed_opportunities_json),
                 )
                 self.conn.commit()
             except Exception:

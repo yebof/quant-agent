@@ -366,6 +366,12 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
         weekly_narrative: str = kwargs.get("weekly_narrative") or ""
         macro_trajectory: str = kwargs.get("macro_trajectory") or ""
         active_state_changes: str = kwargs.get("active_state_changes") or ""
+        # Phase-1 evening-upgrade feedback:
+        # L3d — themes evening flagged as missed ≥ 2 times in last 14 days.
+        # L3f — loss root-causes evening classified on wrong BUYs repeatedly.
+        # Both empty strings when no recurring pattern; section shows defaults.
+        recent_missed_lessons: str = kwargs.get("recent_missed_lessons") or ""
+        recent_loss_pits: str = kwargs.get("recent_loss_pits") or ""
 
         narrative_section = (
             f"## Portfolio Narrative (last 7 trading days)\n{weekly_narrative}"
@@ -381,6 +387,25 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
             f"## Active News State Changes (HIGH conviction, last 14d)\n{active_state_changes}"
             if active_state_changes else
             "## Active News State Changes\n(none surfaced in the rolling 14-day window)"
+        )
+        missed_lessons_section = (
+            f"## Recurring Missed Themes (last 14d — themes evening repeatedly "
+            f"flagged as misses)\n{recent_missed_lessons}\n\n"
+            "If a theme has appeared 2+ times here, it's a coverage or "
+            "timing blind-spot, not random noise. Take a fresh look at it "
+            "today before it runs further away."
+            if recent_missed_lessons else
+            "## Recurring Missed Themes\n(no recurring missed themes in the "
+            "last 14 days)"
+        )
+        loss_pits_section = (
+            f"## Recent Loss Pits (last 14d — repeat failure modes on losing "
+            f"BUYs)\n{recent_loss_pits}\n\n"
+            "If a root-cause has 2+ occurrences, it's a discipline gap, not "
+            "bad luck. Lean against it today — tighten entries / respect "
+            "warnings / cut concentration before you do the same thing again."
+            if recent_loss_pits else
+            "## Recent Loss Pits\n(no repeat failure modes in the last 14 days)"
         )
 
         # Self-calibration layers: PM reads RM's recent verdicts on it + its own
@@ -454,6 +479,10 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
 
 {active_changes_section}
 
+{missed_lessons_section}
+
+{loss_pits_section}
+
 {insights_section}
 
 {macro_section}
@@ -483,6 +512,8 @@ Based on all the above (memory of past decisions + environment trajectory + toda
                projected_portfolio: str = "",
                calibration_note: str = "",
                macro_tech_alignment: str = "",
+               recent_missed_lessons: str = "",
+               recent_loss_pits: str = "",
                facts=None,
                allow_margin: bool = True) -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
@@ -504,6 +535,8 @@ Based on all the above (memory of past decisions + environment trajectory + toda
             projected_portfolio=projected_portfolio,
             calibration_note=calibration_note,
             macro_tech_alignment=macro_tech_alignment,
+            recent_missed_lessons=recent_missed_lessons,
+            recent_loss_pits=recent_loss_pits,
             facts=facts,
             allow_margin=allow_margin,
         )
