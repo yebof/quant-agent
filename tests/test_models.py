@@ -597,9 +597,21 @@ def _valid_meta_chain():
         performance_vs_benchmark="SPY +4%, we +1.5%, alpha -2.5%",
         secular_theme_audit="Nuclear theme ran +45% in Q1, we held 0% of it",
         loss_autopsy_audit="greed_top_chasing 3× (MU/NVDA/AVGO), alpha -8%",
-        agent_hit_rate_audit="macro_analyst emitted 12 regime calls",
-        missed_theme_diagnosis="nuclear theme: news never reported it",
-        style_bias_identification="We're trend-followers, not identifiers",
+        self_portrait_synthesis=(
+            "conviction_calibration: HIGH bucket 35% vs LOW 60%. "
+            "theme_breadth: covered 3 tech themes, 0 energy/materials. "
+            "loss_discipline: 2 thesis breaks ridden for 10 days. "
+            "execution_style: 6.8d avg hold. "
+            "agent_balance: news_analyst 0 HIGH on nuclear/power."
+        ),
+        portrait_gap_diagnosis=(
+            "Gap 1: news_analyst coverage hole in nuclear (0 HIGH hits). "
+            "Gap 2: PM sizing ignores prior calibration (25pp inversion)."
+        ),
+        existing_prompt_audit=(
+            "news_analyst.md has no nuclear/energy rule; Learnings empty. "
+            "portfolio_manager.md Step 5 has sizing scale, no feedback loop."
+        ),
         prompt_edit_reasoning="tech prompt lacks ATR-upper-band guard",
     )
 

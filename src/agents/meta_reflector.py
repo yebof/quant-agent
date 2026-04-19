@@ -165,6 +165,76 @@ def _fmt_corrigibility(corr: dict | None) -> str:
     )
 
 
+def _fmt_agent_prompts_snapshot(snapshot: dict | None) -> str:
+    """Render the agent_prompts_snapshot section — the existing-prompt
+    state each target agent is running with right now.
+
+    This section is the load-bearing input for the
+    `existing_prompt_audit` CoT step. Without it the LLM has no way to
+    ground a proposed learning in what's already in the target prompt,
+    and ends up re-proposing rules that exist or conflict with
+    invariants.
+    """
+    if not snapshot:
+        return (
+            "(agent_prompts_snapshot missing from digest — cannot ground "
+            "`existing_prompt_audit`. Fall back to 'I can't audit the "
+            "existing prompts because the digest didn't ship them; "
+            "propose 0 learnings this quarter' rather than inventing "
+            "rules.)"
+        )
+    out_lines: list[str] = []
+    for agent, payload in snapshot.items():
+        if not isinstance(payload, dict):
+            out_lines.append(f"### {agent}\n(malformed snapshot entry)")
+            continue
+        err = payload.get("error")
+        if err:
+            out_lines.append(
+                f"### {agent}\n(snapshot error: {err} — can't audit "
+                f"existing prompt; skip edits targeting this agent)"
+            )
+            continue
+        intro = (payload.get("intro") or "").strip()
+        key_sections = payload.get("key_sections") or []
+        learnings = (payload.get("learnings") or "").strip()
+        truncated = payload.get("truncated", False)
+
+        agent_block: list[str] = [f"### {agent}"]
+        if intro:
+            agent_block.append(f"**Persona / intro**:\n{intro}")
+        if key_sections:
+            agent_block.append("**Key rule / memory / output sections** (abridged):")
+            for sec in key_sections:
+                if not isinstance(sec, dict):
+                    continue
+                heading = sec.get("heading", "?")
+                body = (sec.get("body") or "").strip()
+                if body:
+                    agent_block.append(f"#### {heading}\n{body}")
+                else:
+                    agent_block.append(f"#### {heading}\n(empty body)")
+        if learnings:
+            agent_block.append(
+                "**Existing system-evolved Learnings** (PRIOR meta-"
+                "reflection edits — check for dupes before proposing):\n"
+                f"{learnings}"
+            )
+        else:
+            agent_block.append(
+                "**Existing system-evolved Learnings**: (none — this "
+                "agent has no prior auto-evolved entries)"
+            )
+        if truncated:
+            agent_block.append(
+                "_[snapshot tail-truncated — full prompt exceeds budget; "
+                "if you need content past this cut, flag it and request a "
+                "focused re-run]_"
+            )
+        out_lines.append("\n\n".join(agent_block))
+    return "\n\n---\n\n".join(out_lines) if out_lines else "(no agents in snapshot)"
+
+
 class MetaReflectorAgent(BaseAgent):
     @property
     def name(self) -> str:
@@ -194,6 +264,9 @@ class MetaReflectorAgent(BaseAgent):
         losses_section = _fmt_loss_patterns(digest.get("loss_patterns"))
         activity_section = _fmt_agent_activity(digest.get("agent_signal_activity"))
         corrigibility_section = _fmt_corrigibility(digest.get("corrigibility_trend"))
+        prompts_snapshot_section = _fmt_agent_prompts_snapshot(
+            digest.get("agent_prompts_snapshot"),
+        )
 
         # Prior reflection (if any) is included as lightweight reference so
         # the LLM can continue its own style/blindspot narrative — NOT as
@@ -241,15 +314,25 @@ Window: {period_start} → {period_end} ({lookback_days} days)
 ### Corrigibility Trend (vs prior quarter)
 {corrigibility_section}
 
+## CURRENT AGENT PROMPTS — the rules each agent is running with RIGHT NOW
+Read these BEFORE proposing any learning. Any proposed learning that
+duplicates or conflicts with text already in the target prompt will be
+rejected — it wastes the operator's review time and compounds the
+prompt toward incoherence. The `existing_prompt_audit` reasoning step
+MUST cite the specific heading / existing rule you checked.
+
+{prompts_snapshot_section}
+
 ## PRIOR REFLECTION (continuity reference; not a source of facts)
 {prior_section}
 
 ---
-Fill the 7-step `meta_reasoning_chain`, the structured
+Fill the 7-step `meta_reasoning_chain` in ORDER (facts → synthesis →
+diagnosis → prompt audit → proposal), the structured
 `theme_coverage_report` and `loss_pattern_report`, plus 0-3
 `proposed_learnings` — every learning MUST cite specific numbers from
-the digest above in its `justification`, and MUST NOT target
-risk_manager or position_reviewer.
+the digest AND reference the existing prompt state from step 6, and
+MUST NOT target risk_manager or position_reviewer.
 
 Respond as JSON matching `QuarterlyMetaReflection`. Be conservative;
 the edits compound forward."""

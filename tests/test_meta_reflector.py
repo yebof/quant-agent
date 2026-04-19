@@ -135,12 +135,30 @@ def _valid_reflection_json() -> str:
         "period": "2026-Q1",
         "meta_reasoning_chain": {
             "performance_vs_benchmark": "Alpha -3.6% over 60 days, DD -5.2%",
-            "secular_theme_audit": "nuclear/power ran 4x in missed_themes",
+            "secular_theme_audit": "nuclear/power ran 4x in missed_themes; we held 0",
             "loss_autopsy_audit": "greed_top_chasing 3x -32% alpha leak",
-            "agent_hit_rate_audit": "all agents active; no silent agent",
-            "missed_theme_diagnosis": "news never tagged nuclear/power",
-            "style_bias_identification": "We are trend-followers",
-            "prompt_edit_reasoning": "greed_top_chasing worsened 2->3",
+            "self_portrait_synthesis": (
+                "conviction_calibration: HIGH 38% vs LOW 62% inverted. "
+                "theme_breadth: tech-only, 4 of 6 misses in energy/materials. "
+                "loss_discipline: 3 wrongs rode thesis-break trigger. "
+                "execution_style: 7d avg hold vs medium-long mandate. "
+                "agent_balance: news_analyst 0 HIGH state_changes on energy."
+            ),
+            "portrait_gap_diagnosis": (
+                "Top 2 gaps: (1) theme_breadth owned by news_analyst "
+                "(4 missed themes, 0 HIGH state_changes). (2) "
+                "conviction_calibration owned by PM (24 pp HIGH vs LOW inversion)."
+            ),
+            "existing_prompt_audit": (
+                "Gap 1: news_analyst.md has no energy/materials coverage rule; "
+                "Learnings section empty → append room. Gap 2: "
+                "portfolio_manager.md Step 5 has sizing scale but no "
+                "calibration feedback; Learnings has 1 entry on rr (different "
+                "axis) → distinct append ok."
+            ),
+            "prompt_edit_reasoning": (
+                "greed_top_chasing worsened 2->3; news gap is 0 HIGH hits in 46 sessions"
+            ),
         },
         "style_self_portrait": (
             "We are trend-followers more than trend-identifiers. Strong in "

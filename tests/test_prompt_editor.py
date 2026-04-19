@@ -44,11 +44,23 @@ from src.models import (
 def _valid_chain():
     return MetaReasoningChain(
         performance_vs_benchmark="alpha -3% over 60 days",
-        secular_theme_audit="nuclear/power ran 4× in missed_themes",
+        secular_theme_audit="nuclear/power ran 4× in missed_themes; held 0",
         loss_autopsy_audit="greed_top_chasing 3× -32% alpha",
-        agent_hit_rate_audit="all agents active",
-        missed_theme_diagnosis="news never tagged nuclear",
-        style_bias_identification="trend-followers",
+        self_portrait_synthesis=(
+            "conviction_calibration: HIGH 38% vs LOW 62%. "
+            "theme_breadth: tech-only, 0 energy/materials coverage. "
+            "loss_discipline: 3 wrongs rode thesis-break trigger. "
+            "execution_style: 7d avg hold. "
+            "agent_balance: news_analyst 0 HIGH on energy in 46 sessions."
+        ),
+        portrait_gap_diagnosis=(
+            "Top gap: news_analyst blind to energy/materials; second: "
+            "PM sizing not calibration-aware."
+        ),
+        existing_prompt_audit=(
+            "news_analyst.md has no energy coverage rule; Learnings empty. "
+            "portfolio_manager.md Step 5 has sizing scale but no feedback loop."
+        ),
         prompt_edit_reasoning="propose tech prompt ATR-guard",
     )
 
