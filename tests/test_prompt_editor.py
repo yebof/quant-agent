@@ -616,6 +616,109 @@ def test_pipeline_editor_silent_when_evolution_disabled(tmp_path):
     assert SECTION_HEADER not in text
 
 
+def test_multi_line_preamble_survives_multiple_appends(tmp_path):
+    """Regression: an earlier parser classified preamble line-by-line using
+    "starts with <!--" / "ends with -->" — middle lines of the 4-line
+    SECTION_PREAMBLE fell into the `other` bucket and were re-rendered
+    AFTER the entry list on each append, progressively fragmenting the
+    section. Fix: everything before the FIRST entry line is preamble.
+    This test does TWO successive appends and asserts the preamble
+    stays intact at the top of the section, entries below it."""
+    editor = _mk_editor(tmp_path)
+    _seed_prompt(editor.prompts_dir, "tech_analyst",
+                 "# Tech Analyst\nbody\n")
+
+    # First append — creates the section with the default 4-line preamble.
+    r1 = editor.apply_reflection(_mk_reflection("2026-Q1", [_basic_learning(
+        text="First learning about stretched tech valuations today.",
+    )]))
+    assert len(r1.applied) == 1
+
+    # Second append — MUST preserve the preamble intact.
+    r2 = editor.apply_reflection(_mk_reflection("2026-Q2", [_basic_learning(
+        text="Second learning about news coverage for nuclear power today.",
+    )]))
+    assert len(r2.applied) == 1
+
+    text = (editor.prompts_dir / "tech_analyst.md").read_text()
+
+    # Preamble must appear exactly once, and ALL FOUR of its lines must
+    # still be contiguous at the top of the Learnings section.
+    preamble_lines = [
+        "Entries auto-appended by quarterly meta-reflection",
+        "Oldest-first FIFO rolloff when count exceeds",
+        "Every entry carries a content hash",
+        "retract ops target that hash",
+    ]
+    for fragment in preamble_lines:
+        # Each preamble fragment should appear exactly once
+        assert text.count(fragment) == 1, (
+            f"preamble fragment {fragment!r} appears "
+            f"{text.count(fragment)} times (should be 1 after 2 appends)"
+        )
+
+    # All four preamble fragments must appear BEFORE both entries
+    preamble_last_idx = max(text.index(f) for f in preamble_lines)
+    entry_first_idx = text.index("[2026-Q1]")
+    assert preamble_last_idx < entry_first_idx, (
+        "preamble fragments leaked past the entry list — "
+        "fragmentation regression"
+    )
+
+
+def test_atomic_write_failure_records_rejection_not_applied(tmp_path):
+    """When os.replace raises (disk full, readonly mount, cross-mount rename),
+    the prompt file was NOT updated. The editor must record a rejection
+    rather than report a phantom applied-edit in the audit log."""
+    editor = _mk_editor(tmp_path)
+    _seed_prompt(editor.prompts_dir, "tech_analyst", "# x\n")
+
+    reflection = _mk_reflection("2026-Q1", [_basic_learning()])
+
+    with patch("src.evolution.prompt_editor.os.replace",
+               side_effect=OSError("No space left on device")):
+        report = editor.apply_reflection(reflection)
+
+    assert report.applied == []
+    assert len(report.rejected) == 1
+    assert "atomic write failed" in report.rejected[0].reason
+    # Prompt file must be untouched (no Learnings section created)
+    text = (editor.prompts_dir / "tech_analyst.md").read_text()
+    assert SECTION_HEADER not in text
+
+
+def test_atomic_write_failure_on_retract_records_rejection(tmp_path):
+    """Retract path gets the same protection as append — io failure
+    must not be silently claimed as success."""
+    from src.models import PromptLearning
+    editor = _mk_editor(tmp_path)
+    _seed_prompt(
+        editor.prompts_dir, "tech_analyst",
+        "# Tech Analyst\n\n## Learnings (system-evolved)\n"
+        "- [2025-Q4] Some entry. <!--hash:aaaaaaaaaaaa-->\n",
+    )
+    retract = PromptLearning(
+        agent_name="tech_analyst", operation="retract",
+        learning_text=(
+            "Withdraw the prior rule — next-quarter data did not support it."
+        ),
+        justification="Q2 2026 evidence 4 of 5 wrongs -18% alpha persist.",
+        retract_target_hash="aaaaaaaaaaaa",
+    )
+    reflection = _mk_reflection("2026-Q2", [retract])
+
+    with patch("src.evolution.prompt_editor.os.replace",
+               side_effect=OSError("Read-only file system")):
+        report = editor.apply_reflection(reflection)
+
+    assert report.applied == []
+    assert len(report.rejected) == 1
+    assert "atomic write failed" in report.rejected[0].reason
+    # Hash is still in file — retract didn't happen on disk
+    text = (editor.prompts_dir / "tech_analyst.md").read_text()
+    assert "aaaaaaaaaaaa" in text
+
+
 def test_parse_entries_extracts_period_text_hash_in_order():
     text = (
         "# Agent Header\n\n"
