@@ -295,7 +295,20 @@ class PromptEditor:
                     period=period,
                 ))
                 return None
-            _atomic_write(prompt_path, new_text)
+            try:
+                _atomic_write(prompt_path, new_text)
+            except OSError as exc:
+                # Disk full / permission / cross-mount rename failure. The
+                # file was NOT updated — record as a rejection rather than
+                # letting the audit log claim an edit that didn't happen.
+                report.rejected.append(Rejection(
+                    agent_name=learning.agent_name,
+                    operation="retract",
+                    learning_text=learning.learning_text,
+                    reason=f"atomic write failed: {exc}",
+                    period=period,
+                ))
+                return None
             return AppliedEdit(
                 agent_name=learning.agent_name, operation="retract",
                 learning_text=learning.learning_text,
@@ -331,7 +344,20 @@ class PromptEditor:
             content_hash=content_hash,
             max_entries=self.config.max_learnings_per_agent,
         )
-        _atomic_write(prompt_path, new_text)
+        try:
+            _atomic_write(prompt_path, new_text)
+        except OSError as exc:
+            # Disk/permission failure. File untouched — NOT appending to
+            # report.applied; record rejection + audit-log it so the
+            # discrepancy is visible rather than silent.
+            report.rejected.append(Rejection(
+                agent_name=learning.agent_name,
+                operation="append",
+                learning_text=learning.learning_text,
+                reason=f"atomic write failed: {exc}",
+                period=period,
+            ))
+            return None
 
         for roll in rolled_off_entries:
             report.rolled_off.append({
@@ -550,22 +576,30 @@ def _append_entry(
             break
     body_lines = lines[start + 1:end]
 
-    # Keep preamble (if present) at top of section. Entries are all lines
-    # whose pattern matches _ENTRY_RE.
-    preamble: list[str] = []
+    # Preamble = every line between the section header and the FIRST entry
+    # (_ENTRY_RE match). This is robust to multi-line HTML comments: our
+    # default SECTION_PREAMBLE spans 4 lines, and an earlier line-by-line
+    # "starts with <!-- / ends with -->" heuristic was fragmenting middle
+    # lines into an `other` bucket — each append would then re-position
+    # those middle lines AFTER the entry list instead of at the top of the
+    # section, progressively corrupting the preamble.
     entry_lines: list[str] = []
+    preamble: list[str] = []
     other: list[str] = []
-    seen_preamble = False
+    first_entry_seen = False
     for line in body_lines:
         if _ENTRY_RE.match(line):
             entry_lines.append(line)
-        elif not seen_preamble and (line.strip().startswith("<!--")
-                                    or line.strip() == ""
-                                    or line.strip().endswith("-->")):
+            first_entry_seen = True
+        elif not first_entry_seen:
+            # Anything before the first recognized entry line is preserved
+            # verbatim as preamble — comments, blank lines, human-added
+            # notes all stay intact.
             preamble.append(line)
-            if "-->" in line:
-                seen_preamble = True
         else:
+            # Lines AFTER entries that aren't themselves entries. Rare
+            # (mostly trailing blanks) but preserve them so we don't nuke
+            # human-added notes at section end.
             other.append(line)
 
     # FIFO rolloff: remove oldest entries until (existing + 1) ≤ max_entries.
@@ -624,7 +658,22 @@ def _remove_entry_by_hash(full_text: str, target_hash: str) -> tuple[str, bool]:
 
 def _atomic_write(path: Path, content: str) -> None:
     """Write `content` to `path` atomically. Using a per-path .tmp next to
-    the target so the rename stays on the same filesystem."""
+    the target so the rename stays on the same filesystem.
+
+    On failure (disk full, permission denied, rename across mount points),
+    raises OSError. Callers wrap this to produce a Rejection rather than
+    recording the would-be edit as a success in the audit log.
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content)
-    os.replace(str(tmp), str(path))
+    try:
+        os.replace(str(tmp), str(path))
+    except OSError:
+        # Best-effort tmp cleanup so we don't leave a .md.tmp artifact that
+        # could confuse a future human reader. Don't swallow the original
+        # OSError — re-raise so the caller records the failure.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise

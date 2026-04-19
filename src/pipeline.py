@@ -1805,9 +1805,16 @@ class TradingPipeline:
         Walks recent tech_analyst agent_logs, parses the batch-output JSON,
         takes the newest rating per symbol. `rating in ("buy","strong_buy")`
         is what drives the `had_ta_signal` flag downstream.
+
+        Production tech_analyst emits two different JSON shapes depending on
+        which code path wrote the log — either ``{"analyses": [...]}`` or a
+        BARE LIST of per-symbol dicts. We delegate shape normalization to
+        `quarterly_digest._tech_analyses_from_data` so both paths stay in
+        sync — adding a third shape should only require editing that helper.
         """
         import json as _json
         from datetime import timedelta
+        from src.evolution.quarterly_digest import _tech_analyses_from_data
         try:
             rows = self.db.get_recent_agent_outputs(
                 agent_name="tech_analyst", limit=lookback_days * 3,
@@ -1826,12 +1833,7 @@ class TradingPipeline:
                 data = _json.loads(row.get("full_response") or "{}")
             except (_json.JSONDecodeError, TypeError):
                 continue
-            analyses = data.get("analyses") or []
-            if not isinstance(analyses, list):
-                continue
-            for a in analyses:
-                if not isinstance(a, dict):
-                    continue
+            for a in _tech_analyses_from_data(data):
                 sym = (a.get("symbol") or "").upper()
                 rating = a.get("rating")
                 if not sym or not rating:

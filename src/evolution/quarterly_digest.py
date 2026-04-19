@@ -369,15 +369,27 @@ def _loss_patterns_aggregated(db: "Database", lookback_days: int) -> dict:
         "by_cause": {
           "greed_top_chasing": {
             "count": int, "symbols": [str], "avg_loss_pct": float,
-            "total_relative_loss_pct": float,  # sum of market_relative moves
-                                                # where available; signals
-                                                # alpha-destruction concentration
+            "total_relative_loss_pct": float,  # SIGNED sum of
+                                                # market_relative_move_pct;
+                                                # NEGATIVE = concentrated
+                                                # alpha destruction in this
+                                                # cause. Positive would mean
+                                                # wrongs here actually beat SPY
+                                                # (rare; possible when SPY
+                                                # crashed harder).
             "example_warnings": [str],         # only for macro_warning_ignored
           },
           ...
         },
         "total_wrong_buys": int,
-        "alpha_destruction_pct": float | None,  # sum across all wrongs
+        "alpha_destruction_pct": float | None,  # SIGNED sum across all wrongs:
+                                                # NEGATIVE = we underperformed
+                                                # SPY during loss trades; more
+                                                # negative = more alpha leak.
+                                                # Reader MUST interpret sign:
+                                                # -20.0 means "losses cost us
+                                                # 20 pp of alpha versus SPY",
+                                                # not "20% alpha destruction".
       }
     """
     try:

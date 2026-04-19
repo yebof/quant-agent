@@ -266,6 +266,41 @@ def test_digest_survives_top_movers_api_failure(_sec):
 # ---------------------------------------------------------------------------
 
 @patch("src.execution.broker._get_sector", return_value="Technology")
+def test_digest_tech_signal_flag_handles_bare_list_shape(_sec):
+    """Regression: production tech_analyst full_response is sometimes a
+    BARE LIST (not ``{"analyses": [...]}``). `_missed_ops_tech_signal`
+    must delegate to the same shape normalizer the quarterly digest uses,
+    otherwise it silently treats every symbol as having no TA signal."""
+    import json as _json
+    from src.trading_calendar import et_today
+    today_iso = et_today().isoformat()
+
+    p = _pipeline_with(
+        universe=["NVDA", "HOLDSYM"],
+        market_closes_by_symbol={
+            "NVDA":    [100, 105, 108, 110, 113, 118],  # +18%
+            "HOLDSYM": [100, 105, 108, 110, 113, 118],
+        },
+        tech_rows=[
+            # BARE LIST — matches the production shape observed 2026-04-19
+            {"timestamp": today_iso + " 09:35:00",
+             "full_response": _json.dumps([
+                 {"symbol": "NVDA", "rating": "buy"},
+                 {"symbol": "HOLDSYM", "rating": "hold"},
+             ])},
+        ],
+    )
+    out = p._build_missed_opportunities_digest(
+        lookback_days=5, move_threshold_pct=8.0,
+    )
+    by = {s.symbol: s for s in out}
+    assert by["NVDA"].had_ta_signal is True
+    assert by["NVDA"].last_ta_rating == "buy"
+    assert by["HOLDSYM"].had_ta_signal is False
+    assert by["HOLDSYM"].last_ta_rating == "hold"
+
+
+@patch("src.execution.broker._get_sector", return_value="Technology")
 def test_digest_populates_ta_signal_flag_from_recent_logs(_sec):
     """had_ta_signal = True when most recent tech_analyst rating in window
     is 'buy' or 'strong_buy'. Any other rating → False."""

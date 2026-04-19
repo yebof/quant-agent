@@ -47,9 +47,16 @@ sections.
   excludes noise_rally / risk_disciplined.
 - **loss_patterns** — `by_cause` (loss_root_cause → count, symbols,
   avg_loss_pct, total_relative_loss_pct, example_warnings for
-  macro_warning_ignored). `alpha_destruction_pct` is the cumulative
-  market-relative loss across all wrong BUYs — this is what the system
-  actively cost the book beyond systemic drawdown.
+  macro_warning_ignored). `alpha_destruction_pct` is the SIGNED sum
+  of market-relative returns across all wrong BUYs. **Convention:
+  negative values = alpha destruction** (we underperformed SPY while
+  losing). A value of `-22.0` means our wrong BUYs collectively cost
+  22 pp of alpha versus SPY — that's real damage. A less-negative
+  or near-zero value means the losses were mostly systemic (market
+  fell and we fell with it, not our fault in isolation). A positive
+  value is rare and means our wrongs outperformed SPY (e.g., SPY
+  crashed harder); don't treat positive as a good signal, treat it
+  as "losses were overshadowed by systemic sell-off."
 - **agent_signal_activity** — per-agent volume counts. Not hit rates.
   A silent agent (n_sessions far below peers) is a problem; a noisy
   agent (PM issuing many decisions RM keeps scaling down) is a
