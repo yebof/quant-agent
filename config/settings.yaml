@@ -18,7 +18,19 @@ llm:
   risk_manager_model: "gpt-5.4"
   position_reviewer_model: "gpt-5.4"
   evening_analyst_model: "gpt-5.4"
+  # Global fallback — any per-agent override below takes precedence.
   max_tokens: 128000
+  # Per-agent caps. Set generously so no agent silently truncates: PM and
+  # Evening emit the heaviest outputs (7-step / 6-step CoT + many list fields);
+  # Macro is the lightest. Leave `null` to inherit `max_tokens` above.
+  tech_analyst_max_tokens: 128000
+  news_analyst_max_tokens: 128000
+  macro_analyst_max_tokens: 128000
+  earnings_analyst_max_tokens: 128000
+  portfolio_manager_max_tokens: 128000
+  risk_manager_max_tokens: 128000
+  position_reviewer_max_tokens: 128000
+  evening_analyst_max_tokens: 128000
 
 risk:
   max_position_pct: 20

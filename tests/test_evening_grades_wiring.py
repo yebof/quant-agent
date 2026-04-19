@@ -179,6 +179,47 @@ def test_trade_grade_summary_ignores_malformed_json():
     assert summary["n_sells"] == 0
 
 
+def test_trade_grade_summary_warns_on_malformed_json(caplog):
+    """When evening writes grades but the persisted JSON is corrupt, we must
+    NOT silently return an empty summary — the position_reviewer would then
+    see n_sells=0 and lose the SELL-discipline feedback loop without anyone
+    knowing. A WARNING log is the signal operators rely on to spot the break.
+    """
+    import logging
+
+    pipeline = _pipeline_with_insights([
+        {"date": "2026-04-18",
+         "sell_grades_json": "{ this isn't json",
+         "buy_grades_json": None},
+    ])
+    with caplog.at_level(logging.WARNING, logger="src.pipeline"):
+        pipeline._build_trade_grade_summary(lookback_days=14)
+    assert any(
+        "failed to parse insights" in rec.message and "sell_grades_json" in rec.message
+        for rec in caplog.records
+    ), "expected a WARNING naming the column that failed to parse"
+
+
+def test_trade_grade_summary_warns_when_json_is_not_a_list(caplog):
+    """An insights row whose grades column is valid JSON but the wrong shape
+    (e.g. a dict/string instead of a list) used to return empty silently.
+    Same data-loss symptom as malformed JSON → must also log WARNING."""
+    import json
+    import logging
+
+    pipeline = _pipeline_with_insights([
+        {"date": "2026-04-18",
+         "sell_grades_json": json.dumps({"not": "a list"}),
+         "buy_grades_json": None},
+    ])
+    with caplog.at_level(logging.WARNING, logger="src.pipeline"):
+        pipeline._build_trade_grade_summary(lookback_days=14)
+    assert any(
+        "expected list" in rec.message and "sell_grades_json" in rec.message
+        for rec in caplog.records
+    )
+
+
 def test_trade_grade_summary_flags_repeat_wrong_separately():
     import json
     pipeline = _pipeline_with_insights([
@@ -260,6 +301,54 @@ def test_prompt_no_grade_section_when_no_history():
         },
     )
     assert "Recent Trade Calibration from Evening" not in msg
+
+
+def test_prompt_surfaces_force_delever_and_emergency_sell_from_morning_trades():
+    """Non-LLM system actions (force de-lever when margin drifted; emergency
+    sell-all on −3% breach) bypass the reviewer. They must still be surfaced
+    so it knows why a symbol dropped from the book — otherwise it reasons in
+    a vacuum about the refreshed ctx.positions."""
+    agent = _make_reviewer()
+    msg = agent.build_user_message(
+        positions=[],
+        macro_summary={"vix": {"current": 18}},
+        cash_balance=10_000.0, total_value=50_000.0,
+        session_type="midday",
+        morning_trades=[
+            {"symbol": "NVDA", "action": "FORCE_DELEVER", "qty": 20,
+             "fill_status": "filled", "fill_qty": 20,
+             "reasoning": "cash-only auto de-lever: cash $-900 deficit"},
+            {"symbol": "MSFT", "action": "EMERGENCY_SELL", "qty": 10,
+             "fill_status": "filled", "fill_qty": 10,
+             "reasoning": "daily loss -3.2% breached circuit breaker"},
+            # Regular morning BUY — should NOT be in the system-actions section.
+            {"symbol": "GOOGL", "action": "BUY", "qty": 5,
+             "fill_status": "filled", "fill_qty": 5,
+             "reasoning": "tech buy"},
+        ],
+    )
+    assert "Non-LLM System Actions Earlier Today" in msg
+    assert "FORCE_DELEVER NVDA" in msg
+    assert "EMERGENCY_SELL MSFT" in msg
+    # The normal BUY is not listed as a system action.
+    assert "FORCE_DELEVER GOOGL" not in msg
+    assert "EMERGENCY_SELL GOOGL" not in msg
+
+
+def test_prompt_omits_system_actions_section_when_nothing_happened():
+    """Clean session with no hard-rule trips → no empty section stub."""
+    agent = _make_reviewer()
+    msg = agent.build_user_message(
+        positions=[],
+        macro_summary={"vix": {"current": 18}},
+        cash_balance=10_000.0, total_value=50_000.0,
+        session_type="midday",
+        morning_trades=[
+            {"symbol": "GOOGL", "action": "BUY", "qty": 5,
+             "fill_status": "filled", "fill_qty": 5, "reasoning": "ok"},
+        ],
+    )
+    assert "Non-LLM System Actions Earlier Today" not in msg
 
 
 def test_prompt_surfaces_lessons_and_sell_prose_from_yesterday():

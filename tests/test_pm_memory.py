@@ -232,6 +232,7 @@ def test_handle_ex_dividends_lowers_stop_day_before(tmp_path):
     args, kwargs = pipeline.broker.replace_stop_loss.call_args
     assert args[0] == "JPM"
     assert args[1] == round(185.00 - 1.20, 2)
+    assert kwargs["allow_lowering"] is True
 
     # Running again same day → idempotent (no broker call repeat)
     pipeline.broker.replace_stop_loss.reset_mock()

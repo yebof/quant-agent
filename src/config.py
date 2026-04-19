@@ -39,7 +39,21 @@ class LLMConfig(BaseModel):
     risk_manager_model: str = "claude-opus-4-6"
     position_reviewer_model: str = "claude-opus-4-6"
     evening_analyst_model: str = "claude-opus-4-6"
+    # Global fallback — used by any agent without an explicit override below.
     max_tokens: int
+    # Per-agent overrides. Each agent emits a different output shape; the PM
+    # writes 7-step reasoning + 20-35 target positions, while Macro emits a
+    # single compact regime call. One-size-fits-all can silently truncate the
+    # heavy ones when the global is tuned to the average. `None` inherits
+    # `max_tokens`; set explicitly in settings.yaml to tune per agent.
+    tech_analyst_max_tokens: int | None = None
+    news_analyst_max_tokens: int | None = None
+    macro_analyst_max_tokens: int | None = None
+    earnings_analyst_max_tokens: int | None = None
+    portfolio_manager_max_tokens: int | None = None
+    risk_manager_max_tokens: int | None = None
+    position_reviewer_max_tokens: int | None = None
+    evening_analyst_max_tokens: int | None = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -51,6 +65,41 @@ class LLMConfig(BaseModel):
                 f"llm.max_tokens must be >= 512 for agent outputs; got {v}"
             )
         return v
+
+    @field_validator(
+        "tech_analyst_max_tokens",
+        "news_analyst_max_tokens",
+        "macro_analyst_max_tokens",
+        "earnings_analyst_max_tokens",
+        "portfolio_manager_max_tokens",
+        "risk_manager_max_tokens",
+        "position_reviewer_max_tokens",
+        "evening_analyst_max_tokens",
+    )
+    @classmethod
+    def _per_agent_max_tokens_sane(cls, v: int | None) -> int | None:
+        # Same floor as the global — prevents a misconfigured override from
+        # silently starving an agent. None means "inherit global".
+        if v is None:
+            return None
+        if v < 512:
+            raise ValueError(
+                f"per-agent max_tokens override must be >= 512 (or null to "
+                f"inherit global); got {v}"
+            )
+        return v
+
+    def get_max_tokens(self, agent_name: str) -> int:
+        """Return the max_tokens for `agent_name`, falling back to the global.
+
+        `agent_name` is the logical agent name (e.g. "tech_analyst"). Returns
+        the per-agent override when set, else `self.max_tokens`. Unknown
+        agent names also fall back to the global.
+        """
+        override = getattr(self, f"{agent_name}_max_tokens", None)
+        if override is not None:
+            return override
+        return self.max_tokens
 
 
 class RiskConfig(BaseModel):

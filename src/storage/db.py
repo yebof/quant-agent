@@ -1,8 +1,11 @@
+import logging
 import sqlite3
 import threading
 from datetime import date, datetime, time, timedelta
 
 from src.util.time import ET, UTC, et_today
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
@@ -640,12 +643,35 @@ class Database:
         reading RM's recent verdicts on those decisions. `before_date` (ISO
         'YYYY-MM-DD') skips the in-progress run so PM doesn't accidentally
         read a log it just wrote in the same pipeline tick.
+
+        `before_date` is interpreted as an ET trading-day key (the rest of the
+        system uses ET day boundaries — see `session_date_key`). It's converted
+        to the UTC instant for "00:00 ET on that date" before comparing
+        against `timestamp`, because SQLite's default `datetime('now')` writes
+        UTC. A naive `date(timestamp) < before_date` compares UTC-date against
+        ET-date and drops rows whose UTC date has ticked over ahead of ET —
+        specifically, logs written within the last few hours of ET-today that
+        already carry a UTC-tomorrow timestamp.
         """
         conditions = ["agent_name = ?"]
         params: list = [agent_name]
         if before_date:
-            conditions.append("date(timestamp) < ?")
-            params.append(before_date)
+            from datetime import datetime as _dt, timezone as _tz
+            try:
+                et_midnight = _dt.fromisoformat(before_date).replace(tzinfo=ET)
+                utc_cutoff = et_midnight.astimezone(_tz.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                conditions.append("timestamp < ?")
+                params.append(utc_cutoff)
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "get_recent_agent_outputs: unparseable before_date=%r (%s); "
+                    "falling back to date-string comparison",
+                    before_date, exc,
+                )
+                conditions.append("date(timestamp) < ?")
+                params.append(before_date)
         where = "WHERE " + " AND ".join(conditions)
         with self._lock:
             rows = self.conn.execute(

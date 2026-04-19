@@ -1,7 +1,7 @@
 import logging
 import uuid
 from datetime import date
-from src.trading_calendar import et_today, session_date_key
+from src.trading_calendar import et_now, et_today, session_date_key
 
 from pydantic import ValidationError
 
@@ -73,17 +73,17 @@ class TradingPipeline:
         self.tech_analyst = TechAnalystAgent(
             api_key=_key_for(config.llm.tech_analyst_model),
             model=config.llm.tech_analyst_model,
-            max_tokens=config.llm.max_tokens,
+            max_tokens=config.llm.get_max_tokens("tech_analyst"),
         )
         self.portfolio_manager = PortfolioManagerAgent(
             api_key=_key_for(config.llm.portfolio_manager_model),
             model=config.llm.portfolio_manager_model,
-            max_tokens=config.llm.max_tokens,
+            max_tokens=config.llm.get_max_tokens("portfolio_manager"),
         )
         self.risk_manager = RiskManagerAgent(
             api_key=_key_for(config.llm.risk_manager_model),
             model=config.llm.risk_manager_model,
-            max_tokens=config.llm.max_tokens,
+            max_tokens=config.llm.get_max_tokens("risk_manager"),
         )
         self.risk_engine = RiskRuleEngine(RiskConfig(
             max_position_pct=config.risk.max_position_pct,
@@ -95,22 +95,22 @@ class TradingPipeline:
         self.position_reviewer = PositionReviewerAgent(
             api_key=_key_for(config.llm.position_reviewer_model),
             model=config.llm.position_reviewer_model,
-            max_tokens=config.llm.max_tokens,
+            max_tokens=config.llm.get_max_tokens("position_reviewer"),
         )
         self.evening_analyst = EveningAnalystAgent(
             api_key=_key_for(config.llm.evening_analyst_model),
             model=config.llm.evening_analyst_model,
-            max_tokens=config.llm.max_tokens,
+            max_tokens=config.llm.get_max_tokens("evening_analyst"),
         )
         self.news_analyst = NewsAnalystAgent(
             api_key=_key_for(config.llm.news_analyst_model),
             model=config.llm.news_analyst_model,
-            max_tokens=config.llm.max_tokens,
+            max_tokens=config.llm.get_max_tokens("news_analyst"),
         )
         self.macro_analyst = MacroAnalystAgent(
             api_key=_key_for(config.llm.macro_analyst_model),
             model=config.llm.macro_analyst_model,
-            max_tokens=config.llm.max_tokens,
+            max_tokens=config.llm.get_max_tokens("macro_analyst"),
         )
         self.news_provider = NewsDataProvider()
         self.news_store = NewsStore()
@@ -119,7 +119,7 @@ class TradingPipeline:
         self.earnings_analyst = EarningsAnalystAgent(
             api_key=_key_for(config.llm.earnings_analyst_model),
             model=config.llm.earnings_analyst_model,
-            max_tokens=config.llm.max_tokens,
+            max_tokens=config.llm.get_max_tokens("earnings_analyst"),
         )
         self.earnings_provider = EarningsDataProvider()
         self.broker = AlpacaBroker(
@@ -750,7 +750,9 @@ class TradingPipeline:
                 )
                 continue
             try:
-                order = self.broker.replace_stop_loss(p.symbol, new_stop)
+                order = self.broker.replace_stop_loss(
+                    p.symbol, new_stop, allow_lowering=True,
+                )
             except Exception as e:
                 logger.error("ex-div: replace_stop_loss failed for %s: %s", p.symbol, e)
                 continue
@@ -1371,9 +1373,27 @@ class TradingPipeline:
                 return []
             try:
                 v = _json.loads(raw)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as exc:
+                # Silent degradation here previously hid real data loss — if
+                # evening wrote grades but they can't be parsed back, the
+                # position_reviewer was reading n_sells=0 and silently losing
+                # the SELL-discipline feedback loop. Warn loudly so the next
+                # evening run can regenerate and we can see the symptom.
+                preview = (raw if isinstance(raw, str) else str(raw))[:120]
+                logger.warning(
+                    "_build_trade_grade_summary: failed to parse insights[%s] "
+                    "(row date=%s): %s — preview=%r",
+                    col, row.get("date", "?"), exc, preview,
+                )
                 return []
-            return v if isinstance(v, list) else []
+            if not isinstance(v, list):
+                logger.warning(
+                    "_build_trade_grade_summary: insights[%s] (row date=%s) "
+                    "expected list, got %s — ignoring",
+                    col, row.get("date", "?"), type(v).__name__,
+                )
+                return []
+            return v
 
         rows_in_window = rows[:lookback_days]  # newest first from get_recent_insights
         for row in rows_in_window:
@@ -2345,6 +2365,41 @@ class TradingPipeline:
         if not self._is_trading_day():
             logger.info("%s run skipped: market closed for non-trading day", session_type)
             return {"status": "market_holiday", "positions": 0, "orders": [], "run_id": run_id}
+
+        # Early-close check. On half-day sessions (day after Thanksgiving 13:00
+        # close; July 3 half-day) the launchd-gated midday (13:00-14:30 ET) and
+        # close (15:30-15:55 ET) windows fire against a market that's already
+        # shut. Every submit would land as rejected; the LLM would still burn
+        # tokens reviewing. Skip cleanly when today's session_close has already
+        # passed. `isinstance(datetime)` instead of `is not None` because we
+        # can only compare to a real datetime — a None or unexpected type
+        # (misconfigured mock, broker returning a placeholder) defaults to
+        # "proceed and let downstream checks handle it" rather than crashing.
+        from datetime import datetime as _dt
+        session_close = None
+        if hasattr(self.broker, "get_session_close"):
+            try:
+                session_close = self.broker.get_session_close()
+            except Exception as exc:
+                logger.warning(
+                    "early_close check: get_session_close failed (%s); "
+                    "proceeding with %s run",
+                    exc, session_type,
+                )
+                session_close = None
+        if isinstance(session_close, _dt) and et_now() >= session_close:
+            logger.info(
+                "%s run skipped: regular session already closed today at %s ET "
+                "(early-close day)",
+                session_type, session_close.strftime("%H:%M"),
+            )
+            return {
+                "status": "early_close",
+                "positions": 0,
+                "orders": [],
+                "run_id": run_id,
+                "session_close_et": session_close.isoformat(),
+            }
 
         # 1. Sync positions (snapshot into ctx)
         account = self.broker.get_account()

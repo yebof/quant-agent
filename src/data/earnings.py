@@ -11,7 +11,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from src.util.time import et_now
 from pathlib import Path
@@ -113,7 +113,7 @@ class EarningsDataProvider:
             entry["failed_attempts"] = attempts
             if attempts >= max_attempts:
                 entry["abandoned"] = True
-                entry["abandoned_at"] = datetime.utcnow().isoformat()
+                entry["abandoned_at"] = et_now().isoformat()
                 abandoned = True
                 logger.error(
                     "Abandoning earnings analysis for %s %s (%s) after %d attempts",

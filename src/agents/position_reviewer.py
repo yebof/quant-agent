@@ -125,6 +125,22 @@ class PositionReviewerAgent(BaseAgent):
             ):
                 trade_context[sym] = t
 
+        # Non-LLM system actions taken earlier in this session (force-delever
+        # when margin drifted negative; emergency sell-all when daily loss
+        # breached -3%). These bypass the reviewer — the sold positions are
+        # already gone from ctx.positions — but surfacing them prevents the
+        # reviewer from reasoning in a vacuum about why the book shrank.
+        system_action_lines: list[str] = []
+        for t in morning_trades:
+            act = t.get("action")
+            if act not in ("FORCE_DELEVER", "EMERGENCY_SELL"):
+                continue
+            sym = t.get("symbol") or "?"
+            qty = t.get("qty") or 0
+            reason = (t.get("reasoning") or "").strip()[:160]
+            suffix = f" — {reason}" if reason else ""
+            system_action_lines.append(f"- {act} {sym} (qty={qty}){suffix}")
+
         # Positions block — surfaces deterministic metrics alongside the raw numbers.
         def _pnl_pct(p: Position) -> str:
             cost = p.avg_entry * p.qty
@@ -380,12 +396,25 @@ class PositionReviewerAgent(BaseAgent):
         else:
             margin_section = ""
 
+        if system_action_lines:
+            system_actions_section = (
+                "### Non-LLM System Actions Earlier Today\n"
+                "These sells were triggered by hard-rule safety nets (force de-lever "
+                "when cash < 0; emergency sell-all on −3% daily-loss breach) and "
+                "bypassed LLM review — the listed symbols are already closed out of "
+                "the book. Context-only; do not try to re-open, re-stop, or second-guess:\n"
+                + "\n".join(system_action_lines) + "\n"
+            )
+        else:
+            system_actions_section = ""
+
         session_label = _SESSION_LABEL.get(session_type, session_type)
         session_bias = _SESSION_DISPOSITION.get(session_type, "")
 
         return f"""## Position Review — {session_label}
 
 {margin_section}
+{system_actions_section}
 ### Session Disposition
 {session_bias}
 

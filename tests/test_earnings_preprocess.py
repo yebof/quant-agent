@@ -83,6 +83,48 @@ def test_preprocess_skips_when_market_closed(tmp_path):
     pipeline.earnings_provider.check_and_fetch.assert_not_called()
 
 
+def test_record_failure_abandons_after_max_attempts_with_et_timestamp(tmp_path):
+    """When a filing's LLM analysis fails 3 times, it is marked abandoned with
+    an ET-tzaware ISO timestamp (not naive UTC). Every other day/session key
+    in the system is ET — drifting to UTC on this one field desyncs
+    operator-facing logs from trading-day reality."""
+    from src.data.earnings import EarningsDataProvider, EarningsReport
+
+    provider = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
+    report = EarningsReport(
+        symbol="NVDA", form_type="10-Q", filing_date="2026-04-20",
+        filing_path="/tmp/nvda.html", analysis_path=None,
+        text_excerpt="...", is_new=True,
+    )
+
+    # Two failures — not yet abandoned.
+    assert provider.record_failure(report, max_attempts=3) is False
+    assert provider.record_failure(report, max_attempts=3) is False
+    entry = provider.manifest["NVDA_10-Q"]
+    assert entry["failed_attempts"] == 2
+    assert entry.get("abandoned") is not True
+
+    # Third failure — abandoned + timestamped.
+    assert provider.record_failure(report, max_attempts=3) is True
+    entry = provider.manifest["NVDA_10-Q"]
+    assert entry["abandoned"] is True
+    assert "abandoned_at" in entry
+
+    # Timestamp must be ET-aware — parse-round-trip and confirm tz offset.
+    from datetime import datetime as _dt
+    from src.trading_calendar import ET
+
+    parsed = _dt.fromisoformat(entry["abandoned_at"])
+    assert parsed.tzinfo is not None, (
+        "abandoned_at must carry a timezone; naive utcnow drifts from ET day keys"
+    )
+    # The offset must equal ET's offset at that same instant (ET shifts DST —
+    # compare offsets at the exact same moment rather than asserting a fixed
+    # number of hours).
+    et_offset_at_that_instant = parsed.astimezone(ET).utcoffset()
+    assert parsed.utcoffset() == et_offset_at_that_instant
+
+
 def test_preprocess_records_failures_on_llm_error(tmp_path):
     """If analyze_reports raises, each new filing gets record_failure called."""
     new_filing = EarningsReport(

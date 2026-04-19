@@ -26,6 +26,116 @@ def test_stage_classes_take_pipeline_reference():
         assert stage._pipeline is fake_pipeline
 
 
+def test_execution_stage_skips_buy_when_entry_price_more_than_5pct_off_market():
+    """When LLM's entry_price deviates >5% from live market, the BUY must be
+    skipped — not fallback-to-market. A stale entry implies the stop_loss
+    (computed against that entry) is also stale, so the whole R/R math is
+    unsafe. Better to wait for the next session's fresh signal."""
+    from src.models import PortfolioDecision, TradeDecision
+    from src.pipeline_context import RunContext
+
+    pipeline = MagicMock()
+    pipeline.broker.get_latest_price.return_value = 100.0  # live market
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._order_accepted.return_value = True
+
+    ctx = RunContext.start("morning")
+    ctx.cash = 50_000.0
+    ctx.total_value = 100_000.0
+    ctx.positions = []
+    ctx.portfolio_decision = PortfolioDecision(
+        decisions=[
+            # LLM says entry $80, market is $100 → 20% off → must skip.
+            TradeDecision(
+                action="BUY", symbol="SPY", allocation_pct=10,
+                entry_price=80.0, stop_loss=72.0, take_profit=130.0,
+                reasoning="stale entry scenario",
+            ),
+        ],
+        portfolio_view="test",
+    )
+    ctx.symbols_bars = {}
+
+    stage = ExecutionStage(pipeline=pipeline)
+    orders = stage.run(ctx)
+
+    assert orders == [], "BUY should have been skipped entirely"
+    pipeline.broker.submit_order.assert_not_called()
+
+
+def test_execution_stage_allows_buy_when_entry_price_within_5pct():
+    """A 2% deviation is well within the 5% threshold — BUY proceeds,
+    sizing uses the live market price (limit < market → raised to market)."""
+    from src.models import PortfolioDecision, TradeDecision
+    from src.pipeline_context import RunContext
+
+    pipeline = MagicMock()
+    pipeline.broker.get_latest_price.return_value = 100.0
+    pipeline.broker.submit_order.return_value = {
+        "id": "order-1", "status": "accepted", "symbol": "SPY",
+    }
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._order_accepted.return_value = True
+
+    ctx = RunContext.start("morning")
+    ctx.cash = 50_000.0
+    ctx.total_value = 100_000.0
+    ctx.positions = []
+    ctx.portfolio_decision = PortfolioDecision(
+        decisions=[
+            # LLM says $98, market $100 → 2% off → proceed.
+            TradeDecision(
+                action="BUY", symbol="SPY", allocation_pct=10,
+                entry_price=98.0, stop_loss=72.0, take_profit=130.0,
+                reasoning="fresh setup",
+            ),
+        ],
+        portfolio_view="test",
+    )
+    ctx.symbols_bars = {}
+
+    stage = ExecutionStage(pipeline=pipeline)
+    stage.run(ctx)
+
+    pipeline.broker.submit_order.assert_called_once()
+
+
+def test_execution_stage_skips_buy_when_entry_price_above_market_by_more_than_5pct():
+    """Symmetric case: LLM proposed entry ABOVE market by >5% — still stale,
+    still skip. The direction of the deviation doesn't change the conclusion
+    (LLM's thesis was priced at something that isn't the current tape)."""
+    from src.models import PortfolioDecision, TradeDecision
+    from src.pipeline_context import RunContext
+
+    pipeline = MagicMock()
+    pipeline.broker.get_latest_price.return_value = 100.0
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._order_accepted.return_value = True
+
+    ctx = RunContext.start("morning")
+    ctx.cash = 50_000.0
+    ctx.total_value = 100_000.0
+    ctx.positions = []
+    ctx.portfolio_decision = PortfolioDecision(
+        decisions=[
+            # LLM says $115, market $100 → 15% above → skip.
+            TradeDecision(
+                action="BUY", symbol="SPY", allocation_pct=10,
+                entry_price=115.0, stop_loss=105.0, take_profit=135.0,
+                reasoning="above-market proposal",
+            ),
+        ],
+        portfolio_view="test",
+    )
+    ctx.symbols_bars = {}
+
+    stage = ExecutionStage(pipeline=pipeline)
+    orders = stage.run(ctx)
+
+    assert orders == []
+    pipeline.broker.submit_order.assert_not_called()
+
+
 def test_execution_stage_delegation_runs_pipeline_path():
     """Pipeline's `_execution_stage` thunks into `execution_stage.run(ctx)`."""
     from src.pipeline import TradingPipeline

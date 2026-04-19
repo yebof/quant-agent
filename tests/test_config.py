@@ -222,6 +222,57 @@ def test_llm_config_rejects_tiny_max_tokens():
     assert cfg.max_tokens == 4096
 
 
+def test_llm_config_get_max_tokens_falls_back_to_global():
+    """No per-agent override set → every agent uses the global max_tokens."""
+    from src.config import LLMConfig
+
+    cfg = LLMConfig(max_tokens=8192)
+    for agent in (
+        "tech_analyst", "news_analyst", "macro_analyst", "earnings_analyst",
+        "portfolio_manager", "risk_manager", "position_reviewer", "evening_analyst",
+    ):
+        assert cfg.get_max_tokens(agent) == 8192
+
+
+def test_llm_config_get_max_tokens_respects_per_agent_override():
+    """When a per-agent override is set, it takes precedence over the global."""
+    from src.config import LLMConfig
+
+    cfg = LLMConfig(
+        max_tokens=4096,
+        portfolio_manager_max_tokens=16384,
+        evening_analyst_max_tokens=32000,
+    )
+    assert cfg.get_max_tokens("portfolio_manager") == 16384
+    assert cfg.get_max_tokens("evening_analyst") == 32000
+    # Unspecified agents still fall back.
+    assert cfg.get_max_tokens("tech_analyst") == 4096
+    assert cfg.get_max_tokens("risk_manager") == 4096
+
+
+def test_llm_config_get_max_tokens_unknown_agent_falls_back():
+    """Accidental typo in agent name should not crash — fall back, not throw."""
+    from src.config import LLMConfig
+
+    cfg = LLMConfig(max_tokens=4096, portfolio_manager_max_tokens=16384)
+    # Typo: "pm" instead of "portfolio_manager" — no field by that name → fallback.
+    assert cfg.get_max_tokens("pm") == 4096
+    assert cfg.get_max_tokens("nonexistent_agent") == 4096
+
+
+def test_llm_config_rejects_tiny_per_agent_max_tokens():
+    """Per-agent overrides get the same >=512 floor as the global."""
+    from pydantic import ValidationError
+
+    from src.config import LLMConfig
+
+    with pytest.raises(ValidationError):
+        LLMConfig(max_tokens=4096, portfolio_manager_max_tokens=100)
+    # None (unset) is fine — means inherit.
+    cfg = LLMConfig(max_tokens=4096, portfolio_manager_max_tokens=None)
+    assert cfg.get_max_tokens("portfolio_manager") == 4096
+
+
 def test_risk_rules_warn_when_baseline_missing(caplog):
     """The daily-loss denominator silently falling back to current total_value
     should emit a warning — the check appears correct but the semantic changed.
