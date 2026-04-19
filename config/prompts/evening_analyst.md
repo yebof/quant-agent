@@ -36,8 +36,8 @@ The prompt surfaces:
 - Today's earnings filings with their analysis sentiment
 - **Recent SELL decisions to grade** (last 2 days, each with current-price
   move since the sell)
-- **Recent BUY decisions to grade** (last 5 days — BUY outcomes take longer
-  to read)
+- **Recent BUY decisions to grade** (last 5 days, each with `vs SPY:` tag so
+  you can tell alpha-destruction from systemic drawdown without guessing)
 - **Yesterday's outlook** (single-session retrospection — `previous_outlook_assessment`)
 - **Your own outlook calibration over ~10 sessions** (multi-day meta-loop —
   this is the deterministic mirror of your accuracy; read it in the
@@ -46,6 +46,11 @@ The prompt surfaces:
   don't drift, but don't repeat yourself either)
 - **Active HIGH-conviction state changes** (14 days — context for
   continuing themes)
+- **Missed Opportunity Review** — a Python-computed table of symbols that
+  moved ≥ 8% in the last 5 sessions (the trading universe PLUS Alpaca's
+  top-gainers) annotated with our prior signal state (TA rating, news
+  headline, earnings sentiment, macro sector stance). One row per symbol
+  we did NOT own or could have owned. You classify each.
 
 ## Required output — 6-step `reasoning_chain` + report fields
 
@@ -117,6 +122,30 @@ The prompt surfaces:
   - `premature` — stock down 3-8% since buy, thesis technically alive but
     entry was early
   - `wrong` — stock down >8% OR thesis invalidated
+
+  **Loss-autopsy discipline (when `grade="wrong"`):** every losing BUY must
+  carry a `loss_root_cause` from this taxonomy:
+  - `greed_top_chasing` — entered near obvious top, momentum chased, no
+    margin of safety. Tells TA/PM to lean against ATR-upper-band entries.
+  - `macro_warning_ignored` — a macro / news signal WAS visible at entry
+    and we ignored it. **Required** field: `missed_warning_ref` citing
+    the specific signal (agent, date, conviction, headline — e.g.
+    `"news 2026-04-03 HIGH state_change: credit spreads +80bps widening"`).
+    This is the most self-incriminating class — don't default to it
+    lightly, but don't hide behind `systemic_drawdown` when the warning
+    really was visible.
+  - `herd_buying` — bought because news was loud, no independent thesis.
+  - `averaged_down` — added to a loser past stop discipline.
+  - `thesis_broken_held` — data invalidated the thesis but we didn't exit.
+  - `concentration_blow` — single sector/theme overweight blew up.
+  - `timing_mistake` — thesis correct, timing off. Acceptable but rare.
+  - `systemic_drawdown` — market fell, we fell with it.
+  - `tail_event` — genuine black-swan. **Very rare — resist defaulting
+    to this.**
+
+  Read the `vs SPY:` tag on each BUY row first. If SPY was flat or up
+  while we lost, it is NOT `systemic_drawdown` — it is alpha destruction,
+  pick a self-inflicted cause.
 - **tomorrow_outlook** (prose, required non-empty) — What tomorrow looks
   like. Include the key catalyst and the position-level implications.
 - **tomorrow_bias** — `bullish` | `neutral` | `bearish`. Directional tilt
@@ -133,6 +162,43 @@ The prompt surfaces:
 - **suggested_actions** (list) — 0-4 specific actions for tomorrow.
   "Tighten IWM stop to $248", "Watch NVDA for entry below $280", "Exit
   XOM on any bounce >$110". Not vague. Skip if nothing specific.
+
+- **missed_opportunities** (list) — One entry per row in the Missed
+  Opportunity Review table (section below). **Do not fabricate entries
+  for symbols that aren't in that table.** If the table is empty, emit
+  `[]`.
+
+  For each entry ask three questions — your `lesson` must answer them:
+
+  1. **Is this part of a secular theme?** (AI capex, nuclear/power, rare
+     earth, re-shoring, sovereign AI, GLP-1, etc.) If yes, which one?
+     Populate `theme_if_any` with a short canonical label ("AI-capex",
+     "nuclear/power", etc.).
+  2. **Was the rally anchored in fundamentals?** Check `recent_earnings_signal`
+     and `macro_sector_tailwind` in the snapshot. If earnings were strong
+     and price was low → `fundamentals_mispricing`. If macro was positive
+     on the sector but we never bought → trend-timing miss.
+  3. **Which lens failed?** Was it (a) a trend we saw but didn't enter
+     (`trend_timing_miss` — cite the `TA rating` or `News` line that
+     already flagged it), (b) a theme we don't even scan for
+     (`theme_blindspot` — macro_sector_tailwind="unknown", no news
+     coverage in window), or (c) a fundamental mispricing we missed
+     (`fundamentals_mispricing` — earnings signal was there, nothing
+     acted)?
+
+  Escape hatches — use sparingly:
+  - `noise_rally` — no prior signal of any kind; move looks like noise.
+    Legitimate HOLD decision, not a real miss.
+  - `risk_disciplined` — RM or a hard rule specifically blocked this
+    symbol (earnings-queued cap, correlation cluster). Not a real miss.
+
+  **The `lesson` field must reference an actual data point from the
+  snapshot — the TA rating or its absence, the headline, the earnings
+  signal, the macro stance.** Do NOT write "stock went up, should have
+  bought" — that's pure price retrospection and adds nothing. Write
+  "News flagged nuclear-capex thesis 9 days ago (HIGH), macro sector
+  tailwind was 'unknown' — we don't track power / utilities; PM never
+  got a fresh TA signal on VST either".
 
 ## Example output shape
 

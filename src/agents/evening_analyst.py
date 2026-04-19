@@ -65,6 +65,49 @@ def _fmt_earnings_for_evening(earnings_analyses: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_missed_opportunities(snapshots: list) -> str:
+    """Render the digest rows as a prompt table the LLM can reason over.
+
+    Each row surfaces: symbol, window return, source (universe vs top_mover),
+    whether we held it, and the signal state at the time (prior TA rating,
+    news headline, earnings signal, macro sector stance). Theme tags (if
+    any) are listed to help the LLM pick the canonical `theme_if_any`.
+
+    Empty snapshot list → a short note; LLM should emit
+    `missed_opportunities: []` in that case.
+    """
+    if not snapshots:
+        return (
+            "(no symbols crossed the ±8% move threshold in the 5-day window — "
+            "emit `missed_opportunities: []`)"
+        )
+    lines: list[str] = []
+    for s in snapshots:
+        tags = ", ".join(s.theme_tags) if s.theme_tags else "—"
+        ta_bit = (
+            f"TA {s.last_ta_rating} ({s.last_ta_date})"
+            if s.last_ta_rating else "TA: no rating in window"
+        )
+        news_bit = (
+            f"News: \"{s.last_news_headline}\""
+            if s.last_news_headline else "News: no coverage in window"
+        )
+        earn_bit = (
+            f"Earnings: {s.recent_earnings_signal[:100]}"
+            if s.recent_earnings_signal else "Earnings: no recent filing"
+        )
+        held_bit = "HELD" if s.held_during_window else "not held"
+        lines.append(
+            f"- **{s.symbol}** [{s.source}] {s.move_pct:+.1f}% over {s.window_days}d · {held_bit}\n"
+            f"    {ta_bit}\n"
+            f"    {news_bit}\n"
+            f"    {earn_bit}\n"
+            f"    Macro sector stance: {s.macro_sector_tailwind}\n"
+            f"    Theme tags (raw): {tags}"
+        )
+    return "\n".join(lines)
+
+
 def _fmt_outlook_calibration(calib: dict) -> str:
     """Render evening's own recent bias/conviction accuracy.
 
@@ -127,6 +170,9 @@ class EveningAnalystAgent(BaseAgent):
         weekly_narrative: str = kwargs.get("weekly_narrative") or ""
         active_state_changes: str = kwargs.get("active_state_changes") or ""
         outlook_calibration: dict = kwargs.get("outlook_calibration") or {}
+        # Phase-1 evening-upgrade: Python-computed notable movers we didn't own.
+        # LLM classifies each into miss_category + writes a lesson.
+        missed_ops_snapshots: list = kwargs.get("missed_ops_snapshots") or []
 
         positions_text = "\n".join(
             f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Close: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} | Sector: {p.sector}"
@@ -168,8 +214,20 @@ class EveningAnalystAgent(BaseAgent):
                 curr = b.get("current_price", 0.0) or 0.0
                 pct = b.get("pct_move_since_buy", 0.0) or 0.0
                 reason = (b.get("reasoning") or "").strip()[:140]
+                # Python-injected SPY benchmark over the same window. Lets the
+                # LLM classify a "wrong" BUY as alpha-destruction vs systemic
+                # without us telling it which. Positive mkt_rel = we
+                # underperformed the tape; ~0 or negative = whole market fell.
+                mkt_rel_raw = b.get("market_relative_move_pct")
+                if mkt_rel_raw is not None:
+                    try:
+                        mkt_rel_bit = f" | vs SPY: {float(mkt_rel_raw):+.2f}%"
+                    except (TypeError, ValueError):
+                        mkt_rel_bit = ""
+                else:
+                    mkt_rel_bit = ""
                 buys_lines.append(
-                    f"- {buy_date} {sym}: bought @ ${buy_price:.2f}, now ${curr:.2f} ({pct:+.2f}%) — "
+                    f"- {buy_date} {sym}: bought @ ${buy_price:.2f}, now ${curr:.2f} ({pct:+.2f}%){mkt_rel_bit} — "
                     f"reason at entry: \"{reason}\""
                 )
             buys_section = "\n".join(buys_lines)
@@ -210,6 +268,8 @@ class EveningAnalystAgent(BaseAgent):
             if active_state_changes.strip() else ""
         )
 
+        missed_ops_section = _fmt_missed_opportunities(missed_ops_snapshots)
+
         return f"""## End-of-Day Review
 
 ### Daily Performance
@@ -243,10 +303,16 @@ class EveningAnalystAgent(BaseAgent):
 ## Today's Earnings Filings
 {_fmt_earnings_for_evening(earnings_analyses)}
 
+## Missed Opportunity Review — universe + Alpaca top gainers (|move|≥8%, 5-day)
+{missed_ops_section}
+
 Fill the 6-step `reasoning_chain` before the per-field output. Each field must
 be non-empty. Grade every recent SELL and BUY into the structured
 `sell_grades` / `buy_grades` lists (mirror the prose assessments for
-continuity). Respond as JSON matching `EveningReport`."""
+continuity). For each row in the Missed Opportunity Review, emit one
+`missed_opportunities` entry classifying `miss_category` and writing a
+concrete `lesson` that cites the signal state above — no pure price
+retrospection. Respond as JSON matching `EveningReport`."""
 
     def analyze(self, positions: list[Position], macro_summary: dict,
                 total_value: float, daily_pnl: float, daily_return_pct: float,
@@ -259,6 +325,7 @@ continuity). Respond as JSON matching `EveningReport`."""
                 weekly_narrative: str = "",
                 active_state_changes: str = "",
                 outlook_calibration: dict | None = None,
+                missed_ops_snapshots: list | None = None,
                 ) -> tuple[EveningReport | None, "AgentResult"]:
         result = self.run(
             positions=positions,
@@ -275,6 +342,7 @@ continuity). Respond as JSON matching `EveningReport`."""
             weekly_narrative=weekly_narrative,
             active_state_changes=active_state_changes,
             outlook_calibration=outlook_calibration or {},
+            missed_ops_snapshots=missed_ops_snapshots or [],
         )
         parsed = result.parse_json()
         if parsed is None:

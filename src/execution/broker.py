@@ -200,6 +200,62 @@ class AlpacaBroker:
             )
             return None
 
+    def get_top_movers(self, n: int = 15) -> list[dict]:
+        """Return today's top-`n` gainers from Alpaca's screener.
+
+        Output shape: ``[{"symbol": str, "percent_change": float, "price": float}, ...]``,
+        sorted by `percent_change` descending as Alpaca returns them.
+        Returns `[]` on any failure (SDK error, auth issue, empty response) —
+        the missed-opportunity digest falls back to universe-only when the
+        top-movers signal is unavailable, so a degraded screener must never
+        crash an evening run. Caller treats [] as "no top-mover augmentation".
+        """
+        if n <= 0:
+            return []
+        try:
+            # Lazy import + lazy-construct so the extra SDK client is only
+            # instantiated the first time evening actually runs a digest.
+            from alpaca.data.historical.screener import ScreenerClient
+            from alpaca.data.requests import MarketMoversRequest
+        except ImportError as exc:
+            logger.warning("get_top_movers: screener SDK unavailable: %s", exc)
+            return []
+
+        if not hasattr(self, "_screener_client") or self._screener_client is None:
+            try:
+                self._screener_client = ScreenerClient(
+                    api_key=self.api_key, secret_key=self.secret_key,
+                )
+                _install_http_timeout(self._screener_client)
+            except Exception as exc:
+                logger.warning("get_top_movers: ScreenerClient init failed: %s", exc)
+                self._screener_client = None
+                return []
+
+        try:
+            movers = self._screener_client.get_market_movers(
+                MarketMoversRequest(top=n)
+            )
+        except Exception as exc:
+            logger.warning("get_top_movers: screener API call failed: %s", exc)
+            return []
+
+        gainers = getattr(movers, "gainers", None) or []
+        out: list[dict] = []
+        for m in gainers[:n]:
+            sym = getattr(m, "symbol", None)
+            if not sym:
+                continue
+            try:
+                out.append({
+                    "symbol": str(sym).upper(),
+                    "percent_change": float(getattr(m, "percent_change", 0) or 0),
+                    "price": float(getattr(m, "price", 0) or 0),
+                })
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def get_bars(self, symbol: str, lookback_days: int = 120) -> list:
         """Fetch daily OHLCV bars from Alpaca as a list[OHLCV].
 

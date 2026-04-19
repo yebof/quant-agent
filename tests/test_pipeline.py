@@ -481,6 +481,10 @@ def test_pipeline_midday_preserves_protective_orders():
     pipeline.macro = MagicMock()
     pipeline.macro.get_macro_summary.return_value = {}
     pipeline.db = MagicMock()
+    # Circuit-breaker probe runs on every position_review tick. No breach in
+    # this scenario — return None so execution flows into the normal path.
+    pipeline.risk_engine = MagicMock()
+    pipeline.risk_engine.check_daily_loss.return_value = None
 
     result = pipeline.run_midday()
 

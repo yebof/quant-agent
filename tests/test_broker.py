@@ -138,6 +138,66 @@ def test_get_session_close_returns_none_on_api_error(mock_tc_cls):
     assert broker.get_session_close() is None
 
 
+@patch("alpaca.data.historical.screener.ScreenerClient")
+@patch("src.execution.broker.TradingClient")
+def test_get_top_movers_returns_normalized_gainer_dicts(mock_tc_cls, mock_screener_cls):
+    """Evening's missed-ops digest augments the 77-symbol universe with the
+    day's top gainers from Alpaca. Result shape must be a list of dicts with
+    uppercase symbols, numeric percent_change, and numeric price — anything
+    Pythonic the digest helper can consume without extra massaging."""
+    mock_tc_cls.return_value = MagicMock()
+
+    mover_a = MagicMock()
+    mover_a.symbol = "vst"
+    mover_a.percent_change = 22.3
+    mover_a.price = 145.2
+    mover_b = MagicMock()
+    mover_b.symbol = "OKLO"
+    mover_b.percent_change = 18.7
+    mover_b.price = 62.9
+
+    movers_response = MagicMock()
+    movers_response.gainers = [mover_a, mover_b]
+
+    mock_screener = MagicMock()
+    mock_screener.get_market_movers.return_value = movers_response
+    mock_screener_cls.return_value = mock_screener
+
+    broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
+    out = broker.get_top_movers(n=15)
+
+    assert len(out) == 2
+    assert out[0]["symbol"] == "VST"          # lowercase normalized
+    assert out[0]["percent_change"] == 22.3
+    assert out[1]["symbol"] == "OKLO"
+    mock_screener.get_market_movers.assert_called_once()
+
+
+@patch("alpaca.data.historical.screener.ScreenerClient")
+@patch("src.execution.broker.TradingClient")
+def test_get_top_movers_returns_empty_on_api_error(mock_tc_cls, mock_screener_cls):
+    """If the screener API itself fails (auth / outage / rate limit), return
+    [] — evening digest falls back to universe-only rather than crashing."""
+    mock_tc_cls.return_value = MagicMock()
+
+    mock_screener = MagicMock()
+    mock_screener.get_market_movers.side_effect = RuntimeError("screener 500")
+    mock_screener_cls.return_value = mock_screener
+
+    broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
+    assert broker.get_top_movers(n=15) == []
+
+
+@patch("src.execution.broker.TradingClient")
+def test_get_top_movers_with_non_positive_n_returns_empty(mock_tc_cls):
+    """Pipeline can disable top-movers augmentation by passing n=0; must not
+    even hit the SDK in that case."""
+    mock_tc_cls.return_value = MagicMock()
+    broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
+    assert broker.get_top_movers(n=0) == []
+    assert broker.get_top_movers(n=-3) == []
+
+
 @patch("src.execution.broker.TradingClient")
 def test_cancel_open_entry_orders_preserves_sell_protection(mock_tc_cls):
     buy_order = MagicMock()

@@ -1185,6 +1185,13 @@ class TradingPipeline:
         entry vs current price. Positive = entry still in the money (so
         far); negative = entry is underwater. Lookback is wider than
         SELLs (5d vs 2d) because BUY outcomes take longer to reveal.
+
+        Also injects `market_relative_move_pct` per BUY = (our move) −
+        (SPY move over same dates). The evening analyst reads this to
+        decide whether a losing BUY was alpha-destruction (we
+        under-performed the tape, positive number) vs systemic drawdown
+        (market also fell, ~0 or negative number). Fetched once upfront
+        so we don't round-trip SPY bars per BUY.
         """
         try:
             all_rows = self.db.get_trades(limit=200, executed_only=True)
@@ -1195,6 +1202,26 @@ class TradingPipeline:
             return []
         from datetime import date as _date, timedelta as _td
         cutoff = et_today() - _td(days=lookback_days)
+        # SPY bars once — used to compute market_relative_move_pct per BUY.
+        # Pad the lookback to cover the oldest BUY date + weekends.
+        spy_close_by_date: dict[str, float] = {}
+        spy_latest_close: float = 0.0
+        try:
+            spy_bars = self.market.get_ohlcv(
+                "SPY", lookback_days=max(lookback_days + 5, 12)
+            )
+            for b in spy_bars or []:
+                try:
+                    spy_close_by_date[str(b.date)] = float(b.close)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+            if spy_bars:
+                try:
+                    spy_latest_close = float(spy_bars[-1].close)
+                except (AttributeError, TypeError, ValueError):
+                    spy_latest_close = 0.0
+        except Exception as e:
+            logger.warning("recent_buys: SPY bars fetch failed (relative-move disabled): %s", e)
         out: list[dict] = []
         seen_symbols: set[str] = set()  # dedupe multiple buys on same symbol — use latest
         for row in all_rows:
@@ -1225,12 +1252,31 @@ class TradingPipeline:
                 if bars:
                     curr = float(bars[-1].close or 0)
             pct = ((curr / buy_price - 1) * 100) if (curr > 0 and buy_price > 0) else 0.0
+            # SPY return over the same window → alpha-destruction vs systemic
+            # drawdown disambiguation. Match buy_date to the nearest SPY close
+            # (buy_date might not be a trading day if fill timestamp rolled
+            # over into an ET weekend), walking backward up to 5 days.
+            spy_entry_close = 0.0
+            if spy_close_by_date and spy_latest_close > 0:
+                probe = buy_date
+                for _ in range(6):
+                    got = spy_close_by_date.get(str(probe))
+                    if got:
+                        spy_entry_close = got
+                        break
+                    probe = probe - _td(days=1)
+            if spy_entry_close > 0 and spy_latest_close > 0:
+                spy_pct = (spy_latest_close / spy_entry_close - 1) * 100
+                market_relative = round(pct - spy_pct, 2)
+            else:
+                market_relative = None
             out.append({
                 "symbol": sym,
                 "buy_date": str(buy_date),
                 "buy_price": buy_price,
                 "current_price": round(curr, 2) if curr else 0.0,
                 "pct_move_since_buy": round(pct, 2),
+                "market_relative_move_pct": market_relative,
                 "reasoning": row.get("reasoning") or "",
             })
         out.sort(key=lambda r: r["buy_date"], reverse=True)
@@ -1427,6 +1473,521 @@ class TradingPipeline:
                 s for s, c in sell_wrong_by_symbol.items() if c >= 2
             ),
         }
+
+    def _build_recent_missed_lessons(self, lookback_days: int = 14) -> str:
+        """PM L3d memory: themes that evening flagged ≥ 2 times as missed.
+
+        Reads `insights.missed_opportunities_json` for the last N days, skips
+        the two "not-really-a-miss" categories (noise_rally, risk_disciplined),
+        groups by `theme_if_any` (falling back to `symbol` when no theme
+        tagged), keeps themes seen on 2+ distinct dates. Output is prose
+        PM renders directly — the whole point of this memory layer is PM
+        sees "nuclear/power keeps showing up — am I blind to it?" before
+        deciding today's positions.
+
+        Empty string when there's nothing worth surfacing — PM's L3d section
+        then shows a default "no recurring missed themes" note.
+        """
+        import json as _json
+        try:
+            rows = self.db.get_recent_insights(limit=lookback_days + 5)
+        except Exception as e:
+            logger.warning("recent_missed_lessons: insights fetch failed: %s", e)
+            return ""
+        if not rows:
+            return ""
+        real_miss_cats = {
+            "trend_timing_miss", "theme_blindspot", "fundamentals_mispricing"
+        }
+        theme_dates: dict[str, set[str]] = {}
+        theme_symbols: dict[str, list[str]] = {}
+        theme_lessons: dict[str, str] = {}  # most recent lesson text per theme
+        for row in rows[:lookback_days]:
+            row_date = row.get("date") or ""
+            raw = row.get("missed_opportunities_json")
+            if not raw:
+                continue
+            try:
+                items = _json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(items, list):
+                continue
+            for m in items:
+                if not isinstance(m, dict):
+                    continue
+                cat = m.get("miss_category")
+                if cat not in real_miss_cats:
+                    continue
+                theme = (m.get("theme_if_any") or "").strip()
+                sym = (m.get("symbol") or "").strip().upper()
+                # Group key: theme name when present, else symbol (fall back so
+                # "no theme tagged but same symbol missed twice" still surfaces).
+                key = theme or f"sym:{sym}"
+                if not key:
+                    continue
+                theme_dates.setdefault(key, set()).add(row_date)
+                theme_symbols.setdefault(key, []).append(sym)
+                # Rows are newest-first; first lesson we see is the freshest.
+                if key not in theme_lessons:
+                    lesson = (m.get("lesson") or "").strip()
+                    if lesson:
+                        theme_lessons[key] = lesson[:200]
+        # Keep themes seen on ≥ 2 distinct dates.
+        recurring = [
+            (k, len(theme_dates[k])) for k in theme_dates
+            if len(theme_dates[k]) >= 2
+        ]
+        if not recurring:
+            return ""
+        # Sort by occurrence count desc, then key alpha for determinism.
+        recurring.sort(key=lambda x: (-x[1], x[0]))
+        lines: list[str] = []
+        for key, n_days in recurring[:5]:
+            syms = theme_symbols.get(key, [])
+            uniq = sorted(set(syms))
+            sym_tally = ", ".join(
+                f"{s}×{syms.count(s)}" if syms.count(s) > 1 else s
+                for s in uniq[:6]
+            )
+            lesson = theme_lessons.get(key, "")
+            label = key[4:] if key.startswith("sym:") else key
+            line = f"- {label}: {n_days} days (symbols: {sym_tally})"
+            if lesson:
+                line += f' — latest lesson: "{lesson}"'
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _build_recent_loss_pits(self, lookback_days: int = 14) -> str:
+        """PM L3f memory: repeat failure modes from losing BUYs.
+
+        Reads `insights.buy_grades_json` for the last N days, pulls entries
+        with `grade="wrong"` and a non-null `loss_root_cause`, groups by
+        cause, keeps causes occurring ≥ 2 times. Output is prose PM renders
+        directly — lets it see "greed_top_chasing × 3 over 14 days"
+        BEFORE deciding today's sizing, not after another wrong entry.
+
+        Empty string when no repeat pattern — PM's L3f section then shows
+        a default "no recurring pits" note.
+        """
+        import json as _json
+        try:
+            rows = self.db.get_recent_insights(limit=lookback_days + 5)
+        except Exception as e:
+            logger.warning("recent_loss_pits: insights fetch failed: %s", e)
+            return ""
+        if not rows:
+            return ""
+        cause_symbols: dict[str, list[str]] = {}
+        cause_move: dict[str, list[float]] = {}
+        cause_refs: dict[str, list[str]] = {}
+        for row in rows[:lookback_days]:
+            raw = row.get("buy_grades_json")
+            if not raw:
+                continue
+            try:
+                items = _json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(items, list):
+                continue
+            for g in items:
+                if not isinstance(g, dict):
+                    continue
+                if g.get("grade") != "wrong":
+                    continue
+                cause = (g.get("loss_root_cause") or "").strip()
+                if not cause:
+                    continue
+                sym = (g.get("symbol") or "").strip().upper()
+                move = g.get("pct_move_since_buy")
+                ref = (g.get("missed_warning_ref") or "").strip()
+                if sym:
+                    cause_symbols.setdefault(cause, []).append(sym)
+                if isinstance(move, (int, float)):
+                    cause_move.setdefault(cause, []).append(float(move))
+                if ref:
+                    cause_refs.setdefault(cause, []).append(ref[:100])
+        repeats = [(c, len(cause_symbols.get(c, []))) for c in cause_symbols
+                   if len(cause_symbols.get(c, [])) >= 2]
+        if not repeats:
+            return ""
+        repeats.sort(key=lambda x: (-x[1], x[0]))
+        lines: list[str] = []
+        for cause, n in repeats[:4]:
+            syms = cause_symbols[cause]
+            moves = cause_move.get(cause, [])
+            detail_bits: list[str] = []
+            for i, s in enumerate(syms[:4]):
+                m = moves[i] if i < len(moves) else None
+                detail_bits.append(f"{s} ({m:+.1f}%)" if m is not None else s)
+            line = f"- {cause} × {n}: {', '.join(detail_bits)}"
+            refs = cause_refs.get(cause, [])
+            if refs and cause == "macro_warning_ignored":
+                line += f' — ignored: "{refs[0]}"'
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _build_missed_opportunities_digest(
+        self,
+        lookback_days: int = 5,
+        move_threshold_pct: float = 8.0,
+        top_n: int = 15,
+        top_movers_count: int = 15,
+        current_position_symbols: set[str] | None = None,
+    ) -> list:
+        """Notable movers we did NOT own — input for evening's missed-op review.
+
+        Symbol set = trading universe ∪ Alpaca top gainers. For each, compute
+        the `lookback_days` window return; keep those crossing
+        `move_threshold_pct` (absolute). Tag each with the signal state that
+        was visible at the time (prior TA rating, news headline, earnings
+        sentiment, macro sector stance) so the LLM's miss classification has
+        to cite observable evidence, not retro-rationalize price.
+
+        Returns a list[MissedOpportunitySnapshot]. Empty when no symbol
+        crosses the threshold. Sort order within the list:
+          (a) not-held, has prior signal — real "we saw it, didn't act" misses
+          (b) not-held, no prior signal — theme-coverage blindspots
+          (c) already held — context for decision-quality review
+        Within each group by |move_pct| descending. Top `top_n` only.
+        """
+        from src.models import MissedOpportunitySnapshot
+
+        universe = list(getattr(self.config.trading, "universe", []) or [])
+        universe_set = {s.upper() for s in universe if s}
+        try:
+            top_movers = self.broker.get_top_movers(n=top_movers_count) or []
+        except Exception as exc:
+            logger.warning("missed_ops: get_top_movers failed: %s", exc)
+            top_movers = []
+        top_mover_syms = {
+            str(m["symbol"]).upper() for m in top_movers
+            if isinstance(m, dict) and m.get("symbol")
+        }
+        all_syms = universe_set | top_mover_syms
+        if not all_syms:
+            return []
+
+        # Per-symbol window return. Pad lookback for weekends / gaps; if we
+        # can't get bars for a symbol, skip it quietly.
+        symbol_moves: dict[str, float] = {}
+        bars_pad = max(lookback_days + 3, 10)
+        for sym in all_syms:
+            try:
+                bars = self.market.get_ohlcv(sym, lookback_days=bars_pad)
+            except Exception:
+                continue
+            if not bars or len(bars) < 2:
+                continue
+            window = bars[-(lookback_days + 1):] if len(bars) > lookback_days else bars
+            if len(window) < 2:
+                continue
+            start_close = getattr(window[0], "close", 0) or 0
+            end_close = getattr(window[-1], "close", 0) or 0
+            if start_close <= 0:
+                continue
+            move_pct = (end_close - start_close) / start_close * 100.0
+            symbol_moves[sym] = round(move_pct, 2)
+
+        candidates = {
+            s: m for s, m in symbol_moves.items()
+            if abs(m) >= move_threshold_pct
+        }
+        if not candidates:
+            return []
+
+        # Pre-compute signal maps once (not per-symbol): cheap vs. re-running
+        # DB/file scans inside the loop.
+        held_set = self._missed_ops_held_set(
+            lookback_days, current_position_symbols or set()
+        )
+        tech_map = self._missed_ops_tech_signal(lookback_days)
+        news_map = self._missed_ops_news_signal(lookback_days)
+        theme_map = self._missed_ops_theme_tags(lookback_days)
+        earnings_map = self._missed_ops_earnings_signal()
+        macro_sector_map = self._missed_ops_macro_sector_map()
+
+        snapshots: list = []
+        for sym, move_pct in candidates.items():
+            if sym in universe_set and sym in top_mover_syms:
+                source = "both"
+            elif sym in top_mover_syms:
+                source = "top_mover"
+            else:
+                source = "universe"
+
+            ta_rating, ta_date = tech_map.get(sym, (None, None))
+            had_ta = ta_rating in ("buy", "strong_buy")
+            news_headline = news_map.get(sym)
+            earnings_signal = earnings_map.get(sym)
+
+            sector_stance = "unknown"
+            try:
+                from src.execution.broker import _get_sector
+                sector = _get_sector(sym) or ""
+            except Exception:
+                sector = ""
+            if sector and sector in macro_sector_map:
+                sector_stance = macro_sector_map[sector]
+
+            snapshots.append(MissedOpportunitySnapshot(
+                symbol=sym,
+                move_pct=move_pct,
+                window_days=lookback_days,
+                held_during_window=(sym in held_set),
+                had_ta_signal=had_ta,
+                had_news_signal=(news_headline is not None),
+                had_earnings_signal=(earnings_signal is not None),
+                source=source,
+                last_ta_rating=ta_rating,
+                last_ta_date=ta_date,
+                last_news_headline=news_headline,
+                theme_tags=theme_map.get(sym, [])[:4],
+                recent_earnings_signal=earnings_signal,
+                macro_sector_tailwind=sector_stance,  # type: ignore[arg-type]
+            ))
+
+        def _priority_key(s) -> tuple:
+            any_signal = s.had_ta_signal or s.had_news_signal or s.had_earnings_signal
+            if not s.held_during_window and any_signal:
+                group = 0
+            elif not s.held_during_window:
+                group = 1
+            else:
+                group = 2
+            return (group, -abs(s.move_pct))
+
+        snapshots.sort(key=_priority_key)
+        return snapshots[:top_n]
+
+    def _missed_ops_held_set(
+        self, lookback_days: int, current_position_symbols: set[str]
+    ) -> set[str]:
+        """Symbols we owned (or traded) within the window.
+
+        Union of (a) symbols currently open in ctx.positions and (b) symbols
+        with any executed trade in the last ~2×`lookback_days` calendar days
+        (accounts for weekends / holidays). Over-inclusive on purpose — better
+        to NOT flag a legitimate hold as "missed" than invent a miss from a
+        stale SELL earlier in the week.
+        """
+        from datetime import timedelta
+        held: set[str] = {s.upper() for s in current_position_symbols if s}
+        try:
+            rows = self.db.get_trades(limit=500, executed_only=True)
+        except Exception as exc:
+            logger.warning("missed_ops: get_trades failed: %s", exc)
+            return held
+        cutoff = et_today() - timedelta(days=lookback_days * 2 + 2)
+        cutoff_str = cutoff.isoformat()
+        for r in rows:
+            ts_date = (r.get("timestamp") or "")[:10]
+            if not ts_date or ts_date < cutoff_str:
+                continue
+            sym = (r.get("symbol") or "").upper()
+            if sym:
+                held.add(sym)
+        return held
+
+    def _missed_ops_tech_signal(
+        self, lookback_days: int
+    ) -> dict[str, tuple[str, str]]:
+        """Most recent TA rating per symbol in window → {symbol: (rating, date)}.
+
+        Walks recent tech_analyst agent_logs, parses the batch-output JSON,
+        takes the newest rating per symbol. `rating in ("buy","strong_buy")`
+        is what drives the `had_ta_signal` flag downstream.
+        """
+        import json as _json
+        from datetime import timedelta
+        try:
+            rows = self.db.get_recent_agent_outputs(
+                agent_name="tech_analyst", limit=lookback_days * 3,
+                before_date=None,
+            )
+        except Exception as exc:
+            logger.warning("missed_ops: tech_analyst logs fetch failed: %s", exc)
+            return {}
+        cutoff_str = (et_today() - timedelta(days=lookback_days * 2 + 2)).isoformat()
+        latest: dict[str, tuple[str, str]] = {}
+        for row in rows:
+            ts_date = (row.get("timestamp") or "")[:10]
+            if not ts_date or ts_date < cutoff_str:
+                continue
+            try:
+                data = _json.loads(row.get("full_response") or "{}")
+            except (_json.JSONDecodeError, TypeError):
+                continue
+            analyses = data.get("analyses") or []
+            if not isinstance(analyses, list):
+                continue
+            for a in analyses:
+                if not isinstance(a, dict):
+                    continue
+                sym = (a.get("symbol") or "").upper()
+                rating = a.get("rating")
+                if not sym or not rating:
+                    continue
+                if sym not in latest:  # newer rows first from get_recent_agent_outputs
+                    latest[sym] = (str(rating), ts_date)
+        return latest
+
+    def _missed_ops_news_signal(self, lookback_days: int) -> dict[str, str]:
+        """Most recent news headline touching each symbol in window.
+
+        Walks dated full_report.json files. For state_changes, harvests
+        (event-text, affected_symbols) pairs. For stock_news, takes the first
+        alert's headline. Newest day wins. Headlines clipped to 140 chars so
+        they don't blow the prompt budget.
+        """
+        import json as _json
+        from datetime import timedelta
+        from pathlib import Path
+        news_dir = getattr(self.news_store, "data_dir", None)
+        if news_dir is None:
+            return {}
+        out: dict[str, str] = {}
+        today = et_today()
+        # Iterate newest → oldest so first-seen wins (freshest headline per symbol).
+        for days_ago in range(lookback_days + 1):
+            day = today - timedelta(days=days_ago)
+            report_path = Path(news_dir) / str(day) / "full_report.json"
+            if not report_path.exists():
+                continue
+            try:
+                report = _json.loads(report_path.read_text())
+            except (_json.JSONDecodeError, OSError):
+                continue
+            for ch in report.get("state_changes", []) or []:
+                event = (ch.get("event") or "").strip()
+                if not event:
+                    continue
+                for sym in ch.get("affected_symbols", []) or []:
+                    sym_u = str(sym).upper()
+                    if sym_u and sym_u not in out:
+                        out[sym_u] = event[:140]
+            for sym, items in (report.get("stock_news") or {}).items():
+                sym_u = str(sym).upper()
+                if sym_u in out or not items:
+                    continue
+                first = items[0] if isinstance(items, list) else None
+                if isinstance(first, dict):
+                    headline = (first.get("headline") or "").strip()
+                    if headline:
+                        out[sym_u] = headline[:140]
+        return out
+
+    def _missed_ops_theme_tags(self, lookback_days: int) -> dict[str, list[str]]:
+        """Rough theme proxies per symbol from recent state_change event text.
+
+        Extracts the first 1-2 meaningful tokens from each event and tags the
+        affected symbols with them. Not a semantic classifier — the LLM
+        refines to one canonical theme name in `MissedOpportunity.theme_if_any`.
+        Purpose here is surface pattern co-occurrence ("AVGO: ai-capex, compute")
+        so the LLM can spot the theme instead of treating each headline
+        in isolation.
+        """
+        import json as _json
+        import re
+        from datetime import timedelta
+        from pathlib import Path
+        news_dir = getattr(self.news_store, "data_dir", None)
+        if news_dir is None:
+            return {}
+        out: dict[str, list[str]] = {}
+        stopwords = {
+            "this", "that", "with", "from", "into", "than", "will", "would",
+            "should", "could", "about", "against", "between", "report",
+        }
+        today = et_today()
+        for days_ago in range(lookback_days + 1):
+            day = today - timedelta(days=days_ago)
+            report_path = Path(news_dir) / str(day) / "full_report.json"
+            if not report_path.exists():
+                continue
+            try:
+                report = _json.loads(report_path.read_text())
+            except (_json.JSONDecodeError, OSError):
+                continue
+            for ch in report.get("state_changes", []) or []:
+                event = (ch.get("event") or "").strip()
+                tokens = [
+                    t.lower() for t in re.findall(r"[A-Za-z]{4,}", event)
+                    if t.lower() not in stopwords
+                ]
+                if not tokens:
+                    continue
+                tag = "-".join(tokens[:2])
+                for sym in ch.get("affected_symbols", []) or []:
+                    sym_u = str(sym).upper()
+                    if not sym_u:
+                        continue
+                    bucket = out.setdefault(sym_u, [])
+                    if tag not in bucket and len(bucket) < 4:
+                        bucket.append(tag)
+        return out
+
+    def _missed_ops_earnings_signal(self) -> dict[str, str]:
+        """Most recent non-bearish earnings take per symbol from on-disk cache.
+
+        Walks earnings_provider.manifest, skips abandoned entries, reads each
+        analysis file's head (first 600 chars) and passes any entry whose
+        head text contains no "bearish" token. Returns {symbol: snippet} where
+        snippet is a clipped first-sentence-ish summary the LLM can cite as
+        evidence for `fundamentals_mispricing` classification.
+        """
+        try:
+            manifest = getattr(self.earnings_provider, "manifest", {}) or {}
+        except Exception:
+            return {}
+        from pathlib import Path
+        out: dict[str, str] = {}
+        for key, entry in manifest.items():
+            if not isinstance(entry, dict) or entry.get("abandoned"):
+                continue
+            analysis_path = entry.get("analysis_path")
+            if not analysis_path:
+                continue
+            p = Path(analysis_path)
+            if not p.exists():
+                continue
+            try:
+                text = p.read_text()
+            except OSError:
+                continue
+            head = text[:600]
+            if "bearish" in head.lower():
+                continue
+            symbol = str(key).split("_")[0].upper()
+            snippet = head.replace("\n", " ").strip()[:140]
+            if snippet:
+                out[symbol] = snippet
+        return out
+
+    def _missed_ops_macro_sector_map(self) -> dict[str, str]:
+        """Latest macro sector stance: {sector: bullish|neutral|bearish}.
+
+        Reads macro_store.load_last_state() — persisted at the end of each
+        morning macro run. Missing keys / stances → empty dict, snapshot
+        defaults to "unknown" for each symbol, which is itself a signal (if
+        macro never covers a whole sector we rally through, that's a
+        coverage blindspot the quarterly meta-reflector should notice).
+        """
+        try:
+            state = self.macro_store.load_last_state() or {}
+        except Exception as exc:
+            logger.warning("missed_ops: macro_store load failed: %s", exc)
+            return {}
+        guidance = state.get("sector_guidance") or {}
+        if not isinstance(guidance, dict):
+            return {}
+        out: dict[str, str] = {}
+        for sector, stance in guidance.items():
+            if (isinstance(stance, str)
+                    and stance in ("bullish", "neutral", "bearish")):
+                out[str(sector)] = stance
+        return out
 
     @staticmethod
     def _actualize_trade_row(row: dict) -> dict:
@@ -2429,11 +2990,7 @@ class TradingPipeline:
         # immediately. This keeps the deterministic safety path alive even when
         # the reviewer model/provider is unavailable.
         daily_pnl = total_value - last_equity
-        risk_engine = getattr(self, "risk_engine", None)
-        loss_violation = (
-            risk_engine.check_daily_loss(last_equity, daily_pnl)
-            if risk_engine is not None else None
-        )
+        loss_violation = self.risk_engine.check_daily_loss(last_equity, daily_pnl)
         if loss_violation and positions:
             logger.warning(
                 "%s risk alert before LLM review: %s — bypassing reviewer and force-closing all positions",
@@ -2567,10 +3124,7 @@ class TradingPipeline:
             # Risk check: if daily loss limit breached, force-sell all. Else:
             # dispatch the LLM's per-position action list.
             daily_pnl = total_value - last_equity
-            loss_violation = (
-                risk_engine.check_daily_loss(last_equity, daily_pnl)
-                if risk_engine is not None else None
-            )
+            loss_violation = self.risk_engine.check_daily_loss(last_equity, daily_pnl)
             if loss_violation:
                 orders.extend(self._midday_emergency_liquidate(
                     positions, loss_violation, run_id,
@@ -2878,6 +3432,19 @@ class TradingPipeline:
         weekly_narrative = self._build_weekly_narrative()
         active_state_changes = self._build_active_state_changes()
 
+        # Phase-1 evening-upgrade: deterministic "what did we miss" digest.
+        # Python pre-computes the signal-state context so the LLM's classification
+        # has to cite observable evidence rather than retro-rationalize price.
+        held_set = {p.symbol for p in positions}
+        try:
+            missed_ops_snapshots = self._build_missed_opportunities_digest(
+                lookback_days=5, move_threshold_pct=8.0, top_n=15,
+                current_position_symbols=held_set,
+            )
+        except Exception as e:
+            logger.warning("missed_ops digest failed (proceeding without it): %s", e)
+            missed_ops_snapshots = []
+
         analysis = None
         analysis_error = False
         try:
@@ -2896,6 +3463,7 @@ class TradingPipeline:
                 weekly_narrative=weekly_narrative,
                 active_state_changes=active_state_changes,
                 outlook_calibration=outlook_calibration,
+                missed_ops_snapshots=missed_ops_snapshots,
             )
         except Exception as e:
             from src.agents.base import AgentResult
@@ -2943,6 +3511,10 @@ class TradingPipeline:
                 # can aggregate counts into its "lean patient" bias.
                 sell_grades=analysis.sell_grades,
                 buy_grades=analysis.buy_grades,
+                # Phase-1 upgrade: per-day missed opportunities feed PM's L3d
+                # memory next morning and the quarterly meta-reflector's
+                # theme_coverage_report.
+                missed_opportunities=analysis.missed_opportunities,
             )
         else:
             # LLM failed — keep at least the P&L number for daily audit.
