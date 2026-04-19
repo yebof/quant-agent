@@ -1087,9 +1087,12 @@ class QuarterlyMetaReflection(BaseModel):
     period: str
     """e.g. '2026-Q1' — matches the digest's period label."""
     meta_reasoning_chain: MetaReasoningChain
-    style_self_portrait: str = Field(min_length=100)
-    """Multi-sentence honest self-description for ongoing audit. Min-length
-    guards against a one-word 'style assessment' that adds no value."""
+    style_self_portrait: str = Field(default="", max_length=2000)
+    """Multi-sentence honest self-description for ongoing audit. Optional:
+    `meta_reasoning_chain.style_bias_identification` carries the same
+    content as part of the CoT, so some LLM outputs legitimately leave
+    this top-level field empty rather than duplicating. When non-empty
+    it's useful for downstream continuity rendering."""
     persistent_blindspots: list[str] = Field(default_factory=list, max_length=5)
     root_cause_hypotheses: list[str] = Field(default_factory=list, max_length=5)
     theme_coverage_report: ThemeCoverage

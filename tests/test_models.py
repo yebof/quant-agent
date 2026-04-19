@@ -530,15 +530,40 @@ def test_quarterly_meta_reflection_composes_and_caps_learnings():
         )
 
 
-def test_quarterly_meta_reflection_style_self_portrait_non_trivial():
-    """style_self_portrait min_length=100 — one-word portraits fail."""
+def test_quarterly_meta_reflection_style_self_portrait_optional():
+    """style_self_portrait is optional — when the LLM's
+    `meta_reasoning_chain.style_bias_identification` carries the same
+    content, leaving the top-level field empty is acceptable (avoids
+    duplication). max_length caps it so a runaway portrait can't
+    dominate the prompt budget."""
     from src.models import QuarterlyMetaReflection
 
+    # Empty is OK
+    rep_empty = QuarterlyMetaReflection(
+        period="2026-Q1",
+        meta_reasoning_chain=_valid_meta_chain(),
+        theme_coverage_report=_valid_theme_coverage(),
+        loss_pattern_report=_valid_loss_report(),
+        # style_self_portrait omitted → defaults to ""
+    )
+    assert rep_empty.style_self_portrait == ""
+
+    # Populated is OK
+    rep_full = QuarterlyMetaReflection(
+        period="2026-Q1",
+        meta_reasoning_chain=_valid_meta_chain(),
+        style_self_portrait="We are currently trend-followers.",
+        theme_coverage_report=_valid_theme_coverage(),
+        loss_pattern_report=_valid_loss_report(),
+    )
+    assert "trend-followers" in rep_full.style_self_portrait
+
+    # Over max_length rejected
     with pytest.raises(ValidationError):
         QuarterlyMetaReflection(
             period="2026-Q1",
             meta_reasoning_chain=_valid_meta_chain(),
-            style_self_portrait="short",   # too short
+            style_self_portrait="x" * 3000,  # blows max_length=2000
             theme_coverage_report=_valid_theme_coverage(),
             loss_pattern_report=_valid_loss_report(),
         )

@@ -525,6 +525,35 @@ def _iter_agent_logs_in_window(
         yield row, data
 
 
+def _tech_analyses_from_data(data) -> list[dict]:
+    """Normalize tech_analyst full_response across historical shape drift.
+
+    Production has emitted at least two JSON shapes for the batch call:
+      - DICT wrapper:  ``{"analyses": [...]}``  (expected)
+      - BARE LIST:     ``[{"symbol": ...}, ...]`` (observed on 2026-04-19
+        tech_analyst logs — 60 items, one per universe symbol)
+
+    Also tolerates a symbol-keyed dict shape ``{"NVDA": {...}, "MSFT": {...}}``
+    as a cheap belt against future drift. Returns a flat list of dicts
+    with at minimum ``symbol`` + ``rating`` keys filled in.
+    """
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        nested = data.get("analyses")
+        if isinstance(nested, list):
+            return [x for x in nested if isinstance(x, dict)]
+        # Symbol-keyed dict: convert to flat list injecting the key as symbol.
+        if data and all(isinstance(v, dict) for v in data.values()):
+            out: list[dict] = []
+            for sym, stats in data.items():
+                if isinstance(stats, dict):
+                    merged = {"symbol": sym, **stats}
+                    out.append(merged)
+            return out
+    return []
+
+
 def _count_tech_signals(
     db: "Database", period_start: date, period_end: date
 ) -> dict:
@@ -533,9 +562,7 @@ def _count_tech_signals(
     for _, data in _iter_agent_logs_in_window(
         db, "tech_analyst", period_start, period_end, limit_hint=500,
     ):
-        for a in (data.get("analyses") or []):
-            if not isinstance(a, dict):
-                continue
+        for a in _tech_analyses_from_data(data):
             rating = (a.get("rating") or "").strip()
             if rating:
                 counts[rating] += 1
@@ -563,6 +590,8 @@ def _count_news_signals(
     for _, data in _iter_agent_logs_in_window(
         db, "news_analyst", period_start, period_end,
     ):
+        if not isinstance(data, dict):
+            continue
         sentiment = (data.get("market_sentiment") or "").strip()
         if sentiment == "bullish":
             n_bullish += 1
@@ -596,6 +625,8 @@ def _count_macro_signals(
     for _, data in _iter_agent_logs_in_window(
         db, "macro_analyst", period_start, period_end,
     ):
+        if not isinstance(data, dict):
+            continue
         regime = (data.get("regime") or "").strip()
         outlook = (data.get("equity_outlook") or "").strip()
         if regime:
@@ -620,6 +651,8 @@ def _count_earnings_signals(
     for _, data in _iter_agent_logs_in_window(
         db, "earnings_analyst", period_start, period_end, limit_hint=200,
     ):
+        if not isinstance(data, dict):
+            continue
         impl = data.get("investment_implications") or {}
         sentiment = (impl.get("sentiment") or "").strip()
         if sentiment:
@@ -644,6 +677,8 @@ def _count_pm_signals(
     for _, data in _iter_agent_logs_in_window(
         db, "portfolio_manager", period_start, period_end,
     ):
+        if not isinstance(data, dict):
+            continue
         n_sessions += 1
         targets = data.get("targets") or []
         decisions = data.get("decisions") or []
@@ -674,6 +709,8 @@ def _count_rm_signals(
     for _, data in _iter_agent_logs_in_window(
         db, "risk_manager", period_start, period_end,
     ):
+        if not isinstance(data, dict):
+            continue
         if data.get("approved") is True:
             n_approved += 1
         elif data.get("approved") is False:
