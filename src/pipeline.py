@@ -4272,31 +4272,44 @@ class TradingPipeline:
         )
 
         # 2. Meta-reflector LLM — observe-only in PR3 (no prompt edits).
+        # analyze() can raise on provider/network failures after retries. The
+        # digest has already been persisted so we must degrade to the
+        # digest_only path rather than let the exception abort the run
+        # (operators lose the audit / status payload otherwise).
         prev_reflection = load_previous_reflection(today, root_dir=evolution_root)
-        reflection, ev_result = self.meta_reflector.analyze(
-            digest=digest, prev_reflection=prev_reflection,
-        )
-
-        # Always log the agent's raw output for audit, even on failure.
+        reflection = None
+        ev_result = None
         try:
-            self.db.insert_agent_log(
-                agent_name="meta_reflector",
-                run_id=f"meta-{digest['period']}",
-                input_summary=(
-                    f"{digest['period']} · "
-                    f"alpha={(digest.get('period_performance') or {}).get('alpha_vs_spy_pct')}"
-                ),
-                input_message=ev_result.user_message,
-                output_summary=(
-                    reflection.style_self_portrait[:200]
-                    if reflection else "parse_error"
-                ),
-                full_response=ev_result.raw_text,
-                model=self.config.llm.meta_reflector_model,
-                tokens_used=ev_result.tokens_used,
+            reflection, ev_result = self.meta_reflector.analyze(
+                digest=digest, prev_reflection=prev_reflection,
             )
         except Exception as exc:
-            logger.warning("meta_reflector agent_log insert failed: %s", exc)
+            logger.error(
+                "meta_reflector.analyze raised; falling back to digest_only: %s",
+                exc, exc_info=True,
+            )
+
+        # Always log the agent's raw output for audit, even on failure.
+        if ev_result is not None:
+            try:
+                self.db.insert_agent_log(
+                    agent_name="meta_reflector",
+                    run_id=f"meta-{digest['period']}",
+                    input_summary=(
+                        f"{digest['period']} · "
+                        f"alpha={(digest.get('period_performance') or {}).get('alpha_vs_spy_pct')}"
+                    ),
+                    input_message=ev_result.user_message,
+                    output_summary=(
+                        reflection.style_self_portrait[:200]
+                        if reflection else "parse_error"
+                    ),
+                    full_response=ev_result.raw_text,
+                    model=self.config.llm.meta_reflector_model,
+                    tokens_used=ev_result.tokens_used,
+                )
+            except Exception as exc:
+                logger.warning("meta_reflector agent_log insert failed: %s", exc)
 
         if reflection is None:
             logger.error("Meta-reflector returned no valid reflection; "
