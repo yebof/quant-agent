@@ -205,10 +205,26 @@ def main():
     agent = EveningAnalystAgent(api_key=api_key, model=model, max_tokens=max_tokens)
     _orig_prop = type(agent).system_prompt
     type(agent).system_prompt = property(lambda self: prompt_text)
+
+    # analyze() can raise on provider/network failure after retries. We still
+    # persist a failure artifact so batch replays / sweeps don't lose the
+    # record — operators need to see which (prompt, date) tuples crashed and
+    # how, not just silently missing files.
+    report = None
+    result = None
+    replay_error: dict | None = None
     try:
-        report, result = agent.analyze(**kwargs)
-    finally:
-        type(agent).system_prompt = _orig_prop
+        try:
+            report, result = agent.analyze(**kwargs)
+        finally:
+            type(agent).system_prompt = _orig_prop
+    except Exception as exc:
+        import traceback as _tb
+        replay_error = {
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "traceback_tail": "".join(_tb.format_exception(exc))[-2000:],
+        }
 
     tag = args.tag or prompt_path.stem
     out_dir = Path(args.output_dir) / args.date
@@ -226,6 +242,7 @@ def main():
         "raw_response": result.raw_text if result else None,
         "tokens_used": result.tokens_used if result else 0,
         "input_tokens": None,  # AgentResult doesn't split; leaving None
+        "error": replay_error,
     }
     tmp = out_file.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(record, indent=2, ensure_ascii=False))
@@ -237,6 +254,10 @@ def main():
               f"{len(report.missed_opportunities)} missed_ops + "
               f"{len(report.sell_grades)} sell_grades + "
               f"{len(report.buy_grades)} buy_grades")
+    elif replay_error:
+        print(f"  ERROR: {replay_error['error_type']}: {replay_error['message']}")
+        # Non-zero exit so batch runners (shell loops / CI) notice.
+        sys.exit(2)
     else:
         print("  WARNING: candidate prompt produced an invalid / unparseable "
               "EveningReport. Check raw_response field for details.")

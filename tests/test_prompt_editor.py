@@ -524,6 +524,28 @@ def test_git_auto_commit_swallows_subprocess_failure(tmp_path):
     assert report.git_commit is None
 
 
+def test_git_auto_commit_swallows_text_mode_stderr(tmp_path):
+    """Regression: commit / rev-parse run with text=True, so a
+    CalledProcessError carries stderr as str. The error path must not
+    call .decode() on it — doing so turned a graceful fallback into an
+    AttributeError crash whenever git rejected the commit (e.g. pre-commit
+    hook failure or 'nothing to commit')."""
+    editor = _mk_editor(tmp_path, auto_commit=True)
+    (tmp_path / ".git").mkdir()
+    editor.prompts_dir = tmp_path / "prompts"
+    _seed_prompt(editor.prompts_dir, "tech_analyst", "# x\n")
+
+    reflection = _mk_reflection("2026-Q1", [_basic_learning()])
+    import subprocess as _sp
+    # str stderr — what text=True actually produces.
+    with patch("subprocess.run", side_effect=_sp.CalledProcessError(
+        returncode=1, cmd=["git"], stderr="pre-commit hook rejected",
+    )):
+        report = editor.apply_reflection(reflection)
+    assert len(report.applied) == 1
+    assert report.git_commit is None
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------

@@ -480,6 +480,23 @@ def test_run_quarterly_meta_returns_digest_only_when_llm_fails(tmp_path):
     assert result["reflection_path"] is None
 
 
+def test_run_quarterly_meta_returns_digest_only_when_analyze_raises(tmp_path):
+    """Regression: meta_reflector.analyze() can raise on provider/network
+    failure after retries. The digest has already been persisted, so the
+    exception must NOT abort the run — we need the digest_only fallback
+    (plus the audit path) just like when analyze() returns None."""
+    p = _pipeline_for_meta(tmp_path)
+    p.broker.is_last_trading_day_of_quarter.return_value = True
+    p.meta_reflector.analyze.side_effect = RuntimeError("provider 503 after 3 retries")
+
+    result = p.run_quarterly_meta_reflection(
+        period_end=date(2026, 3, 31), evolution_root=str(tmp_path),
+    )
+    assert result["status"] == "digest_only"
+    assert Path(result["digest_path"]).exists()
+    assert result["reflection_path"] is None
+
+
 def test_run_quarterly_meta_loads_prior_digest_for_corrigibility(tmp_path):
     """When a prev-quarter digest.json exists, the helper passes its content
     into build_quarterly_digest so corrigibility_trend populates."""
