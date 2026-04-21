@@ -266,7 +266,7 @@ def test_missed_opportunity_lesson_length_bounded():
     with pytest.raises(ValidationError):
         MissedOpportunity(
             symbol="VST", move_pct=10, miss_category="noise_rally",
-            lesson="x" * 500,  # over 240 chars rejected
+            lesson="x" * 500,  # over 400 chars rejected
         )
 
 
