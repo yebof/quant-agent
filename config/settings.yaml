@@ -161,11 +161,14 @@ storage:
 evolution:
   # Quarterly meta-reflection can auto-append "Learnings" bullets to the six
   # non-discipline prompts (tech / news / macro / earnings / portfolio_manager
-  # / evening_analyst). `enabled=false` keeps the editor dormant — the
-  # reflector still writes reflection.json for manual review, but no prompt
-  # file is touched. Flip to true only after eyeballing a quarter of LLM
-  # outputs and being satisfied with the proposal quality.
-  enabled: false
+  # / evening_analyst). When enabled, PromptEditor applies reflection.json
+  # proposals at end-of-quarter; risk_manager + position_reviewer are
+  # protected (MetaReflectionAgentName schema literal rejects them). Four
+  # belts still enforce: FIFO cap per agent, Jaccard dedup against existing
+  # Learnings, prohibited-word regex, and git auto-commit (revert <hash>
+  # rolls back a whole quarter). Flip back to false any time — already-
+  # applied learnings stay put; use the retract path to remove specifics.
+  enabled: true
   auto_commit: true
   max_agents_per_cycle: 3
   max_learnings_per_agent: 10
