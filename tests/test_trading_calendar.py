@@ -76,12 +76,30 @@ def test_is_weekday_weekday_vs_weekend():
         ("morning",             570, 720),
         ("intra_check",         570, 960),
         ("midday",              780, 870),
-        ("close",               930, 955),
+        ("close",               930, 960),
         ("evening",            1200, 1320),
     ],
 )
 def test_session_windows_cover_documented_ranges(mode, lo_min, hi_min):
     assert SESSION_WINDOWS[mode] == (lo_min, hi_min)
+
+
+def test_every_session_window_is_at_least_launchd_tick_wide():
+    """Regression: 2026-04-23/24 close session (then 25min wide) silently
+    missed two days because launchd StartInterval=1800s (30min) ticks
+    could land on both sides of the narrow window depending on phase
+    (e.g. 15:28 + 15:58 → never inside 15:30-15:55).
+
+    Rule: every window MUST be ≥ 30 minutes so at least one tick always
+    lands inside, regardless of when launchd loaded the plist.
+    """
+    LAUNCHD_TICK_MIN = 30
+    for mode, (lo, hi) in SESSION_WINDOWS.items():
+        width = hi - lo
+        assert width >= LAUNCHD_TICK_MIN, (
+            f"{mode} window is {width}min wide (<{LAUNCHD_TICK_MIN}min); "
+            f"launchd 30-min ticks can miss it entirely on unlucky phase"
+        )
 
 
 def _et_dt(y, m, d, hh, mm) -> datetime:
