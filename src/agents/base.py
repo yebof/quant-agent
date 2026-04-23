@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -8,6 +9,26 @@ logger = logging.getLogger(__name__)
 
 # Model prefixes that route to OpenAI
 _OPENAI_PREFIXES = ("gpt-", "o1-", "o3-", "o4-")
+
+# Retry budget for a single LLM call — exponential backoff 2**attempt means
+# N=5 yields a total wait of 1+2+4+8+16 = 31s, enough to ride through a
+# typical macOS DNS hiccup (~10-20s) or a provider blip. Prior N=3 only
+# bought 7s, which let 2026-04-23 morning die when DNS was out ~15s.
+# Overridable via QUANT_AGENT_MAX_RETRIES for tests / harder retries.
+_DEFAULT_MAX_RETRIES = 5
+
+
+def _max_retries() -> int:
+    """Read at call time so tests can monkeypatch the env var per case
+    without reloading the module."""
+    raw = os.environ.get("QUANT_AGENT_MAX_RETRIES")
+    if raw is None:
+        return _DEFAULT_MAX_RETRIES
+    try:
+        n = int(raw)
+    except ValueError:
+        return _DEFAULT_MAX_RETRIES
+    return max(1, n)
 
 
 def _is_openai_model(model: str) -> bool:
@@ -133,8 +154,8 @@ class BaseAgent(ABC):
         logger.info("Agent %s running with model %s", self.name, self.model)
         logger.info("Agent %s input:\n%s", self.name, user_message)
 
-        last_exc = None
-        for attempt in range(3):
+        max_retries = _max_retries()
+        for attempt in range(max_retries):
             try:
                 if self._use_openai:
                     raw_text, input_tokens, output_tokens = self._call_openai(user_message)
@@ -142,14 +163,17 @@ class BaseAgent(ABC):
                     raw_text, input_tokens, output_tokens = self._call_anthropic(user_message)
                 break
             except Exception as e:
-                last_exc = e
+                # Last attempt: re-raise immediately — sleeping then giving
+                # up wastes the final backoff on nothing.
+                if attempt == max_retries - 1:
+                    logger.warning("Agent %s attempt %d failed: %s. Giving up.",
+                                   self.name, attempt + 1, e)
+                    raise
                 wait = 2 ** attempt
                 logger.warning("Agent %s attempt %d failed: %s. Retrying in %ds...",
                                self.name, attempt + 1, e, wait)
                 import time
                 time.sleep(wait)
-        else:
-            raise last_exc
 
         tokens = input_tokens + output_tokens
         logger.info("Agent %s completed, input_tokens: %d, output_tokens: %d, total: %d",
