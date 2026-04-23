@@ -45,14 +45,14 @@ fi
 # morning            : 09:30-12:00 ET (pre-market / early session, wide for late-wake grace)
 # intra_check        : 09:30-16:00 ET (flash-crash circuit breaker, fires every 30min tick; NOT subject to once-per-day guard — stateless, all actions idempotent)
 # midday             : 13:00-14:30 ET (position reviewer, afternoon patience)
-# close              : 15:30-15:55 ET (position reviewer, act-on-trigger before overnight)
+# close              : 15:30-16:00 ET (position reviewer, act-on-trigger before overnight; 30min width so launchd StartInterval=1800 always lands one tick inside regardless of phase)
 # evening            : 20:00-22:00 ET (post-market, insights written before next morning)
 case "$MODE" in
     earnings_preprocess) LO=480; HI=555  ;;
     morning)             LO=570; HI=720  ;;
     intra_check)         LO=570; HI=960  ;;
     midday)              LO=780; HI=870  ;;
-    close)               LO=930; HI=955  ;;
+    close)               LO=930; HI=960  ;;
     evening)             LO=1200; HI=1320 ;;
     *) echo "unknown mode: $MODE" >&2; exit 2 ;;
 esac

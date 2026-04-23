@@ -207,7 +207,7 @@ Automated via macOS launchd — plist files in `~/Library/LaunchAgents/com.quant
 - `morning` 09:30-12:00 ET — research + trading
 - `intra_check` 09:30-16:00 ET — every 30min tick; stateless circuit-breaker (no LLM)
 - `midday` 13:00-14:30 ET — position review + real trailing stops (patient disposition)
-- `close` 15:30-15:55 ET — position review (act-on-trigger; final 25min gate)
+- `close` 15:30-16:00 ET — position review (act-on-trigger; window ≥ launchd 30min tick so it never misses)
 - `evening` 20:00-22:00 ET — daily P&L + insights for next morning
 
 ## Trading Universe

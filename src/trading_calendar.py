@@ -40,7 +40,7 @@ SESSION_WINDOWS: dict[str, tuple[int, int]] = {
     "morning":             (570, 720),   # 09:30 - 12:00 ET
     "intra_check":         (570, 960),   # 09:30 - 16:00 ET  (P&L circuit-breaker, no LLM, every 30min tick; NOT subject to once-per-day guard)
     "midday":              (780, 870),   # 13:00 - 14:30 ET  (position reviewer, patient)
-    "close":               (930, 955),   # 15:30 - 15:55 ET  (position reviewer, act-on-trigger)
+    "close":               (930, 960),   # 15:30 - 16:00 ET  (position reviewer, act-on-trigger; 30min width guarantees a 30-min launchd tick lands inside regardless of phase)
     "evening":             (1200, 1320), # 20:00 - 22:00 ET  (reporting only)
 }
 
