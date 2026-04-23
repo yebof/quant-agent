@@ -164,6 +164,31 @@ EOF
 
 2. Edit `config/settings.yaml` — models per agent, risk parameters, trading universe, schedule
 
+### Optional env vars
+
+- `QUANT_AGENT_MAX_RETRIES` (default `5`) — base agent LLM-call retry budget; total exponential backoff is 1+2+4+8+16 = 31s. Raised from 3 after a 2026-04-23 DNS hiccup killed a morning session. Drop to 2-3 for faster tests; raise to 6+ if running on flaky networks.
+
+### macOS Sequoia setup (launchd automation only)
+
+If you deploy via `scripts/install_plists.sh` so the 6 sessions fire on schedule, macOS Sequoia has two extra hurdles that are easy to miss:
+
+1. **Full Disk Access for `/bin/bash`** — System Settings → Privacy & Security → Full Disk Access → `+` → ⌘+Shift+G → `/bin/bash` → enable. Without this, launchd-spawned bash can't read `.env` or the project files in `~/Documents/`. Symptom: `Operation not permitted` (errno 8) flooding `logs/launchd_*.log`.
+
+2. **Plugged-in power on trading nights** — if the laptop hibernates (critical battery), launchd's `StartInterval` jobs don't fire and you'll lose the session. For evening runs specifically, `sudo pmset -c sleep 0` keeps the Mac awake on AC.
+
+If you only use the CLI modes (`python main.py --mode morning` etc.), neither applies.
+
+### Quarterly prompt auto-evolution
+
+Set `evolution.enabled: true` in `config/settings.yaml` (default is `false`) to let the meta-reflector **write to prompt files** at end-of-quarter:
+
+- Runs only when you invoke `python main.py --mode meta` (launchd doesn't schedule this — it's a manual trigger on the last trading day of each quarter)
+- Appends proposed Learnings bullets to the 6 editable agent prompts (tech / news / macro / earnings / portfolio_manager / evening_analyst)
+- **`risk_manager` and `position_reviewer` are schema-protected** — the `MetaReflectionAgentName` literal in `src/models.py` doesn't include them, so even with `enabled: true` the reflector can't touch them
+- Four belts enforce safety: FIFO cap (10 Learnings per agent, oldest auto-evicted), Jaccard dedup (0.6 threshold), prohibited-words regex (never/always/override/ignore all), and `auto_commit: true` so each quarter's edits land as one `chore(prompts):` commit — `git revert <sha>` is your one-shot rollback
+
+Keep `enabled: false` until you've eyeballed at least one quarterly `reflection.json` under `data/evolution/{period}/` and are comfortable with proposal quality.
+
 ## Usage
 
 ```bash

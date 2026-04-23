@@ -57,10 +57,16 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 - `broker.submit_order` 提交前 `_quantize_price()` 按 Alpaca tick 归整（≥$1 → 0.01、<$1 → 0.0001）——防 sub-penny reject（2026-04-17 UPS 事故）
 - 预处理 LLM 分析失败调 `record_failure()`；连 3 次失败就 abandon + 标 `abandoned=True`，不再重分析——防 LLM 失败循环烧 token
 - **macOS Sequoia launchd + `com.apple.provenance`**：plist 的 `ProgramArguments` **必须**以 `/bin/bash` 开头，后面把 wrapper 作为参数传（不能直接 exec wrapper）。launchd 只 exec 系统 binary `/bin/bash`，provenance 不会挡；bash 读 wrapper 当文本源走，provenance 也不管。配套 `scripts/install_plists.sh` 会一键重写 + reload，编辑 wrapper 后务必重跑（2026-04-17 周五事故，launchd 5 个 job 全 exit 126 + 没跑）
+- **macOS TCC / Full Disk Access**：launchd 派生的 bash 默认没权限读 `~/Documents/` 下的文件。wrapper 通过 `install_plists.sh` 装到 `~/Library/Application Support/quant-agent/` 绕开第一层；但 wrapper 仍要 `source ${PROJECT_ROOT}/.env` 和执行 `~/Documents/.../main.py` 及其 src/ config/ data/ 读取——这些都在 Documents 保护目录里。解法：**System Settings → Privacy & Security → Full Disk Access → `+` → ⌘+Shift+G → `/bin/bash` → 开启**。不加这个，launchd 日志会反复看到 `Operation not permitted`（errno 8）并且 session 全部哑火（2026-04-20 周一事故）
+- **Mac hibernate 丢 session**：电池低时 macOS 进 hibernate，launchd 的 StartInterval 任务不触发。若交易日晚上笔记本掉电 hibernate 到 evening 窗口之后，当晚 evening 不跑 → 没生成 insights → 次日 PM 缺衔接信号。交易日建议插电 + `sudo pmset -c sleep 0`，或手工 `python main.py --mode evening` 补跑（evening 窗外也能跑，但记得它不经 wrapper 所以不更新 `~/.cache/quant-agent/last-evening`）（2026-04-21 周二事故）
 
 ## 开发规范
 
 - Python 3.11+、依赖在 pyproject.toml
 - LLM agent 改动后：改 `config/prompts/*.md` 的 rule + 对应 `src/agents/*.py` 的 build_user_message，然后加 test（在 `tests/test_*.py`）
 - 任何进 trades / positions 表的写入必须先过 `_order_accepted()`
+- **Env vars（可选调节）**：
+  - `QUANT_AGENT_MAX_RETRIES` — base agent LLM 调用重试次数（默认 5，总退避 1+2+4+8+16=31s）。2026-04-23 DNS 抖动事件之后从 3 升到 5，想更严格或测试用可以覆盖
+  - `.env` 的必需项：`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` / `FRED_API_KEY`
+- **长期反思（quarterly auto-evolution）**：`evolution.enabled=true` 时，每季末 `--mode meta` 会让 `PromptEditor` 按 `reflection.json` 的提案真实写入 6 个 editable agent 的 prompt 文件的 `## Learnings (system-evolved)` 段。`risk_manager` + `position_reviewer` 被 `MetaReflectionAgentName` schema literal 硬挡，`evolution.enabled=true` 也改不了。4 层护栏：FIFO cap / Jaccard dedup / prohibited-words regex / git auto-commit（`git revert <sha>` 一条命令整季回滚）
 - **记忆**：我的长期偏好 / 决策背景见 `~/.claude/projects/-Users-yebof-Documents-Claude-workspace-quant-agent/memory/`
