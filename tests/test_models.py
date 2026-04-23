@@ -769,6 +769,42 @@ def test_loss_pattern_example_trades_bounded():
         )
 
 
+def test_loss_pattern_proposed_guard_cap_matches_lesson():
+    """proposed_guard and MissedOpportunity.lesson are the two places the
+    meta-reflector / evening LLM writes evidence-heavy prose (symbols,
+    dates, pct moves, valuation metrics). The 240-char cap was too tight
+    and caused evening to crash on 2026-04-22; bump to 400 matches
+    MissedOpportunity.lesson so neither field ambushes the other."""
+    from src.models import LossPattern
+
+    # ~390 chars — well above old 240 cap, within new 400 cap.
+    guard_390 = (
+        "When recent_pnl_move falls below -8% within 3 sessions AND "
+        "macro_regime flips to risk-off OR transitional AND VIX > 22, "
+        "reduce new BUY allocation_pct by 40%. This pattern hit 5 times "
+        "in 2026-Q2 across NVDA / AVGO / MU, each losing 12-18%, always "
+        "with same signature: tech_analyst bullish on momentum but "
+        "ignoring macro / vol context. Rule: macro veto wins on conflict."
+    )
+    assert len(guard_390) > 240 and len(guard_390) <= 400
+    lp = LossPattern(
+        root_cause="greed_top_chasing", occurrences=5, total_loss_pct=-72.0,
+        example_trades=["NVDA 2026-05-01 -13%", "AVGO 2026-05-08 -15%"],
+        attributable_agent="portfolio_manager",
+        proposed_guard=guard_390,
+    )
+    assert lp.proposed_guard.startswith("When recent_pnl_move")
+
+    # Over 400 still rejected.
+    with pytest.raises(ValidationError):
+        LossPattern(
+            root_cause="greed_top_chasing", occurrences=5, total_loss_pct=-72.0,
+            example_trades=["NVDA 2026-05-01 -13%"],
+            attributable_agent="portfolio_manager",
+            proposed_guard="x" * 500,
+        )
+
+
 def test_quarterly_meta_reflection_composes_and_caps_learnings():
     """Top-level object accepts all sub-parts; enforces max 3 learnings
     (PR 4's single-quarter cap is echoed in the schema)."""

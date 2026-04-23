@@ -1244,9 +1244,12 @@ class LossPattern(BaseModel):
     """`no_agent` when the failure is pure discipline (PM / evening's
     discipline — nothing any individual agent's prompt could have
     caught). `execution` when the issue was broker-side, not LLM."""
-    proposed_guard: str = Field(min_length=1, max_length=240)
+    proposed_guard: str = Field(min_length=1, max_length=400)
     """One-sentence candidate prompt addition that would have caught
-    this pattern. Empty strings / vague hedges fail validation."""
+    this pattern. Empty strings / vague hedges fail validation.
+    400 cap is intentionally matched to MissedOpportunity.lesson — the
+    LLM cites concrete facts (symbols, dates, pct moves) so terse caps
+    force vague language, which is worse than the extra context."""
 
 
 class LossPatternReport(BaseModel):
