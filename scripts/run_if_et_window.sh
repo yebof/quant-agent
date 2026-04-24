@@ -102,7 +102,7 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
     set +a
 fi
 
-if "$TIMEOUT" --kill-after=30 600 "$PYTHON" main.py --mode "$MODE"; then
+if "$TIMEOUT" --kill-after=30 1200 "$PYTHON" main.py --mode "$MODE"; then
     # intra_check is intentionally guard-less (see last-run guard block above) —
     # we don't write the marker for it, so the next 30-min tick can fire freely.
     if [[ "$MODE" != "intra_check" ]]; then
