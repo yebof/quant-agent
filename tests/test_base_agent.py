@@ -127,6 +127,30 @@ def test_agent_retry_budget_respects_env_override(mock_anthropic, monkeypatch):
     assert calls["n"] == 2
 
 
+def test_anthropic_client_gets_explicit_http_timeout():
+    """LLM clients must pin an explicit per-request HTTP timeout —
+    SDK default is 600s, which leaves the morning window exposed to a
+    single stalled SSE stream. Regression-guards the _LLM_HTTP_TIMEOUT
+    invariant so a future refactor can't silently drop the kwarg."""
+    from src.agents.base import _LLM_HTTP_TIMEOUT
+
+    with patch("anthropic.Anthropic") as mock_cls:
+        ConcreteAgent(api_key="k", model="claude-sonnet-4-6-20250514", max_tokens=1024)
+        mock_cls.assert_called_once_with(api_key="k", timeout=_LLM_HTTP_TIMEOUT)
+
+
+def test_openai_client_gets_explicit_http_timeout():
+    """Same invariant for the OpenAI path. Model prefix 'gpt-' routes
+    to OpenAI (see _OPENAI_PREFIXES), and tech_analyst runs on gpt-5.4
+    — that's the agent that 2026-04-23 morning failed on, so this
+    branch is the load-bearing one."""
+    from src.agents.base import _LLM_HTTP_TIMEOUT
+
+    with patch("openai.OpenAI") as mock_cls:
+        ConcreteAgent(api_key="k", model="gpt-5.4", max_tokens=1024)
+        mock_cls.assert_called_once_with(api_key="k", timeout=_LLM_HTTP_TIMEOUT)
+
+
 def test_parse_json_prefers_agent_shape_over_larger_fragment():
     """When multiple JSON candidates exist, pick the one with expected keys.
 

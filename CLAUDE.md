@@ -54,6 +54,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 
 ### 生产侧防挂死 / 防拒单（都有血泪）
 - 所有 Alpaca SDK 调用通过 `_install_http_timeout()` 注入 30s HTTP timeout；launchd plist 外层 `/opt/homebrew/bin/timeout --kill-after=30 600 ...` 10 分钟兜底——**双层**，防再次出现 13 小时 hang（2026-04-17 事故）
+- **LLM client 也要钉 HTTP timeout**：`src/agents/base.py:_LLM_HTTP_TIMEOUT = 60.0` 传给 `OpenAI()` / `Anthropic()` 构造器。SDK 默认 600s 会让单次 stalled SSE 流吃掉整个 session 窗口；60s 远大于 retry 指数退避 max 16s（两层不冲突），5 次 retry 最坏 5min，稳在 launchd 600s 外层 kill 之内。和 `_BROKER_HTTP_TIMEOUT` 是一条纪律（2026-04-23 morning tech_analyst 连接错误事故的结构性补丁）
 - `broker.submit_order` 提交前 `_quantize_price()` 按 Alpaca tick 归整（≥$1 → 0.01、<$1 → 0.0001）——防 sub-penny reject（2026-04-17 UPS 事故）
 - 预处理 LLM 分析失败调 `record_failure()`；连 3 次失败就 abandon + 标 `abandoned=True`，不再重分析——防 LLM 失败循环烧 token
 - **macOS Sequoia launchd + `com.apple.provenance`**：plist 的 `ProgramArguments` **必须**以 `/bin/bash` 开头，后面把 wrapper 作为参数传（不能直接 exec wrapper）。launchd 只 exec 系统 binary `/bin/bash`，provenance 不会挡；bash 读 wrapper 当文本源走，provenance 也不管。配套 `scripts/install_plists.sh` 会一键重写 + reload，编辑 wrapper 后务必重跑（2026-04-17 周五事故，launchd 5 个 job 全 exit 126 + 没跑）
