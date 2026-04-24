@@ -17,6 +17,14 @@ _OPENAI_PREFIXES = ("gpt-", "o1-", "o3-", "o4-")
 # Overridable via QUANT_AGENT_MAX_RETRIES for tests / harder retries.
 _DEFAULT_MAX_RETRIES = 5
 
+# Per-request HTTP timeout for LLM clients. OpenAI/Anthropic SDKs default to
+# 600s, which means a single stalled SSE stream could hang the morning
+# window. 60s is well above retry's max 16s sleep, so the two mechanisms
+# don't trip each other, and 5 retries × 60s caps worst-case wall time at
+# 5 min — comfortably inside launchd's 600s outer kill. Mirrors the
+# _BROKER_HTTP_TIMEOUT discipline in src/execution/broker.py.
+_LLM_HTTP_TIMEOUT = 60.0
+
 
 def _max_retries() -> int:
     """Read at call time so tests can monkeypatch the env var per case
@@ -130,10 +138,10 @@ class BaseAgent(ABC):
 
         if self._use_openai:
             from openai import OpenAI
-            self.client = OpenAI(api_key=api_key)
+            self.client = OpenAI(api_key=api_key, timeout=_LLM_HTTP_TIMEOUT)
         else:
             from anthropic import Anthropic
-            self.client = Anthropic(api_key=api_key)
+            self.client = Anthropic(api_key=api_key, timeout=_LLM_HTTP_TIMEOUT)
 
     @property
     @abstractmethod
