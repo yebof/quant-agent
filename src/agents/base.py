@@ -19,11 +19,21 @@ _DEFAULT_MAX_RETRIES = 5
 
 # Per-request HTTP timeout for LLM clients. OpenAI/Anthropic SDKs default to
 # 600s, which means a single stalled SSE stream could hang the morning
-# window. 60s is well above retry's max 16s sleep, so the two mechanisms
-# don't trip each other, and 5 retries × 60s caps worst-case wall time at
-# 5 min — comfortably inside launchd's 600s outer kill. Mirrors the
-# _BROKER_HTTP_TIMEOUT discipline in src/execution/broker.py.
-_LLM_HTTP_TIMEOUT = 60.0
+# window. We pin an explicit ceiling below that default so one bad call
+# can't eat the whole session, but the ceiling has to sit above the
+# *legitimate* response latency of the slowest agent — otherwise a
+# normally-succeeding call gets axed mid-flight and retry-spirals.
+#
+# tech_analyst is the outlier: max_tokens=128K and 25-symbol batched
+# chunks. Historical happy-path chunks took 60-180s (2026-04-21/22),
+# and 2026-04-24 showed OpenAI running slower with single chunks
+# exceeding 180s — the initial 60s pin axed those calls even though
+# they'd have returned successfully, triggering retry loops that blew
+# past launchd's 600s outer kill. 300s covers that tail with buffer,
+# stays below the SDK default, and still bounds worst-case single-call
+# hang at 5 min. Mirrors the _BROKER_HTTP_TIMEOUT discipline in
+# src/execution/broker.py.
+_LLM_HTTP_TIMEOUT = 300.0
 
 
 def _max_retries() -> int:
