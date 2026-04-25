@@ -23,7 +23,12 @@ TIMEOUT="${TIMEOUT_OVERRIDE:-/opt/homebrew/bin/timeout}"
 LAST_RUN_DIR="${LAST_RUN_DIR_OVERRIDE:-${HOME}/.cache/quant-agent}"
 MIN_GAP_SEC="${MIN_GAP_SEC_OVERRIDE:-3600}"  # don't fire same mode twice within an hour
 SESSION_LOCK_DIR="${LAST_RUN_DIR}/active-session.lock"
-SESSION_LOCK_MAX_AGE_SEC="${SESSION_LOCK_MAX_AGE_SEC_OVERRIDE:-7200}"
+# Stale-lock cleanup ceiling. The launchd outer kill is 1200s (20 min); a
+# process still alive past that is impossible, so anything older than
+# 1800s (30 min) is definitely a crashed-without-cleanup leftover. Keeping
+# this tight matters because a stale lock would otherwise block the next
+# legitimate session for the full ceiling window.
+SESSION_LOCK_MAX_AGE_SEC="${SESSION_LOCK_MAX_AGE_SEC_OVERRIDE:-1800}"
 
 mkdir -p "$LAST_RUN_DIR"
 
@@ -91,12 +96,23 @@ fi
 
 # === Cross-mode session lock ===
 # launchd owns one plist per mode, so overlapping windows can otherwise run
-# concurrently (e.g. a long morning LLM call while intra_check fires). Keep one
+# concurrently (e.g. a long morning LLM call while midday fires). Keep one
 # Python trading session active at a time; stale lock cleanup handles crashes.
+#
+# intra_check is INTENTIONALLY exempt — it's the stateless flash-crash
+# circuit breaker that MUST fire on every 30-min tick during 09:30-16:00 ET
+# regardless of what else is running. Mirrors its exemption from the
+# last-run guard above. Without this exemption a long morning/midday holds
+# the lock and intra goes silent for the entire window — which is exactly
+# the time when an unmonitored adverse move would be most damaging.
 LOCK_ACQUIRED=0
 LOCK_OWNER_FILE="${SESSION_LOCK_DIR}/owner"
 
 acquire_session_lock() {
+    if [[ "$MODE" == "intra_check" ]]; then
+        return 0
+    fi
+
     if mkdir "$SESSION_LOCK_DIR" 2>/dev/null; then
         LOCK_ACQUIRED=1
         echo "${MODE} ${ET_DATE} ${NOW_UNIX} $$" > "$LOCK_OWNER_FILE"

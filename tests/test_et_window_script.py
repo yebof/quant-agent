@@ -188,9 +188,10 @@ def test_run_if_et_window_intra_check_fires_every_tick(tmp_path):
     assert not (last_run_dir / "last-intra_check").exists()
 
 
-def test_run_if_et_window_skips_when_another_session_active(tmp_path):
-    """Different launchd plists can overlap; the shared session lock must
-    prevent an intra_check from running on top of a long morning session."""
+def test_run_if_et_window_serializes_non_intra_modes(tmp_path):
+    """The cross-mode session lock must serialize the heavyweight LLM
+    sessions (morning/midday/close/evening/earnings_preprocess) so they
+    never run concurrently. Use midday vs a held morning lock to verify."""
     script = Path(__file__).resolve().parents[1] / "scripts" / "run_if_et_window.sh"
     project_root = tmp_path / "project"
     project_root.mkdir()
@@ -203,7 +204,59 @@ def test_run_if_et_window_skips_when_another_session_active(tmp_path):
 
     timeout_bin = tmp_path / "timeout"
     python_bin = tmp_path / "fake-python"
-    counter_file = tmp_path / "blocked-intra.txt"
+    counter_file = tmp_path / "blocked-midday.txt"
+
+    _write_executable(timeout_bin, "#!/bin/bash\nshift 2\nexec \"$@\"\n")
+    _write_executable(
+        python_bin,
+        "#!/bin/bash\n"
+        f"echo fired >> \"{counter_file}\"\n"
+        "exit 0\n",
+    )
+
+    result = subprocess.run(
+        ["bash", str(script), "midday"],
+        env=os.environ | {
+            "PROJECT_ROOT_OVERRIDE": str(project_root),
+            "PYTHON_OVERRIDE": str(python_bin),
+            "TIMEOUT_OVERRIDE": str(timeout_bin),
+            "LAST_RUN_DIR_OVERRIDE": str(last_run_dir),
+            "ET_DOW_OVERRIDE": "1",
+            "ET_HOUR_OVERRIDE": "13",
+            "ET_MIN_OVERRIDE": "00",
+            "ET_DATE_OVERRIDE": "2026-04-20",
+            "NOW_UNIX_OVERRIDE": "1010",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert not counter_file.exists()
+    assert "another quant-agent session is active" in result.stderr
+
+
+def test_run_if_et_window_intra_check_bypasses_session_lock(tmp_path):
+    """intra_check is the stateless circuit breaker — it MUST fire on every
+    30-min tick during 09:30-16:00 ET regardless of what else is running.
+    A held lock from a long morning/midday must not block it; otherwise the
+    flash-crash protection goes silent during exactly the windows when an
+    adverse move would be most damaging. Mirrors its exemption from the
+    last-run guard."""
+    script = Path(__file__).resolve().parents[1] / "scripts" / "run_if_et_window.sh"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("")
+
+    last_run_dir = tmp_path / "cache"
+    lock_dir = last_run_dir / "active-session.lock"
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "owner").write_text("morning 2026-04-20 1000 12345")
+
+    timeout_bin = tmp_path / "timeout"
+    python_bin = tmp_path / "fake-python"
+    counter_file = tmp_path / "intra-fired.txt"
 
     _write_executable(timeout_bin, "#!/bin/bash\nshift 2\nexec \"$@\"\n")
     _write_executable(
@@ -231,9 +284,11 @@ def test_run_if_et_window_skips_when_another_session_active(tmp_path):
         check=False,
     )
 
-    assert result.returncode == 0
-    assert not counter_file.exists()
-    assert "another quant-agent session is active" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert counter_file.exists(), "intra_check must fire even when lock is held"
+    assert counter_file.read_text().strip() == "fired"
+    # The held lock must remain — intra_check never touches it.
+    assert (lock_dir / "owner").read_text() == "morning 2026-04-20 1000 12345"
 
 
 def test_run_if_et_window_intra_check_skips_outside_window(tmp_path):
