@@ -124,7 +124,7 @@ class RiskConfig(BaseModel):
 
 
 class ScheduleConfig(BaseModel):
-    earnings_preprocess: str = "05:00"
+    earnings_preprocess: str = "08:00"
     morning: str
     intra_check: str = "10:30"
     midday: str

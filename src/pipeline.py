@@ -3317,6 +3317,27 @@ class TradingPipeline:
             # this session. Refreshes ctx.cash / positions on completion, so
             # every stage below runs on clean truth.
             self._force_delever(ctx)
+            positions = ctx.positions
+            cash = ctx.cash
+            total_value = ctx.total_value
+            last_equity = ctx.last_equity
+
+            # Hard circuit breaker before any LLM/research work. If the account
+            # opens through the daily-loss limit, deterministic liquidation must
+            # not depend on PM/RM producing a tradeable plan later in the run.
+            daily_pnl = total_value - last_equity
+            loss_violation = self.risk_engine.check_daily_loss(last_equity, daily_pnl)
+            if loss_violation and positions:
+                logger.warning(
+                    "Morning risk alert before research: %s — force-closing all positions",
+                    loss_violation.message,
+                )
+                orders = self._midday_emergency_liquidate(positions, loss_violation, run_id)
+                return {
+                    "status": "emergency_sold",
+                    "orders": orders,
+                    "run_id": run_id,
+                }
 
             # Phase 4 #1: research stage runs the parallel fan-out (macro / news /
             # tech / earnings). Populates ctx fields; we unpack to local names so

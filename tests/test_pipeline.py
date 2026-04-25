@@ -449,6 +449,8 @@ def test_pipeline_morning_early_return_still_reconciles_fills():
     pipeline.broker.get_positions.return_value = []
     pipeline.morning_research_stage = MagicMock()
     pipeline._reconcile_fills = MagicMock()
+    pipeline.risk_engine = MagicMock()
+    pipeline.risk_engine.check_daily_loss.return_value = None
 
     def _populate_empty_research(ctx):
         ctx.analyses = []
@@ -458,6 +460,43 @@ def test_pipeline_morning_early_return_still_reconciles_fills():
     result = pipeline.run_morning()
 
     assert result["status"] == "no_data"
+    pipeline._reconcile_fills.assert_called_once()
+
+
+def test_pipeline_morning_bypasses_research_when_daily_loss_breached():
+    """Morning must enforce the same deterministic loss circuit breaker before
+    any LLM/research path can fail or return no actionable decisions."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.cancel_open_entry_orders.return_value = None
+    position = Position(
+        symbol="SPY", qty=10.0, avg_entry=500.0, current_price=480.0,
+        market_value=4800.0, unrealized_pnl=-200.0, sector="ETF",
+    )
+    pipeline.broker.get_account.return_value = {
+        "cash": 1000.0,
+        "portfolio_value": 9600.0,
+        "last_equity": 10000.0,
+    }
+    pipeline.broker.get_positions.return_value = [position]
+    pipeline.morning_research_stage = MagicMock()
+    pipeline.risk_engine = MagicMock()
+    loss_violation = MagicMock(message="Daily loss 4.0% exceeds max 3%")
+    pipeline.risk_engine.check_daily_loss.return_value = loss_violation
+    pipeline._midday_emergency_liquidate = MagicMock(return_value=[
+        {"id": "sell-1", "status": "accepted", "symbol": "SPY"}
+    ])
+    pipeline._reconcile_fills = MagicMock()
+
+    result = pipeline.run_morning()
+
+    assert result["status"] == "emergency_sold"
+    assert result["orders"] == [{"id": "sell-1", "status": "accepted", "symbol": "SPY"}]
+    pipeline._midday_emergency_liquidate.assert_called_once_with(
+        [position], loss_violation, result["run_id"],
+    )
+    pipeline.morning_research_stage.run.assert_not_called()
     pipeline._reconcile_fills.assert_called_once()
 
 

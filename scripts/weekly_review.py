@@ -31,6 +31,10 @@ import sys
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
+CALIBRATION_EXIT_ACTIONS = ("EMERGENCY_SELL", "FORCE_DELEVER", "REDUCE", "TAKE_PROFIT")
 
 # ---------------------------------------------------------------------------
 # Formatting helpers
@@ -78,7 +82,7 @@ def _et_cutoff_date(days: int) -> date:
     # "Last N trading-day-ish" as calendar days. Close enough for reporting —
     # we don't need the full trading calendar here; weekends/holidays just
     # won't have rows and naturally drop out of aggregates.
-    return date.today() - timedelta(days=days)
+    return datetime.now(ET).date() - timedelta(days=days)
 
 
 def _existing_tables(conn: sqlite3.Connection) -> set[str]:
@@ -101,7 +105,7 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def report_header(days: int, cutoff: date) -> None:
-    end = date.today()
+    end = datetime.now(ET).date()
     print("═" * 70)
     print(f" quant-agent weekly review — last {days} calendar days")
     print(f" Window: {cutoff.isoformat()} → {end.isoformat()}  (ET; weekends skip naturally)")
@@ -337,7 +341,7 @@ def report_pm_calibration(conn: sqlite3.Connection) -> None:
         if act == "BUY":
             open_lots[sym].append({"qty": qty, "price": price, "ts": ts})
         elif (act.startswith("SELL") or act.startswith("PARTIAL_SELL")
-              or act == "EMERGENCY_SELL" or act == "FORCE_DELEVER"):
+              or act in CALIBRATION_EXIT_ACTIONS):
             remaining = qty
             while remaining > 0 and open_lots[sym]:
                 lot = open_lots[sym][0]

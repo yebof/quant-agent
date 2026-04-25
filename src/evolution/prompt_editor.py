@@ -460,7 +460,7 @@ class PromptEditor:
                 f"{n_learnings} learning(s)"
             )
             commit_proc = subprocess.run(
-                ["git", "-C", str(repo_root), "commit", "-m", msg],
+                ["git", "-C", str(repo_root), "commit", "-m", msg, "--"] + path_args,
                 check=True, capture_output=True, text=True,
             )
             sha_proc = subprocess.run(

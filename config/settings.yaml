@@ -148,12 +148,12 @@ trading:
   # launchd-gated wrapper. The `intra_check` time here is meaningless in prod
   # (launchd fires it every 30-min tick across 09:30-16:00 ET; see wrapper).
   schedule:
-    earnings_preprocess: "05:00"
-    morning: "06:00"
+    earnings_preprocess: "08:00"
+    morning: "09:30"
     intra_check: "10:30"
     midday: "13:00"       # moved from 15:00 — afternoon lull, before EOD noise
     close: "15:30"        # new — 25min before close, triggers-only sell-only
-    evening: "16:30"
+    evening: "20:00"
 
 storage:
   db_path: "data/quant_agent.db"
