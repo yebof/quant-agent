@@ -188,6 +188,54 @@ def test_run_if_et_window_intra_check_fires_every_tick(tmp_path):
     assert not (last_run_dir / "last-intra_check").exists()
 
 
+def test_run_if_et_window_skips_when_another_session_active(tmp_path):
+    """Different launchd plists can overlap; the shared session lock must
+    prevent an intra_check from running on top of a long morning session."""
+    script = Path(__file__).resolve().parents[1] / "scripts" / "run_if_et_window.sh"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("")
+
+    last_run_dir = tmp_path / "cache"
+    lock_dir = last_run_dir / "active-session.lock"
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "owner").write_text("morning 2026-04-20 1000 12345")
+
+    timeout_bin = tmp_path / "timeout"
+    python_bin = tmp_path / "fake-python"
+    counter_file = tmp_path / "blocked-intra.txt"
+
+    _write_executable(timeout_bin, "#!/bin/bash\nshift 2\nexec \"$@\"\n")
+    _write_executable(
+        python_bin,
+        "#!/bin/bash\n"
+        f"echo fired >> \"{counter_file}\"\n"
+        "exit 0\n",
+    )
+
+    result = subprocess.run(
+        ["bash", str(script), "intra_check"],
+        env=os.environ | {
+            "PROJECT_ROOT_OVERRIDE": str(project_root),
+            "PYTHON_OVERRIDE": str(python_bin),
+            "TIMEOUT_OVERRIDE": str(timeout_bin),
+            "LAST_RUN_DIR_OVERRIDE": str(last_run_dir),
+            "ET_DOW_OVERRIDE": "1",
+            "ET_HOUR_OVERRIDE": "09",
+            "ET_MIN_OVERRIDE": "30",
+            "ET_DATE_OVERRIDE": "2026-04-20",
+            "NOW_UNIX_OVERRIDE": "1010",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert not counter_file.exists()
+    assert "another quant-agent session is active" in result.stderr
+
+
 def test_run_if_et_window_intra_check_skips_outside_window(tmp_path):
     """intra_check window is 09:30-16:00 ET. Outside, it must not fire."""
     script = Path(__file__).resolve().parents[1] / "scripts" / "run_if_et_window.sh"

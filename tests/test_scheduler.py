@@ -33,12 +33,12 @@ def test_scheduler_runs_on_trading_day(mock_pipeline_cls):
 def test_scheduler_setup_registers_all_six_sessions(mock_pipeline_cls):
     cfg = MagicMock()
     cfg.trading.schedule = SimpleNamespace(
-        earnings_preprocess="05:00",
-        morning="06:00",
+        earnings_preprocess="08:00",
+        morning="09:30",
         intra_check="10:30",
         midday="13:00",
         close="15:30",
-        evening="16:30",
+        evening="20:00",
     )
     mock_pipeline_cls.return_value = MagicMock()
 

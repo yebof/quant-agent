@@ -1,7 +1,7 @@
 #!/bin/bash
 # Fire main.py --mode $1 only when the US/Eastern wall clock is inside the
-# window for that mode, it's a weekday (ET), and we haven't already run this
-# mode in the last hour.
+# window for that mode, it's a weekday (ET), and the mode has not already
+# completed during this ET session date.
 #
 # Called from launchd every 30 minutes (StartInterval=1800). All three plists
 # share this script so the system fires at correct US market times regardless
@@ -22,6 +22,8 @@ PYTHON="${PYTHON_OVERRIDE:-${PROJECT_ROOT}/.venv/bin/python}"
 TIMEOUT="${TIMEOUT_OVERRIDE:-/opt/homebrew/bin/timeout}"
 LAST_RUN_DIR="${LAST_RUN_DIR_OVERRIDE:-${HOME}/.cache/quant-agent}"
 MIN_GAP_SEC="${MIN_GAP_SEC_OVERRIDE:-3600}"  # don't fire same mode twice within an hour
+SESSION_LOCK_DIR="${LAST_RUN_DIR}/active-session.lock"
+SESSION_LOCK_MAX_AGE_SEC="${SESSION_LOCK_MAX_AGE_SEC_OVERRIDE:-7200}"
 
 mkdir -p "$LAST_RUN_DIR"
 
@@ -86,6 +88,55 @@ if [[ "$MODE" != "intra_check" && -f "$LAST_FILE" ]]; then
         fi
     fi
 fi
+
+# === Cross-mode session lock ===
+# launchd owns one plist per mode, so overlapping windows can otherwise run
+# concurrently (e.g. a long morning LLM call while intra_check fires). Keep one
+# Python trading session active at a time; stale lock cleanup handles crashes.
+LOCK_ACQUIRED=0
+LOCK_OWNER_FILE="${SESSION_LOCK_DIR}/owner"
+
+acquire_session_lock() {
+    if mkdir "$SESSION_LOCK_DIR" 2>/dev/null; then
+        LOCK_ACQUIRED=1
+        echo "${MODE} ${ET_DATE} ${NOW_UNIX} $$" > "$LOCK_OWNER_FILE"
+        return 0
+    fi
+
+    LOCK_VALUE=""
+    LOCK_TS=""
+    if [[ -f "$LOCK_OWNER_FILE" ]]; then
+        LOCK_VALUE="$(cat "$LOCK_OWNER_FILE" 2>/dev/null || true)"
+        read -r _LOCK_MODE _LOCK_DATE LOCK_TS _LOCK_PID <<< "$LOCK_VALUE"
+    fi
+
+    if [[ "$LOCK_TS" =~ ^[0-9]+$ ]]; then
+        LOCK_AGE=$((NOW_UNIX - LOCK_TS))
+        if [[ "$LOCK_AGE" -gt "$SESSION_LOCK_MAX_AGE_SEC" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Removing stale quant-agent session lock (${LOCK_AGE}s old): ${LOCK_VALUE}" >&2
+            rm -f "$LOCK_OWNER_FILE"
+            rmdir "$SESSION_LOCK_DIR" 2>/dev/null || true
+            if mkdir "$SESSION_LOCK_DIR" 2>/dev/null; then
+                LOCK_ACQUIRED=1
+                echo "${MODE} ${ET_DATE} ${NOW_UNIX} $$" > "$LOCK_OWNER_FILE"
+                return 0
+            fi
+        fi
+    fi
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Skipping ${MODE}: another quant-agent session is active (${LOCK_VALUE:-unknown})" >&2
+    exit 0
+}
+
+release_session_lock() {
+    if [[ "$LOCK_ACQUIRED" -eq 1 ]]; then
+        rm -f "$LOCK_OWNER_FILE"
+        rmdir "$SESSION_LOCK_DIR" 2>/dev/null || true
+    fi
+}
+
+acquire_session_lock
+trap release_session_lock EXIT INT TERM
 
 # === All checks passed — fire ===
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Firing ${MODE} (ET ${ET_DATE} ${ET_HOUR}:${ET_MIN}, weekday ${ET_DOW})"

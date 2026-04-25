@@ -502,9 +502,13 @@ def test_git_auto_commit_called_with_expected_message(tmp_path):
         if len(c.args) >= 1 and "commit" in c.args[0]
     ]
     assert len(commit_calls) == 1
-    msg = commit_calls[0].args[0][-1]
+    commit_cmd = commit_calls[0].args[0]
+    msg = commit_cmd[commit_cmd.index("-m") + 1]
     assert "2026-Q1" in msg
     assert "1 learning" in msg
+    assert "--" in commit_cmd
+    committed_paths = commit_cmd[commit_cmd.index("--") + 1:]
+    assert committed_paths == [str((editor.prompts_dir / "tech_analyst.md").resolve())]
 
 
 def test_git_auto_commit_swallows_subprocess_failure(tmp_path):
