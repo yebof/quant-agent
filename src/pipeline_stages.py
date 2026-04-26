@@ -759,6 +759,36 @@ class ExecutionStage:
         else:
             price_map = {p.symbol: p.current_price for p in positions}
 
+        # Daily-loss re-check before BUYs. The initial circuit breaker ran
+        # ~10 min ago (before LLM research); the tape may have gapped
+        # through the limit while PM/RM was thinking, especially relevant
+        # now that intra_check fires concurrently per #46. We block BUYs
+        # (no new risk during a confirmed breach) but let any pending SELLs
+        # stay — they reduced exposure already. intra's next tick handles
+        # full emergency liquidation; morning's job here is just to not
+        # add to the hole. Refresh first when sells didn't fire so the
+        # check uses fresh portfolio_value, not the stale research-stage
+        # snapshot.
+        if buy_decisions:
+            if not sell_decisions:
+                account, positions, _ = pipeline._refresh_account_state()
+                cash = account["cash"]
+                total_value = account["portfolio_value"]
+                ctx.positions = positions
+                ctx.cash = cash
+                ctx.total_value = total_value
+            daily_pnl_now = total_value - ctx.last_equity
+            loss_violation_now = pipeline.risk_engine.check_daily_loss(
+                ctx.last_equity, daily_pnl_now,
+            )
+            if loss_violation_now:
+                logger.warning(
+                    "ExecutionStage daily-loss re-check: %s — blocking "
+                    "%d BUY(s); intra will liquidate on next tick",
+                    loss_violation_now.message, len(buy_decisions),
+                )
+                buy_decisions = []
+
         available_cash = cash
         for decision in buy_decisions:
             if decision.action != "BUY":
