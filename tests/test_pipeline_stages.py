@@ -38,10 +38,18 @@ def test_execution_stage_skips_buy_when_entry_price_more_than_5pct_off_market():
     pipeline.broker.get_latest_price.return_value = 100.0  # live market
     pipeline._format_qty = lambda q: str(q)
     pipeline._order_accepted.return_value = True
+    # Pre-BUY daily-loss re-check (fix for P1 #1) refreshes account state
+    # and consults risk_engine — wire benign defaults so this orthogonal
+    # entry-price-stale test isn't entangled with the loss-breach path.
+    pipeline._refresh_account_state.return_value = (
+        {"cash": 50_000.0, "portfolio_value": 100_000.0}, [], {},
+    )
+    pipeline.risk_engine.check_daily_loss.return_value = None
 
     ctx = RunContext.start("morning")
     ctx.cash = 50_000.0
     ctx.total_value = 100_000.0
+    ctx.last_equity = 100_000.0
     ctx.positions = []
     ctx.portfolio_decision = PortfolioDecision(
         decisions=[
@@ -76,10 +84,15 @@ def test_execution_stage_allows_buy_when_entry_price_within_5pct():
     }
     pipeline._format_qty = lambda q: str(q)
     pipeline._order_accepted.return_value = True
+    pipeline._refresh_account_state.return_value = (
+        {"cash": 50_000.0, "portfolio_value": 100_000.0}, [], {},
+    )
+    pipeline.risk_engine.check_daily_loss.return_value = None
 
     ctx = RunContext.start("morning")
     ctx.cash = 50_000.0
     ctx.total_value = 100_000.0
+    ctx.last_equity = 100_000.0
     ctx.positions = []
     ctx.portfolio_decision = PortfolioDecision(
         decisions=[
@@ -100,6 +113,131 @@ def test_execution_stage_allows_buy_when_entry_price_within_5pct():
     pipeline.broker.submit_order.assert_called_once()
 
 
+def test_execution_stage_blocks_buys_when_daily_loss_breached_during_run():
+    """The initial morning circuit breaker (#45) runs before LLM/research
+    — but the LLM window is 5-10 min on a slow OpenAI day, plenty of room
+    for the tape to gap through the daily-loss limit while PM/RM is
+    thinking. With intra_check exempt from the session lock (#46), this
+    race is now real: morning's stale snapshot says we can BUY while
+    intra is firing emergency sells off the live state.
+
+    Fix is a re-check before the BUY loop: refresh portfolio_value,
+    re-run risk_engine.check_daily_loss against ctx.last_equity, and
+    drop BUYs if the breach materialised mid-run. SELLs that already
+    fired through this session are kept (they reduce exposure, never
+    add)."""
+    from src.models import PortfolioDecision, Position, TradeDecision
+    from src.pipeline_context import RunContext
+
+    pipeline = MagicMock()
+    pipeline.broker.get_latest_price.return_value = 100.0
+    pipeline.broker.cancel_protective_stops.return_value = True
+    # SELL submits cleanly first.
+    pipeline.broker.submit_order.return_value = {
+        "id": "sell-1", "status": "accepted", "symbol": "JPM",
+    }
+    pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    # After the SELL, refresh shows total_value crashed through the limit.
+    pipeline._refresh_account_state.return_value = (
+        {"cash": 60_000.0, "portfolio_value": 96_500.0},  # -3.5% from last_equity
+        [],
+        {},
+    )
+    loss_violation = MagicMock(message="Daily loss 3.5% exceeds max 3%")
+    pipeline.risk_engine.check_daily_loss.return_value = loss_violation
+    pipeline._order_accepted.return_value = True
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._full_sell_qty = lambda q: q
+    pipeline.db = MagicMock()
+
+    ctx = RunContext.start("morning")
+    ctx.cash = 30_000.0
+    ctx.total_value = 100_000.0
+    ctx.last_equity = 100_000.0
+    ctx.positions = [
+        Position(
+            symbol="JPM", qty=10.0, avg_entry=300.0, current_price=320.0,
+            market_value=3_200.0, unrealized_pnl=200.0, sector="Financial",
+        ),
+    ]
+    ctx.portfolio_decision = PortfolioDecision(
+        decisions=[
+            TradeDecision(
+                action="SELL", symbol="JPM", allocation_pct=100,
+                entry_price=300.0, stop_loss=280.0, take_profit=350.0,
+                reasoning="thesis broken",
+            ),
+            TradeDecision(
+                action="BUY", symbol="SPY", allocation_pct=10,
+                entry_price=99.0, stop_loss=92.0, take_profit=110.0,
+                reasoning="dip buy that should be blocked by re-check",
+            ),
+        ],
+        portfolio_view="test",
+    )
+    ctx.symbols_bars = {}
+
+    stage = ExecutionStage(pipeline=pipeline)
+    orders = stage.run(ctx)
+
+    # SELL went through (it fired BEFORE the re-check), BUY blocked.
+    submit_calls = pipeline.broker.submit_order.call_args_list
+    sides = [c.kwargs.get("side") for c in submit_calls]
+    assert "sell" in sides, f"SELL must have fired before the re-check; got {sides}"
+    assert "buy" not in sides, (
+        f"BUY must be blocked by daily-loss re-check; got submit_calls={submit_calls}"
+    )
+    pipeline.risk_engine.check_daily_loss.assert_called_with(
+        100_000.0, 96_500.0 - 100_000.0,
+    )
+
+
+def test_execution_stage_allows_buys_when_daily_loss_not_breached_after_refresh():
+    """Sanity check: if the re-check shows no breach, BUYs proceed normally.
+    The re-check must not become a permanent BUY block on every morning."""
+    from src.models import PortfolioDecision, TradeDecision
+    from src.pipeline_context import RunContext
+
+    pipeline = MagicMock()
+    pipeline.broker.get_latest_price.return_value = 100.0
+    pipeline.broker.cancel_protective_stops.return_value = True
+    pipeline.broker.submit_order.return_value = {
+        "id": "buy-1", "status": "accepted", "symbol": "SPY",
+    }
+    # No sells fired, so refresh runs from inside the re-check branch.
+    pipeline._refresh_account_state.return_value = (
+        {"cash": 50_000.0, "portfolio_value": 100_500.0},  # +0.5%, no breach
+        [],
+        {},
+    )
+    pipeline.risk_engine.check_daily_loss.return_value = None
+    pipeline._order_accepted.return_value = True
+    pipeline._format_qty = lambda q: str(q)
+
+    ctx = RunContext.start("morning")
+    ctx.cash = 50_000.0
+    ctx.total_value = 100_000.0
+    ctx.last_equity = 100_000.0
+    ctx.positions = []
+    ctx.portfolio_decision = PortfolioDecision(
+        decisions=[
+            TradeDecision(
+                action="BUY", symbol="SPY", allocation_pct=10,
+                entry_price=99.0, stop_loss=92.0, take_profit=110.0,
+                reasoning="normal dip buy",
+            ),
+        ],
+        portfolio_view="test",
+    )
+    ctx.symbols_bars = {}
+
+    stage = ExecutionStage(pipeline=pipeline)
+    stage.run(ctx)
+
+    pipeline.broker.submit_order.assert_called_once()
+    assert pipeline.broker.submit_order.call_args.kwargs["side"] == "buy"
+
+
 def test_execution_stage_skips_buy_when_entry_price_above_market_by_more_than_5pct():
     """Symmetric case: LLM proposed entry ABOVE market by >5% — still stale,
     still skip. The direction of the deviation doesn't change the conclusion
@@ -111,10 +249,15 @@ def test_execution_stage_skips_buy_when_entry_price_above_market_by_more_than_5p
     pipeline.broker.get_latest_price.return_value = 100.0
     pipeline._format_qty = lambda q: str(q)
     pipeline._order_accepted.return_value = True
+    pipeline._refresh_account_state.return_value = (
+        {"cash": 50_000.0, "portfolio_value": 100_000.0}, [], {},
+    )
+    pipeline.risk_engine.check_daily_loss.return_value = None
 
     ctx = RunContext.start("morning")
     ctx.cash = 50_000.0
     ctx.total_value = 100_000.0
+    ctx.last_equity = 100_000.0
     ctx.positions = []
     ctx.portfolio_decision = PortfolioDecision(
         decisions=[
