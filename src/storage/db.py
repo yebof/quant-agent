@@ -308,6 +308,44 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def has_pending_action_for_symbol(
+        self, symbol: str, action: str, today_only: bool = True,
+    ) -> bool:
+        """True if a (symbol, action) trade row exists with fill_status
+        'submitted' and a broker_order_id — i.e., a previous submission
+        is still in flight at the broker.
+
+        Used to keep consecutive intra_check ticks from re-firing the same
+        EMERGENCY_SELL while the first limit order is still pending fill.
+        Without this, intra at T submits a -1% LIMIT EMERGENCY_SELL, the
+        tape goes through it without filling, and intra at T+30min sees
+        the position still on book and submits a duplicate — risking
+        double-exit on a partial fill of the first order.
+
+        today_only restricts the lookup to the current ET trading day so
+        a stale 'submitted' row from a previous session can't permanently
+        block a fresh exit. If your reconciliation pass updated the row
+        to a terminal status, this returns False as expected.
+        """
+        conditions = [
+            "fill_status = 'submitted'",
+            "broker_order_id IS NOT NULL",
+            "symbol = ?",
+            "action = ?",
+        ]
+        params: list = [symbol, action]
+        if today_only:
+            start, end = self._et_day_utc_bounds()
+            conditions.append("timestamp >= ?")
+            conditions.append("timestamp < ?")
+            params.extend([start, end])
+        where = " AND ".join(conditions)
+        with self._lock:
+            row = self.conn.execute(
+                f"SELECT 1 FROM trades WHERE {where} LIMIT 1", tuple(params),
+            ).fetchone()
+        return row is not None
+
     @staticmethod
     def _executed_trade_predicate() -> str:
         """SQL predicate for trades that executed at least some quantity."""

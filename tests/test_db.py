@@ -190,6 +190,96 @@ def test_prune_trades_respects_ttl(db):
     assert remaining == {"RECENT"}
 
 
+def test_has_pending_action_for_symbol_no_rows_returns_false(db):
+    """Empty DB — nothing pending, safe to fire a fresh emergency sell."""
+    assert db.has_pending_action_for_symbol("AMZN", "EMERGENCY_SELL") is False
+
+
+def test_has_pending_action_for_symbol_matches_pending_row(db):
+    """A submitted EMERGENCY_SELL with a broker_order_id is the exact case
+    we need to detect: intra fired a -1% LIMIT, broker accepted it but the
+    tape went through without filling, the row sits as 'submitted'. Next
+    intra tick must see this and skip — no duplicate emergency sell."""
+    db.insert_trade(
+        symbol="AMZN", action="EMERGENCY_SELL", qty=51.0, price=230.0,
+        reasoning="intra-session daily-loss breach", run_id="run-1",
+        broker_order_id="alpaca-uuid-1", fill_status="submitted",
+    )
+    assert db.has_pending_action_for_symbol("AMZN", "EMERGENCY_SELL") is True
+
+
+def test_has_pending_action_for_symbol_ignores_filled_row(db):
+    """If the prior submission already terminal-filled, a new emergency sell
+    is appropriate (residual position somehow grew, or we're on a
+    different symbol). Don't block on completed history."""
+    db.insert_trade(
+        symbol="AMZN", action="EMERGENCY_SELL", qty=51.0, price=230.0,
+        reasoning="prior fill", run_id="run-1",
+        broker_order_id="alpaca-uuid-1", fill_status="filled",
+    )
+    assert db.has_pending_action_for_symbol("AMZN", "EMERGENCY_SELL") is False
+
+
+def test_has_pending_action_for_symbol_ignores_row_without_broker_id(db):
+    """A trade row without broker_order_id never reached Alpaca — no
+    in-flight order to dedupe against. (Edge case: filter exists to
+    keep the predicate symmetric with get_unreconciled_orders.)"""
+    db.insert_trade(
+        symbol="AMZN", action="EMERGENCY_SELL", qty=51.0, price=230.0,
+        reasoning="never submitted", run_id="run-1",
+        broker_order_id=None, fill_status="submitted",
+    )
+    assert db.has_pending_action_for_symbol("AMZN", "EMERGENCY_SELL") is False
+
+
+def test_has_pending_action_for_symbol_scopes_by_symbol_and_action(db):
+    """Another symbol's pending sell, or this symbol's pending REDUCE,
+    must NOT block this symbol's EMERGENCY_SELL."""
+    db.insert_trade(
+        symbol="JPM", action="EMERGENCY_SELL", qty=10.0, price=300.0,
+        reasoning="other symbol pending", run_id="run-1",
+        broker_order_id="alpaca-jpm", fill_status="submitted",
+    )
+    db.insert_trade(
+        symbol="AMZN", action="REDUCE", qty=10.0, price=230.0,
+        reasoning="different action pending", run_id="run-1",
+        broker_order_id="alpaca-amzn-reduce", fill_status="submitted",
+    )
+    assert db.has_pending_action_for_symbol("AMZN", "EMERGENCY_SELL") is False
+
+
+def test_has_pending_action_for_symbol_today_only_drops_yesterday(db, monkeypatch):
+    """Stale 'submitted' from a previous session shouldn't permanently
+    block fresh exits today. today_only=True windows to current ET day."""
+    import src.storage.db as db_module
+
+    today = datetime.now(ET).date()
+    yesterday = today - timedelta(days=1)
+    monkeypatch.setattr(db_module, "et_today", lambda: today)
+
+    yesterday_ts = (
+        datetime.combine(yesterday, time(14, 0), tzinfo=ET)
+        .astimezone(UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+    )
+    db.conn.execute(
+        "INSERT INTO trades (symbol, action, qty, price, reasoning, run_id, "
+        "broker_order_id, fill_status, timestamp) "
+        "VALUES (?, 'EMERGENCY_SELL', 1, 100, 'stale', 'r-old', 'old-id', "
+        "'submitted', ?)",
+        ("AMZN", yesterday_ts),
+    )
+    db.conn.commit()
+
+    assert db.has_pending_action_for_symbol("AMZN", "EMERGENCY_SELL") is False
+    # Sanity: with today_only=False we DO see the stale row.
+    assert (
+        db.has_pending_action_for_symbol(
+            "AMZN", "EMERGENCY_SELL", today_only=False,
+        )
+        is True
+    )
+
+
 def test_prune_agent_logs(db):
     """Old rows dropped; recent rows retained."""
     db.insert_agent_log(

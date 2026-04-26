@@ -2990,6 +2990,13 @@ class TradingPipeline:
                 qty = self._full_sell_qty(p.qty)
                 if qty is None:
                     continue
+                if self.db.has_pending_action_for_symbol(p.symbol, "EMERGENCY_SELL"):
+                    logger.info(
+                        "Midday emergency sell: skipping %s — prior "
+                        "EMERGENCY_SELL submission still pending at broker",
+                        p.symbol,
+                    )
+                    continue
                 emergency_limit = round(p.current_price * 0.99, 2)
                 if not self.broker.cancel_protective_stops(p.symbol):
                     logger.warning(
@@ -3967,6 +3974,13 @@ class TradingPipeline:
             try:
                 qty = self._full_sell_qty(p.qty)
                 if qty is None:
+                    continue
+                if self.db.has_pending_action_for_symbol(p.symbol, "EMERGENCY_SELL"):
+                    logger.info(
+                        "Intra emergency sell: skipping %s — prior "
+                        "EMERGENCY_SELL submission still pending at broker",
+                        p.symbol,
+                    )
                     continue
                 emergency_limit = round(p.current_price * 0.99, 2)
                 if not self.broker.cancel_protective_stops(p.symbol):

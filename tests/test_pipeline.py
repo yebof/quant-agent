@@ -567,6 +567,55 @@ def test_pipeline_midday_bypasses_reviewer_when_daily_loss_breached():
     pipeline._reconcile_fills.assert_called_once()
 
 
+def test_emergency_liquidate_skips_position_when_pending_emergency_sell_already_open():
+    """Emergency sells go out as -1% LIMIT orders. On a fast-moving day the
+    tape can blow through that limit without filling — the order sits as
+    'submitted' at the broker. 30 minutes later intra fires again, sees
+    the position still on book (because the unfilled order didn't reduce
+    qty), and would naively submit a duplicate -1% LIMIT. If the first
+    order then fills against a partial qty, we double-exit. Pin the
+    idempotence: the DB pending check skips this symbol on the second
+    tick. Other symbols without pending submissions still proceed."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+    # AMZN had its emergency sell submitted 25 min ago, still pending.
+    # SPY is a fresh symbol — no prior submission.
+    pipeline.db.has_pending_action_for_symbol.side_effect = (
+        lambda symbol, action: symbol == "AMZN" and action == "EMERGENCY_SELL"
+    )
+    pipeline.broker.cancel_protective_stops.return_value = True
+    pipeline.broker.submit_order.return_value = {
+        "id": "sell-spy-new", "status": "accepted", "symbol": "SPY",
+    }
+    pipeline._order_accepted = MagicMock(return_value=True)
+    pipeline._full_sell_qty = lambda q: q
+    pipeline._format_qty = lambda q: str(q)
+
+    pos_pending = Position(
+        symbol="AMZN", qty=51.0, avg_entry=240.0, current_price=230.0,
+        market_value=11730.0, unrealized_pnl=-510.0, sector="Consumer Cyclical",
+    )
+    pos_fresh = Position(
+        symbol="SPY", qty=10.0, avg_entry=500.0, current_price=480.0,
+        market_value=4800.0, unrealized_pnl=-200.0, sector="ETF",
+    )
+
+    loss_violation = MagicMock(message="Daily loss 4.0% exceeds max 3%")
+    orders = pipeline._midday_emergency_liquidate(
+        [pos_pending, pos_fresh], loss_violation, "run-test",
+    )
+
+    assert len(orders) == 1, f"only fresh SPY should sell, AMZN dedup'd; got {orders}"
+    assert orders[0]["symbol"] == "SPY"
+    submit_calls = pipeline.broker.submit_order.call_args_list
+    assert all(c.kwargs.get("symbol") != "AMZN" for c in submit_calls), (
+        f"AMZN must be skipped due to pending submission; got {submit_calls}"
+    )
+    pipeline.db.has_pending_action_for_symbol.assert_any_call("AMZN", "EMERGENCY_SELL")
+    pipeline.db.has_pending_action_for_symbol.assert_any_call("SPY", "EMERGENCY_SELL")
+
+
 def test_emergency_liquidate_skips_position_when_protective_stop_cancel_fails():
     """If a symbol's protective stops can't be cleared, Alpaca rejects the
     SELL on held_for_orders. Emergency liquidate must skip that symbol
@@ -589,6 +638,10 @@ def test_emergency_liquidate_skips_position_when_protective_stop_cancel_fails():
     pipeline.broker.submit_order.return_value = {
         "id": "sell-spy", "status": "accepted", "symbol": "SPY"
     }
+    # Idempotence guard added in P1 #2 — no prior pending submissions for
+    # this test, so both symbols pass that gate; the protective-stop gate
+    # is what we're actually exercising here.
+    pipeline.db.has_pending_action_for_symbol.return_value = False
     pipeline._order_accepted = MagicMock(return_value=True)
     pipeline._full_sell_qty = lambda q: q
     pipeline._format_qty = lambda q: str(q)
