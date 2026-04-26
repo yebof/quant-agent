@@ -828,8 +828,21 @@ class AlpacaBroker:
                 cancelled_specs.append(spec)
             except Exception as exc:
                 logger.warning("replace_stop_loss: cancel failed for order %s: %s", spec["id"], exc)
-                if not self._list_open_sell_stop_orders(symbol):
-                    self._restore_stop_orders(symbol, cancelled_specs)
+                # Always restore whatever we already cancelled. The previous
+                # "if no open stops remain" gate was wrong for partial
+                # failures: with [A, B, C], if A and B cancel cleanly and C
+                # fails, the broker now shows [C] — the gate sees something
+                # open and skips restore, leaving A's and B's qty
+                # unprotected. Restore is safe even when C is still live;
+                # at worst we end up with slightly more stops than minimal,
+                # but full original coverage is preserved.
+                if cancelled_specs:
+                    restored = self._restore_stop_orders(symbol, cancelled_specs)
+                    logger.warning(
+                        "replace_stop_loss: rolled back %d/%d already-cancelled "
+                        "stop(s) for %s after partial cancel failure",
+                        restored, len(cancelled_specs), symbol,
+                    )
                 return None
 
         # Re-read position right before submit — in the sub-second window
