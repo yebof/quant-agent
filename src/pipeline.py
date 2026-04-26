@@ -3856,12 +3856,24 @@ class TradingPipeline:
                     logger.error("record_failure failed for %s: %s", r.symbol, re)
             return {"status": "analysis_error", "run_id": run_id, "error": str(e)}
 
-        successful_symbols = {
-            res["symbol"]
+        # Match results to reports by (symbol, form_type, filing_date), not
+        # just symbol. Same-symbol multiple-form-day is rare but real
+        # (10-Q + 10-K can land the same fiscal-year-end day). Symbol-only
+        # matching meant a successful 10-K silently flagged a failed 10-Q
+        # as confirmed and never consumed its retry budget — the failed
+        # filing would then be re-queued every preprocess run forever.
+        def _filing_key(symbol: str, form_type: str | None, filing_date: str | None):
+            return (symbol, form_type, filing_date)
+
+        successful_keys = {
+            _filing_key(res["symbol"], res.get("form_type"), res.get("filing_date"))
             for res in results
             if res.get("is_new")
         }
-        failed_reports = [r for r in new_reports if r.symbol not in successful_symbols]
+        failed_reports = [
+            r for r in new_reports
+            if _filing_key(r.symbol, r.form_type, r.filing_date) not in successful_keys
+        ]
         for report in failed_reports:
             try:
                 self.earnings_provider.record_failure(report)
@@ -3896,9 +3908,11 @@ class TradingPipeline:
 
         # Confirm filings. Do this AFTER logging so a crash between the two
         # leaves the filing still "new" for the next preprocess run.
+        # Match by (symbol, form_type, filing_date) to avoid confirming a
+        # failed 10-Q on the back of a successful same-day 10-K.
         confirmed = 0
         for r in new_reports:
-            if any(res["symbol"] == r.symbol and res["is_new"] for res in results):
+            if _filing_key(r.symbol, r.form_type, r.filing_date) in successful_keys:
                 try:
                     self.earnings_provider.confirm_filing(r)
                     confirmed += 1
