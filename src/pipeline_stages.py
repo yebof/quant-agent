@@ -708,6 +708,13 @@ class ExecutionStage:
                     action_label = "SELL"
                 sell_price = existing[0].current_price
                 sell_limit = round(sell_price * 0.995, 2)
+                if not pipeline.broker.cancel_protective_stops(decision.symbol):
+                    logger.warning(
+                        "Skipping %s %s: protective-stop clear failed; "
+                        "Alpaca would reject on held_for_orders",
+                        action_label, decision.symbol,
+                    )
+                    continue
                 order = pipeline.broker.submit_order(
                     symbol=decision.symbol, qty=qty, side="sell",
                     limit_price=sell_limit,

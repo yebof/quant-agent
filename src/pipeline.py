@@ -961,6 +961,12 @@ class TradingPipeline:
                 # let the trailing stop handle that decision.
                 continue
             sell_limit = round(p.current_price * 0.995, 2)
+            if not self.broker.cancel_protective_stops(p.symbol):
+                logger.warning(
+                    "auto_take_profit: skipping %s — protective-stop clear failed",
+                    p.symbol,
+                )
+                continue
             try:
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=trim_qty, side="sell",
@@ -2985,6 +2991,12 @@ class TradingPipeline:
                 if qty is None:
                     continue
                 emergency_limit = round(p.current_price * 0.99, 2)
+                if not self.broker.cancel_protective_stops(p.symbol):
+                    logger.warning(
+                        "Midday emergency sell: skipping %s — protective-stop "
+                        "clear failed; broker would reject the SELL", p.symbol,
+                    )
+                    continue
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=qty, side="sell",
                     limit_price=emergency_limit,
@@ -3114,6 +3126,12 @@ class TradingPipeline:
                 if qty is None:
                     continue
                 sell_limit = round(existing[0].current_price * 0.995, 2)
+                if not self.broker.cancel_protective_stops(symbol):
+                    logger.warning(
+                        "Reviewer %s %s skipped: protective-stop clear failed",
+                        act, symbol,
+                    )
+                    continue
                 order = self.broker.submit_order(
                     symbol=symbol, qty=qty, side="sell",
                     limit_price=sell_limit,
@@ -3205,6 +3223,12 @@ class TradingPipeline:
             if qty is None:
                 continue
             sell_limit = round(p.current_price * 0.99, 2)
+            if not self.broker.cancel_protective_stops(p.symbol):
+                logger.warning(
+                    "Force-delever: skipping %s — protective-stop clear failed",
+                    p.symbol,
+                )
+                continue
             try:
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=qty, side="sell",
@@ -3945,6 +3969,12 @@ class TradingPipeline:
                 if qty is None:
                     continue
                 emergency_limit = round(p.current_price * 0.99, 2)
+                if not self.broker.cancel_protective_stops(p.symbol):
+                    logger.warning(
+                        "Intra emergency sell: skipping %s — protective-stop "
+                        "clear failed; broker would reject the SELL", p.symbol,
+                    )
+                    continue
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=qty, side="sell",
                     limit_price=emergency_limit,

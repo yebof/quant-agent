@@ -280,6 +280,80 @@ def test_cancel_open_entry_orders_preserves_sell_protection(mock_tc_cls):
 
 
 @patch("src.execution.broker.TradingClient")
+def test_cancel_protective_stops_no_stops_returns_true(mock_tc_cls):
+    """No open stops on this symbol — nothing to clear, SELL is safe to submit."""
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = []
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    assert broker.cancel_protective_stops("AMZN") is True
+    mock_client.cancel_order_by_id.assert_not_called()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_cancel_protective_stops_cancels_each_stop(mock_tc_cls):
+    """All stops cancelled successfully → returns True. Verifies the
+    AMZN-2026-04-25 path: a TRAIL_STOP holding all 51 shares must be
+    cleared before the reviewer's REDUCE/SELL has any chance of acceptance."""
+    stop_a = MagicMock(); stop_a.id = "stop-a"
+    stop_a.order_type = "stop"; stop_a.side = "sell"
+    stop_b = MagicMock(); stop_b.id = "stop-b"
+    stop_b.order_type = "trailing_stop"; stop_b.side = "sell"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [stop_a, stop_b]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    assert broker.cancel_protective_stops("AMZN") is True
+    assert mock_client.cancel_order_by_id.call_count == 2
+    mock_client.cancel_order_by_id.assert_any_call("stop-a")
+    mock_client.cancel_order_by_id.assert_any_call("stop-b")
+
+
+@patch("src.execution.broker.TradingClient")
+def test_cancel_protective_stops_partial_failure_returns_false(mock_tc_cls):
+    """If any cancel raises, return False so the caller skips the SELL.
+    Submitting through a partially-cleared stop set would still hit
+    held_for_orders on the surviving stop's qty — better to skip than
+    waste a reject/log-noise round-trip on Alpaca."""
+    stop_a = MagicMock(); stop_a.id = "stop-a"
+    stop_a.order_type = "stop"; stop_a.side = "sell"
+    stop_b = MagicMock(); stop_b.id = "stop-b"
+    stop_b.order_type = "stop"; stop_b.side = "sell"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [stop_a, stop_b]
+    mock_client.cancel_order_by_id.side_effect = [None, RuntimeError("api error")]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    assert broker.cancel_protective_stops("AMZN") is False
+    assert mock_client.cancel_order_by_id.call_count == 2
+
+
+@patch("src.execution.broker.TradingClient")
+def test_cancel_protective_stops_ignores_non_stop_orders(mock_tc_cls):
+    """The helper must only target SELL stop legs — never BUY entries or
+    open SELL limits left by a previous reviewer SELL. The underlying
+    _list_open_sell_stop_orders filter handles this; verify the wrapper
+    doesn't accidentally widen the scope."""
+    buy_order = MagicMock(); buy_order.id = "buy-1"
+    buy_order.order_type = "limit"; buy_order.side = "buy"
+    stop_order = MagicMock(); stop_order.id = "stop-1"
+    stop_order.order_type = "stop"; stop_order.side = "sell"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [buy_order, stop_order]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    assert broker.cancel_protective_stops("AMZN") is True
+    mock_client.cancel_order_by_id.assert_called_once_with("stop-1")
+
+
+@patch("src.execution.broker.TradingClient")
 def test_submit_order_quantizes_sub_penny_limit_price(mock_tc_cls):
     """Quote midpoint can yield $106.515; Alpaca requires $0.01 ticks for ≥$1.
     submit_order must round BEFORE building the request. Observed 2026-04-17:

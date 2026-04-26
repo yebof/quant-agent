@@ -47,6 +47,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 ### 责任边界
 - Macro 拥有 regime 枚举（risk-on / risk-off / transitional / neutral）的权威；News 的 `current_regime` 只描述新闻/地缘背景，不重复 Macro 的枚举
 - 所有 SELL 面单 path（morning SELL、midday SELL/REDUCE、emergency sell）提交后都走 `_order_accepted()` 校验，broker 返 error/rejected 不写 trades 表，别再绕开这层
+- 同上 SELL path **提交前必须先调 `broker.cancel_protective_stops(symbol)`**——morning BUY 的 OTO stop-loss leg 和 midday/close 的 TRAIL_STOP 都会让 Alpaca 把 shares 标 `held_for_orders=qty`，再下 SELL 必被 `insufficient qty available` 拒（2026-04-25 AMZN 实例）。helper 返 False 时**直接 skip 这个 symbol**，别盲目下单。这条对 SELL/REDUCE/EMERGENCY_SELL/FORCE_DELEVER/TAKE_PROFIT 5 个 action 全适用，新增 SELL path 时永远先加这步
 
 ### 时区
 - ET 统一走 `src/trading_calendar.py`（`et_today` / `et_now` / `session_date_key` / `in_session_window` / `SESSION_WINDOWS`）。`src/util/time.py` 是向后兼容 shim，新代码直接 import `src.trading_calendar`。`daily_pnl` 主键、`insights` 查询、`broker.is_trading_day`、news/macro 快照目录、earnings cutoff、market OHLCV 全部 ET——任何 host TZ 都要出同样数据
