@@ -623,6 +623,77 @@ def test_replace_stop_loss_uses_max_of_multiple_existing_stops(mock_tc_cls):
 
 
 @patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_restores_partially_cancelled_stops_when_one_cancel_fails(mock_tc_cls):
+    """Partial-cancel rollback (P2 #1). Symbol has 3 protective stops.
+    First two cancel cleanly, third raises. Without restore, A and B are
+    permanently gone while C is still alive — the symbol's qty that was
+    covered by A and B is now naked. Always restore whatever was already
+    cancelled, even if some stops are still live at the broker. The
+    'leave broker state alone if anything is still open' optimization
+    was wrong for this exact case (partial failure inside the loop)."""
+    def _stop(id_, stop_price, qty=10):
+        s = MagicMock()
+        s.id = id_; s.order_type = "stop"; s.side = "sell"
+        s.qty = str(qty); s.stop_price = str(stop_price); s.limit_price = str(stop_price * 0.97)
+        return s
+
+    stop_a = _stop("stop-a", 180.0)
+    stop_b = _stop("stop-b", 180.0)
+    stop_c = _stop("stop-c", 180.0)
+    restore_a = MagicMock(); restore_a.id = "restored-a"; restore_a.status = "accepted"
+    restore_b = MagicMock(); restore_b.id = "restored-b"; restore_b.status = "accepted"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [stop_a, stop_b, stop_c]
+    # cancel: A ok, B ok, C raises
+    mock_client.cancel_order_by_id.side_effect = [None, None, RuntimeError("api hiccup")]
+    # _restore_stop_orders re-submits A and B; submit_order returns the new
+    # stop ids in order.
+    mock_client.submit_order.side_effect = [restore_a, restore_b]
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("NVDA", 30, 180.0, 200.0, 6000.0, 600.0),
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    # New stop $195 — high enough to ratchet past original 180.
+    result = broker.replace_stop_loss("NVDA", 195.0)
+
+    assert result is None  # the wider operation aborts on partial cancel
+    # All three cancels attempted.
+    assert mock_client.cancel_order_by_id.call_count == 3
+    # Restore must have re-submitted both A and B (the ones we did cancel).
+    # No new stop is submitted for the wider replace (we returned early).
+    assert mock_client.submit_order.call_count == 2, (
+        f"expected 2 restore submits for A and B; got {mock_client.submit_order.call_count}"
+    )
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_first_cancel_failure_no_restore_attempted(mock_tc_cls):
+    """If the very first cancel fails, cancelled_specs is empty → nothing
+    to roll back. The function must still bail cleanly without trying to
+    re-submit phantom stops."""
+    stop_a = MagicMock(); stop_a.id = "stop-a"; stop_a.order_type = "stop"
+    stop_a.side = "sell"; stop_a.qty = "10"; stop_a.stop_price = "180.0"
+    stop_a.limit_price = "175.0"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [stop_a]
+    mock_client.cancel_order_by_id.side_effect = RuntimeError("api hiccup")
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("NVDA", 10, 180.0, 200.0, 2000.0, 200.0),
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    assert broker.replace_stop_loss("NVDA", 195.0) is None
+    mock_client.cancel_order_by_id.assert_called_once()
+    # No restore attempts — nothing was successfully cancelled.
+    mock_client.submit_order.assert_not_called()
+
+
+@patch("src.execution.broker.TradingClient")
 def test_replace_stop_loss_no_position_returns_none(mock_tc_cls):
     mock_client = MagicMock()
     mock_client.get_orders.return_value = []
