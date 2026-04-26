@@ -567,6 +567,50 @@ def test_pipeline_midday_bypasses_reviewer_when_daily_loss_breached():
     pipeline._reconcile_fills.assert_called_once()
 
 
+def test_emergency_liquidate_skips_position_when_protective_stop_cancel_fails():
+    """If a symbol's protective stops can't be cleared, Alpaca rejects the
+    SELL on held_for_orders. Emergency liquidate must skip that symbol
+    rather than blast a guaranteed-reject SELL into the broker — and must
+    still proceed with the OTHER symbols whose stops cleared cleanly. This
+    pins the AMZN-2026-04-25 production failure mode for the crisis path."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+    pos_clean = Position(
+        symbol="SPY", qty=10.0, avg_entry=500.0, current_price=480.0,
+        market_value=4800.0, unrealized_pnl=-200.0, sector="ETF",
+    )
+    pos_blocked = Position(
+        symbol="AMZN", qty=51.0, avg_entry=240.0, current_price=230.0,
+        market_value=11730.0, unrealized_pnl=-510.0, sector="Consumer Cyclical",
+    )
+
+    pipeline.broker.cancel_protective_stops.side_effect = lambda sym: sym != "AMZN"
+    pipeline.broker.submit_order.return_value = {
+        "id": "sell-spy", "status": "accepted", "symbol": "SPY"
+    }
+    pipeline._order_accepted = MagicMock(return_value=True)
+    pipeline._full_sell_qty = lambda q: q
+    pipeline._format_qty = lambda q: str(q)
+
+    loss_violation = MagicMock(message="Daily loss 4.0% exceeds max 3%")
+    orders = pipeline._midday_emergency_liquidate(
+        [pos_clean, pos_blocked], loss_violation, "run-test",
+    )
+
+    assert len(orders) == 1, f"only the cleanly-cleared SPY should sell, got {orders}"
+    assert orders[0]["symbol"] == "SPY"
+    assert pipeline.broker.cancel_protective_stops.call_count == 2
+    pipeline.broker.cancel_protective_stops.assert_any_call("SPY")
+    pipeline.broker.cancel_protective_stops.assert_any_call("AMZN")
+    # AMZN must NOT have reached the SELL submit — that's the whole point.
+    submit_calls = pipeline.broker.submit_order.call_args_list
+    assert all(c.kwargs.get("symbol") != "AMZN" for c in submit_calls), (
+        f"AMZN SELL must be skipped when its stops can't be cleared; "
+        f"got submit_calls={submit_calls}"
+    )
+
+
 def test_pipeline_midday_fetches_only_executed_morning_trades():
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.broker = MagicMock()
