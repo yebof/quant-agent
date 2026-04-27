@@ -90,6 +90,25 @@ class Database:
                 buy_grades_json TEXT DEFAULT '[]',
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            -- Orphaned protective stops awaiting follow-up restore.
+            -- Written by _finalize_protection_after_sell when the lingering
+            -- SELL couldn't be cancelled cleanly (or didn't reach terminal
+            -- after cancel). Drained at the start of every session: each
+            -- row's sell_order_id is re-queried; if now terminal, we
+            -- finalize protection from the persisted specs and delete the
+            -- row. Without persistence, the bail branches' "next session
+            -- reconcile rebuilds coverage" promise was a lie — _reconcile_fills
+            -- only updates fill columns, not stop coverage.
+            CREATE TABLE IF NOT EXISTS pending_protection_restores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                sell_order_id TEXT NOT NULL,
+                position_qty_before_sell REAL NOT NULL,
+                specs_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                run_id TEXT
+            );
         """)
         self.conn.commit()
         self._migrate()
@@ -151,6 +170,23 @@ class Database:
             "missed_opportunities_json",
             "missed_opportunities_json TEXT DEFAULT '[]'",
         )
+        # codex r7 P1 #3: pending_protection_restores table for older DBs
+        # that pre-date the orphaned-stop-restore queue. Idempotent.
+        try:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_protection_restores (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    sell_order_id TEXT NOT NULL,
+                    position_qty_before_sell REAL NOT NULL,
+                    specs_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    run_id TEXT
+                )
+            """)
+            self.conn.commit()
+        except Exception as e:
+            _log.error("Schema migration failed for pending_protection_restores: %s", e)
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
@@ -345,6 +381,50 @@ class Database:
                 f"SELECT 1 FROM trades WHERE {where} LIMIT 1", tuple(params),
             ).fetchone()
         return row is not None
+
+    def insert_pending_protection_restore(
+        self, *, symbol: str, sell_order_id: str,
+        position_qty_before_sell: float, specs_json: str,
+        run_id: str | None = None,
+    ) -> int:
+        """Persist an orphaned protection-restore intent.
+
+        Written when _finalize_protection_after_sell can't act now —
+        either cancel of the lingering SELL raised, or the order didn't
+        converge to terminal within the short post-cancel wait. Drained
+        at session start: the pending row's sell_order_id is re-queried
+        for terminal status, and if now terminal, the persisted specs
+        drive a fresh finalize attempt.
+        """
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT INTO pending_protection_restores "
+                "(symbol, sell_order_id, position_qty_before_sell, specs_json, run_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (symbol, sell_order_id, position_qty_before_sell, specs_json, run_id),
+            )
+            self.conn.commit()
+            return cur.lastrowid or 0
+
+    def get_pending_protection_restores(self) -> list[dict]:
+        """All currently-pending protection-restore rows, oldest first."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, symbol, sell_order_id, position_qty_before_sell, "
+                "specs_json, created_at, run_id FROM pending_protection_restores "
+                "ORDER BY created_at ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_pending_protection_restore(self, row_id: int) -> int:
+        """Remove a row by its primary key (after successful drain)."""
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM pending_protection_restores WHERE id = ?",
+                (row_id,),
+            )
+            self.conn.commit()
+            return cur.rowcount or 0
 
     @staticmethod
     def _executed_trade_predicate() -> str:
