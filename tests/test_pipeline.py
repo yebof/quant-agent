@@ -970,6 +970,42 @@ def test_finalize_protection_uses_partial_fill_after_lingering_cancel():
     pipeline.broker._restore_stop_orders.assert_not_called()
 
 
+def test_finalize_protection_bails_when_post_cancel_status_still_non_terminal():
+    """Cancel API succeeds but propagation takes longer than the 5s
+    short-wait — broker still reports `pending_cancel` (or even `new`).
+    Restoring stops at this point recreates the held_for_orders conflict
+    PR K was supposed to fix. Pin: bail if post-cancel status is not in
+    the terminal set."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._reprotect_residual_after_partial_sell = MagicMock()
+
+    # First read: live. After cancel + 5s wait: STILL non-terminal
+    # (pending_cancel). Cancel itself didn't raise — it succeeded —
+    # but propagation hasn't completed.
+    pipeline.broker.get_order_fill_info.side_effect = [
+        {"status": "new", "filled_qty": "0", "filled_avg_price": None},
+        {"status": "pending_cancel", "filled_qty": "0", "filled_avg_price": None},
+    ]
+
+    cancelled = [{"id": "stop-old", "qty": 100, "stop_price": 95.0}]
+
+    pipeline._finalize_protection_after_sell(
+        order_id="alpaca-slow-cancel",
+        symbol="NVDA",
+        position_qty_before_sell=100.0,
+        cancelled_specs=cancelled,
+    )
+
+    pipeline.broker.client.cancel_order_by_id.assert_called_once()
+    # Critical: restore must NOT fire — broker may still consider the
+    # SELL live. Compounding with a stop submit would re-trigger
+    # held_for_orders.
+    pipeline.broker._restore_stop_orders.assert_not_called()
+    pipeline._reprotect_residual_after_partial_sell.assert_not_called()
+
+
 def test_finalize_protection_bails_when_lingering_cancel_fails():
     """If we can't even cancel the lingering SELL (API timeout etc.),
     we have no clean state to finalize from. Restoring stops anyway

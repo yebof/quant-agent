@@ -641,6 +641,25 @@ class TradingPipeline:
                 "filled_qty=%s",
                 symbol, status, fill_info.get("filled_qty"),
             )
+            # Cancel propagation can take longer than the 5s wait window,
+            # especially during halts or illiquid conditions. If status
+            # is still non-terminal (`pending_cancel`, `new`, etc.),
+            # restoring stops now would re-trigger the held_for_orders
+            # conflict this whole guard exists to prevent. Bail with a
+            # loud warning — the next session reconcile will pick up
+            # the orphaned SELL and rebuild coverage. Codex r6 caught
+            # this — earlier versions (PR K) fell through assuming the
+            # cancel always converged within 5s.
+            if status not in self._TERMINAL_ORDER_STATUSES:
+                logger.warning(
+                    "Cancel of lingering SELL on %s did not converge to "
+                    "terminal within 5s (post-cancel status=%s) — skipping "
+                    "protection finalize. Position currently has no stops "
+                    "and a maybe-still-live SELL; next session reconcile "
+                    "will rebuild coverage.",
+                    symbol, status or "?",
+                )
+                return
 
         fill_qty_raw = fill_info.get("filled_qty")
         try:
