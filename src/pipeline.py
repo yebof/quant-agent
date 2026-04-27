@@ -205,6 +205,13 @@ class TradingPipeline:
             max_daily_loss_pct=config.risk.max_daily_loss_pct,
             max_sector_pct=config.risk.max_sector_pct,
             require_stop_loss=config.risk.require_stop_loss,
+            # Codex r11 P2: previously omitted, defaulting to False even
+            # when settings.yaml said True. Prompts + force_delever read
+            # config.risk.allow_margin directly, so the agent saw "margin
+            # OK" while the deterministic engine still applied cash_only.
+            # Result: a user opting in to margin had their BUYs blocked
+            # by a hard rule the agent didn't know was active.
+            allow_margin=config.risk.allow_margin,
         ))
         self.position_reviewer = PositionReviewerAgent(
             api_key=_key_for(config.llm.position_reviewer_model),
