@@ -131,7 +131,7 @@ def test_execution_stage_blocks_buys_when_daily_loss_breached_during_run():
 
     pipeline = MagicMock()
     pipeline.broker.get_latest_price.return_value = 100.0
-    pipeline.broker.cancel_protective_stops.return_value = True
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
     # SELL submits cleanly first.
     pipeline.broker.submit_order.return_value = {
         "id": "sell-1", "status": "accepted", "symbol": "JPM",
@@ -200,7 +200,7 @@ def test_execution_stage_allows_buys_when_daily_loss_not_breached_after_refresh(
 
     pipeline = MagicMock()
     pipeline.broker.get_latest_price.return_value = 100.0
-    pipeline.broker.cancel_protective_stops.return_value = True
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
     pipeline.broker.submit_order.return_value = {
         "id": "buy-1", "status": "accepted", "symbol": "SPY",
     }

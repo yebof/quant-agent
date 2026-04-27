@@ -556,6 +556,47 @@ class TradingPipeline:
                     return True
         return False
 
+    def _reprotect_residual_after_partial_sell(
+        self, symbol: str, residual_qty: float, cancelled_specs: list[dict],
+    ) -> None:
+        """After a partial exit (TAKE_PROFIT / REDUCE / PARTIAL_SELL), place a
+        fresh stop on the residual qty using the most-protective price among
+        the stops we cancelled to clear held_for_orders for the SELL.
+
+        Without this, the cancel-then-sell flow introduced in P1 #3 leaves
+        the residual position naked until the next morning's BUY rebuilds an
+        OTO leg — which never happens for a held-through position. The stop
+        we re-place isn't a perfect copy of the original (we collapse
+        multiple stops onto the highest stop_price), but it preserves at
+        least the most-protective coverage that was in place pre-SELL.
+
+        Best-effort: if _submit_stop_limit_order raises, log loudly but
+        don't propagate — the SELL itself already succeeded; failing the
+        re-protection shouldn't undo that.
+        """
+        if residual_qty <= 0 or not cancelled_specs:
+            return
+        best_stop = max(
+            (s.get("stop_price", 0) for s in cancelled_specs),
+            default=0,
+        )
+        if best_stop <= 0:
+            return
+        try:
+            self.broker._submit_stop_limit_order(
+                symbol=symbol, qty=residual_qty, stop_price=best_stop,
+            )
+            logger.info(
+                "Re-protected %s residual qty=%s @ stop $%.2f after partial exit",
+                symbol, self._format_qty(residual_qty), best_stop,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Re-protect failed for %s residual=%s @ $%.2f: %s — position "
+                "is unprotected until the next session re-attaches a stop",
+                symbol, self._format_qty(residual_qty), best_stop, exc,
+            )
+
     @staticmethod
     def _order_accepted(order: dict, symbol: str, side: str) -> bool:
         """Returns True iff the order payload looks like a live broker order.
@@ -961,7 +1002,8 @@ class TradingPipeline:
                 # let the trailing stop handle that decision.
                 continue
             sell_limit = round(p.current_price * 0.995, 2)
-            if not self.broker.cancel_protective_stops(p.symbol):
+            ok, stop_specs = self.broker.cancel_protective_stops(p.symbol)
+            if not ok:
                 logger.warning(
                     "auto_take_profit: skipping %s — protective-stop clear failed",
                     p.symbol,
@@ -975,9 +1017,20 @@ class TradingPipeline:
                 )
             except Exception as e:
                 logger.error("auto_take_profit: submit failed for %s: %s", p.symbol, e)
+                if stop_specs:
+                    self.broker._restore_stop_orders(p.symbol, stop_specs)
                 continue
             if not self._order_accepted(order, p.symbol, "sell"):
+                if stop_specs:
+                    self.broker._restore_stop_orders(p.symbol, stop_specs)
                 continue
+            # TAKE_PROFIT is always a partial trim (the qty>=p.qty branch
+            # above continues out). Re-protect the residual qty so the
+            # remaining position doesn't ride naked between now and the
+            # next session's OTO rebuild.
+            self._reprotect_residual_after_partial_sell(
+                p.symbol, p.qty - trim_qty, stop_specs,
+            )
             try:
                 self.db.insert_trade(
                     symbol=p.symbol, action="TAKE_PROFIT", qty=trim_qty,
@@ -3006,7 +3059,8 @@ class TradingPipeline:
                     )
                     continue
                 emergency_limit = round(p.current_price * 0.99, 2)
-                if not self.broker.cancel_protective_stops(p.symbol):
+                ok, stop_specs = self.broker.cancel_protective_stops(p.symbol)
+                if not ok:
                     logger.warning(
                         "Midday emergency sell: skipping %s — protective-stop "
                         "clear failed; broker would reject the SELL", p.symbol,
@@ -3018,7 +3072,13 @@ class TradingPipeline:
                     reference_price=p.current_price,
                 )
                 if not self._order_accepted(order, p.symbol, "sell"):
+                    # Emergency sell didn't reach the broker — restore the
+                    # protective stops we cancelled so the position isn't
+                    # naked while the next intra tick takes another shot.
+                    if stop_specs:
+                        self.broker._restore_stop_orders(p.symbol, stop_specs)
                     continue
+                # Emergency sell is always a full exit — no residual to re-protect.
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,
@@ -3141,7 +3201,9 @@ class TradingPipeline:
                 if qty is None:
                     continue
                 sell_limit = round(existing[0].current_price * 0.995, 2)
-                if not self.broker.cancel_protective_stops(symbol):
+                position_qty = existing[0].qty
+                ok, stop_specs = self.broker.cancel_protective_stops(symbol)
+                if not ok:
                     logger.warning(
                         "Reviewer %s %s skipped: protective-stop clear failed",
                         act, symbol,
@@ -3153,7 +3215,16 @@ class TradingPipeline:
                     reference_price=existing[0].current_price,
                 )
                 if not self._order_accepted(order, symbol, "sell"):
+                    if stop_specs:
+                        self.broker._restore_stop_orders(symbol, stop_specs)
                     continue
+                # REDUCE is always partial. Full SELL by reviewer (rare —
+                # reviewer prompt biases toward HOLD/REDUCE/TRAIL_STOP) leaves
+                # nothing to protect.
+                if qty < position_qty:
+                    self._reprotect_residual_after_partial_sell(
+                        symbol, position_qty - qty, stop_specs,
+                    )
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=symbol, action=act, qty=qty,
@@ -3238,7 +3309,8 @@ class TradingPipeline:
             if qty is None:
                 continue
             sell_limit = round(p.current_price * 0.99, 2)
-            if not self.broker.cancel_protective_stops(p.symbol):
+            ok, stop_specs = self.broker.cancel_protective_stops(p.symbol)
+            if not ok:
                 logger.warning(
                     "Force-delever: skipping %s — protective-stop clear failed",
                     p.symbol,
@@ -3251,7 +3323,13 @@ class TradingPipeline:
                     reference_price=p.current_price,
                 )
                 if not self._order_accepted(order, p.symbol, "sell"):
+                    # FORCE_DELEVER didn't reach broker — restore stops so
+                    # the position isn't naked while morning/midday tries
+                    # other paths to free cash.
+                    if stop_specs:
+                        self.broker._restore_stop_orders(p.symbol, stop_specs)
                     continue
+                # FORCE_DELEVER is always a full exit — no residual to re-protect.
                 self.db.insert_trade(
                     symbol=p.symbol, action="FORCE_DELEVER", qty=qty,
                     price=p.current_price,
@@ -4012,7 +4090,8 @@ class TradingPipeline:
                     )
                     continue
                 emergency_limit = round(p.current_price * 0.99, 2)
-                if not self.broker.cancel_protective_stops(p.symbol):
+                ok, stop_specs = self.broker.cancel_protective_stops(p.symbol)
+                if not ok:
                     logger.warning(
                         "Intra emergency sell: skipping %s — protective-stop "
                         "clear failed; broker would reject the SELL", p.symbol,
@@ -4024,7 +4103,13 @@ class TradingPipeline:
                     reference_price=p.current_price,
                 )
                 if not self._order_accepted(order, p.symbol, "sell"):
+                    # Intra emergency didn't reach broker — restore stops so
+                    # the position keeps its existing protection until the
+                    # next 30-min tick takes another shot.
+                    if stop_specs:
+                        self.broker._restore_stop_orders(p.symbol, stop_specs)
                     continue
+                # Intra emergency is always a full exit — no residual to re-protect.
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,

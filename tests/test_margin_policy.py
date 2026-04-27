@@ -265,6 +265,7 @@ def test_force_delever_picks_biggest_loser_first():
         "id": "ord-1", "status": "accepted", "symbol": "LOSER",
     }
     pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
     pipeline.broker.get_account.return_value = {
         "cash": 500.0, "portfolio_value": 10_000.0, "last_equity": 10_500.0,
     }
@@ -302,6 +303,7 @@ def test_force_delever_stops_once_deficit_covered():
         "id": "ord-X", "status": "accepted", "symbol": "X",
     }
     pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
     pipeline.broker.get_account.return_value = {
         "cash": 1_000.0, "portfolio_value": 10_000.0, "last_equity": 11_000.0,
     }
@@ -370,6 +372,7 @@ def test_force_delever_tiebreak_is_deterministic_on_equal_pnl():
         "id": "ord-1", "status": "accepted", "symbol": "AAA",
     }
     pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
     pipeline.broker.get_account.return_value = {
         "cash": 100.0, "portfolio_value": 10_000.0, "last_equity": 10_500.0,
     }
