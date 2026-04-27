@@ -39,10 +39,17 @@ class TradingScheduler:
             id="morning_run",
         )
 
-        # Lightweight intra-session circuit breaker between morning and midday.
-        h, m = self._parse_time(schedule.intra_check)
+        # Stateless flash-crash circuit breaker — must fire on every 30-min
+        # tick during market hours, matching the launchd wrapper's StartInterval
+        # behaviour (run_if_et_window.sh exempts intra_check from both the
+        # last-run guard and the cross-mode session lock for the same reason:
+        # a single afternoon tick is woefully insufficient for circuit-breaker
+        # coverage). schedule.intra_check is intentionally ignored here — the
+        # config's TIME field is meaningless for a multi-tick job; the daily
+        # window is hardcoded to mirror the launchd window.
         self.scheduler.add_job(
-            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
+            self._run_safe,
+            CronTrigger(hour="9-15", minute="0,30", day_of_week="mon-fri"),
             args=[self.pipeline.run_intra_check, "intra_check"],
             id="intra_check",
         )
