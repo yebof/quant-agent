@@ -4295,6 +4295,15 @@ class TradingPipeline:
         orders = list(auto_tp_orders) + list(exdiv_orders)
 
         if positions:
+            # Sweep any straggler fills before building the reviewer prompt.
+            # run_morning's final reconcile is run_id-scoped, so a BUY whose
+            # fill landed AFTER morning's wait window stays at fill_status=
+            # 'submitted' in DB even though broker shows the position. The
+            # reviewer's executed_only=True query would skip it, losing
+            # entry/stop/thesis context for that holding. An unscoped
+            # reconcile here is cheap (1 broker call per pending row) and
+            # closes that gap. Codex r11 P2.
+            self._reconcile_fills()
             morning_trades = self.db.get_trades(
                 limit=50, today_only=True, executed_only=True,
             )

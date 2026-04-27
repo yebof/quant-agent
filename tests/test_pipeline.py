@@ -1862,6 +1862,83 @@ def test_emergency_liquidate_skips_position_when_protective_stop_cancel_fails():
     )
 
 
+def test_pipeline_midday_reconciles_fills_before_reviewer_prompt(tmp_path):
+    """Codex r11 P2: morning's final reconcile is run_id-scoped, so a BUY
+    whose fill landed AFTER morning's wait window stays at fill_status=
+    'submitted' in DB. The reviewer's executed_only=True query then
+    skips that holding even though the broker shows the position —
+    losing entry/stop/thesis context.
+
+    Pin: midday must call _reconcile_fills BEFORE get_trades for the
+    reviewer prompt. Use a real DB so we can verify a 'submitted' row
+    actually flips to 'filled' and shows up in the reviewer's trade list."""
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    # Morning BUY: still 'submitted' from the run-id-scoped reconcile.
+    db.insert_trade(
+        symbol="SPY", action="BUY", qty=10.0, price=500.0,
+        reasoning="morning entry", run_id="morning-r1",
+        broker_order_id="alpaca-late-fill", fill_status="submitted",
+        stop_loss=480.0, take_profit=540.0,
+    )
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.get_account.return_value = {"cash": 1000.0, "portfolio_value": 5000.0}
+    pipeline.broker.get_positions.return_value = [
+        Position(
+            symbol="SPY", qty=10.0, avg_entry=500.0, current_price=505.0,
+            market_value=5050.0, unrealized_pnl=50.0, sector="ETF",
+        )
+    ]
+    # Broker reports the late fill — our scoped reconcile in run_morning
+    # didn't see it because the order_id wasn't tied to morning's run_id
+    # at terminal-status time, but a fresh unscoped reconcile here will.
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "filled", "filled_qty": "10.0", "filled_avg_price": "500.0",
+    }
+    pipeline.macro = MagicMock()
+    pipeline.macro.get_macro_summary.return_value = {}
+    pipeline.config = MagicMock()
+    pipeline.config.llm.position_reviewer_model = "test-model"
+    pipeline._auto_take_profit = MagicMock(return_value=[])
+    pipeline._handle_ex_dividends = MagicMock(return_value=[])
+    pipeline._run_news_update = MagicMock(return_value=None)
+    pipeline._load_earnings_analyses = MagicMock(return_value=(None, []))
+    pipeline._midday_execute_llm_actions = MagicMock(return_value=[])
+    pipeline.risk_engine = MagicMock()
+    pipeline.risk_engine.check_daily_loss.return_value = None
+    pipeline.position_reviewer = MagicMock()
+    pipeline.position_reviewer.review.return_value = (
+        PositionReview(reasoning_chain=_review_rc(), actions=[], overall_assessment="stable", risk_level="low"),
+        _mock_agent_result(),
+    )
+
+    result = pipeline.run_midday()
+
+    assert result["status"] == "reviewed"
+    # The 'submitted' row must be reconciled to 'filled' BEFORE the
+    # reviewer reads it — otherwise executed_only=True drops it.
+    rows = db.execute(
+        "SELECT fill_status FROM trades WHERE broker_order_id = 'alpaca-late-fill'"
+    ).fetchall()
+    assert rows[0]["fill_status"] == "filled", (
+        "morning BUY must be reconciled to 'filled' before the reviewer "
+        "queries with executed_only=True; otherwise reviewer loses entry context"
+    )
+    # And the reviewer DID see it.
+    rev_kwargs = pipeline.position_reviewer.review.call_args.kwargs
+    morning_trades = rev_kwargs.get("morning_trades") or []
+    assert any(t.get("symbol") == "SPY" for t in morning_trades), (
+        "post-reconcile SPY BUY must surface in reviewer's morning_trades"
+    )
+    db.close()
+
+
 def test_pipeline_midday_fetches_only_executed_morning_trades():
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.broker = MagicMock()
