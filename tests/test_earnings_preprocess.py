@@ -125,6 +125,70 @@ def test_record_failure_abandons_after_max_attempts_with_et_timestamp(tmp_path):
     assert parsed.utcoffset() == et_offset_at_that_instant
 
 
+def test_record_failure_resets_retry_budget_when_filing_date_changes(tmp_path):
+    """Codex r11 P2: the manifest is keyed by symbol+form_type, but a single
+    key spans every quarter's 10-Q. Without a filing_date check, Q1's 3
+    failures (abandoned) leave failed_attempts=3 / abandoned=True in the
+    entry. When Q2 lands and its first failure runs record_failure, the
+    code reads attempts=3 → +1 = 4 → abandoned again immediately.
+
+    Pin: when prior_filing_date differs from incoming, reset
+    failed_attempts to 0 and clear abandoned/abandoned_at. Q2 then gets
+    its full 3-attempt budget."""
+    from src.data.earnings import EarningsDataProvider, EarningsReport
+
+    provider = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
+    q1_report = EarningsReport(
+        symbol="NVDA", form_type="10-Q", filing_date="2026-01-20",
+        filing_path="/tmp/nvda_q1.html", analysis_path=None,
+        text_excerpt="...", is_new=True,
+    )
+    # Burn through Q1 retry budget: 3 failures → abandoned.
+    for _ in range(3):
+        provider.record_failure(q1_report, max_attempts=3)
+    entry = provider.manifest["NVDA_10-Q"]
+    assert entry["failed_attempts"] == 3
+    assert entry["abandoned"] is True
+
+    # Q2 lands on the same key with a NEW filing_date. The first failure
+    # must NOT inherit Q1's abandoned state — it should start fresh.
+    q2_report = EarningsReport(
+        symbol="NVDA", form_type="10-Q", filing_date="2026-04-20",
+        filing_path="/tmp/nvda_q2.html", analysis_path=None,
+        text_excerpt="...", is_new=True,
+    )
+    abandoned = provider.record_failure(q2_report, max_attempts=3)
+
+    assert abandoned is False, (
+        "Q2's first failure must NOT abandon — that's Q1's history "
+        "incorrectly carried forward"
+    )
+    entry = provider.manifest["NVDA_10-Q"]
+    assert entry["filing_date"] == "2026-04-20"
+    assert entry["failed_attempts"] == 1, (
+        f"Q2 should be on attempt 1 of its own budget; got {entry['failed_attempts']}"
+    )
+    assert entry.get("abandoned") is not True
+    assert "abandoned_at" not in entry
+
+
+def test_record_failure_does_not_reset_within_same_filing_date(tmp_path):
+    """Sanity: the reset only fires across filing_dates. Multiple failures
+    on the SAME filing_date must accumulate normally."""
+    from src.data.earnings import EarningsDataProvider, EarningsReport
+
+    provider = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
+    report = EarningsReport(
+        symbol="NVDA", form_type="10-Q", filing_date="2026-04-20",
+        filing_path="/tmp/nvda.html", analysis_path=None,
+        text_excerpt="...", is_new=True,
+    )
+    provider.record_failure(report, max_attempts=3)
+    provider.record_failure(report, max_attempts=3)
+    entry = provider.manifest["NVDA_10-Q"]
+    assert entry["failed_attempts"] == 2  # NOT reset
+
+
 def test_preprocess_records_failures_on_llm_error(tmp_path):
     """If analyze_reports raises, each new filing gets record_failure called."""
     new_filing = EarningsReport(
