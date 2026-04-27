@@ -62,6 +62,53 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _apply_scale_all_buys(decisions, verdict) -> tuple[list, float]:
+    """Apply RiskVerdict.scale_all_buys to BUY decisions.
+
+    `scale_all_buys` is documented in config/prompts/risk_manager.md as
+    a portfolio-level sizing knob with a ge=0.0 le=1.0 range — 0.0 is
+    an explicit "kill all BUYs" veto. The pre-fix code did
+    ``getattr(...) or 1.0`` which silently collapsed 0.0 to 1.0 because
+    0.0 is falsy in Python, disabling the veto. Treat None/missing as
+    1.0 (no scaling), but pass 0.0 through so the scaling branch zeros
+    every BUY allocation.
+
+    Returns ``(scaled_decisions, scale)`` so the caller can use the
+    coerced scale for follow-up filters (re-running hard risk if the
+    scale dropped allocations into different buckets).
+    """
+    scale_raw = getattr(verdict, "scale_all_buys", 1.0)
+    scale = 1.0 if scale_raw is None else float(scale_raw)
+    if scale >= 1.0 or scale < 0.0:
+        return list(decisions), scale
+
+    scaled: list = []
+    for d in decisions:
+        if d.action == "BUY":
+            new_alloc = max(0.0, min(100.0, d.allocation_pct * scale))
+            if new_alloc <= 0:
+                logger.info(
+                    "scale_all_buys=%.2f drops %s (alloc 0 after scaling)",
+                    scale, d.symbol,
+                )
+                continue
+            try:
+                scaled.append(d.model_copy(update={"allocation_pct": new_alloc}))
+                logger.info(
+                    "scale_all_buys=%.2f: %s %.2f%% → %.2f%%",
+                    scale, d.symbol, d.allocation_pct, new_alloc,
+                )
+            except Exception as e:
+                logger.warning(
+                    "scale_all_buys copy failed for %s: %s — keeping original",
+                    d.symbol, e,
+                )
+                scaled.append(d)
+        else:
+            scaled.append(d)
+    return scaled, scale
+
+
 class MorningResearchStage:
     """Parallel data + LLM fan-out at morning open.
 
@@ -594,33 +641,9 @@ class RiskStage:
                 portfolio_decision.decisions, verdict.modifications,
             )
 
-        scale = getattr(verdict, "scale_all_buys", 1.0) or 1.0
-        if scale < 1.0 and scale >= 0.0:
-            scaled: list = []
-            for d in portfolio_decision.decisions:
-                if d.action == "BUY":
-                    new_alloc = max(0.0, min(100.0, d.allocation_pct * scale))
-                    if new_alloc <= 0:
-                        logger.info(
-                            "scale_all_buys=%.2f drops %s (alloc 0 after scaling)",
-                            scale, d.symbol,
-                        )
-                        continue
-                    try:
-                        scaled.append(d.model_copy(update={"allocation_pct": new_alloc}))
-                        logger.info(
-                            "scale_all_buys=%.2f: %s %.2f%% → %.2f%%",
-                            scale, d.symbol, d.allocation_pct, new_alloc,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "scale_all_buys copy failed for %s: %s — keeping original",
-                            d.symbol, e,
-                        )
-                        scaled.append(d)
-                else:
-                    scaled.append(d)
-            portfolio_decision.decisions = scaled
+        portfolio_decision.decisions, scale = _apply_scale_all_buys(
+            portfolio_decision.decisions, verdict,
+        )
 
         if verdict.modifications or scale < 1.0:
             portfolio_decision.decisions, _, blocked_reasons = (
