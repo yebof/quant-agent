@@ -1611,19 +1611,20 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
     mock_broker = MagicMock()
     mock_broker.is_trading_day.return_value = True
     mock_broker.get_latest_price.return_value = 100.0
-    # 3 account snapshots: (1) initial pre-research, (2) post-research
-    # late-breach check added by codex r7 P1, (3) post-sell refresh.
-    # ExecutionStage's pre-BUY recheck (#48) only re-refreshes when
-    # there were no sells — this test has sells, so step 5's refresh
-    # is reused. last_equity == value everywhere so check_daily_loss
-    # never trips → no emergency-sold path.
+    # 4 account snapshots: (1) initial pre-research, (2) post-research
+    # late-breach check (#60), (3) post-decision late-breach check
+    # (codex r8 #1), (4) post-sell refresh. ExecutionStage's pre-BUY
+    # recheck (#48) only re-refreshes when there were no sells —
+    # this test has sells, so step 4's refresh is reused. last_equity
+    # == value everywhere so check_daily_loss never trips.
     mock_broker.get_account.side_effect = [
+        {"cash": 500.0, "portfolio_value": 10000.0, "last_equity": 10000.0},
         {"cash": 500.0, "portfolio_value": 10000.0, "last_equity": 10000.0},
         {"cash": 500.0, "portfolio_value": 10000.0, "last_equity": 10000.0},
         {"cash": 3500.0, "portfolio_value": 10000.0, "last_equity": 10000.0},
     ]
     mock_broker.get_positions.side_effect = [
-        [spy_position], [spy_position], [],
+        [spy_position], [spy_position], [spy_position], [],
     ]
     mock_broker.wait_for_order_terminal.return_value = "filled"
     mock_broker.submit_order.side_effect = [

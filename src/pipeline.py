@@ -3870,6 +3870,19 @@ class TradingPipeline:
             self._decision_stage(ctx)
             portfolio_decision = ctx.portfolio_decision
 
+            # Second late-breach check: PM is itself a multi-second LLM
+            # call (memory layers + Constructor sizing). The post-research
+            # check (#60) caught breaches during research but a parse-fail
+            # or empty-plan exit at this point would still skip
+            # deterministic liquidation until the next intra tick. Codex
+            # r8 #1 caught this gap — same fix as #60, just one stage
+            # later in the pipeline.
+            late_breach = self._check_late_breach_and_emergency_liquidate(
+                run_id, "post-decision",
+            )
+            if late_breach is not None:
+                return late_breach
+
             if not portfolio_decision:
                 logger.info("Portfolio manager: parse failed, no decision object")
                 return {"status": "no_trades", "orders": [], "run_id": run_id}
