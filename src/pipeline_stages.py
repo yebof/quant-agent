@@ -676,6 +676,7 @@ class ExecutionStage:
                 logger.warning("Failed to record HOLD decision for %s: %s", d.symbol, e)
 
         sell_order_ids: list[str] = []
+        pending_protections: list[dict] = []
         for decision in sell_decisions:
             try:
                 existing = [p for p in positions if p.symbol == decision.symbol]
@@ -726,13 +727,16 @@ class ExecutionStage:
                     if stop_specs:
                         pipeline.broker._restore_stop_orders(decision.symbol, stop_specs)
                     continue
-                # If this was a partial exit, re-place a stop on the residual
-                # so the remaining position isn't naked. Full SELL leaves
-                # nothing to protect (qty == position_qty).
-                if qty < position_qty:
-                    pipeline._reprotect_residual_after_partial_sell(
-                        decision.symbol, position_qty - qty, stop_specs,
-                    )
+                # Defer reprotect/restore decision until the existing
+                # post-sell wait below resolves the actual fill_qty —
+                # see _finalize_protection_after_sell. Stash specs +
+                # pre-sell qty here so we can act on truth, not on
+                # submit-acceptance optimism.
+                pending_protections.append({
+                    "order_id": order["id"], "symbol": decision.symbol,
+                    "position_qty_before_sell": position_qty,
+                    "specs": stop_specs,
+                })
                 orders.append(order)
                 sell_order_ids.append(order["id"])
                 pipeline.db.insert_trade(
@@ -755,6 +759,15 @@ class ExecutionStage:
                     "Sell order %s did not fill before buy phase (status=%s); buys will use current cash only",
                     order_id, status or "unknown",
                 )
+
+        # Now that wait_for_order_terminal has returned for every sell,
+        # the broker's fill_info is final. Reprotect on actual residual
+        # (filled successfully) or restore originals (no-fill terminal).
+        for prot in pending_protections:
+            pipeline._finalize_protection_after_sell(
+                prot["order_id"], prot["symbol"],
+                prot["position_qty_before_sell"], prot["specs"],
+            )
 
         if sell_decisions:
             account, positions, price_map = pipeline._refresh_account_state()
