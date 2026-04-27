@@ -600,7 +600,7 @@ def test_emergency_liquidate_reconciles_before_dedupe_check(tmp_path):
     pipeline.broker.get_order_fill_info.return_value = {
         "status": "canceled", "filled_qty": None, "filled_avg_price": None,
     }
-    pipeline.broker.cancel_protective_stops.return_value = True
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
     pipeline.broker.submit_order.return_value = {
         "id": "alpaca-fresh", "status": "accepted", "symbol": "AMZN",
     }
@@ -632,6 +632,216 @@ def test_emergency_liquidate_reconciles_before_dedupe_check(tmp_path):
     db.close()
 
 
+def test_reprotect_residual_picks_highest_stop_price_among_specs():
+    """When multiple stops covered the original position, the re-placed stop
+    on the residual qty must use the HIGHEST stop_price from the cancelled
+    set — that's the most-protective price the position had pre-SELL.
+    Picking the lowest would silently weaken protection on the way back."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+
+    cancelled = [
+        {"id": "stop-low", "qty": 51, "stop_price": 240.0, "limit_price": 235.0},
+        {"id": "stop-high", "qty": 51, "stop_price": 248.5, "limit_price": 240.0},
+        {"id": "stop-mid", "qty": 51, "stop_price": 244.0, "limit_price": 238.0},
+    ]
+    pipeline._reprotect_residual_after_partial_sell("AMZN", 41.0, cancelled)
+
+    pipeline.broker._submit_stop_limit_order.assert_called_once_with(
+        symbol="AMZN", qty=41.0, stop_price=248.5,
+    )
+
+
+def test_reprotect_residual_skips_when_no_specs():
+    """No cancelled stops → nothing to re-protect with. Helper must be a
+    no-op rather than submitting a stop with no anchor price."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+
+    pipeline._reprotect_residual_after_partial_sell("AMZN", 41.0, [])
+
+    pipeline.broker._submit_stop_limit_order.assert_not_called()
+
+
+def test_reprotect_residual_skips_when_residual_zero():
+    """Full-exit path passes residual=0 — helper must skip rather than
+    submitting a 0-qty stop."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+
+    cancelled = [{"id": "stop-1", "qty": 51, "stop_price": 248.5}]
+    pipeline._reprotect_residual_after_partial_sell("AMZN", 0.0, cancelled)
+
+    pipeline.broker._submit_stop_limit_order.assert_not_called()
+
+
+def test_reprotect_residual_swallows_submit_failure_with_loud_warning(caplog):
+    """If the re-protect submit raises, we log loudly but don't propagate —
+    the SELL itself already succeeded; failing the re-protect shouldn't
+    undo that. The position is unprotected until the next session, and
+    the warning needs to be loud enough that operators notice."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker._submit_stop_limit_order.side_effect = RuntimeError("api error")
+    pipeline._format_qty = lambda q: str(q)
+
+    cancelled = [{"id": "stop-1", "qty": 51, "stop_price": 248.5}]
+    # Must not raise.
+    pipeline._reprotect_residual_after_partial_sell("AMZN", 41.0, cancelled)
+
+    assert any(
+        "Re-protect failed for AMZN" in rec.message and rec.levelname == "WARNING"
+        for rec in caplog.records
+    )
+
+
+def test_take_profit_restores_stops_when_sell_rejected(tmp_path):
+    """If the partial-trim SELL is rejected by the broker, we already
+    cancelled the protective stops to clear held_for_orders — and now
+    we have NO sell going through AND no protection. Restore the
+    cancelled stops so the position reverts to its pre-cancel state."""
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    db.insert_trade("NVDA", "BUY", 100, 100.0, "opened", "r1")
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    # SELL is rejected by broker
+    pipeline.broker.submit_order.return_value = {
+        "id": "tp-rejected", "status": "rejected", "symbol": "NVDA",
+    }
+    cancelled = [
+        {"id": "stop-old", "qty": 100, "stop_price": 95.0, "limit_price": 92.0},
+    ]
+    pipeline.broker.cancel_protective_stops.return_value = (True, cancelled)
+
+    winner = Position(
+        symbol="NVDA", qty=100, avg_entry=100, current_price=118,
+        market_value=11800, unrealized_pnl=1800, sector="Technology",
+    )
+
+    orders = pipeline._auto_take_profit([winner], run_id="r2")
+
+    assert orders == [], "rejected SELL should not be in orders list"
+    # Critical: the cancelled stop must be restored (not re-protected on
+    # residual — there's no successful sell, so nothing changed about
+    # the position size, only the stops).
+    pipeline.broker._restore_stop_orders.assert_called_once_with(
+        "NVDA", cancelled,
+    )
+    # And no new residual-stop submission, since the SELL didn't fire.
+    pipeline.broker._submit_stop_limit_order.assert_not_called()
+    db.close()
+
+
+def test_full_sell_skips_residual_reprotect(tmp_path):
+    """When the SELL is for the entire position, residual qty == 0 and
+    re-protect must be a no-op. The whole position is being exited;
+    placing a stop on 0 shares would error. Pin via the morning
+    ExecutionStage path where action_label='SELL' (not PARTIAL_SELL)
+    triggers full-qty exit."""
+    from src.models import PortfolioDecision, TradeDecision
+    from src.pipeline_context import RunContext
+    from src.pipeline_stages import ExecutionStage
+
+    pipeline = MagicMock()
+    pipeline.broker.get_latest_price.return_value = 100.0
+    pipeline.broker.submit_order.return_value = {
+        "id": "sell-full", "status": "accepted", "symbol": "JPM",
+    }
+    pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline.broker.cancel_protective_stops.return_value = (True, [
+        {"id": "stop-1", "qty": 10, "stop_price": 280.0, "limit_price": 275.0}
+    ])
+    pipeline._refresh_account_state.return_value = (
+        {"cash": 60_000.0, "portfolio_value": 100_500.0}, [], {},
+    )
+    pipeline.risk_engine.check_daily_loss.return_value = None
+    pipeline._order_accepted.return_value = True
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._full_sell_qty = lambda q: q
+    pipeline.db = MagicMock()
+
+    ctx = RunContext.start("morning")
+    ctx.cash = 30_000.0
+    ctx.total_value = 100_000.0
+    ctx.last_equity = 100_000.0
+    ctx.positions = [
+        Position(
+            symbol="JPM", qty=10.0, avg_entry=300.0, current_price=320.0,
+            market_value=3_200.0, unrealized_pnl=200.0, sector="Financial",
+        ),
+    ]
+    ctx.portfolio_decision = PortfolioDecision(
+        decisions=[
+            TradeDecision(
+                action="SELL", symbol="JPM", allocation_pct=100,
+                entry_price=300.0, stop_loss=280.0, take_profit=350.0,
+                reasoning="full exit",
+            ),
+        ],
+        portfolio_view="test",
+    )
+    ctx.symbols_bars = {}
+
+    ExecutionStage(pipeline=pipeline).run(ctx)
+
+    # Full SELL fired
+    assert any(
+        c.kwargs.get("side") == "sell" and c.kwargs.get("symbol") == "JPM"
+        for c in pipeline.broker.submit_order.call_args_list
+    )
+    # No residual to protect — must not call _reprotect helper
+    pipeline._reprotect_residual_after_partial_sell.assert_not_called()
+
+
+def test_take_profit_reprotects_residual_after_partial_trim(tmp_path):
+    """End-to-end: TAKE_PROFIT trims 33% of a 100-share NVDA position. After
+    the partial sell submits, the remaining 67 shares MUST get a fresh
+    stop covering them — otherwise PR A's protective-stop clear leaves
+    the residual naked between trim and next morning. This is the
+    regression P1 (codex round 3) was filed for."""
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    db.insert_trade("NVDA", "BUY", 100, 100.0, "opened", "r1")
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline.broker.submit_order.return_value = {
+        "id": "tp-1", "status": "accepted", "symbol": "NVDA",
+    }
+    # cancel returns (success, two-stop snapshot)
+    cancelled = [
+        {"id": "stop-old-low", "qty": 100, "stop_price": 90.0, "limit_price": 87.0},
+        {"id": "stop-old-high", "qty": 100, "stop_price": 95.0, "limit_price": 92.0},
+    ]
+    pipeline.broker.cancel_protective_stops.return_value = (True, cancelled)
+
+    winner = Position(
+        symbol="NVDA", qty=100, avg_entry=100, current_price=118,
+        market_value=11800, unrealized_pnl=1800, sector="Technology",
+    )
+
+    orders = pipeline._auto_take_profit([winner], run_id="r2")
+
+    assert len(orders) == 1
+    # Residual = 100 - 33 = 67 shares; new stop at the highest pre-existing
+    # price (95.0).
+    pipeline.broker._submit_stop_limit_order.assert_called_once_with(
+        symbol="NVDA", qty=67.0, stop_price=95.0,
+    )
+    db.close()
+
+
 def test_emergency_liquidate_skips_position_when_pending_emergency_sell_already_open():
     """Emergency sells go out as -1% LIMIT orders. On a fast-moving day the
     tape can blow through that limit without filling — the order sits as
@@ -649,7 +859,7 @@ def test_emergency_liquidate_skips_position_when_pending_emergency_sell_already_
     pipeline.db.has_pending_action_for_symbol.side_effect = (
         lambda symbol, action: symbol == "AMZN" and action == "EMERGENCY_SELL"
     )
-    pipeline.broker.cancel_protective_stops.return_value = True
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
     pipeline.broker.submit_order.return_value = {
         "id": "sell-spy-new", "status": "accepted", "symbol": "SPY",
     }
@@ -699,7 +909,9 @@ def test_emergency_liquidate_skips_position_when_protective_stop_cancel_fails():
         market_value=11730.0, unrealized_pnl=-510.0, sector="Consumer Cyclical",
     )
 
-    pipeline.broker.cancel_protective_stops.side_effect = lambda sym: sym != "AMZN"
+    pipeline.broker.cancel_protective_stops.side_effect = (
+        lambda sym: ((sym != "AMZN"), [])
+    )
     pipeline.broker.submit_order.return_value = {
         "id": "sell-spy", "status": "accepted", "symbol": "SPY"
     }
@@ -918,6 +1130,7 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
         {"id": "sell-1", "status": "accepted", "symbol": "SPY"},
         {"id": "buy-1", "status": "accepted", "symbol": "QQQ"},
     ]
+    mock_broker.cancel_protective_stops.return_value = (True, [])
     mock_broker_cls.return_value = mock_broker
 
     mock_maa = MagicMock()

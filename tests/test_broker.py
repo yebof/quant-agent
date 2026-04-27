@@ -287,50 +287,78 @@ def test_cancel_protective_stops_no_stops_returns_true(mock_tc_cls):
     mock_tc_cls.return_value = mock_client
 
     broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
-    assert broker.cancel_protective_stops("AMZN") is True
+    ok, specs = broker.cancel_protective_stops("AMZN")
+    assert ok is True
+    assert specs == []
     mock_client.cancel_order_by_id.assert_not_called()
 
 
 @patch("src.execution.broker.TradingClient")
-def test_cancel_protective_stops_cancels_each_stop(mock_tc_cls):
-    """All stops cancelled successfully → returns True. Verifies the
-    AMZN-2026-04-25 path: a TRAIL_STOP holding all 51 shares must be
-    cleared before the reviewer's REDUCE/SELL has any chance of acceptance."""
+def test_cancel_protective_stops_cancels_each_stop_and_returns_specs(mock_tc_cls):
+    """All stops cancelled successfully → returns (True, specs). Specs
+    must carry qty + stop_price + (optional) limit_price so the caller
+    can either restore them on SELL rejection or re-protect the
+    residual qty after a partial exit. Pins the AMZN-2026-04-25 path:
+    a TRAIL_STOP holding all 51 shares must be cleared before the
+    reviewer's REDUCE/SELL has any chance of acceptance, AND the specs
+    must come back so the residual after the trim isn't naked."""
     stop_a = MagicMock(); stop_a.id = "stop-a"
     stop_a.order_type = "stop"; stop_a.side = "sell"
+    stop_a.qty = "51"; stop_a.stop_price = "248.50"; stop_a.limit_price = "240.00"
     stop_b = MagicMock(); stop_b.id = "stop-b"
     stop_b.order_type = "trailing_stop"; stop_b.side = "sell"
+    stop_b.qty = "51"; stop_b.stop_price = "246.00"; stop_b.limit_price = "238.00"
 
     mock_client = MagicMock()
     mock_client.get_orders.return_value = [stop_a, stop_b]
     mock_tc_cls.return_value = mock_client
 
     broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
-    assert broker.cancel_protective_stops("AMZN") is True
+    ok, specs = broker.cancel_protective_stops("AMZN")
+    assert ok is True
     assert mock_client.cancel_order_by_id.call_count == 2
     mock_client.cancel_order_by_id.assert_any_call("stop-a")
     mock_client.cancel_order_by_id.assert_any_call("stop-b")
+    assert len(specs) == 2
+    by_id = {s["id"]: s for s in specs}
+    assert by_id["stop-a"]["stop_price"] == 248.50
+    assert by_id["stop-b"]["stop_price"] == 246.00
+    assert by_id["stop-a"]["qty"] == 51.0
 
 
 @patch("src.execution.broker.TradingClient")
-def test_cancel_protective_stops_partial_failure_returns_false(mock_tc_cls):
-    """If any cancel raises, return False so the caller skips the SELL.
-    Submitting through a partially-cleared stop set would still hit
-    held_for_orders on the surviving stop's qty — better to skip than
-    waste a reject/log-noise round-trip on Alpaca."""
+def test_cancel_protective_stops_partial_failure_rolls_back_and_returns_false(mock_tc_cls):
+    """If any cancel raises, restore the ones we already cancelled and
+    return (False, []). Submitting through a partially-cleared stop set
+    would still hit held_for_orders on the surviving stop's qty, so the
+    caller skips the SELL anyway — but we don't want to leave coverage
+    REDUCED in the meantime, so we roll back. Same discipline as
+    replace_stop_loss's partial-cancel rollback (P2 #1)."""
     stop_a = MagicMock(); stop_a.id = "stop-a"
     stop_a.order_type = "stop"; stop_a.side = "sell"
+    stop_a.qty = "10"; stop_a.stop_price = "180.0"; stop_a.limit_price = "175.0"
     stop_b = MagicMock(); stop_b.id = "stop-b"
     stop_b.order_type = "stop"; stop_b.side = "sell"
+    stop_b.qty = "10"; stop_b.stop_price = "180.0"; stop_b.limit_price = "175.0"
+    restore_a = MagicMock(); restore_a.id = "restored-a"; restore_a.status = "accepted"
 
     mock_client = MagicMock()
     mock_client.get_orders.return_value = [stop_a, stop_b]
+    # Cancel: A succeeds, B raises → A must be restored.
     mock_client.cancel_order_by_id.side_effect = [None, RuntimeError("api error")]
+    mock_client.submit_order.return_value = restore_a
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("AMZN", 10, 240.0, 250.0, 2500.0, 100.0),
+    ]
     mock_tc_cls.return_value = mock_client
 
     broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
-    assert broker.cancel_protective_stops("AMZN") is False
+    ok, specs = broker.cancel_protective_stops("AMZN")
+    assert ok is False
+    assert specs == []  # On failure caller gets no specs to act on
     assert mock_client.cancel_order_by_id.call_count == 2
+    # Restore submitted exactly one new stop (the one we successfully cancelled).
+    assert mock_client.submit_order.call_count == 1
 
 
 @patch("src.execution.broker.TradingClient")
@@ -343,13 +371,17 @@ def test_cancel_protective_stops_ignores_non_stop_orders(mock_tc_cls):
     buy_order.order_type = "limit"; buy_order.side = "buy"
     stop_order = MagicMock(); stop_order.id = "stop-1"
     stop_order.order_type = "stop"; stop_order.side = "sell"
+    stop_order.qty = "10"; stop_order.stop_price = "180.0"; stop_order.limit_price = "175.0"
 
     mock_client = MagicMock()
     mock_client.get_orders.return_value = [buy_order, stop_order]
     mock_tc_cls.return_value = mock_client
 
     broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
-    assert broker.cancel_protective_stops("AMZN") is True
+    ok, specs = broker.cancel_protective_stops("AMZN")
+    assert ok is True
+    assert len(specs) == 1
+    assert specs[0]["id"] == "stop-1"
     mock_client.cancel_order_by_id.assert_called_once_with("stop-1")
 
 

@@ -299,6 +299,7 @@ def test_run_intra_check_emergency_sells_on_breach(tmp_path):
     pipeline.broker.submit_order.return_value = {
         "id": "sell-1", "status": "accepted", "symbol": "NVDA",
     }
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
 
     result = pipeline.run_intra_check()
     assert result["status"] == "emergency_sold"
@@ -358,6 +359,7 @@ def test_auto_take_profit_triggers_once_at_15pct(tmp_path):
     pipeline.broker.submit_order.return_value = {
         "id": "tp-1", "status": "accepted", "symbol": "NVDA",
     }
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
 
     # Position: 100 shares @ $100 cost, current $118 → 18% gain → triggers TP
     winner = Position(
@@ -407,6 +409,7 @@ def test_auto_take_profit_retries_after_canceled_zero_fill(tmp_path):
     pipeline.broker.submit_order.return_value = {
         "id": "tp-1", "status": "accepted", "symbol": "NVDA",
     }
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
 
     winner = Position(
         symbol="NVDA", qty=100, avg_entry=100, current_price=118,

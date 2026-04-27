@@ -708,7 +708,9 @@ class ExecutionStage:
                     action_label = "SELL"
                 sell_price = existing[0].current_price
                 sell_limit = round(sell_price * 0.995, 2)
-                if not pipeline.broker.cancel_protective_stops(decision.symbol):
+                position_qty = existing[0].qty
+                ok, stop_specs = pipeline.broker.cancel_protective_stops(decision.symbol)
+                if not ok:
                     logger.warning(
                         "Skipping %s %s: protective-stop clear failed; "
                         "Alpaca would reject on held_for_orders",
@@ -721,7 +723,16 @@ class ExecutionStage:
                     reference_price=existing[0].current_price,
                 )
                 if not pipeline._order_accepted(order, decision.symbol, "sell"):
+                    if stop_specs:
+                        pipeline.broker._restore_stop_orders(decision.symbol, stop_specs)
                     continue
+                # If this was a partial exit, re-place a stop on the residual
+                # so the remaining position isn't naked. Full SELL leaves
+                # nothing to protect (qty == position_qty).
+                if qty < position_qty:
+                    pipeline._reprotect_residual_after_partial_sell(
+                        decision.symbol, position_qty - qty, stop_specs,
+                    )
                 orders.append(order)
                 sell_order_ids.append(order["id"])
                 pipeline.db.insert_trade(

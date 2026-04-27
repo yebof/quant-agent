@@ -446,12 +446,23 @@ class AlpacaBroker:
             logger.warning("Failed to cancel open orders: %s", exc)
             return 0
 
-    def cancel_protective_stops(self, symbol: str) -> bool:
+    def cancel_protective_stops(self, symbol: str) -> tuple[bool, list[dict]]:
         """Cancel all open SELL stop orders for one symbol so a fresh exit
         order has free shares to work with.
 
-        Returns True if no stops remain (safe to submit a new SELL),
-        False if any cancel failed and at least one stop is still live.
+        Returns ``(success, cancelled_specs)``:
+          - ``success`` is True iff every stop was cancelled cleanly (or
+            none existed). Caller should skip the SELL on False.
+          - ``cancelled_specs`` is the list of stop snapshots (qty,
+            stop_price, limit_price) that were successfully cancelled.
+            Caller uses this to:
+              1. ``_restore_stop_orders`` if the SELL is rejected by
+                 the broker (rollback the cancellation so coverage is
+                 preserved).
+              2. ``_submit_stop_limit_order`` on the residual qty after
+                 a *partial* exit (TAKE_PROFIT / REDUCE / PARTIAL_SELL)
+                 — without this, the residual position rides naked
+                 until the next session re-attaches an OTO stop.
 
         Why this exists: Alpaca rejects new SELL orders when shares are
         held_for_orders by an existing protective stop — the OTO stop-loss
@@ -459,34 +470,44 @@ class AlpacaBroker:
         Without clearing those holds first, REDUCE / SELL / EMERGENCY_SELL
         / TAKE_PROFIT all surface as 'insufficient qty available' rejects
         (2026-04-25 AMZN incident, related_orders=[<TRAIL_STOP id>]).
-        Caller must check the return and skip the SELL on False; otherwise
-        the order will be rejected and the SELL silently lost.
+
+        On partial cancel failure (some succeed, then one raises) the
+        already-cancelled stops are restored before returning False —
+        same rollback discipline as ``replace_stop_loss``. The caller
+        won't proceed with the SELL anyway, so leaving partial-cancelled
+        state at the broker would just shrink coverage for no gain.
         """
         stops = self._list_open_sell_stop_orders(symbol)
         if not stops:
-            return True
+            return True, []
+
+        cancelled_specs: list[dict] = []
         failed = 0
         for order in stops:
-            order_id = getattr(order, "id", None)
-            if not order_id:
+            spec = self._snapshot_stop_order(order)
+            if not spec:
                 continue
             try:
-                self.client.cancel_order_by_id(str(order_id))
+                self.client.cancel_order_by_id(spec["id"])
+                cancelled_specs.append(spec)
             except Exception as exc:
                 logger.warning(
                     "cancel_protective_stops: cancel failed for %s order %s: %s",
-                    symbol, order_id, exc,
+                    symbol, spec["id"], exc,
                 )
                 failed += 1
         if failed > 0:
+            if cancelled_specs:
+                self._restore_stop_orders(symbol, cancelled_specs)
             logger.warning(
-                "cancel_protective_stops: %d/%d cancel(s) failed for %s; "
-                "downstream SELL would be rejected by Alpaca held_for_orders",
-                failed, len(stops), symbol,
+                "cancel_protective_stops: %d/%d cancel(s) failed for %s "
+                "(rolled back %d that succeeded); downstream SELL won't proceed",
+                failed, len(stops), symbol, len(cancelled_specs),
             )
-            return False
-        logger.info("Cancelled %d protective stop(s) for %s", len(stops), symbol)
-        return True
+            return False, []
+        if cancelled_specs:
+            logger.info("Cancelled %d protective stop(s) for %s", len(cancelled_specs), symbol)
+        return True, cancelled_specs
 
     def cancel_open_entry_orders(self) -> int:
         """Cancel open BUY/entry orders while preserving protective SELL legs."""
