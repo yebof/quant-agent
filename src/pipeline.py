@@ -4103,6 +4103,12 @@ class TradingPipeline:
                 "session_close_et": session_close.isoformat(),
             }
 
+        # Drain orphaned protection-restore intents from prior sessions.
+        # If morning bailed on a finalize and the SELL has since become
+        # terminal, recover stop coverage NOW rather than waiting for
+        # next-morning's drain — codex r8 #2.
+        self._drain_pending_protection_restores()
+
         # 1. Sync positions (snapshot into ctx)
         account = self.broker.get_account()
         positions = self.broker.get_positions()
@@ -4442,6 +4448,11 @@ class TradingPipeline:
             logger.info("Intra check skipped: market closed for non-trading day")
             return {"status": "market_holiday", "run_id": run_id}
 
+        # Drain orphaned protection-restore intents — intra runs every
+        # 30 min so this is the most frequent recovery opportunity for
+        # bails that landed during morning. Codex r8 #2.
+        self._drain_pending_protection_restores()
+
         try:
             account = self.broker.get_account()
             positions = self.broker.get_positions()
@@ -4576,6 +4587,12 @@ class TradingPipeline:
         if not self._is_trading_day():
             logger.info("Evening run skipped: market closed for non-trading day")
             return {"status": "market_holiday", "analysis": None, "run_id": run_id}
+
+        # Drain orphaned protection-restore intents — last chance before
+        # the trading day ends. If close-session bailed and the SELL has
+        # since gone terminal, recover coverage now rather than carrying
+        # a naked position overnight. Codex r8 #2.
+        self._drain_pending_protection_restores()
 
         # 1. Record daily PnL — use Alpaca's last_equity (previous trading-day close)
         # as the baseline. This correctly handles weekends/holidays (Alpaca updates

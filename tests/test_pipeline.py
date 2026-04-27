@@ -1129,6 +1129,44 @@ def test_drain_pending_protection_restores_replays_finalize_when_terminal(tmp_pa
     db.close()
 
 
+def test_intra_check_drains_orphan_restores_at_entry(tmp_path):
+    """Codex r8 #2: drain must run on every session entry, not just
+    morning. Pin: intra_check (every 30 min during 09:30-16:00 ET)
+    runs the drain so a bail from morning can recover intra-day."""
+    from src.storage.db import Database
+    import json as _json
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    cancelled = [{"id": "stop-old", "qty": 100, "stop_price": 95.0}]
+    db.insert_pending_protection_restore(
+        symbol="NVDA", sell_order_id="alpaca-orphan",
+        position_qty_before_sell=100.0,
+        specs_json=_json.dumps(cancelled),
+    )
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.get_account.return_value = {
+        "portfolio_value": 100_500.0, "last_equity": 100_000.0, "cash": 5000.0,
+    }
+    pipeline.broker.get_positions.return_value = []
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "canceled", "filled_qty": "0", "filled_avg_price": None,
+    }
+    pipeline.risk_engine = MagicMock()
+    pipeline.risk_engine.check_daily_loss.return_value = None  # no breach
+
+    pipeline.run_intra_check()
+
+    # Drain ran during entry → row consumed (broker said terminal).
+    assert db.get_pending_protection_restores() == []
+    pipeline.broker._restore_stop_orders.assert_called_once_with("NVDA", cancelled)
+    db.close()
+
+
 def test_drain_leaves_row_when_sell_still_non_terminal(tmp_path):
     """If broker still reports the SELL as non-terminal, leave the row
     for a later drain. Otherwise we'd repeat the held_for_orders bug
