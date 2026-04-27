@@ -626,10 +626,11 @@ class TradingPipeline:
             except Exception as exc:
                 logger.warning(
                     "Failed to cancel lingering SELL on %s (order %s): %s "
-                    "— skipping protection finalize. Position has no "
-                    "stops AND a live SELL; next session reconcile will "
-                    "see this and rebuild coverage.",
+                    "— persisting orphaned restore intent for next session.",
                     symbol, order_id, exc,
+                )
+                self._persist_orphaned_protection_restore(
+                    order_id, symbol, position_qty_before_sell, cancelled_specs,
                 )
                 return
             # Re-read post-cancel — broker may report partial fill that
@@ -643,21 +644,20 @@ class TradingPipeline:
             )
             # Cancel propagation can take longer than the 5s wait window,
             # especially during halts or illiquid conditions. If status
-            # is still non-terminal (`pending_cancel`, `new`, etc.),
-            # restoring stops now would re-trigger the held_for_orders
-            # conflict this whole guard exists to prevent. Bail with a
-            # loud warning — the next session reconcile will pick up
-            # the orphaned SELL and rebuild coverage. Codex r6 caught
-            # this — earlier versions (PR K) fell through assuming the
-            # cancel always converged within 5s.
+            # is still non-terminal, persist the restore intent and bail
+            # — next session's drain pass picks it up. Without persistence
+            # the previous bail was a slow leak: the warning promised
+            # "next session reconcile rebuilds coverage" but
+            # _reconcile_fills only updates fill columns. Codex r7 #3.
             if status not in self._TERMINAL_ORDER_STATUSES:
                 logger.warning(
                     "Cancel of lingering SELL on %s did not converge to "
-                    "terminal within 5s (post-cancel status=%s) — skipping "
-                    "protection finalize. Position currently has no stops "
-                    "and a maybe-still-live SELL; next session reconcile "
-                    "will rebuild coverage.",
+                    "terminal within 5s (post-cancel status=%s) — "
+                    "persisting orphaned restore intent for next session.",
                     symbol, status or "?",
+                )
+                self._persist_orphaned_protection_restore(
+                    order_id, symbol, position_qty_before_sell, cancelled_specs,
                 )
                 return
 
@@ -690,6 +690,130 @@ class TradingPipeline:
         self._reprotect_residual_after_partial_sell(
             symbol, actual_residual, cancelled_specs,
         )
+
+    def _persist_orphaned_protection_restore(
+        self,
+        order_id: str,
+        symbol: str,
+        position_qty_before_sell: float,
+        cancelled_specs: list[dict],
+    ) -> None:
+        """Write a row to pending_protection_restores so a follow-up
+        session can finish what we couldn't here.
+
+        Used by the bail branches of _finalize_protection_after_sell:
+        cancel raised, OR cancel was accepted but didn't converge to
+        terminal in 5s. In both cases the position is sitting with the
+        original stops cancelled and a maybe-still-live SELL — neither
+        restoring nor reprotecting is safe right now. Persist the
+        restore intent (specs + sell_order_id) and let the next
+        session's drain pass act once the broker state has settled.
+        Best-effort — DB failure logs but doesn't propagate (the
+        immediate path already had no good option).
+        """
+        if not cancelled_specs:
+            return
+        import json as _json
+        try:
+            self.db.insert_pending_protection_restore(
+                symbol=symbol,
+                sell_order_id=order_id,
+                position_qty_before_sell=position_qty_before_sell,
+                specs_json=_json.dumps(cancelled_specs),
+            )
+            logger.info(
+                "Persisted orphaned protection-restore for %s (order %s, "
+                "%d cancelled stop(s)) — drain pass will retry next session",
+                symbol, order_id, len(cancelled_specs),
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to persist orphaned protection-restore for %s: %s — "
+                "position is unprotected with no recovery plan; manual "
+                "intervention required",
+                symbol, exc,
+            )
+
+    def _drain_pending_protection_restores(self) -> int:
+        """Re-attempt orphaned protection restores from previous sessions.
+
+        For each persisted row: re-query the SELL's terminal status. If
+        terminal, run finalize from the persisted specs; on success,
+        delete the row. If still non-terminal, leave the row for next
+        session. Returns the number of rows successfully drained.
+
+        Called at the start of each pipeline session so a single bail
+        doesn't leave a position permanently unprotected.
+        """
+        try:
+            rows = self.db.get_pending_protection_restores()
+        except Exception as exc:
+            logger.warning("drain_pending_protection_restores: DB read failed: %s", exc)
+            return 0
+        if not rows:
+            return 0
+
+        import json as _json
+        drained = 0
+        for row in rows:
+            row_id = row["id"]
+            symbol = row["symbol"]
+            order_id = row["sell_order_id"]
+            try:
+                fill_info = self.broker.get_order_fill_info(order_id) or {}
+            except Exception as exc:
+                logger.warning(
+                    "drain: broker query failed for %s (order %s): %s — "
+                    "leaving row %d for next session",
+                    symbol, order_id, exc, row_id,
+                )
+                continue
+            status = (fill_info.get("status") or "").lower()
+            if status not in self._TERMINAL_ORDER_STATUSES:
+                logger.info(
+                    "drain: %s (order %s) still non-terminal (status=%s) — "
+                    "leaving row %d for next session",
+                    symbol, order_id, status, row_id,
+                )
+                continue
+            try:
+                cancelled_specs = _json.loads(row["specs_json"])
+            except Exception as exc:
+                logger.error(
+                    "drain: row %d has unparseable specs_json (%s) — "
+                    "deleting orphan to unblock the queue",
+                    row_id, exc,
+                )
+                try:
+                    self.db.delete_pending_protection_restore(row_id)
+                except Exception:
+                    pass
+                continue
+            # Order is terminal; replay finalize from persisted specs.
+            # finalize itself reads fill_info again — same broker call,
+            # cheap.
+            try:
+                self._finalize_protection_after_sell(
+                    order_id=order_id,
+                    symbol=symbol,
+                    position_qty_before_sell=float(row["position_qty_before_sell"]),
+                    cancelled_specs=cancelled_specs,
+                )
+                self.db.delete_pending_protection_restore(row_id)
+                drained += 1
+                logger.info(
+                    "drain: replayed protection finalize for %s (order %s, "
+                    "row %d cleared)", symbol, order_id, row_id,
+                )
+            except Exception as exc:
+                logger.error(
+                    "drain: finalize replay failed for %s row %d: %s — "
+                    "leaving row for next session",
+                    symbol, row_id, exc,
+                )
+        if drained:
+            logger.info("drain: cleared %d orphaned protection-restore row(s)", drained)
+        return drained
 
     def _reprotect_residual_after_partial_sell(
         self, symbol: str, residual_qty: float, cancelled_specs: list[dict],
@@ -3654,6 +3778,12 @@ class TradingPipeline:
             return {"status": "market_holiday", "orders": [], "run_id": run_id}
 
         try:
+            # 0a. Drain orphaned protection-restore intents from prior
+            # sessions where finalize had to bail (lingering SELL didn't
+            # converge, or broker API hiccup). Each drained row brings a
+            # symbol's stop coverage back in line with broker reality.
+            self._drain_pending_protection_restores()
+
             # 0. Cancel stale entry orders from previous sessions, but preserve live protective exits.
             self.broker.cancel_open_entry_orders()
 

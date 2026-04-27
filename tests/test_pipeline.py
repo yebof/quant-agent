@@ -1006,6 +1006,164 @@ def test_finalize_protection_bails_when_post_cancel_status_still_non_terminal():
     pipeline._reprotect_residual_after_partial_sell.assert_not_called()
 
 
+def test_finalize_persists_orphan_when_lingering_cancel_fails(tmp_path):
+    """Codex r7 #3: when cancel raises, the bail branch must persist the
+    restore intent to pending_protection_restores so a later drain can
+    pick it up. Earlier versions just logged "next session reconcile
+    rebuilds coverage" — but reconcile only updates fill columns, never
+    actually rebuilds stop coverage. Pin: a row lands in DB with the
+    right symbol + sell_order_id + specs."""
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._reprotect_residual_after_partial_sell = MagicMock()
+
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "new", "filled_qty": "0", "filled_avg_price": None,
+    }
+    pipeline.broker.client.cancel_order_by_id.side_effect = RuntimeError("api timeout")
+
+    cancelled = [
+        {"id": "stop-old", "qty": 100, "stop_price": 95.0, "limit_price": 92.0},
+    ]
+
+    pipeline._finalize_protection_after_sell(
+        order_id="alpaca-stuck",
+        symbol="NVDA",
+        position_qty_before_sell=100.0,
+        cancelled_specs=cancelled,
+    )
+
+    rows = db.get_pending_protection_restores()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["symbol"] == "NVDA"
+    assert row["sell_order_id"] == "alpaca-stuck"
+    assert row["position_qty_before_sell"] == 100.0
+    import json as _json
+    persisted_specs = _json.loads(row["specs_json"])
+    assert persisted_specs[0]["stop_price"] == 95.0
+    db.close()
+
+
+def test_finalize_persists_orphan_when_post_cancel_status_non_terminal(tmp_path):
+    """Same persistence path for the slow-cancel branch: cancel API
+    succeeded but propagation didn't converge in 5s. Drain queue must
+    capture the intent so we don't silently lose protection."""
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._reprotect_residual_after_partial_sell = MagicMock()
+
+    pipeline.broker.get_order_fill_info.side_effect = [
+        {"status": "new", "filled_qty": "0", "filled_avg_price": None},
+        {"status": "pending_cancel", "filled_qty": "0", "filled_avg_price": None},
+    ]
+    cancelled = [{"id": "stop-old", "qty": 100, "stop_price": 95.0}]
+
+    pipeline._finalize_protection_after_sell(
+        order_id="alpaca-slow-cancel",
+        symbol="AAPL",
+        position_qty_before_sell=50.0,
+        cancelled_specs=cancelled,
+    )
+
+    rows = db.get_pending_protection_restores()
+    assert len(rows) == 1
+    assert rows[0]["sell_order_id"] == "alpaca-slow-cancel"
+    db.close()
+
+
+def test_drain_pending_protection_restores_replays_finalize_when_terminal(tmp_path):
+    """Drain pass: row exists from a prior session's bail. SELL is now
+    terminal at the broker. Drain must run finalize from persisted
+    specs (which will restore the original stops since fill_qty=0)
+    AND delete the row from the queue."""
+    from src.storage.db import Database
+    import json as _json
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    cancelled = [{"id": "stop-old", "qty": 100, "stop_price": 95.0, "limit_price": 92.0}]
+    db.insert_pending_protection_restore(
+        symbol="NVDA",
+        sell_order_id="alpaca-resolved",
+        position_qty_before_sell=100.0,
+        specs_json=_json.dumps(cancelled),
+    )
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._reprotect_residual_after_partial_sell = MagicMock()
+
+    # Order is now terminal (canceled with no fill) — drain replays
+    # finalize, which hits the no-fill branch → restore originals.
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "canceled", "filled_qty": "0", "filled_avg_price": None,
+    }
+
+    drained = pipeline._drain_pending_protection_restores()
+
+    assert drained == 1
+    pipeline.broker._restore_stop_orders.assert_called_once()
+    args = pipeline.broker._restore_stop_orders.call_args
+    assert args[0][0] == "NVDA"
+    assert args[0][1] == cancelled
+    # Row should be cleared.
+    assert db.get_pending_protection_restores() == []
+    db.close()
+
+
+def test_drain_leaves_row_when_sell_still_non_terminal(tmp_path):
+    """If broker still reports the SELL as non-terminal, leave the row
+    for a later drain. Otherwise we'd repeat the held_for_orders bug
+    we were trying to defer past in the first place."""
+    from src.storage.db import Database
+    import json as _json
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    cancelled = [{"id": "stop-old", "qty": 100, "stop_price": 95.0}]
+    db.insert_pending_protection_restore(
+        symbol="NVDA",
+        sell_order_id="alpaca-still-pending",
+        position_qty_before_sell=100.0,
+        specs_json=_json.dumps(cancelled),
+    )
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "pending_cancel", "filled_qty": "0", "filled_avg_price": None,
+    }
+    pipeline._reprotect_residual_after_partial_sell = MagicMock()
+
+    drained = pipeline._drain_pending_protection_restores()
+
+    assert drained == 0
+    pipeline.broker._restore_stop_orders.assert_not_called()
+    # Row NOT deleted — still pending.
+    assert len(db.get_pending_protection_restores()) == 1
+    db.close()
+
+
 def test_finalize_protection_bails_when_lingering_cancel_fails():
     """If we can't even cancel the lingering SELL (API timeout etc.),
     we have no clean state to finalize from. Restoring stops anyway
