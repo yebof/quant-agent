@@ -1862,6 +1862,63 @@ def test_emergency_liquidate_skips_position_when_protective_stop_cancel_fails():
     )
 
 
+def test_pipeline_init_propagates_allow_margin_to_risk_engine():
+    """Codex r11 P2: TradingPipeline.__init__ rebuilds RiskConfig for the
+    deterministic engine. Previously it omitted allow_margin → engine
+    defaulted to False even when settings.yaml had allow_margin=true.
+    Mismatch: prompts + force_delever read config.risk.allow_margin
+    directly (saw True), but the hard cash_only rule still blocked
+    BUY → user opting in to margin had BUYs killed by a rule the
+    agent didn't know was active.
+
+    Pin: pipeline.risk_engine.config.allow_margin == config.risk.allow_margin."""
+    from unittest.mock import patch as _patch
+    from src.pipeline import TradingPipeline
+
+    mock_config = MagicMock()
+    mock_config.risk.max_position_pct = 15.0
+    mock_config.risk.max_total_position_pct = 90.0
+    mock_config.risk.max_daily_loss_pct = 3.0
+    mock_config.risk.max_sector_pct = 40.0
+    mock_config.risk.require_stop_loss = True
+    mock_config.risk.allow_margin = True  # ← the load-bearing field
+    mock_config.alpaca.api_key = "x"
+    mock_config.alpaca.secret_key = "y"
+    mock_config.alpaca.paper = True
+    mock_config.storage.db_path = ":memory:"
+    mock_config.trading.universe = ["SPY"]
+    mock_config.llm.tech_analyst_model = "claude-sonnet-4-6-20250514"
+    mock_config.llm.tech_analyst_max_tokens = 8000
+    mock_config.llm.macro_analyst_model = "claude-sonnet-4-6-20250514"
+    mock_config.llm.news_analyst_model = "claude-sonnet-4-6-20250514"
+    mock_config.llm.earnings_analyst_model = "claude-sonnet-4-6-20250514"
+    mock_config.llm.portfolio_manager_model = "claude-sonnet-4-6-20250514"
+    mock_config.llm.risk_manager_model = "claude-sonnet-4-6-20250514"
+    mock_config.llm.position_reviewer_model = "claude-sonnet-4-6-20250514"
+    mock_config.llm.evening_analyst_model = "claude-sonnet-4-6-20250514"
+    mock_config.llm.meta_reflector_model = "claude-sonnet-4-6-20250514"
+    mock_config.llm.get_max_tokens = MagicMock(return_value=8000)
+
+    with _patch("src.pipeline.AlpacaBroker"), \
+         _patch("src.pipeline.EarningsDataProvider"), \
+         _patch("src.pipeline.NewsDataProvider"), \
+         _patch("src.pipeline.MacroAnalystAgent"), \
+         _patch("src.pipeline.NewsAnalystAgent"), \
+         _patch("src.pipeline.TechAnalystAgent"), \
+         _patch("src.pipeline.PortfolioManagerAgent"), \
+         _patch("src.pipeline.RiskManagerAgent"), \
+         _patch("src.pipeline.EarningsAnalystAgent"), \
+         _patch("src.pipeline.MarketDataProvider"), \
+         _patch("src.pipeline.MacroDataProvider"):
+        pipeline = TradingPipeline(mock_config)
+
+    assert pipeline.risk_engine.config.allow_margin is True, (
+        "settings.yaml allow_margin=True must propagate into the "
+        "deterministic RiskRuleEngine; otherwise prompts say 'margin OK' "
+        "while cash_only silently blocks every margin-using BUY"
+    )
+
+
 def test_pipeline_midday_reconciles_fills_before_reviewer_prompt(tmp_path):
     """Codex r11 P2: morning's final reconcile is run_id-scoped, so a BUY
     whose fill landed AFTER morning's wait window stays at fill_status=
