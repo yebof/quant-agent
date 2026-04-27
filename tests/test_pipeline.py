@@ -1116,6 +1116,8 @@ def test_drain_pending_protection_restores_replays_finalize_when_terminal(tmp_pa
     pipeline.broker.get_order_fill_info.return_value = {
         "status": "canceled", "filled_qty": "0", "filled_avg_price": None,
     }
+    # PR S: restore now returns (count, failed_specs). Full success → empty failed.
+    pipeline.broker._restore_stop_orders.return_value = (1, [])
 
     drained = pipeline._drain_pending_protection_restores()
 
@@ -1156,6 +1158,7 @@ def test_intra_check_drains_orphan_restores_at_entry(tmp_path):
     pipeline.broker.get_order_fill_info.return_value = {
         "status": "canceled", "filled_qty": "0", "filled_avg_price": None,
     }
+    pipeline.broker._restore_stop_orders.return_value = (1, [])  # full success
     pipeline.risk_engine = MagicMock()
     pipeline.risk_engine.check_daily_loss.return_value = None  # no breach
 
@@ -1164,6 +1167,162 @@ def test_intra_check_drains_orphan_restores_at_entry(tmp_path):
     # Drain ran during entry → row consumed (broker said terminal).
     assert db.get_pending_protection_restores() == []
     pipeline.broker._restore_stop_orders.assert_called_once_with("NVDA", cancelled)
+    db.close()
+
+
+def test_finalize_persists_only_failed_specs_on_partial_restore(tmp_path):
+    """Codex r9 #2: 1 of 2 stops restored is still partial coverage. The
+    failed spec must be persisted so a later session can retry just
+    that one — but NOT the spec that already restored (would create a
+    duplicate at the broker, or fail on held_for_orders). Pin: the
+    persisted row carries only the failed spec, not all originals."""
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+
+    spec_a = {"id": "stop-a", "qty": 50, "stop_price": 95.0, "limit_price": 92.0}
+    spec_b = {"id": "stop-b", "qty": 50, "stop_price": 96.0, "limit_price": 93.0}
+    cancelled = [spec_a, spec_b]
+
+    # Order is terminal (canceled, no fill). Restore: 1 of 2 succeeds —
+    # spec_a landed, spec_b failed.
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "canceled", "filled_qty": "0", "filled_avg_price": None,
+    }
+    pipeline.broker._restore_stop_orders.return_value = (1, [spec_b])
+
+    ok = pipeline._finalize_protection_after_sell(
+        order_id="alpaca-resolved",
+        symbol="NVDA",
+        position_qty_before_sell=100.0,
+        cancelled_specs=cancelled,
+    )
+
+    assert ok is False, "partial restore must be flagged as incomplete coverage"
+    rows = db.get_pending_protection_restores()
+    assert len(rows) == 1
+    import json as _json
+    persisted = _json.loads(rows[0]["specs_json"])
+    # Only spec_b (the failed one) should be in the persisted recovery —
+    # NOT spec_a (already alive at broker).
+    assert len(persisted) == 1
+    assert persisted[0]["id"] == "stop-b"
+    db.close()
+
+
+def test_finalize_persists_recovery_when_restore_raises_in_non_drain_path(tmp_path):
+    """Codex r9 #1: when restore raises during a normal SELL-finalize
+    flow (not from drain), the bool False return is propagated but the
+    SELL-path callers ignore it. Without persistence inside finalize,
+    the recovery intent is silently lost. Pin: the failure branch
+    writes a row when from_drain=False."""
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+
+    cancelled = [{"id": "stop-old", "qty": 100, "stop_price": 95.0}]
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "canceled", "filled_qty": "0", "filled_avg_price": None,
+    }
+    pipeline.broker._restore_stop_orders.side_effect = RuntimeError("api 503")
+
+    ok = pipeline._finalize_protection_after_sell(
+        order_id="alpaca-resolved",
+        symbol="NVDA",
+        position_qty_before_sell=100.0,
+        cancelled_specs=cancelled,
+        # from_drain defaults to False — this is the SELL-path entry case.
+    )
+
+    assert ok is False
+    rows = db.get_pending_protection_restores()
+    assert len(rows) == 1
+    assert rows[0]["sell_order_id"] == "alpaca-resolved"
+    db.close()
+
+
+def test_finalize_persists_recovery_when_reprotect_raises_in_non_drain_path(tmp_path):
+    """Same idea for the partial-fill branch: reprotect submit raises
+    after a partial fill. Non-drain caller (e.g., morning ExecutionStage
+    finalize) ignores the False bool, so finalize itself must persist."""
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+
+    cancelled = [{"id": "stop-old", "qty": 100, "stop_price": 95.0}]
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "canceled", "filled_qty": "12", "filled_avg_price": "117.5",
+    }
+    pipeline.broker._submit_stop_limit_order.side_effect = RuntimeError("rejected")
+
+    ok = pipeline._finalize_protection_after_sell(
+        order_id="alpaca-partial",
+        symbol="NVDA",
+        position_qty_before_sell=100.0,
+        cancelled_specs=cancelled,
+    )
+
+    assert ok is False
+    rows = db.get_pending_protection_restores()
+    assert len(rows) == 1
+
+
+def test_finalize_does_not_double_persist_when_called_from_drain(tmp_path):
+    """Drain path's safety net: when finalize is called with
+    from_drain=True, the failure branches must NOT call
+    _persist_orphaned_protection_restore — the row already exists in
+    DB. The drain caller uses the False return to keep the existing
+    row alive instead. Pin: zero new rows after a from_drain failure."""
+    from src.storage.db import Database
+    import json as _json
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    cancelled = [{"id": "stop-old", "qty": 100, "stop_price": 95.0}]
+    db.insert_pending_protection_restore(
+        symbol="NVDA", sell_order_id="alpaca-orphan",
+        position_qty_before_sell=100.0, specs_json=_json.dumps(cancelled),
+    )
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "canceled", "filled_qty": "0", "filled_avg_price": None,
+    }
+    pipeline.broker._restore_stop_orders.side_effect = RuntimeError("api 503")
+
+    ok = pipeline._finalize_protection_after_sell(
+        order_id="alpaca-orphan",
+        symbol="NVDA",
+        position_qty_before_sell=100.0,
+        cancelled_specs=cancelled,
+        from_drain=True,
+    )
+
+    assert ok is False
+    # Still exactly 1 row (the original) — finalize did NOT persist again.
+    rows = db.get_pending_protection_restores()
+    assert len(rows) == 1
     db.close()
 
 
@@ -1195,8 +1354,9 @@ def test_drain_keeps_row_when_restore_submits_zero_stops(tmp_path):
         "status": "canceled", "filled_qty": "0", "filled_avg_price": None,
     }
     # Broker rejects every restore attempt (e.g., a residual stop is
-    # still hanging around or position isn't visible). 0 of 2 restored.
-    pipeline.broker._restore_stop_orders.return_value = 0
+    # still hanging around or position isn't visible). 0 of 2 restored,
+    # both specs in failed list. PR S: return is now (count, failed_specs).
+    pipeline.broker._restore_stop_orders.return_value = (0, cancelled)
 
     drained = pipeline._drain_pending_protection_restores()
 
