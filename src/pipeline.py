@@ -683,7 +683,9 @@ class TradingPipeline:
 
         if fill_qty <= 0:
             try:
-                restored = self.broker._restore_stop_orders(symbol, cancelled_specs)
+                restored, failed_specs = self.broker._restore_stop_orders(
+                    symbol, cancelled_specs,
+                )
                 logger.info(
                     "SELL on %s terminated with no fill (status=%s) — "
                     "restored %d/%d original protective stop(s)",
@@ -692,20 +694,30 @@ class TradingPipeline:
             except Exception as exc:
                 logger.warning(
                     "Failed to restore stops for %s after no-fill SELL: %s — "
-                    "position is unprotected; recovery deferred",
+                    "persisting recovery intent",
                     symbol, exc,
                 )
+                if not from_drain:
+                    self._persist_orphaned_protection_restore(
+                        order_id, symbol, position_qty_before_sell, cancelled_specs,
+                    )
                 return False
-            # _restore_stop_orders catches per-spec failures internally and
-            # returns the count that succeeded. If 0 of N succeeded, the
-            # broker rejected every restore attempt — coverage was NOT
-            # rebuilt and the drain caller must keep the recovery row.
-            if restored == 0 and len(cancelled_specs) > 0:
+            # PARTIAL restore is incomplete coverage — restoring 1 of 2
+            # original stops still leaves the slice covered by the failed
+            # spec naked. Codex r9: previously we only flagged 0 of N as
+            # failure; now any partial-restore persists ONLY the failed
+            # specs (not the originals — the ones that DID restore are
+            # already alive at the broker, retrying would double-stack).
+            if failed_specs:
                 logger.warning(
-                    "Restore for %s submitted 0/%d stops — coverage NOT "
-                    "rebuilt; recovery deferred",
-                    symbol, len(cancelled_specs),
+                    "Restore for %s submitted %d/%d stops — %d failed; "
+                    "persisting failed spec(s) for retry",
+                    symbol, restored, len(cancelled_specs), len(failed_specs),
                 )
+                if not from_drain:
+                    self._persist_orphaned_protection_restore(
+                        order_id, symbol, position_qty_before_sell, failed_specs,
+                    )
                 return False
             return True
 
@@ -713,9 +725,19 @@ class TradingPipeline:
         if actual_residual <= 0:
             return True  # full exit — no residual to re-protect
 
-        return self._reprotect_residual_after_partial_sell(
+        if not self._reprotect_residual_after_partial_sell(
             symbol, actual_residual, cancelled_specs,
-        )
+        ):
+            # Reprotect submit raised. Persist so a later session can retry.
+            # Codex r9 #1: previously this just returned False without
+            # persisting, and the SELL-path callers ignored that bool —
+            # the recovery intent was silently lost.
+            if not from_drain:
+                self._persist_orphaned_protection_restore(
+                    order_id, symbol, position_qty_before_sell, cancelled_specs,
+                )
+            return False
+        return True
 
     def _persist_orphaned_protection_restore(
         self,

@@ -768,8 +768,20 @@ class AlpacaBroker:
         order = self.client.submit_order(req)
         return {"id": str(order.id), "status": str(order.status), "symbol": symbol}
 
-    def _restore_stop_orders(self, symbol: str, stop_specs: list[dict]) -> int:
+    def _restore_stop_orders(
+        self, symbol: str, stop_specs: list[dict],
+    ) -> tuple[int, list[dict]]:
+        """Re-submit a set of cancelled stop specs. Best-effort per-spec —
+        a single broker rejection doesn't abort the loop.
+
+        Returns ``(restored_count, failed_specs)``. failed_specs contains
+        the specs that raised on submit. Callers needing to persist a
+        partial-restore recovery intent (P1 codex r9) use failed_specs
+        directly, so the next session retries ONLY the ones that didn't
+        land — not the originals already alive at the broker.
+        """
         restored = 0
+        failed_specs: list[dict] = []
         for spec in stop_specs:
             try:
                 self._submit_stop_limit_order(
@@ -784,12 +796,13 @@ class AlpacaBroker:
                     "replace_stop_loss: failed to restore prior stop for %s @ $%.2f: %s",
                     symbol, spec["stop_price"], exc,
                 )
+                failed_specs.append(spec)
         if restored:
             logger.warning(
-                "replace_stop_loss rollback: restored %d prior stop order(s) for %s",
-                restored, symbol,
+                "replace_stop_loss rollback: restored %d/%d prior stop order(s) for %s",
+                restored, len(stop_specs), symbol,
             )
-        return restored
+        return restored, failed_specs
 
     def replace_stop_loss(
         self,
@@ -858,7 +871,7 @@ class AlpacaBroker:
                 # at worst we end up with slightly more stops than minimal,
                 # but full original coverage is preserved.
                 if cancelled_specs:
-                    restored = self._restore_stop_orders(symbol, cancelled_specs)
+                    restored, _failed = self._restore_stop_orders(symbol, cancelled_specs)
                     logger.warning(
                         "replace_stop_loss: rolled back %d/%d already-cancelled "
                         "stop(s) for %s after partial cancel failure",
@@ -896,7 +909,7 @@ class AlpacaBroker:
                     symbol,
                 )
                 return None
-            restored = self._restore_stop_orders(symbol, cancelled_specs)
+            restored, _failed = self._restore_stop_orders(symbol, cancelled_specs)
             if restored == 0:
                 logger.error(
                     "replace_stop_loss: %s has no confirmed stop protection after replacement failure",
