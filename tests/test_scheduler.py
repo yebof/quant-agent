@@ -85,17 +85,27 @@ def test_scheduler_intra_check_fires_every_30_min_during_market_hours(mock_pipel
     trigger = intra_job.trigger
     et = ZoneInfo("US/Eastern")
 
-    # Walk the trigger from 08:00 ET on a Monday and collect the next 6
-    # firings. Expect 09:00, 09:30, 10:00, 10:30, 11:00, 11:30 — i.e.
-    # a 30-min cadence kicking in at the top of market hours.
-    base = datetime(2026, 4, 20, 8, 0, tzinfo=et)  # Monday pre-market
+    # Walk the trigger from 08:00 ET Monday and collect ALL firings until
+    # the end of the day. Must align EXACTLY with SESSION_WINDOWS["intra_check"]
+    # (09:30 - 16:00 ET) — no pre-market 09:00 firing, no missing 16:00.
+    base = datetime(2026, 4, 20, 8, 0, tzinfo=et)
     fire_times = []
     cur = base
-    for _ in range(6):
+    end_of_day = datetime(2026, 4, 20, 23, 59, tzinfo=et)
+    while True:
         nxt = trigger.get_next_fire_time(None, cur)
-        assert nxt is not None
+        if nxt is None or nxt >= end_of_day:
+            break
         fire_times.append((nxt.hour, nxt.minute))
-        # Advance just past nxt so the next call returns the following tick.
         cur = nxt.replace(microsecond=1)
 
-    assert fire_times == [(9, 0), (9, 30), (10, 0), (10, 30), (11, 0), (11, 30)]
+    expected = [
+        (9, 30), (10, 0), (10, 30), (11, 0), (11, 30),
+        (12, 0), (12, 30), (13, 0), (13, 30),
+        (14, 0), (14, 30), (15, 0), (15, 30),
+        (16, 0),
+    ]
+    assert fire_times == expected, (
+        f"intra_check must fire on every 30-min tick within the canonical "
+        f"SESSION_WINDOWS window (09:30-16:00 ET inclusive); got {fire_times}"
+    )
