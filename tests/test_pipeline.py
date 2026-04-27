@@ -567,6 +567,71 @@ def test_pipeline_midday_bypasses_reviewer_when_daily_loss_breached():
     pipeline._reconcile_fills.assert_called_once()
 
 
+def test_emergency_liquidate_reconciles_before_dedupe_check(tmp_path):
+    """The dedupe guard added in P1 #2 reads DB rows, but DB rows can be
+    stale: a prior EMERGENCY_SELL limit might have been cancelled or
+    expired at the broker (halted symbol, day-order rollover, etc.) while
+    the row still says 'submitted'. Without reconciling first, the dedupe
+    sees the stale row and silently disables the circuit breaker — every
+    subsequent intra tick skips this symbol forever. Reconciliation flips
+    terminal statuses so the dedupe sees broker truth.
+
+    Uses a real DB so the reconcile-then-check flow is genuinely exercised
+    end to end (vs mocking _reconcile_fills, which would only test that
+    we *call* it in the right order)."""
+    from src.storage.db import Database
+
+    db_path = tmp_path / "t.db"
+    db = Database(str(db_path))
+    db.initialize()
+
+    # Stale 'submitted' row from a prior intra tick. Broker actually
+    # cancelled this order but DB hasn't seen the update yet.
+    db.insert_trade(
+        symbol="AMZN", action="EMERGENCY_SELL", qty=51.0, price=230.0,
+        reasoning="prior intra tick — broker has since cancelled",
+        run_id="run-old", broker_order_id="alpaca-stale", fill_status="submitted",
+    )
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    # Reconcile asks broker for terminal status of stale order — it was cancelled.
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "canceled", "filled_qty": None, "filled_avg_price": None,
+    }
+    pipeline.broker.cancel_protective_stops.return_value = True
+    pipeline.broker.submit_order.return_value = {
+        "id": "alpaca-fresh", "status": "accepted", "symbol": "AMZN",
+    }
+    pipeline._order_accepted = MagicMock(return_value=True)
+    pipeline._full_sell_qty = lambda q: q
+    pipeline._format_qty = lambda q: str(q)
+
+    pos = Position(
+        symbol="AMZN", qty=51.0, avg_entry=240.0, current_price=230.0,
+        market_value=11730.0, unrealized_pnl=-510.0, sector="Consumer Cyclical",
+    )
+    loss_violation = MagicMock(message="Daily loss 4.0% exceeds max 3%")
+
+    orders = pipeline._midday_emergency_liquidate([pos], loss_violation, "run-now")
+
+    # The fresh emergency sell MUST fire — the stale row was reconciled
+    # to 'canceled' before the dedupe check, so dedupe didn't match.
+    assert len(orders) == 1, (
+        f"emergency sell must fire after reconcile flips stale row to "
+        f"terminal status; got orders={orders}"
+    )
+    assert orders[0]["symbol"] == "AMZN"
+    # And the stale row should now be marked canceled in DB.
+    rows = db.execute(
+        "SELECT fill_status FROM trades WHERE broker_order_id = 'alpaca-stale'"
+    ).fetchall()
+    assert rows[0]["fill_status"] == "canceled"
+
+    db.close()
+
+
 def test_emergency_liquidate_skips_position_when_pending_emergency_sell_already_open():
     """Emergency sells go out as -1% LIMIT orders. On a fast-moving day the
     tape can blow through that limit without filling — the order sits as
