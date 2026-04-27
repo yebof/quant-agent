@@ -26,6 +26,108 @@ def test_stage_classes_take_pipeline_reference():
         assert stage._pipeline is fake_pipeline
 
 
+def _buy(symbol, alloc):
+    from src.models import TradeDecision
+    return TradeDecision(
+        action="BUY", symbol=symbol, allocation_pct=alloc,
+        entry_price=100.0, stop_loss=95.0, take_profit=110.0,
+        reasoning="x",
+    )
+
+
+def _hold(symbol):
+    from src.models import TradeDecision
+    return TradeDecision(
+        action="HOLD", symbol=symbol, allocation_pct=0.0,
+        entry_price=100.0, stop_loss=95.0, take_profit=110.0,
+        reasoning="hold",
+    )
+
+
+def _sell(symbol):
+    from src.models import TradeDecision
+    return TradeDecision(
+        action="SELL", symbol=symbol, allocation_pct=100.0,
+        entry_price=100.0, stop_loss=95.0, take_profit=110.0,
+        reasoning="exit",
+    )
+
+
+def test_apply_scale_all_buys_zero_drops_every_buy():
+    """scale_all_buys=0.0 is the documented full-BUY veto. The pre-fix
+    `or 1.0` collapsed 0.0 to 1.0 because Python truthiness, silently
+    disabling the veto. Pin: zero passes through and zeros every BUY,
+    while HOLD and SELL pass unchanged."""
+    from src.models import RiskVerdict
+    from src.pipeline_stages import _apply_scale_all_buys
+
+    verdict = RiskVerdict(
+        approved=True, scale_all_buys=0.0,
+        reasoning="risk-off — kill all BUYs",
+    )
+    decisions = [_buy("SPY", 10), _buy("QQQ", 8), _hold("MSFT"), _sell("NVDA")]
+
+    scaled, scale = _apply_scale_all_buys(decisions, verdict)
+
+    assert scale == 0.0, "0.0 must propagate, not collapse to 1.0"
+    actions = [d.action for d in scaled]
+    assert "BUY" not in actions, f"every BUY must be dropped; got {actions}"
+    assert "HOLD" in actions and "SELL" in actions
+
+
+def test_apply_scale_all_buys_partial_scales_buy_allocations():
+    """0 < scale < 1 reduces BUY allocations proportionally, keeps HOLD/SELL."""
+    from src.models import RiskVerdict
+    from src.pipeline_stages import _apply_scale_all_buys
+
+    verdict = RiskVerdict(approved=True, scale_all_buys=0.5, reasoning="trim")
+    decisions = [_buy("SPY", 10), _buy("QQQ", 8), _hold("MSFT")]
+
+    scaled, scale = _apply_scale_all_buys(decisions, verdict)
+
+    assert scale == 0.5
+    by_sym = {d.symbol: d for d in scaled}
+    assert by_sym["SPY"].allocation_pct == 5.0
+    assert by_sym["QQQ"].allocation_pct == 4.0
+    assert by_sym["MSFT"].action == "HOLD"
+
+
+def test_apply_scale_all_buys_one_is_no_op():
+    """scale=1.0 (default) leaves decisions untouched."""
+    from src.models import RiskVerdict
+    from src.pipeline_stages import _apply_scale_all_buys
+
+    verdict = RiskVerdict(approved=True, scale_all_buys=1.0, reasoning="ok")
+    decisions = [_buy("SPY", 10), _buy("QQQ", 8)]
+
+    scaled, scale = _apply_scale_all_buys(decisions, verdict)
+
+    assert scale == 1.0
+    assert [(d.symbol, d.allocation_pct) for d in scaled] == [
+        ("SPY", 10.0), ("QQQ", 8.0),
+    ]
+
+
+def test_apply_scale_all_buys_handles_missing_attribute_as_one():
+    """If a verdict somehow lacks scale_all_buys (legacy or partial parse),
+    treat as 1.0 (no scaling) — not as None propagating to a TypeError."""
+    from src.pipeline_stages import _apply_scale_all_buys
+
+    class LegacyVerdict:
+        approved = True
+        # no scale_all_buys attribute
+        modifications = []
+
+    decisions = [_buy("SPY", 10)]
+    scaled, scale = _apply_scale_all_buys(decisions, LegacyVerdict())
+
+    assert scale == 1.0
+    assert len(scaled) == 1
+
+
+
+
+
 def test_execution_stage_skips_buy_when_entry_price_more_than_5pct_off_market():
     """When LLM's entry_price deviates >5% from live market, the BUY must be
     skipped — not fallback-to-market. A stale entry implies the stop_loss
