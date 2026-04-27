@@ -99,6 +99,15 @@ class EarningsDataProvider:
         mark the filing abandoned so _check_symbol skips it and falls back to
         any prior analysis.
 
+        Filing-date scoping: the manifest is keyed by symbol+form_type, but
+        a single key spans multiple quarters of 10-Qs. When the entry's
+        stored filing_date differs from the incoming report, this is a NEW
+        filing — reset failed_attempts and abandoned flag so a one-off
+        parse failure on Q1 doesn't pre-abandon Q2 on its first attempt.
+        Codex r11 P2: previously the prior quarter's abandoned/attempts
+        carried forward, so Q2's first transient failure landed at
+        attempts=4 (abandon immediately).
+
         Returns True when the filing has just been abandoned (caller should
         stop queueing it).
         """
@@ -106,6 +115,19 @@ class EarningsDataProvider:
         with self._manifest_lock:
             key = f"{report.symbol}_{report.form_type}"
             entry = dict(self.manifest.get(key, {}))
+            prior_filing_date = entry.get("filing_date")
+            if prior_filing_date and prior_filing_date != report.filing_date:
+                # Different filing_date → this is a new quarter. Reset the
+                # retry budget; previous failure history doesn't apply.
+                entry["failed_attempts"] = 0
+                entry.pop("abandoned", None)
+                entry.pop("abandoned_at", None)
+                logger.info(
+                    "Earnings retry budget reset for %s %s: prior filing %s "
+                    "→ new filing %s",
+                    report.symbol, report.form_type,
+                    prior_filing_date, report.filing_date,
+                )
             attempts = int(entry.get("failed_attempts", 0)) + 1
             entry["filing_date"] = report.filing_date
             entry["form_type"] = report.form_type
