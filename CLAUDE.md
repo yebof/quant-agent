@@ -47,7 +47,11 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 ### 责任边界
 - Macro 拥有 regime 枚举（risk-on / risk-off / transitional / neutral）的权威；News 的 `current_regime` 只描述新闻/地缘背景，不重复 Macro 的枚举
 - 所有 SELL 面单 path（morning SELL、midday SELL/REDUCE、emergency sell）提交后都走 `_order_accepted()` 校验，broker 返 error/rejected 不写 trades 表，别再绕开这层
-- 同上 SELL path **提交前必须先调 `broker.cancel_protective_stops(symbol)`**——morning BUY 的 OTO stop-loss leg 和 midday/close 的 TRAIL_STOP 都会让 Alpaca 把 shares 标 `held_for_orders=qty`，再下 SELL 必被 `insufficient qty available` 拒（2026-04-25 AMZN 实例）。helper 返回 `(ok, stop_specs)` 元组：`ok=False` 时**直接 skip 这个 symbol**；`ok=True` 时拿到 specs，**SELL 提交后必须**：(a) submit 被 broker 拒 → 调 `broker._restore_stop_orders(symbol, stop_specs)` 恢复保护，(b) **partial exit**（TAKE_PROFIT/REDUCE/PARTIAL_SELL，即 `qty < position.qty`）→ 调 `pipeline._reprotect_residual_after_partial_sell(symbol, residual_qty, stop_specs)` 在残仓上挂新 stop（取 specs 中最高 stop_price 最保护）。这条对 SELL/REDUCE/EMERGENCY_SELL/FORCE_DELEVER/TAKE_PROFIT 5 个 action 全适用——**新增 SELL path 时这三步**（cancel / restore-on-reject / reprotect-on-partial）**全要写齐**，少一个就会留下 residual 裸奔的窗口
+- 同上 SELL path **提交前必须先调 `broker.cancel_protective_stops(symbol)`**——morning BUY 的 OTO stop-loss leg 和 midday/close 的 TRAIL_STOP 都会让 Alpaca 把 shares 标 `held_for_orders=qty`，再下 SELL 必被 `insufficient qty available` 拒（2026-04-25 AMZN 实例）。helper 返回 `(ok, stop_specs)` 元组。**完整三步纪律**：
+  1. **`ok=False`** → 直接 skip 这个 symbol（不要盲目下单）
+  2. **`_order_accepted=False`**（broker 当场拒单）→ 立刻调 `broker._restore_stop_orders(symbol, stop_specs)` 恢复保护
+  3. **submit 接受后必须 stash `(order_id, position_qty, specs)` 到 `pending_protections`，等 SELL 跑完一轮后调 `wait_for_order_terminal` + `pipeline._finalize_protection_after_sell(...)`** —— **finalize 必须基于实际 fill_qty，不能在 submit 接受时就 reprotect residual**：accepted 的 limit 后续可能 cancel/expire 不成交（PR I 的洞，2026-04-26 codex r4 修复 PR J）。finalize 的三种分支：填 0 → 用 specs restore 原仓覆盖；填 < position → reprotect 实际 residual = `position - fill_qty`；全部填满 → 完整退出无残仓
+  这条对 SELL/REDUCE/EMERGENCY_SELL/FORCE_DELEVER/TAKE_PROFIT 5 个 action 全适用——**新增 SELL path 必须把 cancel / restore-on-reject / wait+finalize-on-actual-fill 三步全写齐**，少一个就会有残仓裸奔窗口（partial 没成交时尤其危险）
 
 ### 时区
 - ET 统一走 `src/trading_calendar.py`（`et_today` / `et_now` / `session_date_key` / `in_session_window` / `SESSION_WINDOWS`）。`src/util/time.py` 是向后兼容 shim，新代码直接 import `src.trading_calendar`。`daily_pnl` 主键、`insights` 查询、`broker.is_trading_day`、news/macro 快照目录、earnings cutoff、market OHLCV 全部 ET——任何 host TZ 都要出同样数据

@@ -556,6 +556,71 @@ class TradingPipeline:
                     return True
         return False
 
+    def _finalize_protection_after_sell(
+        self,
+        order_id: str,
+        symbol: str,
+        position_qty_before_sell: float,
+        cancelled_specs: list[dict],
+    ) -> None:
+        """Decide stop coverage based on the actual SELL fill outcome,
+        not on submit acceptance.
+
+        Submit-acceptance is too early — Alpaca can accept a LIMIT and
+        then have it expire / cancel / get rejected later in the session
+        without ever filling. If we reprotected on the residual qty at
+        accept-time and the SELL doesn't fill, the to-be-sold portion
+        rides naked for the rest of the day. PR I (#55) had this gap.
+
+        Reads broker.get_order_fill_info() AFTER wait_for_order_terminal
+        has returned, so the fill_qty is final:
+
+        1. ``fill_qty == 0`` (cancelled/expired/rejected after acceptance):
+           the position is unchanged but we cancelled the protective
+           stops. Restore the original specs covering the full position.
+        2. ``0 < fill_qty < position_qty``: protect the actual residual
+           ``position_qty_before_sell - fill_qty`` at the most-protective
+           cancelled stop_price.
+        3. ``fill_qty == position_qty``: full exit, nothing to protect.
+
+        No-op when there were no specs to begin with — a position that
+        had no protective stop pre-SELL has nothing to restore.
+        """
+        if not cancelled_specs:
+            return
+
+        fill_info = self.broker.get_order_fill_info(order_id) or {}
+        fill_qty_raw = fill_info.get("filled_qty")
+        try:
+            fill_qty = float(fill_qty_raw) if fill_qty_raw is not None else 0.0
+        except (TypeError, ValueError):
+            fill_qty = 0.0
+
+        if fill_qty <= 0:
+            try:
+                restored = self.broker._restore_stop_orders(symbol, cancelled_specs)
+                status = (fill_info.get("status") or "?").lower()
+                logger.info(
+                    "SELL on %s terminated with no fill (status=%s) — "
+                    "restored %d original protective stop(s)",
+                    symbol, status, restored,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to restore stops for %s after no-fill SELL: %s — "
+                    "position is unprotected until the next session",
+                    symbol, exc,
+                )
+            return
+
+        actual_residual = position_qty_before_sell - fill_qty
+        if actual_residual <= 0:
+            return  # full exit — no residual to re-protect
+
+        self._reprotect_residual_after_partial_sell(
+            symbol, actual_residual, cancelled_specs,
+        )
+
     def _reprotect_residual_after_partial_sell(
         self, symbol: str, residual_qty: float, cancelled_specs: list[dict],
     ) -> None:
@@ -954,6 +1019,7 @@ class TradingPipeline:
         gain while the remaining 2/3 still rides the trailing stop.
         """
         orders: list[dict] = []
+        pending_protections: list[dict] = []
         for p in positions:
             if p.qty <= 0 or p.avg_entry <= 0:
                 continue
@@ -1024,13 +1090,16 @@ class TradingPipeline:
                 if stop_specs:
                     self.broker._restore_stop_orders(p.symbol, stop_specs)
                 continue
-            # TAKE_PROFIT is always a partial trim (the qty>=p.qty branch
-            # above continues out). Re-protect the residual qty so the
-            # remaining position doesn't ride naked between now and the
-            # next session's OTO rebuild.
-            self._reprotect_residual_after_partial_sell(
-                p.symbol, p.qty - trim_qty, stop_specs,
-            )
+            # Defer the re-protect / restore decision until we know the
+            # actual fill outcome (see _finalize_protection_after_sell).
+            # An accepted limit can still cancel/expire later in the
+            # session, in which case the original full protection — not
+            # a residual-shaped stop — is what the position needs.
+            pending_protections.append({
+                "order_id": order["id"], "symbol": p.symbol,
+                "position_qty_before_sell": p.qty,
+                "specs": stop_specs,
+            })
             try:
                 self.db.insert_trade(
                     symbol=p.symbol, action="TAKE_PROFIT", qty=trim_qty,
@@ -1051,6 +1120,21 @@ class TradingPipeline:
                 "Auto take-profit: %s +%.1f%% → sold %s of %s @ limit $%.2f",
                 p.symbol, pnl_pct, self._format_qty(trim_qty),
                 self._format_qty(p.qty), sell_limit,
+            )
+        # Wait for each accepted sell to terminate, then reprotect on
+        # actual residual or restore originals if the sell didn't fill.
+        for prot in pending_protections:
+            try:
+                self.broker.wait_for_order_terminal(prot["order_id"])
+            except Exception as exc:
+                logger.warning(
+                    "auto_take_profit: wait failed for %s order %s: %s — "
+                    "finalize will use whatever fill_info reads now",
+                    prot["symbol"], prot["order_id"], exc,
+                )
+            self._finalize_protection_after_sell(
+                prot["order_id"], prot["symbol"],
+                prot["position_qty_before_sell"], prot["specs"],
             )
         return orders
 
@@ -3046,6 +3130,7 @@ class TradingPipeline:
         # statuses in DB so has_pending_action_for_symbol sees truth.
         self._reconcile_fills()
         orders: list[dict] = []
+        pending_protections: list[dict] = []
         for p in positions:
             try:
                 qty = self._full_sell_qty(p.qty)
@@ -3078,7 +3163,14 @@ class TradingPipeline:
                     if stop_specs:
                         self.broker._restore_stop_orders(p.symbol, stop_specs)
                     continue
-                # Emergency sell is always a full exit — no residual to re-protect.
+                # Emergency sell is always a full exit, but the limit can
+                # still cancel/expire post-acceptance — defer the
+                # restore-on-no-fill decision to after wait below.
+                pending_protections.append({
+                    "order_id": order["id"], "symbol": p.symbol,
+                    "position_qty_before_sell": p.qty,
+                    "specs": stop_specs,
+                })
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,
@@ -3094,6 +3186,20 @@ class TradingPipeline:
                 )
             except Exception as e:
                 logger.error("Emergency sell failed for %s: %s", p.symbol, e)
+        # Wait + finalize: if any limit didn't fill, restore the original
+        # stops so the position doesn't ride the rest of the session naked.
+        for prot in pending_protections:
+            try:
+                self.broker.wait_for_order_terminal(prot["order_id"])
+            except Exception as exc:
+                logger.warning(
+                    "Midday emergency: wait failed for %s order %s: %s",
+                    prot["symbol"], prot["order_id"], exc,
+                )
+            self._finalize_protection_after_sell(
+                prot["order_id"], prot["symbol"],
+                prot["position_qty_before_sell"], prot["specs"],
+            )
         return orders
 
     def _midday_execute_llm_actions(
@@ -3107,6 +3213,7 @@ class TradingPipeline:
         LLM exits for symbols that already have an in-flight system sell order.
         """
         orders: list[dict] = []
+        pending_protections: list[dict] = []
         blocked = {
             symbol.strip().upper()
             for symbol in (blocked_symbols or set())
@@ -3218,13 +3325,14 @@ class TradingPipeline:
                     if stop_specs:
                         self.broker._restore_stop_orders(symbol, stop_specs)
                     continue
-                # REDUCE is always partial. Full SELL by reviewer (rare —
-                # reviewer prompt biases toward HOLD/REDUCE/TRAIL_STOP) leaves
-                # nothing to protect.
-                if qty < position_qty:
-                    self._reprotect_residual_after_partial_sell(
-                        symbol, position_qty - qty, stop_specs,
-                    )
+                # Defer reprotect/restore decision to after wait — see
+                # _finalize_protection_after_sell. Catches the case where
+                # an accepted limit later cancels/expires without filling.
+                pending_protections.append({
+                    "order_id": order["id"], "symbol": symbol,
+                    "position_qty_before_sell": position_qty,
+                    "specs": stop_specs,
+                })
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=symbol, action=act, qty=qty,
@@ -3241,6 +3349,18 @@ class TradingPipeline:
                 )
             except Exception as e:
                 logger.error("Midday order failed for %s: %s", symbol, e)
+        for prot in pending_protections:
+            try:
+                self.broker.wait_for_order_terminal(prot["order_id"])
+            except Exception as exc:
+                logger.warning(
+                    "Midday reviewer: wait failed for %s order %s: %s",
+                    prot["symbol"], prot["order_id"], exc,
+                )
+            self._finalize_protection_after_sell(
+                prot["order_id"], prot["symbol"],
+                prot["position_qty_before_sell"], prot["specs"],
+            )
         return orders
 
     def _force_delever(self, ctx: RunContext) -> list[dict]:
@@ -3301,6 +3421,7 @@ class TradingPipeline:
         )
 
         orders: list[dict] = []
+        pending_protections: list[dict] = []
         projected_proceeds = 0.0
         for p in targets:
             if projected_proceeds >= deficit:
@@ -3329,7 +3450,14 @@ class TradingPipeline:
                     if stop_specs:
                         self.broker._restore_stop_orders(p.symbol, stop_specs)
                     continue
-                # FORCE_DELEVER is always a full exit — no residual to re-protect.
+                # Defer reprotect/restore decision to the post-wait loop
+                # below — the existing "block until fills land" wait already
+                # gives us terminal status; we just need to act on it.
+                pending_protections.append({
+                    "order_id": order["id"], "symbol": p.symbol,
+                    "position_qty_before_sell": p.qty,
+                    "specs": stop_specs,
+                })
                 self.db.insert_trade(
                     symbol=p.symbol, action="FORCE_DELEVER", qty=qty,
                     price=p.current_price,
@@ -3355,13 +3483,20 @@ class TradingPipeline:
                 logger.error("FORCE DE-LEVER SELL %s failed: %s", p.symbol, e)
 
         # Block the session until fills land so the post-refresh cash is real.
-        for o in orders:
-            oid = o.get("id")
-            if oid:
-                try:
-                    self.broker.wait_for_order_terminal(oid)
-                except Exception as e:
-                    logger.warning("FORCE DE-LEVER: wait failed for %s: %s", oid, e)
+        # Then finalize protection — if any limit didn't fill, restore the
+        # original stop coverage so the position isn't left naked.
+        for prot in pending_protections:
+            try:
+                self.broker.wait_for_order_terminal(prot["order_id"])
+            except Exception as e:
+                logger.warning(
+                    "FORCE DE-LEVER: wait failed for %s order %s: %s",
+                    prot["symbol"], prot["order_id"], e,
+                )
+            self._finalize_protection_after_sell(
+                prot["order_id"], prot["symbol"],
+                prot["position_qty_before_sell"], prot["specs"],
+            )
 
         # Refresh ctx so downstream stages see post-sell truth.
         try:
@@ -4077,6 +4212,7 @@ class TradingPipeline:
         # circuit breaker for the rest of the session.
         self._reconcile_fills()
         orders: list[dict] = []
+        pending_protections: list[dict] = []
         for p in positions:
             try:
                 qty = self._full_sell_qty(p.qty)
@@ -4109,7 +4245,16 @@ class TradingPipeline:
                     if stop_specs:
                         self.broker._restore_stop_orders(p.symbol, stop_specs)
                     continue
-                # Intra emergency is always a full exit — no residual to re-protect.
+                # Always full exit, but the limit can still cancel/expire
+                # post-acceptance — defer the restore-on-no-fill decision
+                # to after wait below. Critical for intra: a flash crash
+                # likely blows past our -1% limit fast and leaves it
+                # unfilled, exactly when stop coverage matters most.
+                pending_protections.append({
+                    "order_id": order["id"], "symbol": p.symbol,
+                    "position_qty_before_sell": p.qty,
+                    "specs": stop_specs,
+                })
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,
@@ -4127,6 +4272,20 @@ class TradingPipeline:
                 )
             except Exception as e:
                 logger.error("Intra emergency sell failed for %s: %s", p.symbol, e)
+
+        # Wait + finalize: restore originals on any no-fill terminal.
+        for prot in pending_protections:
+            try:
+                self.broker.wait_for_order_terminal(prot["order_id"])
+            except Exception as exc:
+                logger.warning(
+                    "Intra emergency: wait failed for %s order %s: %s",
+                    prot["symbol"], prot["order_id"], exc,
+                )
+            self._finalize_protection_after_sell(
+                prot["order_id"], prot["symbol"],
+                prot["position_qty_before_sell"], prot["specs"],
+            )
 
         return {
             "status": "emergency_sold",
