@@ -2984,6 +2984,14 @@ class TradingPipeline:
             "MIDDAY RISK ALERT: %s — force-closing all positions",
             loss_violation.message,
         )
+        # Reconcile pending fills BEFORE the per-symbol idempotence dedupe.
+        # Without this, a stale 'submitted' row whose broker order was
+        # actually cancelled/expired/rejected (e.g., halted symbol, day-order
+        # expiry) would falsely mask the symbol as "still in flight" and
+        # block this fresh emergency exit — the circuit breaker would
+        # silently stop trying to sell. Reconciliation flips terminal
+        # statuses in DB so has_pending_action_for_symbol sees truth.
+        self._reconcile_fills()
         orders: list[dict] = []
         for p in positions:
             try:
@@ -3983,6 +3991,13 @@ class TradingPipeline:
             "INTRA RISK ALERT: %s — force-closing all %d positions",
             loss_violation.message, len(positions),
         )
+        # Reconcile before per-symbol dedupe — see _midday_emergency_liquidate
+        # for full rationale. Critical for intra specifically because intra
+        # ticks every 30 min: a stale 'submitted' row from an earlier tick
+        # whose limit got cancelled at the broker would otherwise lock out
+        # every subsequent tick until end-of-day, silently disabling the
+        # circuit breaker for the rest of the session.
+        self._reconcile_fills()
         orders: list[dict] = []
         for p in positions:
             try:
