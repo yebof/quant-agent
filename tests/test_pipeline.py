@@ -1078,6 +1078,103 @@ def test_take_profit_reprotects_actual_residual_on_partial_fill(tmp_path):
     db.close()
 
 
+def test_late_breach_check_returns_none_when_no_breach():
+    """No breach → helper returns None so the caller proceeds with its
+    normal flow (no_data return / decision_stage / etc)."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.get_account.return_value = {
+        "portfolio_value": 100_500.0, "last_equity": 100_000.0, "cash": 5000.0,
+    }
+    pipeline.broker.get_positions.return_value = [
+        Position(symbol="SPY", qty=10.0, avg_entry=500.0, current_price=510.0,
+                 market_value=5100.0, unrealized_pnl=100.0, sector="ETF"),
+    ]
+    pipeline.risk_engine = MagicMock()
+    pipeline.risk_engine.check_daily_loss.return_value = None  # no breach
+    pipeline._midday_emergency_liquidate = MagicMock()
+
+    out = pipeline._check_late_breach_and_emergency_liquidate("run-1", "post-research")
+
+    assert out is None
+    pipeline._midday_emergency_liquidate.assert_not_called()
+
+
+def test_late_breach_check_emergency_liquidates_on_breach():
+    """If the tape crossed daily-loss during research (5-10 min on slow
+    OpenAI days), the helper must NOT wait for next intra tick — it
+    fires emergency liquidate inline so morning bails to emergency_sold
+    instead of no_data/no_trades. Pin: returns the emergency-sold dict
+    AND calls _midday_emergency_liquidate with fresh positions."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    # 4% drawdown materialised during research
+    pipeline.broker.get_account.return_value = {
+        "portfolio_value": 96_000.0, "last_equity": 100_000.0, "cash": 5000.0,
+    }
+    pos = Position(
+        symbol="SPY", qty=10.0, avg_entry=500.0, current_price=480.0,
+        market_value=4800.0, unrealized_pnl=-200.0, sector="ETF",
+    )
+    pipeline.broker.get_positions.return_value = [pos]
+    pipeline.risk_engine = MagicMock()
+    loss_violation = MagicMock(message="Daily loss 4.0% exceeds max 3%")
+    pipeline.risk_engine.check_daily_loss.return_value = loss_violation
+    pipeline._midday_emergency_liquidate = MagicMock(return_value=[
+        {"id": "sell-1", "status": "accepted", "symbol": "SPY"}
+    ])
+
+    out = pipeline._check_late_breach_and_emergency_liquidate(
+        "run-late", "post-research",
+    )
+
+    assert out == {
+        "status": "emergency_sold",
+        "orders": [{"id": "sell-1", "status": "accepted", "symbol": "SPY"}],
+        "run_id": "run-late",
+    }
+    pipeline._midday_emergency_liquidate.assert_called_once_with(
+        [pos], loss_violation, "run-late",
+    )
+
+
+def test_late_breach_check_swallows_broker_error_and_proceeds():
+    """If the broker query fails (transient), don't crash the pipeline —
+    the next intra tick will catch any breach. Helper returns None,
+    caller proceeds with its normal early-return path."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.get_account.side_effect = RuntimeError("Alpaca 503")
+    pipeline.risk_engine = MagicMock()
+    pipeline._midday_emergency_liquidate = MagicMock()
+
+    out = pipeline._check_late_breach_and_emergency_liquidate("run-1", "post-research")
+
+    assert out is None
+    pipeline.risk_engine.check_daily_loss.assert_not_called()
+    pipeline._midday_emergency_liquidate.assert_not_called()
+
+
+def test_late_breach_check_skips_emergency_when_no_positions():
+    """Even if check_daily_loss returns a violation, with no positions
+    there's nothing to liquidate. Avoid noise from spamming emergency
+    sells of an empty book."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.get_account.return_value = {
+        "portfolio_value": 96_000.0, "last_equity": 100_000.0, "cash": 96_000.0,
+    }
+    pipeline.broker.get_positions.return_value = []
+    pipeline.risk_engine = MagicMock()
+    pipeline.risk_engine.check_daily_loss.return_value = MagicMock(message="x")
+    pipeline._midday_emergency_liquidate = MagicMock()
+
+    out = pipeline._check_late_breach_and_emergency_liquidate("run-1", "post-research")
+
+    assert out is None  # nothing to act on
+    pipeline._midday_emergency_liquidate.assert_not_called()
+
+
 def test_emergency_liquidate_skips_position_when_pending_emergency_sell_already_open():
     """Emergency sells go out as -1% LIMIT orders. On a fast-moving day the
     tape can blow through that limit without filling — the order sits as
@@ -1356,11 +1453,20 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
     mock_broker = MagicMock()
     mock_broker.is_trading_day.return_value = True
     mock_broker.get_latest_price.return_value = 100.0
+    # 3 account snapshots: (1) initial pre-research, (2) post-research
+    # late-breach check added by codex r7 P1, (3) post-sell refresh.
+    # ExecutionStage's pre-BUY recheck (#48) only re-refreshes when
+    # there were no sells — this test has sells, so step 5's refresh
+    # is reused. last_equity == value everywhere so check_daily_loss
+    # never trips → no emergency-sold path.
     mock_broker.get_account.side_effect = [
-        {"cash": 500.0, "portfolio_value": 10000.0},
-        {"cash": 3500.0, "portfolio_value": 10000.0},
+        {"cash": 500.0, "portfolio_value": 10000.0, "last_equity": 10000.0},
+        {"cash": 500.0, "portfolio_value": 10000.0, "last_equity": 10000.0},
+        {"cash": 3500.0, "portfolio_value": 10000.0, "last_equity": 10000.0},
     ]
-    mock_broker.get_positions.side_effect = [[spy_position], []]
+    mock_broker.get_positions.side_effect = [
+        [spy_position], [spy_position], [],
+    ]
     mock_broker.wait_for_order_terminal.return_value = "filled"
     mock_broker.submit_order.side_effect = [
         {"id": "sell-1", "status": "accepted", "symbol": "SPY"},

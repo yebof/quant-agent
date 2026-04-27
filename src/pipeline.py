@@ -3177,6 +3177,53 @@ class TradingPipeline:
     # and calling the method directly.
     # ---------------------------------------------------------------
 
+    def _check_late_breach_and_emergency_liquidate(
+        self, run_id: str, where: str,
+    ) -> dict | None:
+        """Refresh broker state and emergency-liquidate if the daily-loss
+        limit was crossed mid-session.
+
+        Used by morning at the post-research checkpoint and (potentially)
+        by other long-running phases to close the gap between the
+        pre-research circuit breaker (#45) and the pre-execution recheck
+        (#48). On a slow-OpenAI day research can take 5-10 min — plenty
+        of time for the tape to gap through the limit while morning is
+        still computing.
+
+        Returns the emergency-sold response dict on breach, None to
+        proceed. ``where`` is a short tag for the log message
+        (post-research / post-decision / etc).
+        """
+        try:
+            account = self.broker.get_account()
+            positions = self.broker.get_positions()
+        except Exception as exc:
+            logger.warning(
+                "Late-breach check (%s): broker query failed: %s — "
+                "proceeding without recheck", where, exc,
+            )
+            return None
+
+        total_value = account["portfolio_value"]
+        last_equity = account.get("last_equity", total_value)
+        daily_pnl = total_value - last_equity
+
+        loss_violation = self.risk_engine.check_daily_loss(last_equity, daily_pnl)
+        if not (loss_violation and positions):
+            return None
+
+        logger.warning(
+            "Morning late-breach (%s): %s — force-liquidating before "
+            "early-return; intra would otherwise wait 30 min",
+            where, loss_violation.message,
+        )
+        orders = self._midday_emergency_liquidate(positions, loss_violation, run_id)
+        return {
+            "status": "emergency_sold",
+            "orders": orders,
+            "run_id": run_id,
+        }
+
     def _midday_emergency_liquidate(
         self, positions, loss_violation, run_id: str,
     ) -> list[dict]:
@@ -3671,6 +3718,19 @@ class TradingPipeline:
             analyses = ctx.analyses
             earnings_results = ctx.earnings_results
             data_status = ctx.data_status
+
+            # Late-breach check: research can take 5-10 min on slow OpenAI
+            # days. The pre-research circuit breaker (#45) caught open-gap
+            # losses; this catches the case where the tape crosses the
+            # daily-loss limit DURING research and the morning would
+            # otherwise bail to no_data/no_trades, leaving the breach for
+            # the next intra tick (30 min away). Mirror the pre-research
+            # bypass: deterministic emergency liquidate, no LLM dependency.
+            late_breach = self._check_late_breach_and_emergency_liquidate(
+                run_id, "post-research",
+            )
+            if late_breach is not None:
+                return late_breach
 
             if not analyses:
                 logger.warning("No analyses produced, skipping trading")
