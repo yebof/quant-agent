@@ -85,6 +85,14 @@ def _get_sector(symbol: str) -> str:
     Output is canonicalized to the 12-value MacroSectorGuidance enum (or "Unknown"
     for un-classifiable names), so macro sector_guidance and position.sector share
     a namespace.
+
+    Caching policy: only KNOWN sectors are cached. "Unknown" is returned but
+    NOT cached so a transient yfinance outage doesn't permanently exempt the
+    symbol from RiskRuleEngine.max_sector_pct (the engine skips the cap when
+    sector=="Unknown"). Codex r11 P1: a one-shot lookup miss in --mode live
+    used to leave the symbol cap-exempt until process restart. Re-querying
+    yfinance on every call for an unresolved symbol is a small overhead vs.
+    silently disabling a hard risk rule.
     """
     with _sector_lock:
         if symbol in _sector_cache:
@@ -97,8 +105,10 @@ def _get_sector(symbol: str) -> str:
             raw = info.get("sector", "")
         except Exception:
             raw = ""
-        _sector_cache[symbol] = _canonicalize_sector(raw)
-        return _sector_cache[symbol]
+        canonical = _canonicalize_sector(raw)
+        if canonical != "Unknown":
+            _sector_cache[symbol] = canonical
+        return canonical
 
 
 class AlpacaBroker:
