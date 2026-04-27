@@ -570,7 +570,9 @@ class TradingPipeline:
         symbol: str,
         position_qty_before_sell: float,
         cancelled_specs: list[dict],
-    ) -> None:
+        *,
+        from_drain: bool = False,
+    ) -> bool:
         """Decide stop coverage based on the actual SELL fill outcome,
         not on submit acceptance.
 
@@ -600,11 +602,21 @@ class TradingPipeline:
         cancelling the lingering SELL, then re-read fill_info and
         proceed normally. Codex r5 caught this exact gap.
 
+        Returns True iff coverage is in a known-good state (specs were
+        successfully restored / residual was reprotected / no residual
+        existed / there were no specs at all). Returns False on any
+        bail or restore/reprotect failure — drain callers use this to
+        keep the persisted recovery intent alive.
+
+        ``from_drain=True`` skips the persist-on-bail step (caller
+        already has a persisted row, re-persisting would create a
+        duplicate). The returned False signals drain to leave the row.
+
         No-op when there were no specs to begin with — a position that
         had no protective stop pre-SELL has nothing to restore.
         """
         if not cancelled_specs:
-            return
+            return True
 
         fill_info = self.broker.get_order_fill_info(order_id) or {}
         status = (fill_info.get("status") or "").lower()
@@ -629,10 +641,11 @@ class TradingPipeline:
                     "— persisting orphaned restore intent for next session.",
                     symbol, order_id, exc,
                 )
-                self._persist_orphaned_protection_restore(
-                    order_id, symbol, position_qty_before_sell, cancelled_specs,
-                )
-                return
+                if not from_drain:
+                    self._persist_orphaned_protection_restore(
+                        order_id, symbol, position_qty_before_sell, cancelled_specs,
+                    )
+                return False
             # Re-read post-cancel — broker may report partial fill that
             # landed during cancel propagation.
             fill_info = self.broker.get_order_fill_info(order_id) or {}
@@ -656,10 +669,11 @@ class TradingPipeline:
                     "persisting orphaned restore intent for next session.",
                     symbol, status or "?",
                 )
-                self._persist_orphaned_protection_restore(
-                    order_id, symbol, position_qty_before_sell, cancelled_specs,
-                )
-                return
+                if not from_drain:
+                    self._persist_orphaned_protection_restore(
+                        order_id, symbol, position_qty_before_sell, cancelled_specs,
+                    )
+                return False
 
         fill_qty_raw = fill_info.get("filled_qty")
         try:
@@ -672,22 +686,34 @@ class TradingPipeline:
                 restored = self.broker._restore_stop_orders(symbol, cancelled_specs)
                 logger.info(
                     "SELL on %s terminated with no fill (status=%s) — "
-                    "restored %d original protective stop(s)",
-                    symbol, status or "?", restored,
+                    "restored %d/%d original protective stop(s)",
+                    symbol, status or "?", restored, len(cancelled_specs),
                 )
             except Exception as exc:
                 logger.warning(
                     "Failed to restore stops for %s after no-fill SELL: %s — "
-                    "position is unprotected until the next session",
+                    "position is unprotected; recovery deferred",
                     symbol, exc,
                 )
-            return
+                return False
+            # _restore_stop_orders catches per-spec failures internally and
+            # returns the count that succeeded. If 0 of N succeeded, the
+            # broker rejected every restore attempt — coverage was NOT
+            # rebuilt and the drain caller must keep the recovery row.
+            if restored == 0 and len(cancelled_specs) > 0:
+                logger.warning(
+                    "Restore for %s submitted 0/%d stops — coverage NOT "
+                    "rebuilt; recovery deferred",
+                    symbol, len(cancelled_specs),
+                )
+                return False
+            return True
 
         actual_residual = position_qty_before_sell - fill_qty
         if actual_residual <= 0:
-            return  # full exit — no residual to re-protect
+            return True  # full exit — no residual to re-protect
 
-        self._reprotect_residual_after_partial_sell(
+        return self._reprotect_residual_after_partial_sell(
             symbol, actual_residual, cancelled_specs,
         )
 
@@ -791,14 +817,26 @@ class TradingPipeline:
                 continue
             # Order is terminal; replay finalize from persisted specs.
             # finalize itself reads fill_info again — same broker call,
-            # cheap.
+            # cheap. ``from_drain=True`` so finalize doesn't re-persist
+            # if it bails (the row already exists). Only delete the row
+            # when finalize CONFIRMS coverage was actually rebuilt — if
+            # restore_stop_orders submits 0/N or reprotect raises, the
+            # row stays and the next session retries. Codex r8 #3.
             try:
-                self._finalize_protection_after_sell(
+                ok = self._finalize_protection_after_sell(
                     order_id=order_id,
                     symbol=symbol,
                     position_qty_before_sell=float(row["position_qty_before_sell"]),
                     cancelled_specs=cancelled_specs,
+                    from_drain=True,
                 )
+                if not ok:
+                    logger.warning(
+                        "drain: finalize for %s row %d did not rebuild "
+                        "coverage — leaving row for next session",
+                        symbol, row_id,
+                    )
+                    continue
                 self.db.delete_pending_protection_restore(row_id)
                 drained += 1
                 logger.info(
@@ -817,7 +855,7 @@ class TradingPipeline:
 
     def _reprotect_residual_after_partial_sell(
         self, symbol: str, residual_qty: float, cancelled_specs: list[dict],
-    ) -> None:
+    ) -> bool:
         """After a partial exit (TAKE_PROFIT / REDUCE / PARTIAL_SELL), place a
         fresh stop on the residual qty using the most-protective price among
         the stops we cancelled to clear held_for_orders for the SELL.
@@ -829,18 +867,21 @@ class TradingPipeline:
         multiple stops onto the highest stop_price), but it preserves at
         least the most-protective coverage that was in place pre-SELL.
 
-        Best-effort: if _submit_stop_limit_order raises, log loudly but
-        don't propagate — the SELL itself already succeeded; failing the
-        re-protection shouldn't undo that.
+        Returns True iff a fresh stop was successfully submitted (or there
+        was nothing to do). Returns False if the submit raised — drain
+        callers use this to keep the persisted recovery intent alive.
+        Best-effort logging: a False return doesn't propagate the
+        exception (the SELL itself already succeeded), but the caller
+        knows coverage wasn't actually rebuilt.
         """
         if residual_qty <= 0 or not cancelled_specs:
-            return
+            return True
         best_stop = max(
             (s.get("stop_price", 0) for s in cancelled_specs),
             default=0,
         )
         if best_stop <= 0:
-            return
+            return True
         try:
             self.broker._submit_stop_limit_order(
                 symbol=symbol, qty=residual_qty, stop_price=best_stop,
@@ -849,12 +890,14 @@ class TradingPipeline:
                 "Re-protected %s residual qty=%s @ stop $%.2f after partial exit",
                 symbol, self._format_qty(residual_qty), best_stop,
             )
+            return True
         except Exception as exc:
             logger.warning(
                 "Re-protect failed for %s residual=%s @ $%.2f: %s — position "
                 "is unprotected until the next session re-attaches a stop",
                 symbol, self._format_qty(residual_qty), best_stop, exc,
             )
+            return False
 
     @staticmethod
     def _order_accepted(order: dict, symbol: str, side: str) -> bool:
