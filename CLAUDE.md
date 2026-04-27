@@ -50,7 +50,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 - 同上 SELL path **提交前必须先调 `broker.cancel_protective_stops(symbol)`**——morning BUY 的 OTO stop-loss leg 和 midday/close 的 TRAIL_STOP 都会让 Alpaca 把 shares 标 `held_for_orders=qty`，再下 SELL 必被 `insufficient qty available` 拒（2026-04-25 AMZN 实例）。helper 返回 `(ok, stop_specs)` 元组。**完整三步纪律**：
   1. **`ok=False`** → 直接 skip 这个 symbol（不要盲目下单）
   2. **`_order_accepted=False`**（broker 当场拒单）→ 立刻调 `broker._restore_stop_orders(symbol, stop_specs)` 恢复保护
-  3. **submit 接受后必须 stash `(order_id, position_qty, specs)` 到 `pending_protections`，等 SELL 跑完一轮后调 `wait_for_order_terminal` + `pipeline._finalize_protection_after_sell(...)`** —— **finalize 必须基于实际 fill_qty，不能在 submit 接受时就 reprotect residual**：accepted 的 limit 后续可能 cancel/expire 不成交（PR I 的洞，2026-04-26 codex r4 修复 PR J）。finalize 的三种分支：填 0 → 用 specs restore 原仓覆盖；填 < position → reprotect 实际 residual = `position - fill_qty`；全部填满 → 完整退出无残仓
+  3. **submit 接受后必须 stash `(order_id, position_qty, specs)` 到 `pending_protections`，等 SELL 跑完一轮后调 `wait_for_order_terminal` + `pipeline._finalize_protection_after_sell(...)`** —— **finalize 必须基于实际 fill_qty，不能在 submit 接受时就 reprotect residual**：accepted 的 limit 后续可能 cancel/expire 不成交（PR I 的洞，2026-04-26 codex r4 修复 PR J）。finalize 的三种分支：填 0 → 用 specs restore 原仓覆盖；填 < position → reprotect 实际 residual = `position - fill_qty`；全部填满 → 完整退出无残仓。**还有一种特殊路径**：`wait_for_order_terminal` 15s 超时仍非终态时（broker 还在 hold 这单），finalize 不能直接走——会和 broker 抢，restore stop 时撞 held_for_orders。这种情况要 **先 `cancel_order_by_id` 强制收敛到终态再 finalize**（PR K 修复，codex r5）
   这条对 SELL/REDUCE/EMERGENCY_SELL/FORCE_DELEVER/TAKE_PROFIT 5 个 action 全适用——**新增 SELL path 必须把 cancel / restore-on-reject / wait+finalize-on-actual-fill 三步全写齐**，少一个就会有残仓裸奔窗口（partial 没成交时尤其危险）
 
 ### 时区

@@ -556,6 +556,14 @@ class TradingPipeline:
                     return True
         return False
 
+    # Statuses Alpaca uses for terminal/non-terminal orders. Kept as a
+    # class attribute so tests can introspect the exact set the
+    # finalizer treats as "done".
+    _TERMINAL_ORDER_STATUSES = {
+        "filled", "canceled", "cancelled", "expired", "rejected",
+        "done_for_day", "replaced",
+    }
+
     def _finalize_protection_after_sell(
         self,
         order_id: str,
@@ -583,6 +591,15 @@ class TradingPipeline:
            cancelled stop_price.
         3. ``fill_qty == position_qty``: full exit, nothing to protect.
 
+        Special case: if get_order_fill_info reports a NON-terminal status
+        (the SELL is still 'new' / 'accepted' / 'pending_new' because
+        wait_for_order_terminal hit its 15s ceiling without the order
+        reaching terminal), finalizing now would race with the broker —
+        restoring stops while the SELL is open triggers held_for_orders
+        rejection on the new stop submit. Force terminal state by
+        cancelling the lingering SELL, then re-read fill_info and
+        proceed normally. Codex r5 caught this exact gap.
+
         No-op when there were no specs to begin with — a position that
         had no protective stop pre-SELL has nothing to restore.
         """
@@ -590,6 +607,41 @@ class TradingPipeline:
             return
 
         fill_info = self.broker.get_order_fill_info(order_id) or {}
+        status = (fill_info.get("status") or "").lower()
+
+        if status not in self._TERMINAL_ORDER_STATUSES:
+            # The wait window expired with the order still live. We
+            # cannot leave this state — restoring or reprotecting now
+            # races with the broker. Cancel the lingering SELL so
+            # status converges to terminal.
+            logger.warning(
+                "SELL on %s did not reach terminal in wait window "
+                "(status=%s) — cancelling so protection state can settle",
+                symbol, status or "?",
+            )
+            try:
+                self.broker.client.cancel_order_by_id(order_id)
+                # Cancel propagates fast; a tighter 5s wait is enough.
+                self.broker.wait_for_order_terminal(order_id, timeout_seconds=5.0)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to cancel lingering SELL on %s (order %s): %s "
+                    "— skipping protection finalize. Position has no "
+                    "stops AND a live SELL; next session reconcile will "
+                    "see this and rebuild coverage.",
+                    symbol, order_id, exc,
+                )
+                return
+            # Re-read post-cancel — broker may report partial fill that
+            # landed during cancel propagation.
+            fill_info = self.broker.get_order_fill_info(order_id) or {}
+            status = (fill_info.get("status") or "").lower()
+            logger.info(
+                "Cancelled lingering SELL on %s — post-cancel status=%s, "
+                "filled_qty=%s",
+                symbol, status, fill_info.get("filled_qty"),
+            )
+
         fill_qty_raw = fill_info.get("filled_qty")
         try:
             fill_qty = float(fill_qty_raw) if fill_qty_raw is not None else 0.0
@@ -599,11 +651,10 @@ class TradingPipeline:
         if fill_qty <= 0:
             try:
                 restored = self.broker._restore_stop_orders(symbol, cancelled_specs)
-                status = (fill_info.get("status") or "?").lower()
                 logger.info(
                     "SELL on %s terminated with no fill (status=%s) — "
                     "restored %d original protective stop(s)",
-                    symbol, status, restored,
+                    symbol, status or "?", restored,
                 )
             except Exception as exc:
                 logger.warning(

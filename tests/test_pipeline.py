@@ -891,6 +891,117 @@ def test_take_profit_restores_originals_when_limit_does_not_fill(tmp_path):
     db.close()
 
 
+def test_finalize_protection_cancels_lingering_sell_when_status_non_terminal():
+    """If wait_for_order_terminal hit its 15s ceiling without the order
+    going terminal, get_order_fill_info still reports a live status like
+    'new' / 'accepted' / 'pending_new'. Finalizing on that state would
+    race the broker — restoring stops while the SELL is still open
+    fails on held_for_orders.
+
+    The fix forces terminal by cancelling the lingering SELL, re-reads
+    fill_info post-cancel, then proceeds with normal branch logic.
+    Pin the cancel call sequence + the eventual restore."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._reprotect_residual_after_partial_sell = MagicMock()
+
+    # First read: SELL is still live ("new"). After cancel, broker
+    # reports terminal "canceled" with 0 fill.
+    pipeline.broker.get_order_fill_info.side_effect = [
+        {"status": "new", "filled_qty": "0", "filled_avg_price": None},
+        {"status": "canceled", "filled_qty": "0", "filled_avg_price": None},
+    ]
+
+    cancelled = [
+        {"id": "stop-old", "qty": 100, "stop_price": 95.0, "limit_price": 92.0},
+    ]
+
+    pipeline._finalize_protection_after_sell(
+        order_id="alpaca-lingering",
+        symbol="NVDA",
+        position_qty_before_sell=100.0,
+        cancelled_specs=cancelled,
+    )
+
+    # Lingering SELL must be cancelled before finalize proceeds.
+    pipeline.broker.client.cancel_order_by_id.assert_called_once_with(
+        "alpaca-lingering",
+    )
+    pipeline.broker.wait_for_order_terminal.assert_called_once()
+    # Post-cancel fill_qty=0 → restore originals (NOT reprotect residual).
+    pipeline.broker._restore_stop_orders.assert_called_once_with(
+        "NVDA", cancelled,
+    )
+    pipeline._reprotect_residual_after_partial_sell.assert_not_called()
+
+
+def test_finalize_protection_uses_partial_fill_after_lingering_cancel():
+    """Edge case: SELL was non-terminal at wait timeout, but the cancel
+    propagation captured a partial fill. The post-cancel filled_qty
+    must drive the residual computation — NOT a no-fill restore."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._reprotect_residual_after_partial_sell = MagicMock()
+
+    pipeline.broker.get_order_fill_info.side_effect = [
+        {"status": "new", "filled_qty": "0", "filled_avg_price": None},
+        # Cancel raced with a fill of 18 shares before fully cancelling.
+        {"status": "canceled", "filled_qty": "18", "filled_avg_price": "117.5"},
+    ]
+
+    cancelled = [
+        {"id": "stop-old", "qty": 100, "stop_price": 95.0, "limit_price": 92.0},
+    ]
+
+    pipeline._finalize_protection_after_sell(
+        order_id="alpaca-partial-cancel",
+        symbol="NVDA",
+        position_qty_before_sell=100.0,
+        cancelled_specs=cancelled,
+    )
+
+    pipeline.broker.client.cancel_order_by_id.assert_called_once()
+    # Residual = 100 - 18 = 82 (driven by post-cancel fill_qty)
+    pipeline._reprotect_residual_after_partial_sell.assert_called_once_with(
+        "NVDA", 82.0, cancelled,
+    )
+    pipeline.broker._restore_stop_orders.assert_not_called()
+
+
+def test_finalize_protection_bails_when_lingering_cancel_fails():
+    """If we can't even cancel the lingering SELL (API timeout etc.),
+    we have no clean state to finalize from. Restoring stops anyway
+    would compound the problem — broker has live SELL + about-to-be
+    submitted stop on the same shares. Better to bail with a loud
+    warning and let the next session's reconcile rebuild coverage."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._reprotect_residual_after_partial_sell = MagicMock()
+
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "new", "filled_qty": "0", "filled_avg_price": None,
+    }
+    pipeline.broker.client.cancel_order_by_id.side_effect = RuntimeError("api timeout")
+
+    cancelled = [{"id": "stop-old", "qty": 100, "stop_price": 95.0}]
+
+    pipeline._finalize_protection_after_sell(
+        order_id="alpaca-stuck",
+        symbol="NVDA",
+        position_qty_before_sell=100.0,
+        cancelled_specs=cancelled,
+    )
+
+    pipeline.broker.client.cancel_order_by_id.assert_called_once()
+    # Critical: NO restore, NO reprotect — leaving broker state alone
+    # is safer than compounding the inconsistency.
+    pipeline.broker._restore_stop_orders.assert_not_called()
+    pipeline._reprotect_residual_after_partial_sell.assert_not_called()
+
+
 def test_take_profit_reprotects_actual_residual_on_partial_fill(tmp_path):
     """If the limit only partially fills (e.g., 12 of 33), the residual is
     100 - 12 = 88, NOT 100 - 33 = 67. Pin the broker.fill_qty as the
