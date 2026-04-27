@@ -426,6 +426,25 @@ class Database:
             self.conn.commit()
             return cur.rowcount or 0
 
+    def update_pending_protection_restore_specs(
+        self, row_id: int, specs_json: str,
+    ) -> int:
+        """Replace the specs_json of an existing recovery row.
+
+        Used by the drain path's partial-restore handling: when 1 of N
+        specs landed on this drain attempt, the next drain should only
+        retry the N-1 that failed (re-submitting the already-alive stop
+        either creates a duplicate or hits held_for_orders, neither
+        productive). Codex r10 #1.
+        """
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE pending_protection_restores SET specs_json = ? WHERE id = ?",
+                (specs_json, row_id),
+            )
+            self.conn.commit()
+            return cur.rowcount or 0
+
     @staticmethod
     def _executed_trade_predicate() -> str:
         """SQL predicate for trades that executed at least some quantity."""

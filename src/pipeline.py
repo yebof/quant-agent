@@ -572,7 +572,7 @@ class TradingPipeline:
         cancelled_specs: list[dict],
         *,
         from_drain: bool = False,
-    ) -> bool:
+    ) -> tuple[bool, list[dict]]:
         """Decide stop coverage based on the actual SELL fill outcome,
         not on submit acceptance.
 
@@ -602,21 +602,27 @@ class TradingPipeline:
         cancelling the lingering SELL, then re-read fill_info and
         proceed normally. Codex r5 caught this exact gap.
 
-        Returns True iff coverage is in a known-good state (specs were
-        successfully restored / residual was reprotected / no residual
-        existed / there were no specs at all). Returns False on any
-        bail or restore/reprotect failure — drain callers use this to
-        keep the persisted recovery intent alive.
+        Returns ``(success, retry_specs)``:
+          - success: True iff coverage is in a known-good state (specs
+            were successfully restored / residual was reprotected /
+            no residual existed / there were no specs at all). False on
+            any bail or restore/reprotect failure.
+          - retry_specs: when success=False, the subset of cancelled_specs
+            that still need a protection retry. For partial-restore this
+            is ONLY the failed specs (the ones that landed are already
+            alive at the broker). For other failure modes it's the full
+            cancelled_specs list. Empty when success=True.
 
-        ``from_drain=True`` skips the persist-on-bail step (caller
-        already has a persisted row, re-persisting would create a
-        duplicate). The returned False signals drain to leave the row.
+        ``from_drain=True`` skips the persist-on-bail step (drain
+        already has a row). Drain uses retry_specs to NARROW the
+        existing row to just what still needs retry — avoids the next
+        drain re-submitting a stop that already landed (codex r10 #1).
 
         No-op when there were no specs to begin with — a position that
         had no protective stop pre-SELL has nothing to restore.
         """
         if not cancelled_specs:
-            return True
+            return True, []
 
         fill_info = self.broker.get_order_fill_info(order_id) or {}
         status = (fill_info.get("status") or "").lower()
@@ -645,7 +651,7 @@ class TradingPipeline:
                     self._persist_orphaned_protection_restore(
                         order_id, symbol, position_qty_before_sell, cancelled_specs,
                     )
-                return False
+                return False, list(cancelled_specs)
             # Re-read post-cancel — broker may report partial fill that
             # landed during cancel propagation.
             fill_info = self.broker.get_order_fill_info(order_id) or {}
@@ -673,7 +679,7 @@ class TradingPipeline:
                     self._persist_orphaned_protection_restore(
                         order_id, symbol, position_qty_before_sell, cancelled_specs,
                     )
-                return False
+                return False, list(cancelled_specs)
 
         fill_qty_raw = fill_info.get("filled_qty")
         try:
@@ -701,7 +707,7 @@ class TradingPipeline:
                     self._persist_orphaned_protection_restore(
                         order_id, symbol, position_qty_before_sell, cancelled_specs,
                     )
-                return False
+                return False, list(cancelled_specs)
             # PARTIAL restore is incomplete coverage — restoring 1 of 2
             # original stops still leaves the slice covered by the failed
             # spec naked. Codex r9: previously we only flagged 0 of N as
@@ -718,12 +724,12 @@ class TradingPipeline:
                     self._persist_orphaned_protection_restore(
                         order_id, symbol, position_qty_before_sell, failed_specs,
                     )
-                return False
-            return True
+                return False, list(failed_specs)
+            return True, []
 
         actual_residual = position_qty_before_sell - fill_qty
         if actual_residual <= 0:
-            return True  # full exit — no residual to re-protect
+            return True, []  # full exit — no residual to re-protect
 
         if not self._reprotect_residual_after_partial_sell(
             symbol, actual_residual, cancelled_specs,
@@ -736,8 +742,8 @@ class TradingPipeline:
                 self._persist_orphaned_protection_restore(
                     order_id, symbol, position_qty_before_sell, cancelled_specs,
                 )
-            return False
-        return True
+            return False, list(cancelled_specs)
+        return True, []
 
     def _persist_orphaned_protection_restore(
         self,
@@ -845,7 +851,7 @@ class TradingPipeline:
             # restore_stop_orders submits 0/N or reprotect raises, the
             # row stays and the next session retries. Codex r8 #3.
             try:
-                ok = self._finalize_protection_after_sell(
+                ok, retry_specs = self._finalize_protection_after_sell(
                     order_id=order_id,
                     symbol=symbol,
                     position_qty_before_sell=float(row["position_qty_before_sell"]),
@@ -853,6 +859,26 @@ class TradingPipeline:
                     from_drain=True,
                 )
                 if not ok:
+                    # Narrow the row to retry_specs if a partial restore
+                    # made progress: re-submitting an already-alive stop
+                    # next pass would create duplicates / hit
+                    # held_for_orders. Codex r10 #1.
+                    if retry_specs and len(retry_specs) < len(cancelled_specs):
+                        try:
+                            self.db.update_pending_protection_restore_specs(
+                                row_id, _json.dumps(retry_specs),
+                            )
+                            logger.info(
+                                "drain: row %d narrowed from %d to %d "
+                                "spec(s) (partial restore made progress)",
+                                row_id, len(cancelled_specs), len(retry_specs),
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "drain: failed to narrow row %d after "
+                                "partial restore: %s",
+                                row_id, exc,
+                            )
                     logger.warning(
                         "drain: finalize for %s row %d did not rebuild "
                         "coverage — leaving row for next session",
