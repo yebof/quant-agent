@@ -1170,6 +1170,94 @@ def test_intra_check_drains_orphan_restores_at_entry(tmp_path):
     db.close()
 
 
+def test_drain_narrows_row_to_failed_specs_after_partial_restore(tmp_path):
+    """Codex r10: drain partial-restore must update the existing row's
+    specs to ONLY the failed ones. Otherwise the next drain re-submits
+    the already-alive stop spec → broker rejects on duplicate /
+    held_for_orders, and the row can stay stuck forever.
+
+    Pin: row enters drain with [spec_a, spec_b], restore lands spec_a
+    only, drain narrows the row to [spec_b]. Next drain pass would
+    only retry spec_b."""
+    from src.storage.db import Database
+    import json as _json
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    spec_a = {"id": "stop-a", "qty": 50, "stop_price": 95.0, "limit_price": 92.0}
+    spec_b = {"id": "stop-b", "qty": 50, "stop_price": 96.0, "limit_price": 93.0}
+    db.insert_pending_protection_restore(
+        symbol="NVDA", sell_order_id="alpaca-orphan",
+        position_qty_before_sell=100.0,
+        specs_json=_json.dumps([spec_a, spec_b]),
+    )
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._reprotect_residual_after_partial_sell = MagicMock()
+
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "canceled", "filled_qty": "0", "filled_avg_price": None,
+    }
+    # 1 of 2 restored: spec_a landed, spec_b failed.
+    pipeline.broker._restore_stop_orders.return_value = (1, [spec_b])
+
+    drained = pipeline._drain_pending_protection_restores()
+
+    # Drain returned 0 (coverage not fully rebuilt) but the row still exists,
+    # narrowed to just spec_b.
+    assert drained == 0
+    rows = db.get_pending_protection_restores()
+    assert len(rows) == 1
+    persisted_now = _json.loads(rows[0]["specs_json"])
+    assert len(persisted_now) == 1
+    assert persisted_now[0]["id"] == "stop-b", (
+        f"row should be narrowed to just the failed spec; got {persisted_now}"
+    )
+    db.close()
+
+
+def test_drain_does_not_narrow_row_when_no_progress(tmp_path):
+    """If restore made no progress (0 of 2 succeeded, both in failed_specs),
+    don't bother updating — row stays as-is for next pass. Avoid
+    a no-op DB write."""
+    from src.storage.db import Database
+    import json as _json
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    cancelled = [
+        {"id": "stop-a", "qty": 50, "stop_price": 95.0},
+        {"id": "stop-b", "qty": 50, "stop_price": 96.0},
+    ]
+    db.insert_pending_protection_restore(
+        symbol="NVDA", sell_order_id="alpaca-orphan",
+        position_qty_before_sell=100.0, specs_json=_json.dumps(cancelled),
+    )
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "canceled", "filled_qty": "0", "filled_avg_price": None,
+    }
+    # Total failure: 0 of 2 restored.
+    pipeline.broker._restore_stop_orders.return_value = (0, cancelled)
+
+    pipeline._drain_pending_protection_restores()
+
+    # Row unchanged — full original specs still there.
+    rows = db.get_pending_protection_restores()
+    persisted_now = _json.loads(rows[0]["specs_json"])
+    assert len(persisted_now) == 2
+    db.close()
+
+
 def test_finalize_persists_only_failed_specs_on_partial_restore(tmp_path):
     """Codex r9 #2: 1 of 2 stops restored is still partial coverage. The
     failed spec must be persisted so a later session can retry just
@@ -1197,7 +1285,7 @@ def test_finalize_persists_only_failed_specs_on_partial_restore(tmp_path):
     }
     pipeline.broker._restore_stop_orders.return_value = (1, [spec_b])
 
-    ok = pipeline._finalize_protection_after_sell(
+    ok, _retry_specs = pipeline._finalize_protection_after_sell(
         order_id="alpaca-resolved",
         symbol="NVDA",
         position_qty_before_sell=100.0,
@@ -1238,7 +1326,7 @@ def test_finalize_persists_recovery_when_restore_raises_in_non_drain_path(tmp_pa
     }
     pipeline.broker._restore_stop_orders.side_effect = RuntimeError("api 503")
 
-    ok = pipeline._finalize_protection_after_sell(
+    ok, _retry_specs = pipeline._finalize_protection_after_sell(
         order_id="alpaca-resolved",
         symbol="NVDA",
         position_qty_before_sell=100.0,
@@ -1273,7 +1361,7 @@ def test_finalize_persists_recovery_when_reprotect_raises_in_non_drain_path(tmp_
     }
     pipeline.broker._submit_stop_limit_order.side_effect = RuntimeError("rejected")
 
-    ok = pipeline._finalize_protection_after_sell(
+    ok, _retry_specs = pipeline._finalize_protection_after_sell(
         order_id="alpaca-partial",
         symbol="NVDA",
         position_qty_before_sell=100.0,
@@ -1311,7 +1399,7 @@ def test_finalize_does_not_double_persist_when_called_from_drain(tmp_path):
     }
     pipeline.broker._restore_stop_orders.side_effect = RuntimeError("api 503")
 
-    ok = pipeline._finalize_protection_after_sell(
+    ok, _retry_specs = pipeline._finalize_protection_after_sell(
         order_id="alpaca-orphan",
         symbol="NVDA",
         position_qty_before_sell=100.0,
