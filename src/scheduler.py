@@ -1,9 +1,11 @@
 import logging
 from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 
 from src.config import AppConfig
 from src.pipeline import TradingPipeline
+from src.trading_calendar import SESSION_WINDOWS
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,34 @@ class TradingScheduler:
     def _parse_time(self, time_str: str) -> tuple[int, int]:
         parts = time_str.split(":")
         return int(parts[0]), int(parts[1])
+
+    @staticmethod
+    def _build_intra_check_trigger() -> OrTrigger:
+        """OrTrigger covering exactly SESSION_WINDOWS['intra_check'] every 30 min.
+
+        For 09:30-16:00 ET that yields 09:30, 10:00, ..., 15:30, 16:00
+        (14 ticks). Sourced programmatically from SESSION_WINDOWS so any
+        future widening of the canonical window propagates here without
+        a manual edit. Each CronTrigger gets timezone=US/Eastern explicitly
+        — without it APScheduler defaults to local TZ on the *trigger*
+        even when the scheduler itself is set to US/Eastern, and the user
+        may be running --mode live from any host timezone.
+        """
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("US/Eastern")
+
+        lo_min, hi_min = SESSION_WINDOWS["intra_check"]  # minutes-since-midnight
+        triggers: list[CronTrigger] = []
+        for tick_min in range(lo_min, hi_min + 1, 30):
+            triggers.append(
+                CronTrigger(
+                    hour=tick_min // 60,
+                    minute=tick_min % 60,
+                    day_of_week="mon-fri",
+                    timezone=et,
+                )
+            )
+        return OrTrigger(triggers)
 
     def setup(self):
         schedule = self.config.trading.schedule
@@ -39,17 +69,22 @@ class TradingScheduler:
             id="morning_run",
         )
 
-        # Stateless flash-crash circuit breaker — must fire on every 30-min
-        # tick during market hours, matching the launchd wrapper's StartInterval
-        # behaviour (run_if_et_window.sh exempts intra_check from both the
-        # last-run guard and the cross-mode session lock for the same reason:
-        # a single afternoon tick is woefully insufficient for circuit-breaker
-        # coverage). schedule.intra_check is intentionally ignored here — the
-        # config's TIME field is meaningless for a multi-tick job; the daily
-        # window is hardcoded to mirror the launchd window.
+        # Stateless flash-crash circuit breaker — fires every 30-min tick
+        # during the canonical SESSION_WINDOWS["intra_check"] window
+        # (09:30-16:00 ET, inclusive). schedule.intra_check is intentionally
+        # ignored — the config's TIME field is meaningless for a multi-tick
+        # job and the window must stay aligned with src/trading_calendar.py
+        # so live mode and the launchd wrapper agree on coverage.
+        #
+        # Cron can't natively express "09:30 + every 30 min through 16:00"
+        # in a single CronTrigger (the 09:30 start and 16:00 end don't fit
+        # the same hour=N, minute=0,30 pattern). OrTrigger combines three
+        # CronTriggers — opening edge / 30-min middle / closing edge — into
+        # one logical job so the existing six-job invariant in tests/scheduler
+        # still holds.
         self.scheduler.add_job(
             self._run_safe,
-            CronTrigger(hour="9-15", minute="0,30", day_of_week="mon-fri"),
+            self._build_intra_check_trigger(),
             args=[self.pipeline.run_intra_check, "intra_check"],
             id="intra_check",
         )
