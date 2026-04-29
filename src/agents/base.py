@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -10,12 +11,47 @@ logger = logging.getLogger(__name__)
 # Model prefixes that route to OpenAI
 _OPENAI_PREFIXES = ("gpt-", "o1-", "o3-", "o4-")
 
-# Retry budget for a single LLM call — exponential backoff 2**attempt means
-# N=5 yields a total wait of 1+2+4+8+16 = 31s, enough to ride through a
-# typical macOS DNS hiccup (~10-20s) or a provider blip. Prior N=3 only
-# bought 7s, which let 2026-04-23 morning die when DNS was out ~15s.
+# Retry budget for a single LLM call — exponential backoff WITH JITTER.
+#
+# Why N=7 with jitter (was N=5 deterministic):
+#   2026-04-28 + 2026-04-29 morning each had RM-stage network failures.
+#   Tue: OpenAI 21s outage. Wed #1: OpenAI fast-fail. Wed #2: macOS DNS
+#   blackout (errno 8). With N=5 deterministic backoff (1+2+4+8 = 15s
+#   sleeps + 5 fast-fail calls ≈ 25s window), all 5 retries clustered
+#   inside the outage window and gave up before recovery. Either of:
+#     - more retries (wider total window), or
+#     - jitter (decorrelate retries from outage timing)
+#   alone helps; doing both is the cheap belt-and-suspenders fix.
+#
+# N=7 base sleeps: 1, 2, 4, 8, 16, 32 between attempts (no sleep after
+# attempt 6, which raises). Total deterministic ~63s. Plus 7 fast-fail
+# call latencies ~14s ≈ 77s window, vs ~25s before. Comfortably inside
+# launchd's 1200s outer kill even when 4-5 agents per session hit it.
+#
+# Jitter is "decorrelated" (AWS-style approximation): each sleep is
+# in [base, 2*base). Worst case ~126s sleep + ~14s call = ~140s.
+# Effect: a 30s outage starting at any moment in the retry sequence
+# is unlikely to swallow ALL 7 attempts because their exact timing
+# now varies per call.
+#
 # Overridable via QUANT_AGENT_MAX_RETRIES for tests / harder retries.
-_DEFAULT_MAX_RETRIES = 5
+_DEFAULT_MAX_RETRIES = 7
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    """Exponential base + full positive jitter on top.
+
+    Returns a sleep duration in [2**attempt, 2 * 2**attempt). The
+    deterministic floor preserves exponential spacing (so retries
+    don't bunch right at the start), while the random ceiling
+    decorrelates retries within a single sequence and across
+    concurrent callers.
+
+    Sequence for attempt 0..5 (the 6 between-attempt sleeps with N=7):
+      [1, 2), [2, 4), [4, 8), [8, 16), [16, 32), [32, 64)
+    """
+    base = 2 ** attempt
+    return base + random.uniform(0, base)
 
 # Per-request HTTP timeout for LLM clients. OpenAI/Anthropic SDKs default to
 # 600s, which means a single stalled SSE stream could hang the morning
@@ -187,8 +223,8 @@ class BaseAgent(ABC):
                     logger.warning("Agent %s attempt %d failed: %s. Giving up.",
                                    self.name, attempt + 1, e)
                     raise
-                wait = 2 ** attempt
-                logger.warning("Agent %s attempt %d failed: %s. Retrying in %ds...",
+                wait = _retry_backoff_seconds(attempt)
+                logger.warning("Agent %s attempt %d failed: %s. Retrying in %.1fs...",
                                self.name, attempt + 1, e, wait)
                 import time
                 time.sleep(wait)
