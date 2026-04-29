@@ -73,7 +73,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 - LLM agent 改动后：改 `config/prompts/*.md` 的 rule + 对应 `src/agents/*.py` 的 build_user_message，然后加 test（在 `tests/test_*.py`）
 - 任何进 trades / positions 表的写入必须先过 `_order_accepted()`
 - **Env vars（可选调节）**：
-  - `QUANT_AGENT_MAX_RETRIES` — base agent LLM 调用重试次数（默认 5，总退避 1+2+4+8+16=31s）。2026-04-23 DNS 抖动事件之后从 3 升到 5，想更严格或测试用可以覆盖
+  - `QUANT_AGENT_MAX_RETRIES` — base agent LLM 调用重试次数（**默认 7，带 jitter**）。退避用 `_retry_backoff_seconds()`：每次睡 `[2^attempt, 2*2^attempt)` 秒（exponential floor + full positive jitter），6 次 sleep 总最坏 ~126s，加 7 次 fast-fail call 延迟 ~14s，~140s 窗口。**演化**：3→5 (2026-04-23 DNS 抖动) → 7+jitter (2026-04-28+29 RM 阶段连续两天 30s 网络中断把 5 retry 全吞)。jitter 是关键 — 没 jitter 时所有 retry 时机确定，30s outage 必吞所有 5 次 retry；有 jitter 后 retry 时机随机散开，至少有概率落在 outage 之后
   - `.env` 的必需项：`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` / `FRED_API_KEY`
 - **长期反思（quarterly auto-evolution）**：`evolution.enabled=true` 时，每季末 `--mode meta` 会让 `PromptEditor` 按 `reflection.json` 的提案真实写入 6 个 editable agent 的 prompt 文件的 `## Learnings (system-evolved)` 段。`risk_manager` + `position_reviewer` 被 `MetaReflectionAgentName` schema literal 硬挡，`evolution.enabled=true` 也改不了。4 层护栏：FIFO cap / Jaccard dedup / prohibited-words regex / git auto-commit（`git revert <sha>` 一条命令整季回滚）
 - **记忆**：我的长期偏好 / 决策背景见 `~/.claude/projects/-Users-yebof-Documents-Claude-workspace-quant-agent/memory/`

@@ -88,9 +88,12 @@ def test_agent_retries_transient_failure_and_succeeds(mock_anthropic, monkeypatc
     assert result.raw_text == '{"result": "ok"}'
 
 
-def test_agent_retry_budget_is_five_attempts_by_default(mock_anthropic, monkeypatch):
-    """When every attempt fails, the agent still gives up — but only
-    after burning the full 5-attempt budget (total ~31s backoff)."""
+def test_agent_retry_budget_is_seven_attempts_by_default(mock_anthropic, monkeypatch):
+    """When every attempt fails, the agent gives up after the full
+    7-attempt budget. Bumped from 5 after 2026-04-28+29 RM-stage
+    network failures where 5 retries clustered inside ~30s outage
+    windows; 7 retries with jitter widen total window to ~140s
+    worst case, comfortably surviving observed DNS/OpenAI outages."""
     monkeypatch.setattr("time.sleep", lambda s: None)
 
     calls = {"n": 0}
@@ -104,7 +107,7 @@ def test_agent_retry_budget_is_five_attempts_by_default(mock_anthropic, monkeypa
     agent = ConcreteAgent(api_key="test-key", model="claude-sonnet-4-6-20250514", max_tokens=1024)
     with pytest.raises(ConnectionError):
         agent.run(data="test")
-    assert calls["n"] == 5, f"expected 5 attempts before giving up, got {calls['n']}"
+    assert calls["n"] == 7, f"expected 7 attempts before giving up, got {calls['n']}"
 
 
 def test_agent_retry_budget_respects_env_override(mock_anthropic, monkeypatch):
@@ -125,6 +128,53 @@ def test_agent_retry_budget_respects_env_override(mock_anthropic, monkeypatch):
     with pytest.raises(ConnectionError):
         agent.run(data="test")
     assert calls["n"] == 2
+
+
+def test_retry_backoff_exponential_floor_with_positive_jitter():
+    """The backoff helper must produce values in [base, 2*base) where
+    base = 2**attempt. The deterministic floor preserves exponential
+    spacing (no retry can fire before its expected time) while the
+    random ceiling adds spread to decorrelate retries from outage
+    timing."""
+    from src.agents.base import _retry_backoff_seconds
+
+    for attempt in range(7):
+        base = 2 ** attempt
+        # 200 samples is enough to cover both ends of [base, 2*base)
+        # without flake risk.
+        for _ in range(200):
+            wait = _retry_backoff_seconds(attempt)
+            assert base <= wait < 2 * base, (
+                f"attempt={attempt}: expected wait in [{base}, {2 * base}), "
+                f"got {wait}"
+            )
+
+
+def test_retry_backoff_decorrelates_across_calls():
+    """Two consecutive calls at the same attempt index must produce
+    different waits with high probability. This is the property that
+    decorrelates retry timing from outage timing — without it, every
+    session running the SAME attempt at the SAME wall-clock would
+    produce the same retry pattern. With ~50% jitter spread, repeated
+    calls should produce distinct values."""
+    from src.agents.base import _retry_backoff_seconds
+
+    waits = {_retry_backoff_seconds(3) for _ in range(50)}
+    # 50 samples in a continuous range should yield many distinct
+    # values; require at least 30 to allow for some collisions but
+    # rule out a constant function.
+    assert len(waits) >= 30, (
+        f"jitter must produce variability across calls; got "
+        f"{len(waits)} unique values from 50 samples"
+    )
+
+
+def test_agent_retry_budget_default_constant_is_seven():
+    """Pin the constant value so the next refactor can't silently
+    revert to 5 (the value that failed against 30s outages)."""
+    from src.agents.base import _DEFAULT_MAX_RETRIES
+
+    assert _DEFAULT_MAX_RETRIES == 7
 
 
 def test_anthropic_client_gets_explicit_http_timeout():
