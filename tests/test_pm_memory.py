@@ -341,8 +341,15 @@ def test_run_intra_check_ok_when_within_loss_budget(tmp_path):
     pipeline.broker.submit_order.assert_not_called()
 
 
-def test_auto_take_profit_triggers_once_at_15pct(tmp_path):
-    """A position up ≥ 15% gets trimmed 33%, and only once per holding."""
+def test_auto_take_profit_triggers_once_at_30pct(tmp_path):
+    """A position up ≥ 30% gets trimmed 15%, and only once per holding.
+
+    Threshold/fraction tightened from 15%/33% after the 2026-04-30 GOOGL
+    incident, where mechanical 15%/33% clipped 28% of an early-innings
+    multi-bagger on the same day news_analyst flagged HIGH bullish thesis.
+    Auto-TP is now a give-back guardrail (only trips on truly outsized
+    gains), with the LLM reviewer doing thesis-aware trims.
+    """
     from unittest.mock import MagicMock
     from src.pipeline import TradingPipeline
     from src.storage.db import Database
@@ -361,24 +368,26 @@ def test_auto_take_profit_triggers_once_at_15pct(tmp_path):
     }
     pipeline.broker.cancel_protective_stops.return_value = (True, [])
 
-    # Position: 100 shares @ $100 cost, current $118 → 18% gain → triggers TP
+    # Position: 100 shares @ $100 cost, current $135 → 35% gain → triggers TP
     winner = Position(
-        symbol="NVDA", qty=100, avg_entry=100, current_price=118,
-        market_value=11800, unrealized_pnl=1800, sector="Technology",
+        symbol="NVDA", qty=100, avg_entry=100, current_price=135,
+        market_value=13500, unrealized_pnl=3500, sector="Technology",
     )
-    # Position: 100 shares @ $100, current $105 → 5% gain → no TP yet
-    small_winner = Position(
-        symbol="JPM", qty=100, avg_entry=100, current_price=105,
-        market_value=10500, unrealized_pnl=500, sector="Financial Services",
+    # Position: 100 shares @ $100, current $125 → 25% gain → still below 30% trigger
+    # (regression-guard against silent revert to 15% threshold — this would have
+    # triggered under the old defaults.)
+    almost_winner = Position(
+        symbol="JPM", qty=100, avg_entry=100, current_price=125,
+        market_value=12500, unrealized_pnl=2500, sector="Financial Services",
     )
     db.insert_trade("JPM", "BUY", 100, 100.0, "opened", "r1")
 
-    orders_1 = pipeline._auto_take_profit([winner, small_winner], run_id="r2")
+    orders_1 = pipeline._auto_take_profit([winner, almost_winner], run_id="r2")
     assert len(orders_1) == 1
-    # Trim qty = 33% of 100 = 33 shares
+    # Trim qty = 15% of 100 = 15 shares
     kw = pipeline.broker.submit_order.call_args.kwargs
     assert kw["symbol"] == "NVDA"
-    assert kw["qty"] == 33
+    assert kw["qty"] == 15
     assert kw["side"] == "sell"
 
     # Trade row inserted with TAKE_PROFIT tag
@@ -388,7 +397,7 @@ def test_auto_take_profit_triggers_once_at_15pct(tmp_path):
 
     # Running again on the SAME holding → no duplicate TP
     pipeline.broker.submit_order.reset_mock()
-    orders_2 = pipeline._auto_take_profit([winner, small_winner], run_id="r3")
+    orders_2 = pipeline._auto_take_profit([winner, almost_winner], run_id="r3")
     assert orders_2 == []
     pipeline.broker.submit_order.assert_not_called()
 
@@ -412,8 +421,8 @@ def test_auto_take_profit_retries_after_canceled_zero_fill(tmp_path):
     pipeline.broker.cancel_protective_stops.return_value = (True, [])
 
     winner = Position(
-        symbol="NVDA", qty=100, avg_entry=100, current_price=118,
-        market_value=11800, unrealized_pnl=1800, sector="Technology",
+        symbol="NVDA", qty=100, avg_entry=100, current_price=135,
+        market_value=13500, unrealized_pnl=3500, sector="Technology",
     )
 
     orders_1 = pipeline._auto_take_profit([winner], run_id="r2")
@@ -435,7 +444,7 @@ def test_auto_take_profit_retries_after_canceled_zero_fill(tmp_path):
     assert len(orders_2) == 1
     kw = pipeline.broker.submit_order.call_args.kwargs
     assert kw["symbol"] == "NVDA"
-    assert kw["qty"] == 33
+    assert kw["qty"] == 15
 
 
 def test_vol_adjusted_sizing_caps_qty_on_wide_stops():
