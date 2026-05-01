@@ -1299,16 +1299,28 @@ class TradingPipeline:
         return orders
 
     def _auto_take_profit(self, positions, run_id: str,
-                          profit_pct_trigger: float = 15.0,
-                          trim_fraction: float = 0.33) -> list[dict]:
+                          profit_pct_trigger: float = 30.0,
+                          trim_fraction: float = 0.15) -> list[dict]:
         """Auto-sell `trim_fraction` of any position up ≥ `profit_pct_trigger`%.
 
         Runs once per holding (detected by looking for a prior TAKE_PROFIT row
-        in trades after the most recent BUY for that symbol). Prevents winners
-        from giving back all their unrealized gains in a pullback: +30% → +10%
-        happens routinely, and 'let winners run' alone leaves the +20% in the
-        middle uncapured. Trimming 1/3 at the trigger locks a partial realized
-        gain while the remaining 2/3 still rides the trailing stop.
+        in trades after the most recent BUY for that symbol). Defaults bias
+        hard toward "let winners run" — auto-TP is a give-back guardrail, not
+        an alpha-generating mechanism, and the LLM position_reviewer (which
+        runs AFTER this) is the right place for thesis-aware trims.
+
+        Earlier 15%/33% defaults were clipping early-innings multi-baggers:
+        2026-04-30 GOOGL trim fired at +27% gain on the same morning that
+        news_analyst flagged a HIGH bullish state change (AI capex split
+        favoring Alphabet). The LLM reviewer's later read was "clearest hold,
+        fast winner with reinforced thesis should keep running" — but auto-TP
+        had already cut 28% of the position before the LLM got to vote.
+
+        30%/15% defaults: only truly outsized single-name gains (30%+) trigger,
+        and when triggered, the trim is a clip (15%) not a harvest (33%).
+        Combined effect ~75% less auto-TP turnover. Backstops still in place:
+        OTO stop, trailing stop, LLM reviewer at midday/close, hard daily-loss
+        circuit breaker, evening thesis_health_review.
         """
         orders: list[dict] = []
         pending_protections: list[dict] = []

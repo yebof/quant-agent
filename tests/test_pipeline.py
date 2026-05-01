@@ -722,8 +722,8 @@ def test_take_profit_restores_stops_when_sell_rejected(tmp_path):
     pipeline.broker.cancel_protective_stops.return_value = (True, cancelled)
 
     winner = Position(
-        symbol="NVDA", qty=100, avg_entry=100, current_price=118,
-        market_value=11800, unrealized_pnl=1800, sector="Technology",
+        symbol="NVDA", qty=100, avg_entry=100, current_price=135,
+        market_value=13500, unrealized_pnl=3500, sector="Technology",
     )
 
     orders = pipeline._auto_take_profit([winner], run_id="r2")
@@ -802,11 +802,11 @@ def test_full_sell_skips_residual_reprotect(tmp_path):
 
 
 def test_take_profit_reprotects_residual_after_partial_trim_fills(tmp_path):
-    """End-to-end happy path: TAKE_PROFIT trims 33 of 100 NVDA, the limit
-    fills cleanly, and the remaining 67 shares get a fresh stop at the
+    """End-to-end happy path: TAKE_PROFIT trims 15 of 100 NVDA, the limit
+    fills cleanly, and the remaining 85 shares get a fresh stop at the
     most-protective pre-existing price (95.0). PR J defers this to AFTER
     wait_for_order_terminal — so the broker's terminal fill_qty must
-    show 33 (full fill of the trim qty) for the reprotect to fire on
+    show 15 (full fill of the trim qty) for the reprotect to fire on
     the expected residual."""
     from src.storage.db import Database
 
@@ -828,19 +828,19 @@ def test_take_profit_reprotects_residual_after_partial_trim_fills(tmp_path):
     # Limit fills at exactly the trim qty.
     pipeline.broker.wait_for_order_terminal.return_value = "filled"
     pipeline.broker.get_order_fill_info.return_value = {
-        "status": "filled", "filled_qty": "33", "filled_avg_price": "117.5",
+        "status": "filled", "filled_qty": "15", "filled_avg_price": "134.5",
     }
 
     winner = Position(
-        symbol="NVDA", qty=100, avg_entry=100, current_price=118,
-        market_value=11800, unrealized_pnl=1800, sector="Technology",
+        symbol="NVDA", qty=100, avg_entry=100, current_price=135,
+        market_value=13500, unrealized_pnl=3500, sector="Technology",
     )
 
     orders = pipeline._auto_take_profit([winner], run_id="r2")
 
     assert len(orders) == 1
     pipeline.broker._submit_stop_limit_order.assert_called_once_with(
-        symbol="NVDA", qty=67.0, stop_price=95.0,
+        symbol="NVDA", qty=85.0, stop_price=95.0,
     )
     db.close()
 
@@ -848,8 +848,8 @@ def test_take_profit_reprotects_residual_after_partial_trim_fills(tmp_path):
 def test_take_profit_restores_originals_when_limit_does_not_fill(tmp_path):
     """The bug PR J was filed for: an accepted partial limit can later
     cancel/expire without filling. If we'd reprotected on residual at
-    accept-time, the stop would cover only 67 shares of an unchanged
-    100-share position — the 33-share would-be-trim slice is naked.
+    accept-time, the stop would cover only 85 shares of an unchanged
+    100-share position — the 15-share would-be-trim slice is naked.
 
     With the deferred finalize: post-wait, fill_qty=0 → restore the
     original 100-share stops, not the residual-shaped one."""
@@ -876,8 +876,8 @@ def test_take_profit_restores_originals_when_limit_does_not_fill(tmp_path):
     }
 
     winner = Position(
-        symbol="NVDA", qty=100, avg_entry=100, current_price=118,
-        market_value=11800, unrealized_pnl=1800, sector="Technology",
+        symbol="NVDA", qty=100, avg_entry=100, current_price=135,
+        market_value=13500, unrealized_pnl=3500, sector="Technology",
     )
 
     pipeline._auto_take_profit([winner], run_id="r2")
@@ -1627,8 +1627,8 @@ def test_finalize_protection_bails_when_lingering_cancel_fails():
 
 
 def test_take_profit_reprotects_actual_residual_on_partial_fill(tmp_path):
-    """If the limit only partially fills (e.g., 12 of 33), the residual is
-    100 - 12 = 88, NOT 100 - 33 = 67. Pin the broker.fill_qty as the
+    """If the limit only partially fills (e.g., 12 of 15), the residual is
+    100 - 12 = 88, NOT 100 - 15 = 85. Pin the broker.fill_qty as the
     source of truth, not the originally-submitted qty."""
     from src.storage.db import Database
 
@@ -1652,13 +1652,13 @@ def test_take_profit_reprotects_actual_residual_on_partial_fill(tmp_path):
     }
 
     winner = Position(
-        symbol="NVDA", qty=100, avg_entry=100, current_price=118,
-        market_value=11800, unrealized_pnl=1800, sector="Technology",
+        symbol="NVDA", qty=100, avg_entry=100, current_price=135,
+        market_value=13500, unrealized_pnl=3500, sector="Technology",
     )
 
     pipeline._auto_take_profit([winner], run_id="r2")
 
-    # Actual residual = 100 - 12 = 88 (NOT 100 - 33 = 67).
+    # Actual residual = 100 - 12 = 88 (NOT 100 - 15 = 85).
     pipeline.broker._submit_stop_limit_order.assert_called_once_with(
         symbol="NVDA", qty=88.0, stop_price=95.0,
     )

@@ -43,7 +43,7 @@ their own cadence + scope:
 
 13:00-14:30  midday               (once/day, sell-only)
              ├─ Force-delever
-             ├─ Auto take-profit (≥15% gain → trim 33%)
+             ├─ Auto take-profit (≥30% gain → trim 15%; give-back guardrail only)
              ├─ Ex-dividend stop adjustment for held names
              ▼
           Position Reviewer (6-step CoT, session_type="midday" = patient)
