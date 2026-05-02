@@ -526,6 +526,104 @@ def test_replace_stop_loss_restores_old_protection_if_new_submit_fails(mock_tc_c
 
 
 @patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_restores_when_only_pending_cancel_visible(mock_tc_cls):
+    """Race window: Alpaca's QueryOrderStatus.OPEN filter INCLUDES pending_cancel,
+    so a stop we just cancelled can still appear in get_orders for ~1s after the
+    cancel call returns. The old logic treated "any visible stop" as proof that
+    protection still existed, skipped restore, and the cancel finalised a moment
+    later — leaving the position naked. Fix: cross-check by ID. Anything visible
+    whose ID is in cancelled_specs is on its way out and does NOT count as live
+    protection.
+
+    Codex P1 (replace_stop_loss:914-927). Pinned here so a future refactor
+    can't silently revert to the trust-the-list-is-current behaviour.
+    """
+    old_stop = MagicMock()
+    old_stop.id = "old-stop"
+    old_stop.order_type = "stop"
+    old_stop.side = "sell"
+    old_stop.qty = "10"
+    old_stop.stop_price = "185.0"
+    old_stop.limit_price = "179.45"
+
+    # Same object surfaces in BOTH calls: the pre-cancel snapshot AND the
+    # post-failure visibility check. In production this is Alpaca returning
+    # pending_cancel under the OPEN filter; in the test we just reuse the
+    # mock to simulate the same race shape.
+    restored_order = MagicMock()
+    restored_order.id = "restored-stop"
+    restored_order.status = "accepted"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.side_effect = [[old_stop], [old_stop]]
+    mock_client.submit_order.side_effect = [
+        RuntimeError("submit failed"),  # the new-stop attempt
+        restored_order,                  # the restore call
+    ]
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("NVDA", 10, 180.0, 200.0, 2000.0, 200.0),
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.replace_stop_loss("NVDA", 192.0)
+
+    # The replace returns None either way (the new stop didn't make it),
+    # but the critical invariant is that the original stop was restored
+    # — not silently skipped because Alpaca was still showing the cancelled
+    # order in OPEN.
+    assert result is None
+    mock_client.cancel_order_by_id.assert_called_once_with("old-stop")
+    assert mock_client.submit_order.call_count == 2, (
+        "expected the failed new-stop submit AND the restore submit; the bug "
+        "would manifest as submit_order being called only once"
+    )
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_skips_restore_when_unrelated_stop_active(mock_tc_cls):
+    """Inverse of the pending-cancel test: if a fresh stop (different ID,
+    placed by a concurrent path or a pre-existing OTO bracket leg) is
+    visible after our submit fails, restoring our cancelled stops would
+    over-protect the position with stacked stops at potentially different
+    prices. Honour the "non-cancelled stop is real protection" rule and
+    leave broker state alone.
+    """
+    old_stop = MagicMock()
+    old_stop.id = "old-stop"
+    old_stop.order_type = "stop"
+    old_stop.side = "sell"
+    old_stop.qty = "10"
+    old_stop.stop_price = "185.0"
+    old_stop.limit_price = "179.45"
+
+    # A different stop appeared while we were mid-replace.
+    fresh_stop = MagicMock()
+    fresh_stop.id = "fresh-stop-from-elsewhere"
+    fresh_stop.order_type = "stop"
+    fresh_stop.side = "sell"
+    fresh_stop.qty = "10"
+    fresh_stop.stop_price = "188.0"
+    fresh_stop.limit_price = "184.5"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.side_effect = [[old_stop], [old_stop, fresh_stop]]
+    mock_client.submit_order.side_effect = [RuntimeError("submit failed")]
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("NVDA", 10, 180.0, 200.0, 2000.0, 200.0),
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.replace_stop_loss("NVDA", 192.0)
+
+    assert result is None
+    mock_client.cancel_order_by_id.assert_called_once_with("old-stop")
+    # Only the failed new-stop submit; NO restore (fresh-stop is real protection).
+    assert mock_client.submit_order.call_count == 1
+
+
+@patch("src.execution.broker.TradingClient")
 def test_replace_stop_loss_rejects_lower_new_stop(mock_tc_cls):
     """Trailing stops must ratchet UP, never down. If the LLM hallucinates a
     lower new_stop (or a caller passes wrong value), weakening existing
