@@ -389,3 +389,175 @@ def test_old_evening_json_without_reasoning_chain_fails_gracefully():
         EveningReport(**old_json)
     # Error must mention reasoning_chain by name so operators can diagnose
     assert "reasoning_chain" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Per-entry isolation for missed_opportunities (2026-05-01 incident)
+# ---------------------------------------------------------------------------
+
+def _valid_evening_json() -> dict:
+    """Minimum-viable EveningReport JSON shaped like what the LLM returns.
+
+    Matches the on-the-wire dict shape (not Pydantic model instances), so we
+    can exercise the same construction path the real analyze() uses.
+    """
+    return {
+        "reasoning_chain": {
+            "performance_attribution": "Book up 0.1% on AVGO/DXPE adds.",
+            "outlook_retrospection": "Yesterday's bullish bias was correct.",
+            "thesis_health_review": "All 7 holdings intact-to-strengthening.",
+            "decision_quality_review": "Trims were premature on GOOGL.",
+            "calibration_meta": "Bullish hit rate 6/9 last 10 sessions.",
+            "market_regime_read": "Risk-on continues; HY OAS contained.",
+            "tomorrow_preparation": "Watch jobs print 08:30 ET.",
+        },
+        "daily_summary": "Quiet day with two adds.",
+        "lessons": "Mechanical auto-TP overruled a strengthening thesis.",
+        "tomorrow_outlook": "Bullish bias contingent on jobs print.",
+        "risk_rating": "moderate",
+        "tomorrow_bias": "bullish",
+        "tomorrow_conviction": "medium",
+        "tomorrow_key_risks": ["jobs print 08:30 ET"],
+        "sell_decisions_assessment": "",
+        "sell_grades": [],
+        "buy_grades": [],
+    }
+
+
+def _valid_missed_opportunity_dict(symbol: str = "ORCL") -> dict:
+    return {
+        "symbol": symbol,
+        "source": "universe",
+        "move_pct": -8.4,
+        "miss_category": "value_entry_missed",
+        "theme_if_any": "AI-capex",
+        "theme_durability": "multi_year_secular",
+        "lesson": "Down >=8% with intact fundamentals; deserved a value-watch entry.",
+        "universe_addition_recommendation": "no",
+        "universe_addition_reason": "Already in universe.",
+    }
+
+
+def _the_2026_05_01_bad_entry() -> dict:
+    """Exact shape of the entry that crashed the 2026-05-01 evening report.
+
+    LLM marked CMCSA as a 'value_entry_missed' but left theme_if_any empty,
+    which the model_validator rejects (real misses must carry a theme so the
+    quarterly digest can group by theme). This fixture must remain a faithful
+    reproduction so the regression doesn't bit-rot.
+    """
+    return {
+        "symbol": "CMCSA",
+        "source": "universe",
+        "move_pct": -3.2,
+        "miss_category": "value_entry_missed",
+        "theme_if_any": "",
+        "theme_durability": "unknown",
+        "lesson": "Down on cable subscriber concerns; no clear theme attached.",
+        "universe_addition_recommendation": "no",
+        "universe_addition_reason": "Already in universe.",
+    }
+
+
+def test_drop_invalid_missed_opportunities_strips_2026_05_01_shape():
+    """The exact 2026-05-01 bad entry must be dropped, leaving the rest.
+
+    Regression-pin for the incident where one CMCSA entry with
+    miss_category='value_entry_missed' + empty theme_if_any failed pydantic
+    validation, taking the entire EveningReport (7 thesis_health_review
+    narratives + sell_grades + tomorrow_outlook) down with it.
+    """
+    from src.agents.evening_analyst import EveningAnalystAgent
+
+    parsed = _valid_evening_json()
+    parsed["missed_opportunities"] = [
+        _valid_missed_opportunity_dict("ORCL"),
+        _the_2026_05_01_bad_entry(),
+        _valid_missed_opportunity_dict("META"),
+    ]
+    out = EveningAnalystAgent._drop_invalid_missed_opportunities(parsed)
+    syms = [m["symbol"] for m in out["missed_opportunities"]]
+    assert syms == ["ORCL", "META"], (
+        f"CMCSA must be dropped, ORCL+META kept; got {syms}"
+    )
+
+
+def test_evening_report_constructs_after_dropping_bad_missed_opportunity():
+    """End-to-end: with the bad entry stripped, EveningReport(**parsed)
+    must succeed. This is the property that mattered on 2026-05-01 — the
+    core report payload (reasoning_chain, thesis review, outlook) was
+    clean and should have been persisted."""
+    from src.agents.evening_analyst import EveningAnalystAgent
+
+    parsed = _valid_evening_json()
+    parsed["missed_opportunities"] = [
+        _valid_missed_opportunity_dict("ORCL"),
+        _the_2026_05_01_bad_entry(),
+    ]
+    cleaned = EveningAnalystAgent._drop_invalid_missed_opportunities(parsed)
+    # Must not raise — that's the whole point of the fix.
+    report = EveningReport(**cleaned)
+    assert report.tomorrow_bias == "bullish"
+    assert len(report.missed_opportunities) == 1
+    assert report.missed_opportunities[0].symbol == "ORCL"
+
+
+def test_drop_invalid_missed_opportunities_keeps_all_when_all_valid():
+    """No-op path: a clean list passes through untouched."""
+    from src.agents.evening_analyst import EveningAnalystAgent
+
+    parsed = _valid_evening_json()
+    parsed["missed_opportunities"] = [
+        _valid_missed_opportunity_dict("ORCL"),
+        _valid_missed_opportunity_dict("META"),
+    ]
+    out = EveningAnalystAgent._drop_invalid_missed_opportunities(parsed)
+    assert len(out["missed_opportunities"]) == 2
+
+
+def test_drop_invalid_missed_opportunities_handles_non_list_shape():
+    """Defensive: if the LLM emits None or a bare string for the list,
+    normalize to empty list rather than letting it propagate into pydantic
+    as a confusing 'expected list, got str' error in the middle of an
+    otherwise-clean report."""
+    from src.agents.evening_analyst import EveningAnalystAgent
+
+    parsed = _valid_evening_json()
+    parsed["missed_opportunities"] = "oops not a list"
+    out = EveningAnalystAgent._drop_invalid_missed_opportunities(parsed)
+    assert out["missed_opportunities"] == []
+
+
+def test_drop_invalid_missed_opportunities_drops_non_dict_items():
+    """If a list slot is the wrong type (string, None, number) skip it
+    individually rather than raising AttributeError when we try to
+    instantiate MissedOpportunity(**item)."""
+    from src.agents.evening_analyst import EveningAnalystAgent
+
+    parsed = _valid_evening_json()
+    parsed["missed_opportunities"] = [
+        _valid_missed_opportunity_dict("ORCL"),
+        "stray string the LLM hallucinated",
+        None,
+        _valid_missed_opportunity_dict("META"),
+    ]
+    out = EveningAnalystAgent._drop_invalid_missed_opportunities(parsed)
+    syms = [m["symbol"] for m in out["missed_opportunities"]]
+    assert syms == ["ORCL", "META"]
+
+
+def test_drop_invalid_missed_opportunities_logs_bad_entries(caplog):
+    """The drop must be observable in logs — silent stripping is worse
+    than the original crash because operators wouldn't see the LLM is
+    repeatedly tripping the same validator."""
+    import logging
+    from src.agents.evening_analyst import EveningAnalystAgent
+
+    parsed = _valid_evening_json()
+    parsed["missed_opportunities"] = [_the_2026_05_01_bad_entry()]
+    with caplog.at_level(logging.WARNING, logger="src.agents.evening_analyst"):
+        EveningAnalystAgent._drop_invalid_missed_opportunities(parsed)
+    # Must mention the symbol so operators can correlate with the trade log.
+    assert any("CMCSA" in rec.message for rec in caplog.records), (
+        f"warning must mention CMCSA; got {[r.message for r in caplog.records]}"
+    )
