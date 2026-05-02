@@ -355,3 +355,103 @@ def test_review_round_trip():
     assert d["reasoning_chain"]["macro_continuity_check"]
     assert len(d["actions"]) == 2
     assert d["actions"][1]["new_stop_price"] == 185.0
+
+
+# ---------------------------------------------------------------------------
+# Per-entry isolation: one bad PositionAction must not tank the whole review
+# (audit follow-up to PR #73)
+# ---------------------------------------------------------------------------
+
+def _valid_review_json() -> dict:
+    return {
+        "reasoning_chain": {
+            "macro_continuity_check": "regime stable vs morning",
+            "thesis_progress_check": "all positions on pace or ahead",
+            "thesis_integrity_check": "no triggers firing",
+            "winners_discipline_check": "no flags",
+            "session_disposition_check": "hold through close, no triggers",
+            "execution_rationale": "all HOLD; nothing to justify",
+        },
+        "actions": [],
+        "overall_assessment": "Healthy book.",
+        "risk_level": "moderate",
+    }
+
+
+def _valid_action(symbol: str = "NVDA", action: str = "HOLD") -> dict:
+    a = {"action": action, "symbol": symbol, "reason": "on pace, no flags"}
+    if action == "TRAIL_STOP":
+        a["new_stop_price"] = 100.0
+    return a
+
+
+def test_drop_invalid_actions_strips_trail_stop_without_price():
+    """The 2026-05-01 evening crash had a sibling failure mode the audit
+    surfaced: a TRAIL_STOP with no new_stop_price would tank the entire
+    midday/close review (reasoning_chain + risk_level + the OTHER
+    actions all lost). Now: drop the bad action, keep the rest."""
+    from src.agents.position_reviewer import PositionReviewerAgent
+
+    parsed = _valid_review_json()
+    parsed["actions"] = [
+        _valid_action("NVDA", "HOLD"),
+        # Bad: TRAIL_STOP requires new_stop_price > 0
+        {"action": "TRAIL_STOP", "symbol": "AAPL", "reason": "up 9%"},
+        _valid_action("GOOGL", "HOLD"),
+    ]
+    out = PositionReviewerAgent._drop_invalid_actions(parsed)
+    syms = [a["symbol"] for a in out["actions"]]
+    assert syms == ["NVDA", "GOOGL"]
+
+
+def test_drop_invalid_actions_strips_zero_stop_price():
+    """`new_stop_price=0` is also invalid — the validator requires > 0."""
+    from src.agents.position_reviewer import PositionReviewerAgent
+
+    parsed = _valid_review_json()
+    parsed["actions"] = [
+        {"action": "TRAIL_STOP", "symbol": "X", "reason": "x", "new_stop_price": 0.0},
+        _valid_action("NVDA", "HOLD"),
+    ]
+    out = PositionReviewerAgent._drop_invalid_actions(parsed)
+    assert [a["symbol"] for a in out["actions"]] == ["NVDA"]
+
+
+def test_review_constructs_after_dropping_bad_action():
+    """End-to-end: with the bad TRAIL_STOP stripped, PositionReview(**parsed)
+    succeeds — reasoning_chain + risk_level preserved."""
+    from src.agents.position_reviewer import PositionReviewerAgent
+
+    parsed = _valid_review_json()
+    parsed["actions"] = [
+        _valid_action("NVDA", "HOLD"),
+        {"action": "TRAIL_STOP", "symbol": "AAPL", "reason": "up 9%"},
+    ]
+    cleaned = PositionReviewerAgent._drop_invalid_actions(parsed)
+    review = PositionReview(**cleaned)
+    assert review.risk_level == "moderate"
+    assert len(review.actions) == 1
+    assert review.actions[0].symbol == "NVDA"
+
+
+def test_drop_invalid_actions_handles_non_list_shape():
+    from src.agents.position_reviewer import PositionReviewerAgent
+
+    parsed = _valid_review_json()
+    parsed["actions"] = "not a list"
+    out = PositionReviewerAgent._drop_invalid_actions(parsed)
+    assert out["actions"] == []
+
+
+def test_drop_invalid_actions_drops_non_dict_items():
+    from src.agents.position_reviewer import PositionReviewerAgent
+
+    parsed = _valid_review_json()
+    parsed["actions"] = [
+        _valid_action("NVDA", "HOLD"),
+        "stray string",
+        None,
+        _valid_action("GOOGL", "HOLD"),
+    ]
+    out = PositionReviewerAgent._drop_invalid_actions(parsed)
+    assert [a["symbol"] for a in out["actions"]] == ["NVDA", "GOOGL"]

@@ -28,7 +28,9 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from src.agents.base import BaseAgent
-from src.models import NewsIntelligenceReport, Position, PositionReview
+from src.models import (
+    NewsIntelligenceReport, Position, PositionAction, PositionReview,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -493,9 +495,61 @@ schema."""
         if not isinstance(parsed, dict):
             logger.error("Position reviewer expected object, got %s", type(parsed).__name__)
             return None, result
+        # Per-entry isolation: a single malformed PositionAction (e.g. a
+        # TRAIL_STOP without new_stop_price) must not drop the WHOLE
+        # review. The review carries reasoning_chain, overall_assessment,
+        # risk_level, plus the OTHER actions — losing all of that because
+        # one TRAIL_STOP forgot a price would silence midday/close
+        # entirely on that session. Mirrors EveningAnalyst.
+        # _drop_invalid_missed_opportunities (PR #73).
+        parsed = self._drop_invalid_actions(parsed)
         try:
             review = PositionReview(**parsed)
         except ValidationError as e:
             logger.error("Position review failed schema validation: %s", e)
             return None, result
         return review, result
+
+    @staticmethod
+    def _drop_invalid_actions(parsed: dict) -> dict:
+        """Pre-validate each PositionAction; drop malformed entries with a
+        warning naming the symbol so operators can correlate against the
+        position book.
+
+        Mutates parsed in place for `actions`; non-list shapes normalize
+        to []. The schema's `_trail_stop_requires_new_price` validator
+        stays strict (that rule is critical — placing a TRAIL_STOP with
+        no price would later crash broker.replace_stop_loss). What
+        changes is *where* the strictness applies: per-action, not as
+        an atomic whole-review check.
+        """
+        raw = parsed.get("actions")
+        if raw is None:
+            return parsed
+        if not isinstance(raw, list):
+            logger.warning(
+                "Position reviewer: actions is %s, not list — replacing with []",
+                type(raw).__name__,
+            )
+            parsed["actions"] = []
+            return parsed
+        valid: list[dict] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                logger.warning(
+                    "Position reviewer: dropping non-dict actions entry at "
+                    "index %d: %r", i, item,
+                )
+                continue
+            try:
+                PositionAction(**item)
+            except ValidationError as e:
+                sym = item.get("symbol") or f"<idx {i}>"
+                logger.warning(
+                    "Position reviewer: dropping malformed action for %s: %s",
+                    sym, e,
+                )
+                continue
+            valid.append(item)
+        parsed["actions"] = valid
+        return parsed
