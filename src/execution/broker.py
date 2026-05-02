@@ -913,28 +913,52 @@ class AlpacaBroker:
             return order
         except Exception as exc:
             logger.error("replace_stop_loss: failed to submit new stop for %s: %s", symbol, exc)
-            # The Alpaca QueryOrderStatus.OPEN filter INCLUDES pending_cancel,
-            # so the orders we just cancelled (line 871) can still appear in
-            # this list for ~1s after the cancel call returns. If we trust
-            # that as "protection still visible" and skip restore, the cancels
-            # finalize a moment later and the position is naked. Cross-check
-            # by ID: anything visible whose ID is in cancelled_specs is on its
-            # way out and does NOT count as live protection. Only a stop we
-            # did NOT cancel (e.g. a fresh one placed by a concurrent path,
-            # or a stop on a different leg of an OTO bracket) keeps us safe.
+            # The Alpaca QueryOrderStatus.OPEN filter INCLUDES transitional
+            # statuses (pending_cancel / pending_replace), so the orders we
+            # just cancelled can still appear in this list for ~1s after the
+            # cancel call returns AND a *different* stop placed by another
+            # path could itself be in pending_cancel. Three things must all
+            # be true for "visible" to count as real protection:
+            #   1. the order's id is NOT in cancelled_specs (PR #75)
+            #   2. the order's status is in an active state, not pending_*
+            #   3. the *sum* of active stop qtys covers the current position
+            # Miss any of those and `cancelled_specs` must be restored.
+            ACTIVE_STATUSES = {"new", "accepted", "held", "partially_filled"}
+
+            def _is_live_protection(order) -> bool:
+                if str(getattr(order, "id", "")) in cancelled_ids:
+                    return False
+                status_attr = getattr(order, "status", None)
+                status = str(getattr(status_attr, "value", status_attr) or "").lower()
+                return status in ACTIVE_STATUSES
+
+            def _stop_qty(order) -> float:
+                try:
+                    return float(getattr(order, "qty", 0) or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+
             cancelled_ids = {
                 str(spec.get("id")) for spec in cancelled_specs if spec.get("id")
             }
             visible = self._list_open_sell_stop_orders(symbol)
-            non_cancelled_active = [
-                o for o in visible if str(getattr(o, "id", "")) not in cancelled_ids
-            ]
-            if non_cancelled_active:
+            live_stops = [o for o in visible if _is_live_protection(o)]
+            covered_qty = sum(_stop_qty(o) for o in live_stops)
+            position_qty = qty  # captured pre-submit at line 906; the position
+                                # cannot have grown between then and now (this
+                                # path doesn't BUY), so this is an upper bound
+                                # for required coverage.
+            if live_stops and covered_qty >= position_qty:
                 logger.warning(
-                    "replace_stop_loss: %d non-cancelled stop(s) still active for %s after submit failure; leaving stop state unchanged",
-                    len(non_cancelled_active), symbol,
+                    "replace_stop_loss: %d active stop(s) cover %.4f >= position %.4f for %s after submit failure; leaving stop state unchanged",
+                    len(live_stops), covered_qty, position_qty, symbol,
                 )
                 return None
+            if live_stops:
+                logger.warning(
+                    "replace_stop_loss: %d active stop(s) cover only %.4f of %.4f shares for %s; restoring cancelled specs to close the gap",
+                    len(live_stops), covered_qty, position_qty, symbol,
+                )
             restored, _failed = self._restore_stop_orders(symbol, cancelled_specs)
             if restored == 0:
                 logger.error(

@@ -597,7 +597,9 @@ def test_replace_stop_loss_skips_restore_when_unrelated_stop_active(mock_tc_cls)
     old_stop.stop_price = "185.0"
     old_stop.limit_price = "179.45"
 
-    # A different stop appeared while we were mid-replace.
+    # A different stop appeared while we were mid-replace. status="accepted"
+    # is required to make this stop count as LIVE protection — see the
+    # pending_cancel-status test below for the inverse.
     fresh_stop = MagicMock()
     fresh_stop.id = "fresh-stop-from-elsewhere"
     fresh_stop.order_type = "stop"
@@ -605,6 +607,7 @@ def test_replace_stop_loss_skips_restore_when_unrelated_stop_active(mock_tc_cls)
     fresh_stop.qty = "10"
     fresh_stop.stop_price = "188.0"
     fresh_stop.limit_price = "184.5"
+    fresh_stop.status = "accepted"
 
     mock_client = MagicMock()
     mock_client.get_orders.side_effect = [[old_stop], [old_stop, fresh_stop]]
@@ -621,6 +624,117 @@ def test_replace_stop_loss_skips_restore_when_unrelated_stop_active(mock_tc_cls)
     mock_client.cancel_order_by_id.assert_called_once_with("old-stop")
     # Only the failed new-stop submit; NO restore (fresh-stop is real protection).
     assert mock_client.submit_order.call_count == 1
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_restores_when_unrelated_stop_is_pending_cancel(mock_tc_cls):
+    """Codex P1 follow-up. Even after the ID-check fix (PR #75), a *different*
+    visible stop could itself be in pending_cancel status — Alpaca's
+    QueryOrderStatus.OPEN filter returns those. Trusting it as live protection
+    has the same naked-window failure mode as the original bug, just dressed
+    in a different ID.
+
+    The fix-after-the-fix: a non-cancelled-by-us stop only counts as protection
+    if its broker status is in an active set (new/accepted/held/partially_filled).
+    pending_cancel / pending_replace do NOT qualify.
+    """
+    old_stop = MagicMock()
+    old_stop.id = "old-stop"
+    old_stop.order_type = "stop"
+    old_stop.side = "sell"
+    old_stop.qty = "10"
+    old_stop.stop_price = "185.0"
+    old_stop.limit_price = "179.45"
+    old_stop.status = "accepted"
+
+    # An UNRELATED stop placed by some other path — but it itself is being
+    # cancelled by yet another path. About to disappear.
+    ghost_stop = MagicMock()
+    ghost_stop.id = "another-stop-being-killed"
+    ghost_stop.order_type = "stop"
+    ghost_stop.side = "sell"
+    ghost_stop.qty = "10"
+    ghost_stop.stop_price = "186.0"
+    ghost_stop.limit_price = "180.0"
+    ghost_stop.status = "pending_cancel"
+
+    restored_order = MagicMock()
+    restored_order.id = "restored-stop"
+    restored_order.status = "accepted"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.side_effect = [[old_stop], [old_stop, ghost_stop]]
+    mock_client.submit_order.side_effect = [
+        RuntimeError("submit failed"),
+        restored_order,
+    ]
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("NVDA", 10, 180.0, 200.0, 2000.0, 200.0),
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.replace_stop_loss("NVDA", 192.0)
+
+    assert result is None
+    mock_client.cancel_order_by_id.assert_called_once_with("old-stop")
+    # Failed new-stop submit + restore — ghost_stop's pending_cancel status
+    # disqualified it from counting as live protection.
+    assert mock_client.submit_order.call_count == 2
+
+
+@patch("src.execution.broker.TradingClient")
+def test_replace_stop_loss_restores_when_active_stop_undercovers_position(mock_tc_cls):
+    """Codex P1 follow-up. A live stop that covers only PART of the position
+    (e.g. 5 of 10 shares) is not enough — the other 5 are naked. Sum the qty
+    of all active non-cancelled stops; if it's below the position qty, the
+    cancelled originals must be restored to close the gap.
+
+    Realistic scenario: a position was partially trimmed earlier in the
+    session and a stale stop covers only the post-trim residual; meanwhile
+    we just cancelled the full-coverage stop and the new submit failed.
+    """
+    old_stop = MagicMock()
+    old_stop.id = "old-stop"
+    old_stop.order_type = "stop"
+    old_stop.side = "sell"
+    old_stop.qty = "10"
+    old_stop.stop_price = "185.0"
+    old_stop.limit_price = "179.45"
+    old_stop.status = "accepted"
+
+    # A live but PARTIAL stop — covers only 5 of the 10-share position.
+    partial_stop = MagicMock()
+    partial_stop.id = "partial-coverage-stop"
+    partial_stop.order_type = "stop"
+    partial_stop.side = "sell"
+    partial_stop.qty = "5"
+    partial_stop.stop_price = "187.0"
+    partial_stop.limit_price = "181.0"
+    partial_stop.status = "accepted"
+
+    restored_order = MagicMock()
+    restored_order.id = "restored-stop"
+    restored_order.status = "accepted"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.side_effect = [[old_stop], [old_stop, partial_stop]]
+    mock_client.submit_order.side_effect = [
+        RuntimeError("submit failed"),
+        restored_order,
+    ]
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("NVDA", 10, 180.0, 200.0, 2000.0, 200.0),
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.replace_stop_loss("NVDA", 192.0)
+
+    assert result is None
+    mock_client.cancel_order_by_id.assert_called_once_with("old-stop")
+    # Restore must fire — covered=5 < position=10, so the gap matters.
+    assert mock_client.submit_order.call_count == 2
 
 
 @patch("src.execution.broker.TradingClient")
