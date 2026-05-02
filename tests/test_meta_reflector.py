@@ -319,14 +319,53 @@ def test_analyze_returns_none_on_non_json(mock_anthropic):
 
 
 @patch("anthropic.Anthropic")
-def test_analyze_returns_none_on_schema_violation(mock_anthropic):
-    """LLM emits JSON but it targets a protected agent — Pydantic literal
-    rejects and analyze() must return None rather than raise."""
+def test_analyze_drops_protected_agent_learning_keeps_rest(mock_anthropic):
+    """LLM tries to emit a learning targeting a protected agent
+    (risk_manager). The Literal[...] schema correctly rejects that one
+    learning — but with per-entry isolation in place, the REST of the
+    reflection (meta_reasoning_chain, theme_coverage_report, the OTHER
+    proposed_learnings) is preserved.
+
+    Defense-in-depth holds: the protected-agent invariant still works
+    at the per-entry layer (the bad learning is dropped), AND we no
+    longer throw away 90 days of accumulated quarterly data because
+    of one rogue list entry. Repurposed from the pre-PR-#74 version
+    that asserted reflection is None."""
     from src.agents.meta_reflector import MetaReflectorAgent
 
     bad = json.loads(_valid_reflection_json())
     # Try to target the protected risk_manager
     bad["proposed_learnings"][0]["agent_name"] = "risk_manager"
+
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text=json.dumps(bad))]
+    mock_response.usage.input_tokens = 100
+    mock_response.usage.output_tokens = 10
+    mock_client.messages.create.return_value = mock_response
+    mock_anthropic.return_value = mock_client
+
+    agent = MetaReflectorAgent(api_key="k", model="claude-opus-4-7")
+    reflection, _ = agent.analyze(digest=_rich_digest())
+    assert reflection is not None, "rest of reflection must survive"
+    # Critical: no proposed learning targeting risk_manager (protection holds)
+    targeted = [pl.agent_name for pl in reflection.proposed_learnings]
+    assert "risk_manager" not in targeted
+    # The rest of the reflection should still be populated.
+    assert reflection.meta_reasoning_chain is not None
+
+
+@patch("anthropic.Anthropic")
+def test_analyze_returns_none_on_top_level_schema_violation(mock_anthropic):
+    """A TOP-LEVEL field violation (missing meta_reasoning_chain) must
+    still cause analyze() to return None. Per-entry isolation only
+    applies to list-of-models fields; mandatory top-level structure
+    failing is the right signal that the LLM output is unusable."""
+    from src.agents.meta_reflector import MetaReflectorAgent
+
+    bad = json.loads(_valid_reflection_json())
+    # Drop a mandatory top-level field
+    bad.pop("meta_reasoning_chain")
 
     mock_client = MagicMock()
     mock_response = MagicMock()
@@ -529,3 +568,120 @@ def test_run_quarterly_meta_loads_prior_digest_for_corrigibility(tmp_path):
     # The persisted digest for 2026-Q1 should include corrigibility
     digest = json.loads(Path(result["digest_path"]).read_text())
     assert "corrigibility_trend" in digest
+
+
+# ---------------------------------------------------------------------------
+# Per-entry isolation: one bad sub-item must not tank the whole reflection
+# (audit follow-up to PR #73 — quarterly cadence makes this especially
+# expensive: losing the report throws away 90 days of accumulated data)
+# ---------------------------------------------------------------------------
+
+def _valid_meta_json() -> dict:
+    """Reuse the canonical sample so we don't drift from the real schema."""
+    return json.loads(_valid_reflection_json())
+
+
+def _valid_loss_pattern() -> dict:
+    return {
+        "root_cause": "greed_top_chasing",
+        "occurrences": 3,
+        "total_loss_pct": -7.2,
+        "example_trades": ["NVDA 2026-02-12 -3.1%"],
+        "attributable_agent": "portfolio_manager",
+        "proposed_guard": "Cap chasing within 5% of recent ATH.",
+    }
+
+
+def _valid_prompt_learning(agent: str = "portfolio_manager") -> dict:
+    return {
+        "agent_name": agent,
+        "operation": "append",
+        "learning_text": "When chasing within 5% of ATH, halve position size.",
+        "justification": (
+            "Greed_top_chasing fired 3 times in Q1 with -7.2% alpha leak; all "
+            "entered within 2% of 20-day high."
+        ),
+    }
+
+
+def test_drop_invalid_meta_lists_strips_loss_pattern_with_empty_examples():
+    """LossPattern.example_trades has min_length=1 — an empty list crashes
+    construction. Audit pinned this as quarter-end risk: losing the
+    full QuarterlyMetaReflection because of one bad LossPattern would
+    throw away 90 days of accumulated data."""
+    from src.agents.meta_reflector import MetaReflectorAgent
+
+    parsed = _valid_meta_json()
+    parsed["loss_pattern_report"]["top_patterns"] = [
+        _valid_loss_pattern(),
+        {**_valid_loss_pattern(), "example_trades": []},  # bad
+        _valid_loss_pattern(),
+    ]
+    out = MetaReflectorAgent._drop_invalid_meta_lists(parsed)
+    assert len(out["loss_pattern_report"]["top_patterns"]) == 2
+
+
+def test_drop_invalid_meta_lists_strips_prompt_learning_without_digit():
+    """PromptLearning has a model_validator requiring at least one digit
+    in justification (anti-vibes-only). One bad learning must not drop
+    the rest."""
+    from src.agents.meta_reflector import MetaReflectorAgent
+
+    parsed = _valid_meta_json()
+    parsed["proposed_learnings"] = [
+        _valid_prompt_learning("portfolio_manager"),
+        {
+            **_valid_prompt_learning("news_analyst"),
+            "justification": "Just feels like the right thing to do this quarter.",  # no digit
+        },
+        _valid_prompt_learning("evening_analyst"),
+    ]
+    out = MetaReflectorAgent._drop_invalid_meta_lists(parsed)
+    agents = [pl["agent_name"] for pl in out["proposed_learnings"]]
+    assert agents == ["portfolio_manager", "evening_analyst"]
+
+
+def test_meta_reflection_constructs_after_dropping_bad_subitems():
+    """End-to-end: with one bad LossPattern + one bad PromptLearning
+    stripped, QuarterlyMetaReflection(**parsed) succeeds — preserving
+    meta_reasoning_chain (the 7-step CoT itself) for the operator."""
+    from src.agents.meta_reflector import MetaReflectorAgent
+    from src.models import QuarterlyMetaReflection
+
+    parsed = _valid_meta_json()
+    parsed["loss_pattern_report"]["top_patterns"] = [
+        _valid_loss_pattern(),
+        {**_valid_loss_pattern(), "example_trades": []},
+    ]
+    parsed["proposed_learnings"] = [
+        _valid_prompt_learning(),
+        {**_valid_prompt_learning("news_analyst"), "justification": "no digit here"},
+    ]
+    cleaned = MetaReflectorAgent._drop_invalid_meta_lists(parsed)
+    reflection = QuarterlyMetaReflection(**cleaned)
+    assert reflection.period == "2026-Q1"
+    assert len(reflection.loss_pattern_report.top_patterns) == 1
+    assert len(reflection.proposed_learnings) == 1
+
+
+def test_drop_invalid_meta_lists_handles_missing_loss_pattern_report():
+    """If loss_pattern_report itself is missing or non-dict, leave it
+    alone — that's a different failure path (top-level required field)
+    and the parent constructor will surface the right error."""
+    from src.agents.meta_reflector import MetaReflectorAgent
+
+    parsed = _valid_meta_json()
+    parsed.pop("loss_pattern_report")
+    parsed["proposed_learnings"] = [_valid_prompt_learning()]
+    # Should not raise — just no-op the loss_pattern_report path.
+    out = MetaReflectorAgent._drop_invalid_meta_lists(parsed)
+    assert "loss_pattern_report" not in out
+
+
+def test_drop_invalid_meta_lists_handles_non_list_proposed_learnings():
+    from src.agents.meta_reflector import MetaReflectorAgent
+
+    parsed = _valid_meta_json()
+    parsed["proposed_learnings"] = "oops"
+    out = MetaReflectorAgent._drop_invalid_meta_lists(parsed)
+    assert out["proposed_learnings"] == []

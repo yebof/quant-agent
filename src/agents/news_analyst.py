@@ -3,8 +3,10 @@ import logging
 import re
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from src.agents.base import BaseAgent, AgentResult
-from src.models import NewsIntelligenceReport
+from src.models import NewsIntelligenceReport, StateChange, StockNewsItem
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +246,15 @@ Analyze all the above and produce your intelligence report as JSON."""
         if parsed is None:
             logger.error("News analyst returned non-JSON response")
             return None, result
+        # Per-entry isolation: a single malformed StockNewsItem (e.g. empty
+        # headline) or StateChange (e.g. bad conviction enum) must not drop
+        # the WHOLE news report — that report carries macro_narrative,
+        # pm_briefing, and the rest of state_changes / stock_news that
+        # PM relies on to brief the morning. Mirrors EveningAnalyst.
+        # _drop_invalid_missed_opportunities (PR #73) and the
+        # TechAnalyst.analyze_batch isolate-failures-by-symbol discipline.
+        parsed = self._drop_invalid_state_changes(parsed)
+        parsed = self._drop_invalid_stock_news(parsed)
         try:
             report = NewsIntelligenceReport(**parsed)
         except Exception as e:
@@ -253,3 +264,94 @@ Analyze all the above and produce your intelligence report as JSON."""
             report, news_text, prior_session_report=prior_session_report,
         )
         return report, result
+
+    @staticmethod
+    def _drop_invalid_state_changes(parsed: dict) -> dict:
+        """Pre-validate each StateChange; drop malformed entries with a warning.
+
+        StateChange has Literal validation on `conviction`; a typo in one
+        item must not poison the whole report. Mutates parsed in place
+        for `state_changes`; non-list shapes are normalized to [].
+        """
+        raw = parsed.get("state_changes")
+        if raw is None:
+            return parsed
+        if not isinstance(raw, list):
+            logger.warning(
+                "News analyst: state_changes is %s, not list — replacing with []",
+                type(raw).__name__,
+            )
+            parsed["state_changes"] = []
+            return parsed
+        valid: list[dict] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                logger.warning(
+                    "News analyst: dropping non-dict state_changes entry at "
+                    "index %d: %r", i, item,
+                )
+                continue
+            try:
+                StateChange(**item)
+            except ValidationError as e:
+                event = item.get("event") or f"<idx {i}>"
+                logger.warning(
+                    "News analyst: dropping malformed state_change %r: %s",
+                    event, e,
+                )
+                continue
+            valid.append(item)
+        parsed["state_changes"] = valid
+        return parsed
+
+    @staticmethod
+    def _drop_invalid_stock_news(parsed: dict) -> dict:
+        """Pre-validate each StockNewsItem under each symbol bucket.
+
+        `stock_news` is a dict[str, list[StockNewsItem]]. A single item
+        with an empty headline (the most common LLM glitch) currently
+        kills the whole NewsIntelligenceReport — including macro_narrative
+        and pm_briefing, which PM needs even if a single per-symbol
+        bullet is malformed. Drop bad items per-symbol; if a symbol's
+        list ends up empty, drop the symbol entry too.
+        """
+        raw = parsed.get("stock_news")
+        if raw is None:
+            return parsed
+        if not isinstance(raw, dict):
+            logger.warning(
+                "News analyst: stock_news is %s, not dict — replacing with {}",
+                type(raw).__name__,
+            )
+            parsed["stock_news"] = {}
+            return parsed
+        cleaned: dict[str, list[dict]] = {}
+        for sym, items in raw.items():
+            if not isinstance(items, list):
+                logger.warning(
+                    "News analyst: stock_news[%s] is %s, not list — dropping",
+                    sym, type(items).__name__,
+                )
+                continue
+            valid: list[dict] = []
+            for i, item in enumerate(items):
+                if not isinstance(item, dict):
+                    logger.warning(
+                        "News analyst: dropping non-dict stock_news entry "
+                        "under %s at index %d: %r", sym, i, item,
+                    )
+                    continue
+                try:
+                    StockNewsItem(**item)
+                except ValidationError as e:
+                    headline = (item.get("headline") or f"<idx {i}>")[:80]
+                    logger.warning(
+                        "News analyst: dropping malformed stock_news entry "
+                        "under %s (%s): %s", sym, headline, e,
+                    )
+                    continue
+                valid.append(item)
+            if valid:
+                cleaned[sym] = valid
+        parsed["stock_news"] = cleaned
+        return parsed

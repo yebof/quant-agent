@@ -21,7 +21,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from src.agents.base import AgentResult, BaseAgent
-from src.models import QuarterlyMetaReflection
+from src.models import LossPattern, PromptLearning, QuarterlyMetaReflection
 
 logger = logging.getLogger(__name__)
 
@@ -362,11 +362,95 @@ the edits compound forward."""
                 type(parsed).__name__,
             )
             return None, result
+        # Per-entry isolation: meta-reflection is a quarterly cadence —
+        # losing the whole reflection because ONE LossPattern's
+        # example_trades is empty, or ONE PromptLearning's justification
+        # forgot to cite a number, throws away a full quarter of
+        # accumulated data. The schema's strictness (min_length on
+        # example_trades, digit-required on justification) is correct at
+        # the quarterly-aggregation layer; we just stop letting one bad
+        # entry weaponize that strictness against the rest of the
+        # report. Mirrors EveningAnalyst._drop_invalid_missed_opportunities
+        # (PR #73).
+        parsed = self._drop_invalid_meta_lists(parsed)
         try:
             return QuarterlyMetaReflection(**parsed), result
         except ValidationError as e:
             logger.error("Meta-reflection failed schema validation: %s", e)
             return None, result
+
+    @staticmethod
+    def _drop_invalid_meta_lists(parsed: dict) -> dict:
+        """Pre-validate the two list-of-models fields that can fail per-item:
+        `proposed_learnings` (top-level) and
+        `loss_pattern_report.top_patterns` (nested).
+
+        Mutates parsed in place. Non-list shapes normalize to []. Bad
+        items log a warning naming the agent (for learnings) or the
+        root_cause (for loss patterns) so operators can correlate
+        against the digest.
+        """
+        raw_learnings = parsed.get("proposed_learnings")
+        if raw_learnings is None:
+            pass
+        elif not isinstance(raw_learnings, list):
+            logger.warning(
+                "Meta-reflector: proposed_learnings is %s, not list — "
+                "replacing with []", type(raw_learnings).__name__,
+            )
+            parsed["proposed_learnings"] = []
+        else:
+            valid: list[dict] = []
+            for i, item in enumerate(raw_learnings):
+                if not isinstance(item, dict):
+                    logger.warning(
+                        "Meta-reflector: dropping non-dict proposed_learning "
+                        "at index %d: %r", i, item,
+                    )
+                    continue
+                try:
+                    PromptLearning(**item)
+                except ValidationError as e:
+                    agent = item.get("agent_name") or f"<idx {i}>"
+                    logger.warning(
+                        "Meta-reflector: dropping malformed proposed_learning "
+                        "for %s: %s", agent, e,
+                    )
+                    continue
+                valid.append(item)
+            parsed["proposed_learnings"] = valid
+
+        lpr = parsed.get("loss_pattern_report")
+        if isinstance(lpr, dict):
+            raw_patterns = lpr.get("top_patterns")
+            if isinstance(raw_patterns, list):
+                valid_patterns: list[dict] = []
+                for i, item in enumerate(raw_patterns):
+                    if not isinstance(item, dict):
+                        logger.warning(
+                            "Meta-reflector: dropping non-dict top_pattern "
+                            "at index %d: %r", i, item,
+                        )
+                        continue
+                    try:
+                        LossPattern(**item)
+                    except ValidationError as e:
+                        cause = item.get("root_cause") or f"<idx {i}>"
+                        logger.warning(
+                            "Meta-reflector: dropping malformed loss_pattern "
+                            "%r: %s", cause, e,
+                        )
+                        continue
+                    valid_patterns.append(item)
+                lpr["top_patterns"] = valid_patterns
+            elif raw_patterns is not None:
+                logger.warning(
+                    "Meta-reflector: loss_pattern_report.top_patterns is %s, "
+                    "not list — replacing with []",
+                    type(raw_patterns).__name__,
+                )
+                lpr["top_patterns"] = []
+        return parsed
 
 
 def persist_reflection(

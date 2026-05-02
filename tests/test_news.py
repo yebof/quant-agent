@@ -367,3 +367,134 @@ def test_news_analyst_bad_response(mock_cls):
 
     assert analysis is None
     assert agent_result is not None
+
+
+# ---------------------------------------------------------------------------
+# Per-entry isolation: one bad sub-item must not tank the whole report
+# (audit follow-up to PR #73 — same brittleness pattern, found here too)
+# ---------------------------------------------------------------------------
+
+def _valid_news_json() -> dict:
+    """Minimum-viable NewsIntelligenceReport JSON shaped like LLM output."""
+    return {
+        "macro_narrative": {
+            "last_updated": "2026-05-02",
+            "era_themes": ["AI capex"],
+            "current_regime": "selective risk-on",
+            "key_state_tracker": {},
+        },
+        "state_changes": [],
+        "stock_news": {},
+        "pm_briefing": "Quiet tape; AAPL/AMZN earnings backdrop intact.",
+        "market_sentiment": "neutral",
+        "confidence": "medium",
+    }
+
+
+def _valid_state_change(event: str = "Fed signals pause") -> dict:
+    return {
+        "event": event,
+        "previous_state": "hawkish",
+        "new_state": "data-dependent",
+        "market_impact": "supports duration + growth multiples",
+        "affected_symbols": ["SPY"],
+        "conviction": "high",
+    }
+
+
+def _valid_stock_news_item(headline: str = "Earnings beat") -> dict:
+    return {
+        "headline": headline,
+        "sentiment": "bullish",
+        "conviction": "high",
+        "impact_summary": "Confirms thesis",
+    }
+
+
+def test_drop_invalid_state_changes_strips_bad_conviction_keeps_rest():
+    """A StateChange with an invalid conviction enum must be dropped
+    individually instead of failing the whole report. Regression-pin
+    for the audit finding that mirrored PR #73's evening-report fix."""
+    parsed = _valid_news_json()
+    parsed["state_changes"] = [
+        _valid_state_change("Fed signals pause"),
+        # Bad: conviction must be high/medium/low
+        {**_valid_state_change("Bad item"), "conviction": "extremely_high"},
+        _valid_state_change("ECB holds"),
+    ]
+    out = NewsAnalystAgent._drop_invalid_state_changes(parsed)
+    events = [s["event"] for s in out["state_changes"]]
+    assert events == ["Fed signals pause", "ECB holds"]
+
+
+def test_drop_invalid_stock_news_strips_empty_headline_keeps_rest():
+    """Empty `headline` is the most likely LLM glitch — a `field_validator`
+    rejects it, which used to fail the whole report. Now drops only that
+    bullet under that symbol."""
+    parsed = _valid_news_json()
+    parsed["stock_news"] = {
+        "NVDA": [
+            _valid_stock_news_item("AI capex strong"),
+            {**_valid_stock_news_item(), "headline": "   "},  # whitespace only
+            _valid_stock_news_item("Hyperscaler demand intact"),
+        ],
+        "AAPL": [_valid_stock_news_item("Services 76% margin")],
+    }
+    out = NewsAnalystAgent._drop_invalid_stock_news(parsed)
+    assert len(out["stock_news"]["NVDA"]) == 2
+    assert all(item["headline"].strip() for item in out["stock_news"]["NVDA"])
+    assert len(out["stock_news"]["AAPL"]) == 1
+
+
+def test_drop_invalid_stock_news_drops_symbol_when_all_items_bad():
+    """If every bullet under a symbol is malformed, drop the symbol key
+    entirely so PM doesn't see an empty list and infer 'no news' (which
+    would be misleading vs. 'we got news but it was unparseable')."""
+    parsed = _valid_news_json()
+    parsed["stock_news"] = {
+        "NVDA": [_valid_stock_news_item("real")],
+        "GOOGL": [{**_valid_stock_news_item(), "headline": ""}],
+    }
+    out = NewsAnalystAgent._drop_invalid_stock_news(parsed)
+    assert "NVDA" in out["stock_news"]
+    assert "GOOGL" not in out["stock_news"]
+
+
+def test_news_report_constructs_after_dropping_bad_subitems():
+    """End-to-end: with one bad state_change and one bad stock_news item
+    stripped, NewsIntelligenceReport(**parsed) must succeed — preserving
+    macro_narrative + pm_briefing for the morning PM."""
+    from src.models import NewsIntelligenceReport
+
+    parsed = _valid_news_json()
+    parsed["state_changes"] = [
+        _valid_state_change(),
+        {**_valid_state_change("Bad"), "conviction": "extreme"},
+    ]
+    parsed["stock_news"] = {
+        "NVDA": [
+            _valid_stock_news_item("good"),
+            {**_valid_stock_news_item(), "headline": ""},
+        ],
+    }
+    cleaned = NewsAnalystAgent._drop_invalid_stock_news(
+        NewsAnalystAgent._drop_invalid_state_changes(parsed)
+    )
+    report = NewsIntelligenceReport(**cleaned)
+    assert report.pm_briefing.startswith("Quiet tape")
+    assert len(report.state_changes) == 1
+    assert len(report.stock_news["NVDA"]) == 1
+
+
+def test_drop_invalid_state_changes_handles_non_list_shape():
+    parsed = _valid_news_json()
+    parsed["state_changes"] = "oops not a list"
+    out = NewsAnalystAgent._drop_invalid_state_changes(parsed)
+    assert out["state_changes"] == []
+
+
+def test_drop_invalid_stock_news_handles_non_dict_shape():
+    parsed = _valid_news_json()
+    parsed["stock_news"] = "oops not a dict"
+    out = NewsAnalystAgent._drop_invalid_stock_news(parsed)
+    assert out["stock_news"] == {}
