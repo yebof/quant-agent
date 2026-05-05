@@ -2030,8 +2030,21 @@ def test_pipeline_midday_fetches_only_executed_morning_trades():
     result = pipeline.run_midday()
 
     assert result["status"] == "reviewed"
-    pipeline.db.get_trades.assert_called_once_with(
-        limit=50, today_only=True, executed_only=True,
+    # Two get_trades calls now: one for the morning_trades context (was the
+    # only call before), one for _symbols_already_trimmed_today (the same-day
+    # trim discipline added after the 2026-05-04 AMZN double-trim incident).
+    # The first MUST still use executed_only=True so canceled morning orders
+    # don't pollute the reviewer's "what trades fired" context.
+    morning_call_kwargs = {
+        "limit": 50, "today_only": True, "executed_only": True,
+    }
+    morning_calls = [
+        c for c in pipeline.db.get_trades.call_args_list
+        if c.kwargs == morning_call_kwargs
+    ]
+    assert len(morning_calls) == 1, (
+        f"morning_trades fetch must still be exactly one call with "
+        f"executed_only=True; got {pipeline.db.get_trades.call_args_list}"
     )
 
 

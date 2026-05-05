@@ -455,3 +455,292 @@ def test_drop_invalid_actions_drops_non_dict_items():
     ]
     out = PositionReviewerAgent._drop_invalid_actions(parsed)
     assert [a["symbol"] for a in out["actions"]] == ["NVDA", "GOOGL"]
+
+
+# ---------------------------------------------------------------------------
+# Same-day trim discipline (PR following 2026-05-04 AMZN 41 → 21 → 11 incident)
+# ---------------------------------------------------------------------------
+
+def test_reason_cites_hard_trigger_recognises_thesis_invalid():
+    from src.pipeline import _reason_cites_hard_trigger
+
+    assert _reason_cites_hard_trigger(
+        "thesis_invalid_if condition: price closed below MA50 for 2 sessions"
+    )
+    assert _reason_cites_hard_trigger("Thesis Invalid_If satisfied")
+    assert _reason_cites_hard_trigger(
+        "HIGH bearish state change on EU regulatory action"
+    )
+    assert _reason_cites_hard_trigger("bearish earnings filing posted today")
+    assert _reason_cites_hard_trigger("daily loss circuit breaker engaged")
+    assert _reason_cites_hard_trigger("stop hit at $185.50")
+    assert _reason_cites_hard_trigger("thesis broken — guidance cut")
+
+
+def test_reason_cites_hard_trigger_rejects_soft_signals():
+    """The recurring soft flags whose mechanical re-application caused the
+    AMZN double-trim must NOT count as hard triggers."""
+    from src.pipeline import _reason_cites_hard_trigger
+
+    assert not _reason_cites_hard_trigger(
+        "TARGET_BREACH at 150% thesis progress with elevated weight 10.3%"
+    )
+    assert not _reason_cites_hard_trigger(
+        "Pace slowing to 0.5x and macro backdrop turning hostile overnight"
+    )
+    assert not _reason_cites_hard_trigger(
+        "Concentration drift; valuation stretched at 28x forward"
+    )
+    assert not _reason_cites_hard_trigger("")
+    assert not _reason_cites_hard_trigger(
+        "Geopolitical noise from oil shock, prudent to harvest"
+    )
+
+
+def test_symbols_already_trimmed_today_pulls_sell_actions(tmp_path):
+    """Helper aggregates today's sell-side actions into a set of symbols."""
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    # Today's sells in various forms — all should appear.
+    db.insert_trade("AMZN", "REDUCE", 20, 270.66, "midday trim", "r1",
+                    fill_status="filled")
+    db.insert_trade("META", "TAKE_PROFIT", 5, 612.0, "auto-tp", "r1",
+                    fill_status="filled")
+    db.insert_trade("WDC", "SELL", 7, 432.0, "thesis break", "r1",
+                    fill_status="submitted")  # pending also counts
+    # PARTIAL_SELL(15%) form — must normalise.
+    db.insert_trade("AAPL", "PARTIAL_SELL(20%)", 5, 280.0, "lock-in", "r1",
+                    fill_status="filled")
+    # Canceled — does NOT count, symbol should be retry-able.
+    db.insert_trade("NVDA", "REDUCE", 10, 200.0, "midday — order rejected",
+                    "r1", fill_status="canceled")
+    # BUY today — never counts.
+    db.insert_trade("DXPE", "BUY", 18, 170.77, "morning add", "r1",
+                    fill_status="filled")
+    # HOLD audit row — never counts.
+    db.insert_trade("GOOGL", "HOLD", 0, 0, "no action", "r1")
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+
+    out = pipeline._symbols_already_trimmed_today()
+    assert out == {"AMZN", "META", "WDC", "AAPL"}, (
+        f"expected sell-side symbols only, got {out}"
+    )
+    # NVDA had a canceled REDUCE — not blocked, can be re-tried.
+    assert "NVDA" not in out
+    # BUY / HOLD never block.
+    assert "DXPE" not in out
+    assert "GOOGL" not in out
+    db.close()
+
+
+def test_already_trimmed_section_renders_in_prompt():
+    """When pipeline passes already_trimmed_today, build_user_message must
+    surface a clear directive — not a silent filter from the executor."""
+    from src.agents.position_reviewer import PositionReviewerAgent
+
+    with patch("anthropic.Anthropic"):
+        agent = PositionReviewerAgent(api_key="test", model="claude-sonnet-4-6")
+        msg = agent.build_user_message(
+            session_type="close",
+            positions=[Position(
+                symbol="AMZN", qty=21, avg_entry=238.79, current_price=271.67,
+                market_value=5705.07, unrealized_pnl=690.51, sector="Cyclical",
+            )],
+            macro_summary={"vix": {"current": 17.0}},
+            cash_balance=70_000.0,
+            total_value=107_000.0,
+            already_trimmed_today={"AMZN"},
+        )
+
+    assert "Already Trimmed Today" in msg
+    assert "AMZN" in msg
+    # Must communicate the rule, not just the symbol list.
+    assert "thesis_invalid_if" in msg.lower() or "thesis_invalid" in msg.lower()
+    assert "TARGET_BREACH" in msg or "target_breach" in msg.lower()
+
+
+def test_already_trimmed_section_omitted_when_empty():
+    """No symbols trimmed today → no warning section, prompt stays clean."""
+    from src.agents.position_reviewer import PositionReviewerAgent
+
+    with patch("anthropic.Anthropic"):
+        agent = PositionReviewerAgent(api_key="test", model="claude-sonnet-4-6")
+        msg = agent.build_user_message(
+            session_type="midday",
+            positions=[Position(
+                symbol="AAPL", qty=10, avg_entry=250.0, current_price=275.0,
+                market_value=2750.0, unrealized_pnl=250.0, sector="Tech",
+            )],
+            macro_summary={"vix": {"current": 17.0}},
+            cash_balance=10_000.0,
+            total_value=12_750.0,
+            already_trimmed_today=set(),
+        )
+
+    assert "Already Trimmed Today" not in msg
+
+
+# ---------------------------------------------------------------------------
+# Executor-level filter — the second belt for same-day trim discipline
+# ---------------------------------------------------------------------------
+
+def _mk_review_with_action(symbol: str, action: str, reason: str,
+                           new_stop_price: float | None = None):
+    """Build a minimal review-shaped object the executor accepts."""
+    from src.models import PositionAction
+    return MagicMock(actions=[PositionAction(
+        action=action, symbol=symbol, reason=reason,
+        new_stop_price=new_stop_price,
+    )])
+
+
+def _executor_pipeline_with_position(symbol: str, qty: float, current_price: float):
+    """Pipeline scaffold sufficient to exercise _midday_execute_llm_actions
+    on a single position. broker / db are mocked at the call surface."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    pipeline.broker.submit_order.return_value = {
+        "id": "test-order", "status": "accepted", "symbol": symbol,
+    }
+    pipeline.broker.get_latest_price.return_value = current_price
+    pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "filled", "filled_qty": str(int(qty * 0.5)),
+        "filled_avg_price": str(current_price),
+    }
+    pipeline.db = MagicMock()
+    pipeline.db.has_pending_action_for_symbol.return_value = False
+    pipeline._order_accepted = MagicMock(return_value=True)
+    pipeline._reprotect_residual_after_partial_sell = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    return pipeline
+
+
+def test_executor_blocks_reduce_on_already_trimmed_with_soft_reason():
+    """The 2026-05-04 AMZN scenario: midday already trimmed, close emits
+    REDUCE again citing only TARGET_BREACH + macro stress. Without a hard
+    trigger in the reason, the executor must drop the action — submit_order
+    must not fire."""
+    from src.models import Position
+
+    pipeline = _executor_pipeline_with_position("AMZN", 21.0, 271.67)
+    positions = [Position(
+        symbol="AMZN", qty=21, avg_entry=238.79, current_price=271.67,
+        market_value=5705.07, unrealized_pnl=690.51, sector="Cyclical",
+    )]
+    review = _mk_review_with_action(
+        "AMZN", "REDUCE",
+        "thesis_progress 155% with TARGET_BREACH flag and pace only 0.62x. "
+        "Overnight macro backdrop is less forgiving; prudent to trim 50%.",
+    )
+    orders = pipeline._midday_execute_llm_actions(
+        positions, review, run_id="r1",
+        already_trimmed_today={"AMZN"},
+    )
+
+    assert orders == []
+    pipeline.broker.submit_order.assert_not_called()
+
+
+def test_executor_allows_reduce_on_already_trimmed_with_hard_trigger():
+    """If the LLM's reason explicitly cites a hard trigger (e.g. thesis_invalid_if
+    or HIGH bearish state change), the executor lets the second-session
+    REDUCE through. The discipline is 'don't double-trim on soft signals',
+    not 'never sell again today'."""
+    from src.models import Position
+
+    pipeline = _executor_pipeline_with_position("AMZN", 21.0, 271.67)
+    positions = [Position(
+        symbol="AMZN", qty=21, avg_entry=238.79, current_price=271.67,
+        market_value=5705.07, unrealized_pnl=690.51, sector="Cyclical",
+    )]
+    review = _mk_review_with_action(
+        "AMZN", "REDUCE",
+        "thesis_invalid_if condition satisfied — Q1 guidance cut materialised "
+        "post-midday on AWS deceleration. Trim further to size down before close.",
+    )
+    pipeline._midday_execute_llm_actions(
+        positions, review, run_id="r1",
+        already_trimmed_today={"AMZN"},
+    )
+
+    pipeline.broker.submit_order.assert_called_once()
+
+
+def test_executor_does_not_block_trail_stop_on_already_trimmed():
+    """TRAIL_STOP adjusts protection, doesn't sell shares. Allowed even on
+    already-trimmed symbols — tightening a stop on an already-trimmed
+    winner is a defensive move, not a second harvest."""
+    from src.models import Position
+
+    pipeline = _executor_pipeline_with_position("AMZN", 21.0, 271.67)
+    pipeline.broker.replace_stop_loss.return_value = {
+        "id": "trail-1", "status": "accepted", "symbol": "AMZN",
+    }
+    positions = [Position(
+        symbol="AMZN", qty=21, avg_entry=238.79, current_price=271.67,
+        market_value=5705.07, unrealized_pnl=690.51, sector="Cyclical",
+    )]
+    review = _mk_review_with_action(
+        "AMZN", "TRAIL_STOP",
+        "Tighten stop to lock in gain after midday trim",
+        new_stop_price=260.0,
+    )
+    pipeline._midday_execute_llm_actions(
+        positions, review, run_id="r1",
+        already_trimmed_today={"AMZN"},
+    )
+
+    pipeline.broker.replace_stop_loss.assert_called_once()
+
+
+def test_executor_filter_no_op_when_set_empty():
+    """When no symbols were trimmed today, executor behaves exactly as
+    before — even soft-reasoned REDUCEs go through (LLM judgment, not
+    our place to second-guess on a clean session)."""
+    from src.models import Position
+
+    pipeline = _executor_pipeline_with_position("AMZN", 41.0, 270.0)
+    positions = [Position(
+        symbol="AMZN", qty=41, avg_entry=238.79, current_price=270.0,
+        market_value=11070.0, unrealized_pnl=1212.0, sector="Cyclical",
+    )]
+    review = _mk_review_with_action(
+        "AMZN", "REDUCE",
+        "TARGET_BREACH and weight 10.3% — disciplined trim of overdelivered winner.",
+    )
+    pipeline._midday_execute_llm_actions(
+        positions, review, run_id="r1",
+        already_trimmed_today=set(),  # nothing trimmed yet today
+    )
+
+    pipeline.broker.submit_order.assert_called_once()
+
+
+def test_executor_blocks_full_sell_on_already_trimmed_soft_reason():
+    """Same rule applies to SELL, not just REDUCE — a full exit on a soft
+    flag the same day midday already trimmed is the worst version of the
+    bug (one day, two consecutive cuts, one of which closes the position)."""
+    from src.models import Position
+
+    pipeline = _executor_pipeline_with_position("AMZN", 21.0, 271.67)
+    positions = [Position(
+        symbol="AMZN", qty=21, avg_entry=238.79, current_price=271.67,
+        market_value=5705.07, unrealized_pnl=690.51, sector="Cyclical",
+    )]
+    review = _mk_review_with_action(
+        "AMZN", "SELL",
+        "Concentration drift and stretched valuation; close out before overnight.",
+    )
+    orders = pipeline._midday_execute_llm_actions(
+        positions, review, run_id="r1",
+        already_trimmed_today={"AMZN"},
+    )
+
+    assert orders == []
+    pipeline.broker.submit_order.assert_not_called()

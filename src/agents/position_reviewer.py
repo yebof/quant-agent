@@ -114,6 +114,9 @@ class PositionReviewerAgent(BaseAgent):
         trade_grade_summary: dict = kwargs.get("trade_grade_summary") or {}
         yesterday_insights: dict | None = kwargs.get("yesterday_insights")
         recent_performance: dict = kwargs.get("recent_performance") or {}
+        already_trimmed_today: set[str] = set(
+            kwargs.get("already_trimmed_today") or set()
+        )
 
         # Build morning trade context map (entry thesis, stop_loss, reference target).
         trade_context: dict[str, dict] = {}
@@ -410,6 +413,33 @@ class PositionReviewerAgent(BaseAgent):
         else:
             system_actions_section = ""
 
+        # Same-day trim discipline section. Renders only when at least one
+        # symbol was already trimmed earlier today (auto-TP, midday REDUCE,
+        # morning emergency sell, force-delever). The Python executor
+        # enforces this rule independently — this section is the prompt-side
+        # belt so the LLM isn't fighting an invisible filter.
+        if already_trimmed_today:
+            already_trimmed_section = (
+                "### ⚠️ Already Trimmed Today — DO NOT REDUCE/SELL again\n"
+                f"Symbols sold earlier today: {', '.join(sorted(already_trimmed_today))}\n"
+                "These positions ALREADY received a sell-side action this session day "
+                "(auto-take-profit, midday REDUCE, force-delever, or emergency sell).\n"
+                "**HOLD them at this session unless ONE of these HARD triggers fires:**\n"
+                "  - Named `thesis_invalid_if` condition is satisfied (price closed below "
+                "cited level, fundamental signal flipped, etc.)\n"
+                "  - HIGH-conviction bearish stock-specific state_change reversal landed today\n"
+                "  - Bearish earnings filing analysis posted today for this symbol\n"
+                "  - Daily-loss circuit breaker engaged / correlation cluster breach\n\n"
+                "`TARGET_BREACH`, slowing pace, geopolitical noise, valuation stretch, "
+                "concentration drift — these are NOT hard triggers. The earlier action "
+                "already harvested them. Trimming a second time on the same flag is the "
+                "mechanical loop that produced the 2026-05-04 AMZN incident "
+                "(41 → 21 → 11 shares in one day on a strengthening thesis).\n"
+                "TRAIL_STOP is permitted (it adjusts protection, doesn't sell shares).\n"
+            )
+        else:
+            already_trimmed_section = ""
+
         session_label = _SESSION_LABEL.get(session_type, session_type)
         session_bias = _SESSION_DISPOSITION.get(session_type, "")
 
@@ -417,6 +447,7 @@ class PositionReviewerAgent(BaseAgent):
 
 {margin_section}
 {system_actions_section}
+{already_trimmed_section}
 ### Session Disposition
 {session_bias}
 
@@ -466,6 +497,7 @@ schema."""
                trade_grade_summary: dict | None = None,
                yesterday_insights: dict | None = None,
                recent_performance: dict | None = None,
+               already_trimmed_today: set[str] | None = None,
                allow_margin: bool = True) -> tuple[PositionReview | None, "AgentResult"]:
         result = self.run(
             positions=positions,
@@ -486,6 +518,7 @@ schema."""
             trade_grade_summary=trade_grade_summary or {},
             yesterday_insights=yesterday_insights,
             recent_performance=recent_performance or {},
+            already_trimmed_today=already_trimmed_today or set(),
             allow_margin=allow_margin,
         )
         parsed = result.parse_json()
