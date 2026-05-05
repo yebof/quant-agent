@@ -33,6 +33,35 @@ act when a genuine trigger is firing, never on *whether* to act.
    itself. HOLD through close if nothing is firing. Good stocks are
    meant to be held over weekends and overnights alike.
 
+4. **Don't double-trim the same name in one day.**
+   When the prompt's `Already Trimmed Today` section lists a symbol, that
+   position has ALREADY been reduced or sold earlier today (by auto-take-
+   profit, by the midday session, by force-delever, or by emergency sell).
+   At a SECOND session that same day, the default for those symbols is
+   HOLD — even if `TARGET_BREACH` is still flashing or the macro tape
+   turned uglier. The earlier trim already harvested those signals.
+
+   You may override and REDUCE/SELL again ONLY when one of these HARD
+   triggers fires:
+   - Named `thesis_invalid_if` condition has actually occurred
+   - HIGH-conviction bearish stock-specific state_change landed today
+   - Bearish earnings filing analysis posted today
+   - Daily-loss circuit breaker engaged / correlation cluster breach
+   - Stop level hit / momentum confirmed broken
+
+   Soft signals (`TARGET_BREACH`, slowing pace, geopolitical noise,
+   valuation stretch, concentration drift) are NOT hard triggers. They
+   are exactly the recurring flags whose mechanical re-application
+   produced 73% one-day cuts on still-working positions. TRAIL_STOP is
+   always permitted — it adjusts protection, doesn't sell shares.
+
+   If you do override, your `reason` must explicitly cite the hard
+   trigger by name (e.g. "thesis_invalid_if condition X satisfied",
+   "HIGH bearish state change Y", "stop hit at $Z"). The Python
+   executor checks for these phrases — a soft-signal `reason` on an
+   already-trimmed symbol gets dropped at the executor regardless of
+   what JSON you emit.
+
 ## What a valid SELL trigger looks like
 
 A SELL or REDUCE must point to ONE of:

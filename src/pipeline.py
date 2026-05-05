@@ -59,6 +59,47 @@ HARD_BLOCK_RULES = {
 }
 
 
+# Hard-trigger keywords that authorise position_reviewer to REDUCE/SELL a
+# symbol that was ALREADY trimmed earlier today. Anything in the LLM-emitted
+# `reason` field that contains one of these substrings (case-insensitive)
+# bypasses the same-day-trim discipline. The list is intentionally narrow
+# — soft signals like "TARGET_BREACH" / "stretched" / "macro noise" must NOT
+# be on it; those are exactly the recurring flags that mechanical
+# double-application would re-trim on a second session.
+_HARD_TRIGGER_KEYWORDS: tuple[str, ...] = (
+    "thesis_invalid",
+    "thesis invalid",
+    "invalidation triggered",
+    "high bearish",
+    "high-conviction bearish",
+    "high conviction bearish",
+    "bearish earnings",
+    "bearish filing",
+    "earnings missed",
+    "guidance cut",
+    "daily loss",
+    "daily-loss",
+    "circuit breaker",
+    "correlation breach",
+    "correlation cluster breach",
+    "stop hit",
+    "stopped out",
+    "broken thesis",
+    "thesis broken",
+)
+
+
+def _reason_cites_hard_trigger(reason: str) -> bool:
+    """True if the LLM's reason text contains a recognised hard-trigger
+    phrase that authorises a same-day re-trim. Substring match (case-
+    insensitive) — the LLM emits prose so we tolerate variation.
+    """
+    if not reason:
+        return False
+    lower = reason.lower()
+    return any(kw in lower for kw in _HARD_TRIGGER_KEYWORDS)
+
+
 def _valuation_signal_from(forward_pe: float | None) -> str:
     """Coarse valuation bucket from forward PE. Conservative thresholds:
     anything < 12 is cheap even for growth names; >= 25 is stretched for
@@ -3553,8 +3594,54 @@ class TradingPipeline:
             )
         return orders
 
+    def _symbols_already_trimmed_today(self) -> set[str]:
+        """Symbols that received a sell-side action earlier today (ET).
+
+        Used by position_reviewer's same-day-trim discipline at midday/close:
+        if midday already trimmed AMZN at +12% on TARGET_BREACH, close should
+        not trim it AGAIN at +13% on the same flag — that loop produced a
+        73% one-day cut on a still-working position (2026-05-04 AMZN 41 →
+        21 → 11 shares).
+
+        Sell-side = REDUCE / SELL / TAKE_PROFIT / PARTIAL_SELL(...) /
+        EMERGENCY_SELL / FORCE_DELEVER. TRAIL_STOP and HOLD do NOT count
+        (TRAIL_STOP is stop adjustment, HOLD is no-op).
+
+        Filters out canceled / rejected / expired fills — if a SELL was
+        submitted earlier and broker rejected, the symbol is fair game for
+        re-trying. Pending (`submitted`) and `filled` rows both block, so
+        we never double-submit on the same symbol within one day.
+        """
+        try:
+            rows = self.db.get_trades(today_only=True, limit=200)
+        except Exception as exc:
+            logger.warning(
+                "_symbols_already_trimmed_today: query failed: %s", exc,
+            )
+            return set()
+        sell_actions = {
+            "REDUCE", "SELL", "TAKE_PROFIT",
+            "EMERGENCY_SELL", "FORCE_DELEVER",
+        }
+        bad_status = {"canceled", "cancelled", "rejected", "expired", "done_for_day"}
+        out: set[str] = set()
+        for r in rows:
+            action = (r.get("action") or "").upper()
+            # Normalise PARTIAL_SELL(15%) → PARTIAL_SELL.
+            base_action = action.split("(", 1)[0].strip()
+            if base_action not in sell_actions and base_action != "PARTIAL_SELL":
+                continue
+            status = (r.get("fill_status") or "").lower()
+            if status in bad_status:
+                continue
+            sym = r.get("symbol")
+            if sym:
+                out.add(sym)
+        return out
+
     def _midday_execute_llm_actions(
         self, positions, review, run_id: str, blocked_symbols: set[str] | None = None,
+        already_trimmed_today: set[str] | None = None,
     ) -> list[dict]:
         """Dispatch LLM-recommended SELL / REDUCE / TRAIL_STOP actions to broker.
 
@@ -3591,6 +3678,11 @@ class TradingPipeline:
         if not best_by_symbol:
             return orders
 
+        already_trimmed = {
+            symbol.strip().upper()
+            for symbol in (already_trimmed_today or set())
+            if symbol and symbol.strip()
+        }
         for action_item in best_by_symbol.values():
             act = action_item.get("action")
             if act not in ("SELL", "REDUCE", "TRAIL_STOP"):
@@ -3600,6 +3692,28 @@ class TradingPipeline:
                 logger.info(
                     "Midday: skipping %s %s — auto take-profit sell still in flight",
                     act, symbol,
+                )
+                continue
+            # Same-day trim discipline: a symbol that already had a sell-side
+            # action TODAY (auto-TP, midday REDUCE, etc.) is off-limits for
+            # additional REDUCE / SELL on a SECOND session unless the LLM
+            # explicitly cites a hard trigger in the reason. TRAIL_STOP is
+            # exempt — adjusting a stop is not selling shares.
+            #
+            # 2026-05-04 AMZN: midday REDUCE 20 of 41 @ +12.4% on TARGET_BREACH,
+            # then close REDUCE 10 of 21 @ +13.8% on the SAME TARGET_BREACH
+            # flag = 73% one-day trim on a strengthening thesis. Mechanical
+            # double-application of one signal violates "good stocks are meant
+            # to be held".
+            if (
+                act in ("SELL", "REDUCE")
+                and symbol in already_trimmed
+                and not _reason_cites_hard_trigger(action_item.get("reason", ""))
+            ):
+                logger.warning(
+                    "Position reviewer: skipping %s %s — already trimmed today "
+                    "and no hard trigger cited. Reason: %r",
+                    act, symbol, (action_item.get("reason") or "")[:160],
                 )
                 continue
             existing = [p for p in positions if p.symbol == symbol]
@@ -4358,6 +4472,9 @@ class TradingPipeline:
             # 14-day rolling counts of correct/premature/wrong SELLs (and BUYs)
             # let the reviewer lean patient when past SELLs trended premature.
             trade_grade_summary = self._build_trade_grade_summary(lookback_days=14)
+            # Same-day trim discipline — feeds the prompt + the executor.
+            # See _symbols_already_trimmed_today for the AMZN-2026-05-04 origin.
+            already_trimmed_today = self._symbols_already_trimmed_today()
 
             yesterday_insights = self.db.get_latest_insights(before_date=session_date_key())
             recent_performance = self._compute_recent_performance(last_equity)
@@ -4381,6 +4498,7 @@ class TradingPipeline:
                 trade_grade_summary=trade_grade_summary,
                 yesterday_insights=yesterday_insights,
                 recent_performance=recent_performance,
+                already_trimmed_today=already_trimmed_today,
                 allow_margin=bool(getattr(self.config.risk, "allow_margin", False)),
             )
             self.db.insert_agent_log(
@@ -4405,7 +4523,9 @@ class TradingPipeline:
                 ))
             else:
                 orders.extend(self._midday_execute_llm_actions(
-                    positions, review, run_id, blocked_symbols=blocked_position_symbols,
+                    positions, review, run_id,
+                    blocked_symbols=blocked_position_symbols,
+                    already_trimmed_today=already_trimmed_today,
                 ))
 
         logger.info("%s: %d positions, risk=%s, %d orders",
