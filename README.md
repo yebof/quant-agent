@@ -64,11 +64,14 @@ their own cadence + scope:
                 / HIGH state_change reversal / bearish earnings / cluster
                 breach). Price alone is never a trigger.
 
-15:30-15:55  close                (once/day, sell-only, 25-min window)
+15:30-16:00  close                (once/day, sell-only, 30-min window)
              └─ Same Position Reviewer, session_type="close" = act-on-trigger.
                 17.5h until next intraday control — if a thesis trigger is
                 firing, act NOW. But "near close" is never itself a trigger.
                 Good stocks are meant to be held through the night.
+                Window width ≥ launchd's 30-min StartInterval so any phase
+                of the tick lands inside it (PR #41 lesson — earlier 25-min
+                window let bad phases miss the close two days running).
 
 20:00-22:00  evening              (once/day, post-market)
              ├─ Reconcile all submitted orders → terminal status
@@ -103,8 +106,8 @@ SELL allocation_pct semantics, ET-everywhere timezone, etc.).
 | **Earnings Analyst** | SEC 10-Q/10-K analysis | Revenue, margins, cash flow, strategic direction, competitive positioning, strategic vs operational risks, strategy consistency across filings. `investment_implications` carries a 5-step `reasoning_chain` (fundamental_quality / growth_trajectory / strategic_risks / management_execution / valuation_context) — sentiment call is derivable from the numbers, not a vibe check. |
 | **Portfolio Manager** | Central decision maker | Mandatory 7-step reasoning chain + continuity check across **8 memory layers**: L1 today's signals, L2 per-position entry context + Tech rating 7-day trajectory with `Weight:%` and `⚠️DRIFT` flag on concentrated winners, L3a rolling Portfolio Narrative (7 evenings), L3b Macro Regime Trajectory (7 days), L3c Active HIGH-conviction state_changes (14 days), **L4 Trade Calibration** — actual realized win rate + avg return on closed BUYs (45d), bucketed by size, **L5 RM Verdicts** (last 5 sessions — PM shrinks sizing when RM keeps scaling it down), **L6 Own Recent Decisions** (last 3 sessions — spot flip-flops), **L7 Projected Book Preview** — if you rubber-stamp all TA BUYs @ 5%, flags sectors nearing 35% cap. Sizing scales by TechAnalyst's `risk_reward` (R/R ≥ 3 boost, < 1.5 requires catalyst). **Regime-adaptive cash floor**: risk-off 25% / transitional 15% / risk-on 5%. **Drawdown-aware**: halves new BUYs when `in_drawdown` flagged. **Drift trim**: Weight > 12% + P&L > 10% → must trim or justify; Weight > 18% → hard trim. **Earnings-queued hard cap**: just-filed 10-Q with no analysis yet → BUY capped at 5% (enforced in pipeline). **Holding discipline** (tiered by days_held): <5d → default HOLD unless thesis_invalid_if or macro regime flipped today; 5-15d → standard; >15d profitable + trend intact → let it run. 11-row **Rule Priority** cheat sheet resolves conflicts (thesis_invalid > holding > earnings-cap > drift > cash-floor > R/R > ...). |
 | **Risk Manager** | Trade review with veto power | Mandatory 6-step `reasoning_chain` (rr_audit / signal_fidelity / correlation_check / event_risk / sizing_sanity / overall) — vague approvals rejected. Enforces R/R discipline: BUYs with R/R < 1.5 must be downsized via modifications or rejected unless PM named a catalyst. Sees raw Tech ratings + R/R + full macro context. Can modify per-symbol fields OR apply portfolio-wide `scale_all_buys` (0.0-1.0). |
-| **Position Reviewer** | Profit management & trailing-stop execution | Trailing-stop logic is **real**, not cosmetic — `TRAIL_STOP` action actually cancels the broker's old stop and submits a new one at the specified price via `AlpacaBroker.replace_stop_loss`. Sees VIX + HY OAS + core CPI to gauge whether to tighten stops broadly. Output is Pydantic `PositionReview` — action enum enforced (typos like `TRIAL_STOP` rejected); `TRAIL_STOP` requires `new_stop_price > 0`. |
-| **Evening Analyst** | Daily P&L review & multi-layer learning | Pydantic `EveningReport` with mandatory **7-step** `EveningReasoningChain`. **Single-day outlook retrospection** — grades yesterday's `tomorrow_outlook` against today's actual. **Multi-day calibration meta-loop** — its own tomorrow_bias / tomorrow_conviction hit rate over ~10 sessions (deterministic mirror); can't self-delude. **Structured trade grading** — `sell_grades` / `buy_grades` with `correct/premature/wrong` per trade; `buy_grades` also carries `thesis_trajectory` + `loss_root_cause` so "bought expensive vs fundamentals broke" is distinguishable. **Thesis Health Review (value-investor lens)** — per held position surfaces 8-week tech rating trajectory, 8-week news events, valuation bucket (cheap / fair / stretched), AND the full 5-step fundamentals reasoning_chain from the latest 10-Q/10-K (loaded via `src/data/earnings_deep_dive.py` from `data/earnings/{SYMBOL}/analysis_*.md`, truncated to 500c for primary / 300c for risk+mgmt steps). Outputs `thesis_trajectory` ∈ {strengthening/intact/weakening/broken}. **Missed Opportunities** — universe + Alpaca top-movers scan with quality filters (liquidity, volume confirm, valuation) surfacing names we should have held (learn, don't chase). **Quarterly meta-reflector** — separate agent runs at quarter boundaries with a **7-step facts→portrait→gap→prompt-audit→proposal** CoT. The digest now also carries `agent_prompts_snapshot` (compressed persona + rules + memory + `## Learnings (system-evolved)` section for all 6 editable agents), so step 6 `existing_prompt_audit` grounds proposed edits in what's already in each target prompt rather than rediscovering rules from memory. Auto-evolves prompts under 4 guards (FIFO / Jaccard dedup / prohibited-word regex / git commit rollback). Plus 7-day portfolio narrative + 14-day HIGH state changes (same layers PM sees). Outputs feed next morning's PM. |
+| **Position Reviewer** | Profit management & trailing-stop execution | Trailing-stop logic is **real**, not cosmetic — `TRAIL_STOP` action actually cancels the broker's old stop and submits a new one at the specified price via `AlpacaBroker.replace_stop_loss`. Sees VIX + HY OAS + core CPI to gauge whether to tighten stops broadly. Output is Pydantic `PositionReview` — action enum enforced (typos like `TRIAL_STOP` rejected); `TRAIL_STOP` requires `new_stop_price > 0`. **Same-day trim discipline**: a symbol that already received a sell-side action earlier today (auto-take-profit / morning emergency / midday REDUCE / force-delever) is off-limits for additional REDUCE/SELL on a second session unless the LLM's `reason` cites a hard trigger (`thesis_invalid_if`, HIGH bearish state-change, bearish earnings, daily-loss / circuit breaker, correlation cluster breach, stop hit). Soft signals (TARGET_BREACH alone, slowing pace, geopolitical noise, valuation stretch) do NOT qualify — they were already priced into the earlier trim, so re-applying them is the mechanical loop that produced one 73 % single-day cut on a still-strengthening name. The Python executor enforces this independently of the prompt; TRAIL_STOP and HOLD are unaffected. |
+| **Evening Analyst** | Daily P&L review & multi-layer learning | Pydantic `EveningReport` with mandatory **7-step** `EveningReasoningChain`. **Single-day outlook retrospection** — grades yesterday's `tomorrow_outlook` against today's actual. **Multi-day calibration meta-loop** — its own tomorrow_bias / tomorrow_conviction hit rate over ~10 sessions (deterministic mirror); can't self-delude. **Structured trade grading** — `sell_grades` / `buy_grades` with `correct/premature/wrong` per trade; `buy_grades` also carries `thesis_trajectory` + `loss_root_cause` so "bought expensive vs fundamentals broke" is distinguishable. **Thesis Health Review (value-investor lens)** — per held position surfaces 8-week tech rating trajectory, 8-week news events, valuation bucket (cheap / fair / stretched), AND the full 5-step fundamentals reasoning_chain from the latest 10-Q/10-K (loaded via `src/data/earnings_deep_dive.py` from `data/earnings/{SYMBOL}/analysis_*.md`, truncated to 500c for primary / 300c for risk+mgmt steps). Outputs `thesis_trajectory` ∈ {strengthening/intact/weakening/broken}. **Missed Opportunities** — universe + Alpaca top-movers scan with quality filters (liquidity, volume confirm, valuation) surfacing names we should have held (learn, don't chase). **Quarterly meta-reflector** — separate agent runs at quarter boundaries with a **7-step facts→portrait→gap→prompt-audit→proposal** CoT. The digest now also carries `agent_prompts_snapshot` (compressed persona + rules + memory + `## Learnings (system-evolved)` section for all 6 editable agents), so step 6 `existing_prompt_audit` grounds proposed edits in what's already in each target prompt rather than rediscovering rules from memory. Auto-evolves prompts under 10 invariants enforced by `src/evolution/prompt_editor.py` (allow-list, append-only, FIFO cap, per-cycle agent cap, Jaccard dedup, prohibited-word regex, length bounds, atomic file write, audit log, optional git commit + revert rollback). Plus 7-day portfolio narrative + 14-day HIGH state changes (same layers PM sees). Outputs feed next morning's PM. |
 
 ## Risk Management
 
@@ -131,6 +134,7 @@ SELL allocation_pct semantics, ET-everywhere timezone, etc.).
 - **Order-status gating**: every broker submission runs through `_order_accepted()` before the audit log is written — Alpaca error payloads (missing id, status rejected/expired/canceled) are refused so the trades table never records a phantom fill
 - **No-price BUY skip**: if neither the broker nor in-memory OHLCV bars can sanity-check the LLM's `entry_price`, the BUY is skipped rather than submitted as a stale limit
 - **Earnings-queued BUY cap**: pipeline hard-clamps any BUY on a symbol whose latest 10-Q/10-K is `queued` (fresh filing, LLM analysis still running) to ≤ 5% allocation, regardless of PM's conviction
+- **Same-day trim discipline**: once a symbol has been trimmed/sold today (auto-TP / midday / morning emergency / force-delever), the executor blocks additional REDUCE or SELL on it for the remaining sessions of the day unless the LLM cites a hard trigger keyword in its `reason` — see Position Reviewer row above for the full list. Prevents the mechanical loop where a soft flag (TARGET_BREACH, slowing pace, valuation stretch) keeps re-firing across midday + close on the same name
 
 ### LLM Risk Manager
 - Mandatory 6-step `reasoning_chain`: rr_audit → signal_fidelity → correlation_check → event_risk → sizing_sanity → overall
@@ -174,7 +178,7 @@ EOF
 
 ### Optional env vars
 
-- `QUANT_AGENT_MAX_RETRIES` (default `5`) — base agent LLM-call retry budget; total exponential backoff is 1+2+4+8+16 = 31s. Raised from 3 after a 2026-04-23 DNS hiccup killed a morning session. Drop to 2-3 for faster tests; raise to 6+ if running on flaky networks.
+- `QUANT_AGENT_MAX_RETRIES` (default `7`) — base agent LLM-call retry budget. Backoff is **exponential floor + full positive jitter**: each sleep is in `[2^attempt, 2*2^attempt)`. With N=7 the worst-case total window is ~140s (6 sleeps in `[1,2)+[2,4)+[4,8)+[8,16)+[16,32)+[32,64)` ≈ up to 126s, plus 7 fast-fail call latencies). Evolution: `3 → 5 (DNS hiccup, 2026-04-23) → 7+jitter (sustained 30s OpenAI outages, 2026-04-28+29)`. Jitter is the load-bearing piece — without it, every retry attempt fires at deterministic offsets and a 30s outage swallows all of them; with jitter, individual attempts spread over a wider window so at least one tends to land outside any short outage. Drop to 2-3 for fast tests, raise to 10 if your provider chronically misbehaves.
 
 ### macOS Sequoia setup (launchd automation only)
 
@@ -193,7 +197,7 @@ Set `evolution.enabled: true` in `config/settings.yaml` (default is `false`) to 
 - Runs only when you invoke `python main.py --mode meta` (launchd doesn't schedule this — it's a manual trigger on the last trading day of each quarter)
 - Appends proposed Learnings bullets to the 6 editable agent prompts (tech / news / macro / earnings / portfolio_manager / evening_analyst)
 - **`risk_manager` and `position_reviewer` are schema-protected** — the `MetaReflectionAgentName` literal in `src/models.py` doesn't include them, so even with `enabled: true` the reflector can't touch them
-- Four belts enforce safety: FIFO cap (10 Learnings per agent, oldest auto-evicted), Jaccard dedup (0.6 threshold), prohibited-words regex (never/always/override/ignore all), and `auto_commit: true` so each quarter's edits land as one `chore(prompts):` commit — `git revert <sha>` is your one-shot rollback
+- 10 invariants enforce safety (full list in `src/evolution/prompt_editor.py` module docstring). User-visible ones: per-agent **FIFO cap** (10 Learnings, oldest auto-evicted), **Jaccard dedup** (0.6 threshold), **prohibited-words regex** (never / always / override / ignore all — these directly conflict with hard-invariant wording in core prompts), **per-cycle agent cap** (max 3 distinct agents edited per quarterly run), **atomic file writes** (tmp + os.replace), **audit log** at `data/evolution/edits.jsonl` with both accepted and rejected attempts + reasons, and `auto_commit: true` so each quarter's edits land as one `chore(prompts):` commit — `git revert <sha>` is your one-shot rollback
 
 Keep `enabled: false` until you've eyeballed at least one quarterly `reflection.json` under `data/evolution/{period}/` and are comfortable with proposal quality.
 
@@ -260,7 +264,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 385 tests
+├── tests/                         # 798 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -271,7 +275,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 385 tests
+pytest tests/ -v    # 798 tests
 ```
 
 ## Data Sources
