@@ -80,3 +80,121 @@ def test_risk_manager_with_violations(mock_cls, sample_portfolio_decision):
     assert verdict is not None
     assert verdict.approved is False
     assert agent_result is not None
+
+
+# ---------------------------------------------------------------------------
+# Per-entry isolation for modifications (mirrors PR #73/#74 pattern)
+# ---------------------------------------------------------------------------
+
+def _valid_risk_verdict_json() -> dict:
+    return {
+        "approved": True,
+        "reasoning_chain": {
+            "rr_audit": "All BUYs have R/R ≥ 1.5.",
+            "signal_fidelity": "PM aligned with TA.",
+            "correlation_check": "No clustering.",
+            "event_risk": "No earnings within 3 days.",
+            "sizing_sanity": "Sizes proportional to conviction.",
+            "overall": "Approve as-is.",
+        },
+        "modifications": [],
+        "scale_all_buys": 1.0,
+        "reason_category": "clean",
+        "reasoning": "Looks clean.",
+    }
+
+
+def _valid_modification(symbol: str = "NVDA") -> dict:
+    return {
+        "symbol": symbol,
+        "field": "allocation_pct",
+        "original_value": 12.0,
+        "new_value": 8.0,
+        "reason": "Trim concentration risk.",
+    }
+
+
+def test_drop_invalid_modifications_strips_non_numeric_value_keeps_rest():
+    """A RiskModification with `original_value` as a non-coercible string
+    must be dropped individually instead of failing the whole RiskVerdict
+    (which would lose the reasoning_chain + scale_all_buys + the OTHER
+    modifications)."""
+    parsed = _valid_risk_verdict_json()
+    parsed["modifications"] = [
+        _valid_modification("NVDA"),
+        {**_valid_modification("BAD"), "original_value": "not a number"},
+        _valid_modification("AMZN"),
+    ]
+    out = RiskManagerAgent._drop_invalid_modifications(parsed)
+    syms = [m["symbol"] for m in out["modifications"]]
+    assert syms == ["NVDA", "AMZN"]
+
+
+def test_drop_invalid_modifications_strips_missing_field():
+    """A RiskModification missing the required `reason` field gets dropped."""
+    parsed = _valid_risk_verdict_json()
+    parsed["modifications"] = [
+        _valid_modification("NVDA"),
+        {"symbol": "BAD", "field": "x", "original_value": 1.0, "new_value": 0.5},
+        _valid_modification("AMZN"),
+    ]
+    out = RiskManagerAgent._drop_invalid_modifications(parsed)
+    syms = [m["symbol"] for m in out["modifications"]]
+    assert syms == ["NVDA", "AMZN"]
+
+
+def test_risk_verdict_constructs_after_dropping_bad_modification():
+    """End-to-end: with the malformed modification stripped, RiskVerdict
+    constructs and preserves reasoning_chain, scale_all_buys, approved."""
+    from src.models import RiskVerdict
+
+    parsed = _valid_risk_verdict_json()
+    parsed["modifications"] = [
+        _valid_modification("NVDA"),
+        {"symbol": "BAD"},  # missing several required fields
+    ]
+    cleaned = RiskManagerAgent._drop_invalid_modifications(parsed)
+    verdict = RiskVerdict(**cleaned)
+    assert verdict.approved is True
+    assert verdict.scale_all_buys == 1.0
+    assert len(verdict.modifications) == 1
+    assert verdict.modifications[0].symbol == "NVDA"
+
+
+def test_drop_invalid_modifications_handles_non_list_shape():
+    parsed = _valid_risk_verdict_json()
+    parsed["modifications"] = "oops not a list"
+    out = RiskManagerAgent._drop_invalid_modifications(parsed)
+    assert out["modifications"] == []
+
+
+@patch("anthropic.Anthropic")
+def test_risk_review_survives_one_malformed_modification(mock_cls, sample_portfolio_decision):
+    """End-to-end via review(): a bad modification in the LLM output no longer
+    fails the whole verdict. Pre-fix this would leave execution stage with no
+    RM guidance for the morning."""
+    payload = _valid_risk_verdict_json()
+    payload["approved"] = False
+    payload["modifications"] = [
+        _valid_modification("NVDA"),
+        {"symbol": "BAD", "original_value": "garbage"},  # malformed
+    ]
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.content = [MagicMock(text=json.dumps(payload))]
+    mock_resp.usage.input_tokens = 100
+    mock_resp.usage.output_tokens = 50
+    mock_client.messages.create.return_value = mock_resp
+    mock_cls.return_value = mock_client
+
+    agent = RiskManagerAgent(api_key="test", model="claude-opus-4-6-20250725")
+    verdict, _ = agent.review(
+        portfolio_decision=sample_portfolio_decision,
+        positions=[],
+        macro_summary={"vix": {"current": 18.0}},
+        rule_violations=[],
+    )
+    assert verdict is not None
+    assert verdict.approved is False
+    assert len(verdict.modifications) == 1
+    assert verdict.modifications[0].symbol == "NVDA"

@@ -132,3 +132,117 @@ def test_macro_analyze_passes_last_state_and_news_to_prompt(mock_cls):
     assert "transitional" in user_msg.lower() or "Choppy" in user_msg
     assert "AI supercycle" in user_msg
     assert "fed_policy" in user_msg
+
+
+# ---------------------------------------------------------------------------
+# Per-entry isolation for key_observations (mirrors PR #73/#74 pattern)
+# ---------------------------------------------------------------------------
+
+def _valid_macro_json() -> dict:
+    return {
+        "reasoning_chain": {
+            "volatility_analysis": "a", "yield_curve_analysis": "b",
+            "monetary_policy_analysis": "c", "inflation_labor_credit": "d",
+            "cross_signal_synthesis": "e", "sector_implications": "f",
+        },
+        "regime": "risk-on",
+        "confidence": "medium",
+        "equity_outlook": "bullish",
+        "regime_shift": False,
+        "shift_reason": "",
+        "key_observations": [],
+        "sector_guidance": [],
+        "risk_factors": [],
+        "position_guidance": {
+            "target_invested_pct": 70.0,
+            "cash_recommendation_pct": 30.0,
+            "reasoning": "Hold buffer.",
+        },
+        "bull_triggers": [],
+        "bear_triggers": [],
+        "alignment_with_news": "",
+        "summary": "Steady.",
+    }
+
+
+def test_drop_invalid_key_observations_strips_missing_fields_keeps_rest():
+    """A MacroObservation missing the required `interpretation` field must be
+    dropped individually instead of failing the whole MacroAnalysis. Without
+    this, PM gets no regime / position_guidance / sector_guidance for the
+    entire morning session."""
+    parsed = _valid_macro_json()
+    parsed["key_observations"] = [
+        {"indicator": "VIX", "reading": "19.5", "interpretation": "compressing"},
+        {"indicator": "DGS10", "reading": "4.3"},  # missing interpretation
+        {"indicator": "DFF", "reading": "3.6", "interpretation": "flat"},
+    ]
+    out = MacroAnalystAgent._drop_invalid_key_observations(parsed)
+    indicators = [o["indicator"] for o in out["key_observations"]]
+    assert indicators == ["VIX", "DFF"], (
+        f"DGS10 (missing interpretation) must be dropped; got {indicators}"
+    )
+
+
+def test_macro_analysis_constructs_after_dropping_bad_observation():
+    """End-to-end: with the malformed observation stripped,
+    MacroAnalysis(**parsed) must succeed — preserving regime, equity_outlook,
+    position_guidance for the morning PM."""
+    from src.models import MacroAnalysis
+
+    parsed = _valid_macro_json()
+    parsed["key_observations"] = [
+        {"indicator": "VIX", "reading": "19.5", "interpretation": "compressing"},
+        {"indicator": "BAD", "reading": "x"},  # missing interpretation
+    ]
+    cleaned = MacroAnalystAgent._drop_invalid_key_observations(parsed)
+    analysis = MacroAnalysis(**cleaned)
+    assert analysis.regime == "risk-on"
+    assert len(analysis.key_observations) == 1
+    assert analysis.key_observations[0].indicator == "VIX"
+
+
+def test_drop_invalid_key_observations_handles_non_list_shape():
+    parsed = _valid_macro_json()
+    parsed["key_observations"] = "oops not a list"
+    out = MacroAnalystAgent._drop_invalid_key_observations(parsed)
+    assert out["key_observations"] == []
+
+
+def test_drop_invalid_key_observations_drops_non_dict_items():
+    parsed = _valid_macro_json()
+    parsed["key_observations"] = [
+        {"indicator": "VIX", "reading": "19.5", "interpretation": "ok"},
+        "stray string the LLM hallucinated",
+        None,
+        {"indicator": "DFF", "reading": "3.6", "interpretation": "flat"},
+    ]
+    out = MacroAnalystAgent._drop_invalid_key_observations(parsed)
+    indicators = [o["indicator"] for o in out["key_observations"]]
+    assert indicators == ["VIX", "DFF"]
+
+
+@patch("anthropic.Anthropic")
+def test_macro_analyze_survives_one_malformed_observation(mock_cls):
+    """End-to-end via analyze(): a bad observation in the LLM output no longer
+    fails the whole report. Regression-pin: before this fix, the entire
+    MacroAnalysis was lost when a single observation row was malformed."""
+    payload = _valid_macro_json()
+    payload["key_observations"] = [
+        {"indicator": "VIX", "reading": "19.5", "interpretation": "ok"},
+        {"indicator": "BAD"},  # missing reading + interpretation
+    ]
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.content = [MagicMock(text=json.dumps(payload))]
+    mock_resp.usage.input_tokens = 100
+    mock_resp.usage.output_tokens = 50
+    mock_client.messages.create.return_value = mock_resp
+    mock_cls.return_value = mock_client
+
+    agent = MacroAnalystAgent(api_key="test", model="claude-sonnet-4-6")
+    analysis, _ = agent.analyze(macro_summary=MACRO_SUMMARY)
+
+    assert analysis is not None, "report must survive one bad observation"
+    assert analysis.regime == "risk-on"
+    assert len(analysis.key_observations) == 1
+    assert analysis.key_observations[0].indicator == "VIX"

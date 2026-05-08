@@ -1,10 +1,12 @@
 import logging
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from src.agents.base import BaseAgent
 from src.models import (
-    NewsIntelligenceReport, PortfolioDecision, Position, RiskVerdict,
-    TechAnalysisResult,
+    NewsIntelligenceReport, PortfolioDecision, Position, RiskModification,
+    RiskVerdict, TechAnalysisResult,
 )
 from src.risk.rules import RiskViolation
 
@@ -183,8 +185,57 @@ Review these proposed trades and provide your verdict as JSON."""
         if parsed is None:
             logger.error("Risk manager returned non-JSON response")
             return None, result
+        # Per-entry isolation for modifications: a single malformed
+        # RiskModification (e.g. non-numeric original_value, wrong field
+        # name) must not drop the whole RiskVerdict. The verdict carries
+        # `approved`, `reasoning_chain`, `scale_all_buys`, `reason_category`,
+        # plus the OTHER modifications — losing all of that because one
+        # mod row is bad means execution stage has no RM guidance and
+        # PM's calibration history loses a row. Mirrors PR #74 pattern.
+        if isinstance(parsed, dict):
+            parsed = self._drop_invalid_modifications(parsed)
         try:
             return RiskVerdict(**parsed), result
         except Exception as e:
             logger.error("Failed to parse risk verdict: %s", e)
             return None, result
+
+    @staticmethod
+    def _drop_invalid_modifications(parsed: dict) -> dict:
+        """Pre-validate each RiskModification; drop malformed entries with a
+        warning naming the symbol (or list index when missing).
+
+        Mutates parsed in place for `modifications`. Non-list shapes
+        normalize to []. Mirrors EveningAnalyst._drop_invalid_missed_opportunities
+        (PR #73) and the news/position_reviewer/meta_reflector pattern (PR #74).
+        """
+        raw = parsed.get("modifications")
+        if raw is None:
+            return parsed
+        if not isinstance(raw, list):
+            logger.warning(
+                "Risk manager: modifications is %s, not list — replacing with []",
+                type(raw).__name__,
+            )
+            parsed["modifications"] = []
+            return parsed
+        valid: list[dict] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                logger.warning(
+                    "Risk manager: dropping non-dict modifications entry "
+                    "at index %d: %r", i, item,
+                )
+                continue
+            try:
+                RiskModification(**item)
+            except ValidationError as e:
+                sym = item.get("symbol") or f"<idx {i}>"
+                logger.warning(
+                    "Risk manager: dropping malformed modification for %s: %s",
+                    sym, e,
+                )
+                continue
+            valid.append(item)
+        parsed["modifications"] = valid
+        return parsed

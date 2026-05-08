@@ -5,7 +5,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from src.agents.base import BaseAgent, AgentResult
-from src.models import MacroAnalysis
+from src.models import MacroAnalysis, MacroObservation
 
 logger = logging.getLogger(__name__)
 
@@ -127,9 +127,60 @@ Walk through the 6-step reasoning chain, then emit the full JSON schema (includi
         if not isinstance(parsed, dict):
             logger.error("Macro analyst expected object, got %s", type(parsed).__name__)
             return None, result
+        # Per-entry isolation for key_observations: a single malformed
+        # MacroObservation (e.g. missing `interpretation` field) must not
+        # drop the whole MacroAnalysis. The core fields PM relies on
+        # (regime / position_guidance / sector_guidance / equity_outlook)
+        # are typically clean even when one observation row is mangled.
+        # Mirrors EveningAnalyst._drop_invalid_missed_opportunities (PR #73)
+        # and the news_analyst / position_reviewer / meta_reflector pattern
+        # (PR #74). sector_guidance is already protected by the existing
+        # _sanitize_sector_guidance @model_validator on MacroAnalysis.
+        parsed = self._drop_invalid_key_observations(parsed)
         try:
             analysis = MacroAnalysis(**parsed)
         except ValidationError as e:
             logger.error("Macro analysis failed validation: %s", e)
             return None, result
         return analysis, result
+
+    @staticmethod
+    def _drop_invalid_key_observations(parsed: dict) -> dict:
+        """Pre-validate each MacroObservation; drop malformed entries with a
+        warning naming the indicator (or list index when missing).
+
+        Mutates parsed in place for `key_observations`. Non-list shapes
+        normalize to []. The schema's required-field discipline stays —
+        we just stop letting one bad row weaponize that strictness against
+        the rest of the analysis.
+        """
+        raw = parsed.get("key_observations")
+        if raw is None:
+            return parsed
+        if not isinstance(raw, list):
+            logger.warning(
+                "Macro analyst: key_observations is %s, not list — replacing with []",
+                type(raw).__name__,
+            )
+            parsed["key_observations"] = []
+            return parsed
+        valid: list[dict] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                logger.warning(
+                    "Macro analyst: dropping non-dict key_observations entry "
+                    "at index %d: %r", i, item,
+                )
+                continue
+            try:
+                MacroObservation(**item)
+            except ValidationError as e:
+                indicator = item.get("indicator") or f"<idx {i}>"
+                logger.warning(
+                    "Macro analyst: dropping malformed key_observation %r: %s",
+                    indicator, e,
+                )
+                continue
+            valid.append(item)
+        parsed["key_observations"] = valid
+        return parsed
