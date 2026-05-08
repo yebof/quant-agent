@@ -68,6 +68,7 @@ trading:
     - SMH    # Semiconductor (VanEck)
     - SOXX   # Semiconductor (iShares — different weightings than SMH)
     - DRAM   # Memory/Storage Semiconductor (Roundhill)
+    - CHPX   # Sector ETF
     # Inverse / Short ETF
     - SH     # Short S&P 500
     - SDS    # 2x Short S&P 500
