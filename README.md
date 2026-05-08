@@ -1,5 +1,9 @@
 # quant-agent
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![CI](https://github.com/yebof/quant-agent/actions/workflows/test.yml/badge.svg)](https://github.com/yebof/quant-agent/actions/workflows/test.yml)
+
 LLM multi-agent quantitative trading system for US equities. 8 specialized AI agents analyze markets from different angles (technical, macro, news intelligence, SEC earnings), synthesize into trading decisions with explicit chain-of-thought reasoning, and execute via Alpaca with multi-layer risk controls.
 
 > ⚠️ **Disclaimer**: This software is provided **for educational and research purposes only**. It is NOT investment advice. Trading securities involves substantial risk of loss; you can lose more than your initial deposit. Past performance — including any backtest, simulation, paper-trading result, or live result observed in this repository — does not guarantee future performance. The authors and contributors make no representation that any strategy, signal, or system implemented here will achieve any particular result, and no representation that any code path is correct, fit for purpose, or free from defects.
