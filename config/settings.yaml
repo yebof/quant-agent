@@ -101,11 +101,18 @@ trading:
     - LLY
     - PFE
     - ABT
-    # Energy
+    # Energy — Integrated majors
     - XOM
     - CVX
     - COP
     - EQNR   # Equinor (Norwegian energy)
+    # Energy — E&P + Services
+    - OXY    # Occidental Petroleum (Permian leader, Buffett conviction holding)
+    - EOG    # EOG Resources (best-in-class US E&P capital discipline)
+    - SLB    # Schlumberger (global oilfield services leader)
+    # Energy — Refining & Midstream
+    - VLO    # Valero (top US refiner, complexity advantage)
+    - EPD    # Enterprise Products Partners (premier midstream MLP, 25y dividend growth — note: K-1 tax)
     # Consumer
     - COST
     - WMT
@@ -126,6 +133,10 @@ trading:
     - AGX
     - DXPE
     - RKLB   # Rocket Lab
+    # Industrial — Power & Grid Infrastructure (AI capex direct beneficiaries)
+    - ETN    # Eaton (data-center power management — pure AI-infra play)
+    - PWR    # Quanta Services (transmission / grid build-out leader)
+    - MTZ    # MasTec (power transmission + communications infra)
     # Cybersecurity
     - ZS     # Zscaler
     # Wireless / IoT
@@ -144,11 +155,16 @@ trading:
     - GEV    # GE Vernova (GE power-transition spinoff, Apr 2024)
     - ENPH   # Enphase Energy (solar inverters)
     - FLNC   # Fluence Energy (utility-scale battery storage)
+    - CCJ    # Cameco (global #1 uranium miner — completes nuclear-fuel chain w/ OKLO+CEG+VST)
+    - NUE    # Nucor (US steel leader, electric-arc-furnace ESG advantage)
     # Real Estate
     - WDC
     - SNDK
     - AMT
     - PLD
+    # Data Center REITs (AI infra exposure — interconnect + hyperscale)
+    - EQIX   # Equinix (global #1 interconnection / colocation)
+    - DLR    # Digital Realty (hyperscale data-center REIT)
   lookback_days: 120
   # NOTE: these times are only consumed by `main.py --mode live` (APScheduler).
   # Production runs via launchd — see `src/trading_calendar.py SESSION_WINDOWS`
