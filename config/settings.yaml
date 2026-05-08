@@ -66,6 +66,7 @@ trading:
     - XLRE   # Real Estate
     - XLB    # Materials
     - SMH    # Semiconductor (VanEck)
+    - SOXX   # Semiconductor (iShares — different weightings than SMH)
     - DRAM   # Memory/Storage Semiconductor (Roundhill)
     # Inverse / Short ETF
     - SH     # Short S&P 500
@@ -85,6 +86,7 @@ trading:
     - ORCL
     - MU
     - NET
+    - PATH   # UiPath (RPA / AI automation)
     # Finance
     - JPM
     - GS
@@ -112,6 +114,7 @@ trading:
     - SBUX
     - NKE
     - HD
+    - GME    # GameStop (speculative / meme profile — RM tends to size small)
     # Industrial
     - CAT
     - GE
@@ -130,12 +133,16 @@ trading:
     - NFLX
     - DIS
     - CMCSA
-    # Materials & Utilities & Nuclear
+    # Materials & Utilities & Nuclear & Power Transition
     - LIN
     - MP     # MP Materials (rare earth)
     - NEE
     - VST    # Vistra (power/nuclear)
     - OKLO   # Oklo (nuclear)
+    - CEG    # Constellation Energy (nuclear utility)
+    - GEV    # GE Vernova (GE power-transition spinoff, Apr 2024)
+    - ENPH   # Enphase Energy (solar inverters)
+    - FLNC   # Fluence Energy (utility-scale battery storage)
     # Real Estate
     - WDC
     - SNDK
