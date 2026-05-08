@@ -1,9 +1,10 @@
 import logging
 import socket
-from datetime import date
 
 import pandas as pd
 from fredapi import Fred
+
+from src.trading_calendar import et_today
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +33,18 @@ class MacroDataProvider:
 
     @staticmethod
     def _staleness_days(series: pd.Series) -> int | None:
-        """Business days between the latest observation and today. None if series empty."""
+        """Business days between the latest observation and today. None if series empty.
+
+        "Today" is the ET trading-day date — not the host-local date. CLAUDE.md
+        invariant: any host TZ must produce the same data. Using `date.today()`
+        here previously caused SGT-resident operators running before ET cutoff
+        to see staleness ±1 day off vs the same data viewed from ET.
+        """
         if series.empty:
             return None
         try:
             latest = pd.Timestamp(series.index[-1]).normalize()
-            today = pd.Timestamp(date.today())
+            today = pd.Timestamp(et_today())
             delta = today - latest
             return max(0, int(delta.days))
         except Exception:

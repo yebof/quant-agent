@@ -2,8 +2,13 @@ import json
 import logging
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from src.agents.base import BaseAgent
-from src.models import TechAnalysisResult, Position, PortfolioDecision, NewsIntelligenceReport
+from src.models import (
+    NewsIntelligenceReport, PortfolioDecision, Position, TargetPosition,
+    TechAnalysisResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -544,8 +549,61 @@ Based on all the above (memory of past decisions + environment trajectory + toda
         if parsed is None:
             logger.error("Portfolio manager returned non-JSON response")
             return None, result
+        # Per-entry isolation for targets: a single malformed TargetPosition
+        # (e.g. target_weight_pct=30 violating the 0-25 range, or empty
+        # thesis on a Field with no min_length but PortfolioConstructor's
+        # contract assumes non-empty) must not drop the WHOLE PortfolioDecision.
+        # Highest blast radius of any per-entry isolation gap: losing the
+        # decision means losing reasoning_chain + portfolio_view + every
+        # OTHER target → entire morning session is silenced. The
+        # PortfolioConstructor downstream still has remaining valid targets
+        # to translate into orders; better to fire 4 of 5 trades than 0 of 5.
+        # Mirrors PR #73/#74 pattern.
+        if isinstance(parsed, dict):
+            parsed = self._drop_invalid_targets(parsed)
         try:
             return PortfolioDecision(**parsed), result
         except Exception as e:
             logger.error("Failed to parse portfolio decision: %s", e)
             return None, result
+
+    @staticmethod
+    def _drop_invalid_targets(parsed: dict) -> dict:
+        """Pre-validate each TargetPosition; drop malformed entries with a
+        warning naming the symbol (or list index when missing).
+
+        Mutates parsed in place for `targets`. Non-list shapes normalize to
+        []. The TargetPosition validators stay strict (target_weight_pct
+        must be in [0, 25], symbol normalised) — we just stop letting one
+        bad row weaponize that strictness against the rest of the book.
+        """
+        raw = parsed.get("targets")
+        if raw is None:
+            return parsed
+        if not isinstance(raw, list):
+            logger.warning(
+                "Portfolio manager: targets is %s, not list — replacing with []",
+                type(raw).__name__,
+            )
+            parsed["targets"] = []
+            return parsed
+        valid: list[dict] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                logger.warning(
+                    "Portfolio manager: dropping non-dict targets entry "
+                    "at index %d: %r", i, item,
+                )
+                continue
+            try:
+                TargetPosition(**item)
+            except ValidationError as e:
+                sym = item.get("symbol") or f"<idx {i}>"
+                logger.warning(
+                    "Portfolio manager: dropping malformed target for %s: %s",
+                    sym, e,
+                )
+                continue
+            valid.append(item)
+        parsed["targets"] = valid
+        return parsed

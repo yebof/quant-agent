@@ -156,3 +156,45 @@ def test_empty_series_returns_safe_nulls(mock_fred_cls):
     assert provider.get_inflation()["core_cpi_yoy"] is None
     assert provider.get_unemployment()["current"] is None
     assert provider.get_credit_spread()["current_bps"] is None
+
+
+def test_staleness_uses_et_date_not_host_local():
+    """CLAUDE.md invariant: any host TZ must produce the same data. Pre-fix
+    used `date.today()` (host-local), so an SGT operator running before
+    ET cutoff saw staleness ±1 day off vs the same data viewed from ET.
+
+    Pin: with `et_today()` patched to a known ET date, staleness is computed
+    relative to that, regardless of whatever the host calendar shows.
+    """
+    from datetime import date as _date
+
+    series = pd.Series(
+        [4.3, 4.4, 4.5],
+        index=pd.date_range("2026-05-01", periods=3, freq="B"),
+    )
+    # series's latest observation = 2026-05-05 (the third business day from
+    # 2026-05-01). With et_today=2026-05-08, staleness should be 3 calendar
+    # days regardless of host TZ.
+    with patch("src.data.macro.et_today", return_value=_date(2026, 5, 8)):
+        days = MacroDataProvider._staleness_days(series)
+    assert days == 3, f"expected 3 days, got {days}"
+
+
+def test_staleness_returns_zero_when_observation_is_today_in_et():
+    """Same observation date as et_today → zero staleness, even if the host
+    calendar would say it's tomorrow (e.g., SGT after midnight)."""
+    from datetime import date as _date
+
+    series = pd.Series(
+        [4.5],
+        index=pd.date_range("2026-05-08", periods=1),
+    )
+    with patch("src.data.macro.et_today", return_value=_date(2026, 5, 8)):
+        days = MacroDataProvider._staleness_days(series)
+    assert days == 0
+
+
+def test_staleness_returns_none_for_empty_series():
+    """No observations → can't compute staleness. Caller treats this as 'data unavailable'."""
+    series = pd.Series(dtype=float)
+    assert MacroDataProvider._staleness_days(series) is None
