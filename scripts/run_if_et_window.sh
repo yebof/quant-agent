@@ -17,7 +17,25 @@ if [[ -z "$MODE" ]]; then
     exit 2
 fi
 
-PROJECT_ROOT="${PROJECT_ROOT_OVERRIDE:-/Users/yebof/Documents/Claude-workspace/quant-agent}"
+# PROJECT_ROOT resolution, in order of preference:
+#   1. PROJECT_ROOT_OVERRIDE env var (set by the plist when launchd invokes us)
+#   2. Derive from this script's location, IF the script lives in `<repo>/scripts/`
+#      and `<repo>/src/` exists (manual invocation from a freshly-cloned repo)
+#   3. Fail loudly — anywhere else (e.g. the installed copy under
+#      ~/Library/Application Support/quant-agent/) the plist MUST inject
+#      PROJECT_ROOT_OVERRIDE; running without it is a misconfiguration.
+if [[ -n "${PROJECT_ROOT_OVERRIDE:-}" ]]; then
+    PROJECT_ROOT="${PROJECT_ROOT_OVERRIDE}"
+else
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -d "${_SCRIPT_DIR}/../src" && -f "${_SCRIPT_DIR}/../main.py" ]]; then
+        PROJECT_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
+    else
+        echo "PROJECT_ROOT_OVERRIDE not set and cannot derive from script location." >&2
+        echo "Re-run scripts/install_plists.sh to inject PROJECT_ROOT_OVERRIDE into the plist." >&2
+        exit 2
+    fi
+fi
 PYTHON="${PYTHON_OVERRIDE:-${PROJECT_ROOT}/.venv/bin/python}"
 TIMEOUT="${TIMEOUT_OVERRIDE:-/opt/homebrew/bin/timeout}"
 LAST_RUN_DIR="${LAST_RUN_DIR_OVERRIDE:-${HOME}/.cache/quant-agent}"
