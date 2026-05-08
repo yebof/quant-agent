@@ -25,7 +25,11 @@
 
 set -eu
 
-PROJECT_ROOT="${PROJECT_ROOT:-/Users/yebof/Documents/Claude-workspace/quant-agent}"
+# Derive PROJECT_ROOT from this script's location (it lives at
+# `<repo>/scripts/install_plists.sh`). Override via env if invoking from a
+# different layout.
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${_SCRIPT_DIR}/.." && pwd)}"
 SOURCE_SCRIPT="${PROJECT_ROOT}/scripts/run_if_et_window.sh"
 
 # Installed wrapper location — lives OUTSIDE ~/Documents so macOS TCC
@@ -52,6 +56,12 @@ write_plist() {
     local suffix="$2"   # filename suffix: morning / midday / evening / intra / earnings
     local log="$3"      # log filename
 
+    # EnvironmentVariables.PROJECT_ROOT_OVERRIDE injects the absolute repo
+    # path into the wrapper's runtime environment. The installed wrapper lives
+    # under ~/Library/Application Support/ and cannot derive its repo path
+    # from $0 (it's no longer in scripts/), so the plist authoritatively
+    # supplies it. Replaces a previously-hardcoded user-specific default
+    # in the wrapper (open-source prep).
     cat > "${AGENTS}/com.quant-agent.${suffix}.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -65,6 +75,11 @@ write_plist() {
         <string>${SCRIPT}</string>
         <string>${mode}</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PROJECT_ROOT_OVERRIDE</key>
+        <string>${PROJECT_ROOT}</string>
+    </dict>
     <key>StartInterval</key>
     <integer>1800</integer>
     <key>StandardOutPath</key>
