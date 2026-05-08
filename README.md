@@ -343,7 +343,7 @@ Morning/midday PM sees a one-line earnings sentiment snippet (~140 chars — `"b
 
 **Yebo Feng** — [@yebof](https://github.com/yebof) · `fengyebo@gmail.com`
 
-Designed and built end-to-end as a personal research project on multi-agent LLM coordination for swing/position trading. The architecture, prompt engineering across all 9 agents, schema-enforced reasoning chains, broker order-lifecycle state machine, and quarterly self-evolution loop are all original work. Issues and PRs welcome.
+Designed and built end-to-end as a personal research project on multi-agent LLM coordination for swing/position trading. The architecture, prompt engineering across all 9 agents, schema-enforced reasoning chains, broker order-lifecycle state machine, and quarterly self-evolution loop are all original work. Implementation was vibe-coded throughout with Claude Code (Anthropic) and Codex (OpenAI) as pair-programmer agents — the system that runs the agents was itself built by agents. Issues and PRs welcome.
 
 If this repository was useful for your own work — academic, professional, or personal — a star is appreciated and a citation/mention is even better.
 
