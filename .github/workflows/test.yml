@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual re-runs from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest
+        # Inject dummy values for required env vars so any import-time
+        # reads in main.py / config loaders don't fail in CI. The test
+        # suite itself mocks every external client (Anthropic, OpenAI,
+        # Alpaca, FRED) — no real network calls happen.
+        env:
+          ANTHROPIC_API_KEY: dummy-anthropic-key-for-ci
+          OPENAI_API_KEY: dummy-openai-key-for-ci
+          ALPACA_API_KEY: dummy-alpaca-key-for-ci
+          ALPACA_SECRET_KEY: dummy-alpaca-secret-for-ci
+          FRED_API_KEY: dummy-fred-key-for-ci
+        run: pytest tests/ -q
