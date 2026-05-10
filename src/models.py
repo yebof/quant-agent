@@ -42,12 +42,18 @@ class TechnicalIndicators(BaseModel):
 
 
 class TechReasoningChain(BaseModel):
-    """5-step CoT for a single symbol — forces the LLM to show its work per framework step."""
-    trend: str                 # MA alignment, price vs MA20/50/200
-    momentum: str              # RSI level, MACD cross direction
-    volatility: str            # BB position, ATR expansion/contraction
-    volume: str                # volume confirming or diverging vs trend
-    support_resistance: str    # key levels from indicators + recent pivots
+    """5-step CoT for a single symbol — forces the LLM to show its work per
+    framework step. Every field has `min_length=1` so the LLM cannot skip a
+    step by sending an empty string. This matches the discipline already in
+    place on the other CoT chains (Evening / Position / Meta) and closes
+    the audit gap that contradicted the README's 'schema-enforced CoT,
+    LLM cannot skip steps' claim.
+    """
+    trend: str = Field(min_length=1)                 # MA alignment, price vs MA20/50/200
+    momentum: str = Field(min_length=1)              # RSI level, MACD cross direction
+    volatility: str = Field(min_length=1)            # BB position, ATR expansion/contraction
+    volume: str = Field(min_length=1)                # volume confirming or diverging vs trend
+    support_resistance: str = Field(min_length=1)    # key levels from indicators + recent pivots
 
 
 class TechAnalysisResult(BaseModel):
@@ -57,7 +63,7 @@ class TechAnalysisResult(BaseModel):
     entry_price: float | None = None
     reference_target: float | None = None  # renamed from exit_price — it's a soft reference, not a hard TP
     stop_loss: float | None = None
-    reasoning_chain: TechReasoningChain | None = None
+    reasoning_chain: TechReasoningChain
     reasoning: str  # 1-sentence summary; reasoning_chain carries the full analysis
     # Soft exit signal separate from the hard stop_loss. Example:
     # "MACD histogram turns negative for 2 consecutive closes" — lets PM / midday
@@ -68,6 +74,14 @@ class TechAnalysisResult(BaseModel):
     # TechStore after TechAnalystAgent returns; None on first run or when the
     # symbol wasn't in yesterday's cache. Fresh=1 means "new today", 7+=stale.
     signal_age_days: int | None = None
+    # ATR(14) carried through from the input indicators (Python-set after
+    # TechAnalystAgent returns — the LLM doesn't emit this; it's read from
+    # the indicators object the prompt was built from). Used downstream by
+    # `PortfolioConstructor._resolve_stop` as a volatility-aware fallback
+    # when neither the target's `suggested_stop_price` nor the LLM's
+    # `stop_loss` is available — `entry - 2*ATR` thrashes less on
+    # high-volatility names than a hardcoded 5% stop.
+    atr_14: float | None = None
 
     @computed_field
     @property
@@ -170,13 +184,19 @@ class TradeDecision(BaseModel):
 
 
 class ReasoningChain(BaseModel):
-    macro_filter: str
-    news_check: str
-    earnings_check: str
-    signal_conflicts: str
-    sizing_logic: str
-    portfolio_balance: str
-    cash_target: str
+    """7-step CoT for the portfolio manager — forces the audit trail on the
+    central decision. Every required field has `min_length=1` so the LLM
+    can't dodge a step with `""`. continuity_check is intentionally
+    optional (defaults to `""`) for backward-compat with pre-memory-layer
+    logs; everything else is mandatory.
+    """
+    macro_filter: str = Field(min_length=1)
+    news_check: str = Field(min_length=1)
+    earnings_check: str = Field(min_length=1)
+    signal_conflicts: str = Field(min_length=1)
+    sizing_logic: str = Field(min_length=1)
+    portfolio_balance: str = Field(min_length=1)
+    cash_target: str = Field(min_length=1)
     # Continuity check — narrates how today's decisions fit the 7-day arc.
     # Optional (old logs don't carry it) but required when memory layers are provided.
     continuity_check: str = ""
@@ -220,7 +240,7 @@ class TargetPosition(BaseModel):
 
 
 class PortfolioDecision(BaseModel):
-    reasoning_chain: ReasoningChain | None = None
+    reasoning_chain: ReasoningChain
     # Phase 2 output: PM emits intent (target weights), not orders.
     targets: list[TargetPosition] = Field(default_factory=list)
     # Phase 2 derived: populated by PortfolioConstructor AFTER the LLM returns.
@@ -241,18 +261,21 @@ class RiskModification(BaseModel):
 
 
 class RiskReasoningChain(BaseModel):
-    """6-step CoT for the risk manager — forces audit trail on the last gate."""
-    rr_audit: str             # did every BUY respect R/R >= 1.5 without catalyst override?
-    signal_fidelity: str      # does PM's action align with Tech/Macro/News? silent contradictions?
-    correlation_check: str    # any hidden cluster / factor concentration across decisions?
-    event_risk: str           # earnings / FOMC / macro events in the coming 3 days affecting these names?
-    sizing_sanity: str        # is size proportional to conviction and R/R? any outsized bet?
-    overall: str              # final synthesis and why approved/rejected/modified
+    """6-step CoT for the risk manager — forces audit trail on the last gate.
+    Every field has `min_length=1` so the LLM can't skip a step by sending
+    `""`. Matches the discipline on the other CoT chains.
+    """
+    rr_audit: str = Field(min_length=1)             # did every BUY respect R/R >= 1.5 without catalyst override?
+    signal_fidelity: str = Field(min_length=1)      # does PM's action align with Tech/Macro/News? silent contradictions?
+    correlation_check: str = Field(min_length=1)    # any hidden cluster / factor concentration across decisions?
+    event_risk: str = Field(min_length=1)           # earnings / FOMC / macro events in the coming 3 days affecting these names?
+    sizing_sanity: str = Field(min_length=1)        # is size proportional to conviction and R/R? any outsized bet?
+    overall: str = Field(min_length=1)              # final synthesis and why approved/rejected/modified
 
 
 class RiskVerdict(BaseModel):
     approved: bool
-    reasoning_chain: RiskReasoningChain | None = None
+    reasoning_chain: RiskReasoningChain
     modifications: list[RiskModification] = []
     # Portfolio-level size control. Multiplies every BUY decision's allocation_pct after
     # per-symbol modifications are applied. 1.0 = no change; 0.5 = half all buys; 0.0
@@ -330,13 +353,16 @@ class MacroPositionGuidance(BaseModel):
 
 
 class MacroReasoningChain(BaseModel):
-    """Six-step CoT, one field per step — forces the LLM to walk each stage."""
-    volatility_analysis: str        # VIX regime, trend, term structure if inferable
-    yield_curve_analysis: str       # 2Y/10Y level, spread, inversion trajectory
-    monetary_policy_analysis: str   # Fed funds (DFF) level + direction
-    inflation_labor_credit: str     # CPI + UNRATE + HY OAS combined read
-    cross_signal_synthesis: str     # How the above reinforce or contradict each other
-    sector_implications: str        # What this means for sector tilts
+    """Six-step CoT, one field per step — forces the LLM to walk each stage.
+    Every field has `min_length=1` so the LLM can't skip a step by sending
+    `""`. Matches the discipline on the other CoT chains.
+    """
+    volatility_analysis: str = Field(min_length=1)        # VIX regime, trend, term structure if inferable
+    yield_curve_analysis: str = Field(min_length=1)       # 2Y/10Y level, spread, inversion trajectory
+    monetary_policy_analysis: str = Field(min_length=1)   # Fed funds (DFF) level + direction
+    inflation_labor_credit: str = Field(min_length=1)     # CPI + UNRATE + HY OAS combined read
+    cross_signal_synthesis: str = Field(min_length=1)     # How the above reinforce or contradict each other
+    sector_implications: str = Field(min_length=1)        # What this means for sector tilts
 
 
 class MacroAnalysis(BaseModel):
@@ -524,18 +550,21 @@ class EarningsRiskFlags(BaseModel):
 
 
 class EarningsReasoningChain(BaseModel):
-    """5-step CoT for fundamental analysis — why sentiment is what it is."""
-    fundamental_quality: str       # revenue, margin, cash flow trajectory
-    growth_trajectory: str         # YoY / QoQ direction, momentum, inflection
-    strategic_risks: str           # biggest strategic bets and their execution risk
-    management_execution: str      # is management doing what they said? any pivots?
-    valuation_context: str         # is the market pricing this fairly given the above?
+    """5-step CoT for fundamental analysis — why sentiment is what it is.
+    Every field has `min_length=1` so the LLM can't skip a step by sending
+    `""`. Matches the discipline on the other CoT chains.
+    """
+    fundamental_quality: str = Field(min_length=1)       # revenue, margin, cash flow trajectory
+    growth_trajectory: str = Field(min_length=1)         # YoY / QoQ direction, momentum, inflection
+    strategic_risks: str = Field(min_length=1)           # biggest strategic bets and their execution risk
+    management_execution: str = Field(min_length=1)      # is management doing what they said? any pivots?
+    valuation_context: str = Field(min_length=1)         # is the market pricing this fairly given the above?
 
 
 class EarningsInvestmentImplications(BaseModel):
     sentiment: Literal["bullish", "bearish", "neutral"]
     conviction: Literal["high", "medium", "low"]
-    reasoning_chain: EarningsReasoningChain | None = None
+    reasoning_chain: EarningsReasoningChain
     key_thesis: str
     bull_case: str = "not disclosed"
     bear_case: str = "not disclosed"

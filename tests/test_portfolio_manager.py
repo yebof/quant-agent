@@ -2,7 +2,14 @@ import pytest
 import json
 from unittest.mock import patch, MagicMock
 from src.agents.portfolio_manager import PortfolioManagerAgent
-from src.models import TechAnalysisResult, Position
+from src.models import TechAnalysisResult, TechReasoningChain, Position
+
+
+def _tech_rc() -> TechReasoningChain:
+    return TechReasoningChain(
+        trend="x", momentum="x", volatility="x", volume="x",
+        support_resistance="x",
+    )
 
 
 @pytest.fixture
@@ -11,12 +18,12 @@ def sample_analyses():
         TechAnalysisResult(
             symbol="SPY", rating="buy", entry_price=507.0,
             reference_target=530.0, stop_loss=490.0,
-            reasoning="Strong uptrend",
+            reasoning="Strong uptrend", reasoning_chain=_tech_rc(),
         ),
         TechAnalysisResult(
             symbol="QQQ", rating="neutral", entry_price=None,
             reference_target=None, stop_loss=None,
-            reasoning="Mixed signals",
+            reasoning="Mixed signals", reasoning_chain=_tech_rc(),
         ),
     ]
 
@@ -43,6 +50,15 @@ def sample_macro():
 @pytest.fixture
 def mock_pm_response():
     return json.dumps({
+        "reasoning_chain": {
+            "macro_filter": "risk-on regime, tech overweight",
+            "news_check": "no fresh HIGH bearish state changes",
+            "earnings_check": "SPY n/a, AAPL filing intact",
+            "signal_conflicts": "SPY: 4/4 aligned",
+            "sizing_logic": "high conviction → 10%",
+            "portfolio_balance": "Tech 60% well under 40% cap",
+            "cash_target": "current 50% → after ~40%, fine for risk-on",
+        },
         "decisions": [
             {
                 "action": "BUY",

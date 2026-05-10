@@ -497,6 +497,80 @@ def test_reason_cites_hard_trigger_rejects_soft_signals():
     )
 
 
+def test_hard_trigger_keyword_list_covers_every_prompt_category():
+    """The prompt at config/prompts/position_reviewer.md instructs the LLM
+    that ONLY a fixed set of hard triggers authorises a same-day re-trim.
+    The Python executor enforces the same rule independently via
+    `_HARD_TRIGGER_KEYWORDS`. If a future PR adds a new category to the
+    prompt but forgets the keyword list (or vice versa), the two layers
+    drift and the executor either blocks a legitimate override or lets a
+    soft-signal trim through.
+
+    This test pins the alignment: for every canonical category the prompt
+    enumerates, at least one representative LLM-style reason matching that
+    category must be recognised by `_reason_cites_hard_trigger`. If you
+    add a new category to either side, also add a probe here.
+    """
+    from pathlib import Path
+    from src.pipeline import _reason_cites_hard_trigger
+
+    prompt_path = (
+        Path(__file__).resolve().parent.parent
+        / "config" / "prompts" / "position_reviewer.md"
+    )
+    prompt_text = prompt_path.read_text()
+
+    # Each tuple: (category description, prompt-side anchor, sample LLM reason).
+    # The anchor MUST appear in the prompt — proves the prompt still teaches
+    # the category. The sample reason MUST match the keyword list — proves
+    # the executor still recognises it.
+    categories = [
+        (
+            "thesis_invalid_if condition",
+            "thesis_invalid_if",
+            "Named thesis_invalid_if condition X satisfied: MA50 closed below.",
+        ),
+        (
+            "HIGH-conviction bearish state change",
+            "HIGH-conviction bearish",
+            "HIGH bearish state-change reversal on EU regulatory ruling.",
+        ),
+        (
+            "Bearish earnings filing",
+            "Bearish earnings",
+            "Bearish earnings filing analysis posted today.",
+        ),
+        (
+            "Daily-loss circuit breaker",
+            "circuit breaker",
+            "Daily-loss circuit breaker engaged at -3.2%.",
+        ),
+        (
+            "Correlation cluster breach",
+            "correlation cluster breach",
+            "Correlation cluster breach: AI book over 55% with this name.",
+        ),
+        (
+            "Stop level hit",
+            "Stop level hit",
+            "Stop hit at $148.50 with confirming volume.",
+        ),
+    ]
+
+    for label, prompt_anchor, llm_reason in categories:
+        assert prompt_anchor.lower() in prompt_text.lower(), (
+            f"prompt no longer teaches the '{label}' category "
+            f"(missing anchor: {prompt_anchor!r}). If you removed it, "
+            f"also remove the matching keyword(s) from _HARD_TRIGGER_KEYWORDS "
+            f"so the executor doesn't keep accepting it silently."
+        )
+        assert _reason_cites_hard_trigger(llm_reason), (
+            f"the executor's keyword list no longer recognises the "
+            f"'{label}' category — a legitimate override would be blocked. "
+            f"Sample reason that should have matched: {llm_reason!r}"
+        )
+
+
 def test_symbols_already_trimmed_today_pulls_sell_actions(tmp_path):
     """Helper aggregates today's sell-side actions into a set of symbols."""
     from src.storage.db import Database

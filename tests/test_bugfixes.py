@@ -34,6 +34,22 @@ def _valid_evening_rc() -> EveningReasoningChain:
     )
 
 
+def _trc() -> TechReasoningChain:
+    """Minimal valid 5-step TA CoT — every field non-empty."""
+    return TechReasoningChain(
+        trend="x", momentum="x", volatility="x", volume="x",
+        support_resistance="x",
+    )
+
+
+def _risk_rc() -> RiskReasoningChain:
+    """Minimal valid 6-step RM CoT — every field non-empty."""
+    return RiskReasoningChain(
+        rr_audit="x", signal_fidelity="x", correlation_check="x",
+        event_risk="x", sizing_sanity="x", overall="x",
+    )
+
+
 # === Fix 1: Hard risk rules actually block trades ===
 
 @pytest.fixture
@@ -391,6 +407,7 @@ def test_pipeline_symbol_guard_blocks_off_universe_and_unanalyzed_buys():
             reference_target=530,
             stop_loss=480,
             reasoning="supported",
+            reasoning_chain=_trc(),
         )
     ]
 
@@ -830,6 +847,7 @@ def test_tech_analysis_neutral_clears_price_fields():
         rating="neutral",
         entry_price=500, reference_target=530, stop_loss=480,
         reasoning="Mixed signals",
+        reasoning_chain=_trc(),
     )
     assert r.entry_price is None
     assert r.reference_target is None
@@ -856,7 +874,7 @@ def test_tech_analysis_buy_stop_must_be_below_entry():
     ok = TechAnalysisResult(
         symbol="SPY", rating="sell",
         entry_price=500, stop_loss=520,  # stop ABOVE entry — correct for SELL
-        reasoning="x",
+        reasoning="x", reasoning_chain=_trc(),
     )
     assert ok.stop_loss == 520
 
@@ -865,7 +883,7 @@ def test_tech_analysis_conviction_defaults_to_medium():
     r = TechAnalysisResult(
         symbol="SPY", rating="buy",
         entry_price=500, stop_loss=490,
-        reasoning="x",
+        reasoning="x", reasoning_chain=_trc(),
     )
     assert r.conviction == "medium"
 
@@ -875,7 +893,7 @@ def test_tech_analysis_rr_computed_for_buy():
     r = TechAnalysisResult(
         symbol="SPY", rating="buy",
         entry_price=500, stop_loss=490, reference_target=525,
-        reasoning="x",
+        reasoning="x", reasoning_chain=_trc(),
     )
     # risk = 10, reward = 25 → 2.5
     assert r.risk_reward == 2.5
@@ -886,7 +904,7 @@ def test_tech_analysis_rr_computed_for_sell():
     r = TechAnalysisResult(
         symbol="SPY", rating="sell",
         entry_price=500, stop_loss=510, reference_target=475,
-        reasoning="x",
+        reasoning="x", reasoning_chain=_trc(),
     )
     # risk = 10, reward = 25 → 2.5
     assert r.risk_reward == 2.5
@@ -897,13 +915,13 @@ def test_tech_analysis_rr_none_for_neutral_or_missing_target():
     neutral = TechAnalysisResult(
         symbol="SPY", rating="neutral",
         entry_price=500, stop_loss=490, reference_target=525,
-        reasoning="x",
+        reasoning="x", reasoning_chain=_trc(),
     )
     assert neutral.risk_reward is None
     no_target = TechAnalysisResult(
         symbol="SPY", rating="buy",
         entry_price=500, stop_loss=490, reference_target=None,
-        reasoning="x",
+        reasoning="x", reasoning_chain=_trc(),
     )
     assert no_target.risk_reward is None
 
@@ -913,7 +931,7 @@ def test_tech_analysis_rr_handles_malformed_geometry():
     r = TechAnalysisResult(
         symbol="SPY", rating="buy",
         entry_price=500, stop_loss=490, reference_target=495,  # target below entry
-        reasoning="x",
+        reasoning="x", reasoning_chain=_trc(),
     )
     assert r.risk_reward is None
 
@@ -922,7 +940,7 @@ def test_tech_analysis_thesis_invalid_if_defaults_empty():
     r = TechAnalysisResult(
         symbol="SPY", rating="buy",
         entry_price=500, stop_loss=490, reference_target=525,
-        reasoning="x",
+        reasoning="x", reasoning_chain=_trc(),
     )
     assert r.thesis_invalid_if == ""
 
@@ -932,7 +950,7 @@ def test_tech_analysis_rr_exposed_via_model_dump():
     r = TechAnalysisResult(
         symbol="SPY", rating="buy",
         entry_price=500, stop_loss=490, reference_target=525,
-        reasoning="x",
+        reasoning="x", reasoning_chain=_trc(),
     )
     dumped = r.model_dump()
     assert dumped.get("risk_reward") == 2.5
@@ -1059,13 +1077,16 @@ def test_data_degraded_violation_fires_at_two_failures():
 
 def test_risk_verdict_accepts_scale_all_buys():
     from src.models import RiskVerdict
-    v = RiskVerdict(approved=True, scale_all_buys=0.5, reasoning="Cut exposure")
+    v = RiskVerdict(approved=True, scale_all_buys=0.5, reasoning="Cut exposure",
+                    reasoning_chain=_risk_rc())
     assert v.scale_all_buys == 0.5
     # bounds
     with pytest.raises(ValidationError):
-        RiskVerdict(approved=True, scale_all_buys=1.5, reasoning="x")
+        RiskVerdict(approved=True, scale_all_buys=1.5, reasoning="x",
+                    reasoning_chain=_risk_rc())
     with pytest.raises(ValidationError):
-        RiskVerdict(approved=True, scale_all_buys=-0.1, reasoning="x")
+        RiskVerdict(approved=True, scale_all_buys=-0.1, reasoning="x",
+                    reasoning_chain=_risk_rc())
 
 
 def test_macro_analysis_allows_all_yfinance_sectors():

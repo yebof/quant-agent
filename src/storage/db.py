@@ -523,30 +523,41 @@ class Database:
 
         Upserts rows for currently-held symbols and deletes rows for any symbol
         no longer present. Prevents stale closed positions from lingering in the DB.
+
+        Wraps DELETE + INSERT loop in an explicit BEGIN/COMMIT transaction so
+        a crash between the DELETE and the first INSERT cannot leave the table
+        in a half-state (would otherwise leave the next session's reviewer
+        reading an empty positions snapshot while the broker still holds them).
+        Mirrors the atomic-write discipline used in `save_evening_snapshot`.
         """
         current_symbols = {p.symbol for p in positions}
         with self._lock:
-            if current_symbols:
-                placeholders = ",".join("?" for _ in current_symbols)
-                self.conn.execute(
-                    f"DELETE FROM positions WHERE symbol NOT IN ({placeholders})",
-                    tuple(current_symbols),
-                )
-            else:
-                self.conn.execute("DELETE FROM positions")
-            for p in positions:
-                self.conn.execute(
-                    """INSERT INTO positions (symbol, qty, avg_entry, current_price, market_value, unrealized_pnl, sector, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                       ON CONFLICT(symbol) DO UPDATE SET
-                         qty=excluded.qty, avg_entry=excluded.avg_entry,
-                         current_price=excluded.current_price, market_value=excluded.market_value,
-                         unrealized_pnl=excluded.unrealized_pnl, sector=excluded.sector,
-                         updated_at=datetime('now')""",
-                    (p.symbol, p.qty, p.avg_entry, p.current_price, p.market_value,
-                     p.unrealized_pnl, p.sector),
-                )
-            self.conn.commit()
+            try:
+                self.conn.execute("BEGIN")
+                if current_symbols:
+                    placeholders = ",".join("?" for _ in current_symbols)
+                    self.conn.execute(
+                        f"DELETE FROM positions WHERE symbol NOT IN ({placeholders})",
+                        tuple(current_symbols),
+                    )
+                else:
+                    self.conn.execute("DELETE FROM positions")
+                for p in positions:
+                    self.conn.execute(
+                        """INSERT INTO positions (symbol, qty, avg_entry, current_price, market_value, unrealized_pnl, sector, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                           ON CONFLICT(symbol) DO UPDATE SET
+                             qty=excluded.qty, avg_entry=excluded.avg_entry,
+                             current_price=excluded.current_price, market_value=excluded.market_value,
+                             unrealized_pnl=excluded.unrealized_pnl, sector=excluded.sector,
+                             updated_at=datetime('now')""",
+                        (p.symbol, p.qty, p.avg_entry, p.current_price, p.market_value,
+                         p.unrealized_pnl, p.sector),
+                    )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def get_positions(self, open_only: bool = False) -> list[dict]:
         with self._lock:

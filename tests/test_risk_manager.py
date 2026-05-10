@@ -2,13 +2,37 @@ import pytest
 import json
 from unittest.mock import patch, MagicMock
 from src.agents.risk_manager import RiskManagerAgent
-from src.models import PortfolioDecision, TradeDecision, Position
+from src.models import PortfolioDecision, ReasoningChain, TradeDecision, Position
 from src.risk.rules import RiskViolation
+
+
+def _pm_rc() -> ReasoningChain:
+    """Minimal valid 7-step CoT for PortfolioDecision — all required
+    fields populated with non-empty values per `Field(min_length=1)`.
+    """
+    return ReasoningChain(
+        macro_filter="x", news_check="x", earnings_check="x",
+        signal_conflicts="x", sizing_logic="x",
+        portfolio_balance="x", cash_target="x",
+    )
+
+
+def _risk_rc_payload() -> dict:
+    """RM JSON-shape reasoning_chain — every step a non-empty string."""
+    return {
+        "rr_audit": "every BUY at R/R ≥ 1.5",
+        "signal_fidelity": "PM aligned with TA",
+        "correlation_check": "no AI cluster breach",
+        "event_risk": "no earnings within 3 days",
+        "sizing_sanity": "all sizes proportional",
+        "overall": "approve as-is",
+    }
 
 
 @pytest.fixture
 def sample_portfolio_decision():
     return PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         decisions=[
             TradeDecision(
                 action="BUY", symbol="SPY", allocation_pct=10.0,
@@ -24,6 +48,7 @@ def sample_portfolio_decision():
 def mock_risk_response():
     return json.dumps({
         "approved": True,
+        "reasoning_chain": _risk_rc_payload(),
         "modifications": [],
         "reasoning": "Plan looks sound. Risk-reward acceptable.",
     })
@@ -55,6 +80,7 @@ def test_risk_manager_approve(mock_cls, sample_portfolio_decision, mock_risk_res
 def test_risk_manager_with_violations(mock_cls, sample_portfolio_decision):
     rejection = json.dumps({
         "approved": False,
+        "reasoning_chain": _risk_rc_payload(),
         "modifications": [],
         "reasoning": "Daily loss limit exceeded. No new trades.",
     })

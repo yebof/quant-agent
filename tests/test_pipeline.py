@@ -8,7 +8,30 @@ from src.models import (
     NewsAnalysisResult, TargetPosition,
     MacroAnalysis, MacroReasoningChain, MacroPositionGuidance,
     PositionReview, PositionReasoningChain,
+    ReasoningChain, RiskReasoningChain, TechReasoningChain,
 )
+
+
+def _pm_rc() -> ReasoningChain:
+    return ReasoningChain(
+        macro_filter="x", news_check="x", earnings_check="x",
+        signal_conflicts="x", sizing_logic="x",
+        portfolio_balance="x", cash_target="x",
+    )
+
+
+def _risk_rc() -> RiskReasoningChain:
+    return RiskReasoningChain(
+        rr_audit="x", signal_fidelity="x", correlation_check="x",
+        event_risk="x", sizing_sanity="x", overall="x",
+    )
+
+
+def _trc() -> TechReasoningChain:
+    return TechReasoningChain(
+        trend="x", momentum="x", volatility="x", volume="x",
+        support_resistance="x",
+    )
 
 
 def _review_rc():
@@ -106,6 +129,7 @@ def test_pipeline_morning_run_buy(
     spy_analysis = TechAnalysisResult(
         symbol="SPY", rating="buy", entry_price=507.0,
         reference_target=530.0, stop_loss=490.0, reasoning="Bullish",
+        reasoning_chain=_trc(),
     )
     mock_ta.analyze_batch.return_value = ({"SPY": spy_analysis}, _mock_agent_result())
     mock_ta_cls.return_value = mock_ta
@@ -114,6 +138,7 @@ def test_pipeline_morning_run_buy(
     # the constructor derives the actual order from target + TA + live price.
     mock_pm = MagicMock()
     mock_pm.decide.return_value = (PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         targets=[
             TargetPosition(
                 symbol="SPY", target_weight_pct=10.0, conviction="high",
@@ -128,6 +153,7 @@ def test_pipeline_morning_run_buy(
     mock_rm = MagicMock()
     mock_rm.review.return_value = (RiskVerdict(
         approved=True, modifications=[], reasoning="Approved",
+        reasoning_chain=_risk_rc(),
     ), _mock_agent_result())
     mock_rm_cls.return_value = mock_rm
 
@@ -220,12 +246,14 @@ def test_pipeline_market_order_sizes_from_live_market_price(
     spy_analysis = TechAnalysisResult(
         symbol="SPY", rating="buy", entry_price=98.0,
         reference_target=130.0, stop_loss=72.0, reasoning="Bullish",
+        reasoning_chain=_trc(),
     )
     mock_ta.analyze_batch.return_value = ({"SPY": spy_analysis}, _mock_agent_result())
     mock_ta_cls.return_value = mock_ta
 
     mock_pm = MagicMock()
     mock_pm.decide.return_value = (PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         targets=[
             TargetPosition(
                 symbol="SPY", target_weight_pct=10.0, conviction="high",
@@ -239,6 +267,7 @@ def test_pipeline_market_order_sizes_from_live_market_price(
     mock_rm = MagicMock()
     mock_rm.review.return_value = (RiskVerdict(
         approved=True, modifications=[], reasoning="Approved",
+        reasoning_chain=_risk_rc(),
     ), _mock_agent_result())
     mock_rm_cls.return_value = mock_rm
 
@@ -330,12 +359,14 @@ def test_pipeline_risk_rejected(
     spy_analysis = TechAnalysisResult(
         symbol="SPY", rating="buy", entry_price=507.0,
         reference_target=530.0, stop_loss=490.0, reasoning="Bullish",
+        reasoning_chain=_trc(),
     )
     mock_ta.analyze_batch.return_value = ({"SPY": spy_analysis}, _mock_agent_result())
     mock_ta_cls.return_value = mock_ta
 
     mock_pm = MagicMock()
     mock_pm.decide.return_value = (PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         targets=[
             TargetPosition(
                 symbol="SPY", target_weight_pct=10.0, conviction="high",
@@ -350,6 +381,7 @@ def test_pipeline_risk_rejected(
     mock_rm = MagicMock()
     mock_rm.review.return_value = (RiskVerdict(
         approved=False, modifications=[], reasoning="Too risky",
+        reasoning_chain=_risk_rc(),
     ), _mock_agent_result())
     mock_rm_cls.return_value = mock_rm
 
@@ -779,6 +811,7 @@ def test_full_sell_skips_residual_reprotect(tmp_path):
         ),
     ]
     ctx.portfolio_decision = PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         decisions=[
             TradeDecision(
                 action="SELL", symbol="JPM", allocation_pct=100,
@@ -2133,6 +2166,7 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
     qqq_analysis = TechAnalysisResult(
         symbol="QQQ", rating="buy", entry_price=100.0,
         reference_target=110.0, stop_loss=95.0, reasoning="Bullish",
+        reasoning_chain=_trc(),
     )
     mock_ta.analyze_batch.return_value = ({"QQQ": qqq_analysis}, _mock_agent_result())
     mock_ta_cls.return_value = mock_ta
@@ -2141,6 +2175,7 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
     # Rotation: close SPY (target=0) + open QQQ at 30% weight. Constructor
     # turns target_weight_pct=0 on a held symbol into a full-exit SELL.
     mock_pm.decide.return_value = (PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         targets=[
             TargetPosition(
                 symbol="SPY", target_weight_pct=0.0, conviction="medium",
@@ -2158,6 +2193,7 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
     mock_rm = MagicMock()
     mock_rm.review.return_value = (RiskVerdict(
         approved=True, modifications=[], reasoning="Approved",
+        reasoning_chain=_risk_rc(),
     ), _mock_agent_result())
     mock_rm_cls.return_value = mock_rm
 

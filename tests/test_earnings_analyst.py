@@ -50,6 +50,13 @@ def _valid_analysis(report: EarningsReport) -> dict:
         "investment_implications": {
             "sentiment": "bullish",
             "conviction": "medium",
+            "reasoning_chain": {
+                "fundamental_quality": "Revenue +5% with margin expansion",
+                "growth_trajectory": "Operating leverage building QoQ",
+                "strategic_risks": "Cloud competition is real but execution on track",
+                "management_execution": "Guidance hit, capex on plan",
+                "valuation_context": "Trades at a reasonable forward multiple",
+            },
             "key_thesis": "Margins expanded while demand remained resilient",
             "bull_case": "Operating leverage continues",
             "bear_case": "FX pressure worsens",

@@ -208,11 +208,27 @@ Current close: {current_price}""")
             return {}, result
 
         items = parsed if isinstance(parsed, list) else [parsed]
+        # Index input by symbol so we can attach atr_14 back to each
+        # TechAnalysisResult (the LLM doesn't echo ATR; we preserve it from
+        # the indicators that fed the prompt so PortfolioConstructor's
+        # fallback stop can be volatility-aware).
+        input_indicators_by_sym: dict[str, float | None] = {}
+        for s in symbols_data:
+            if not isinstance(s, dict):
+                continue
+            sym = s.get("symbol")
+            indicators = s.get("indicators")
+            if sym and indicators is not None:
+                input_indicators_by_sym[sym] = getattr(indicators, "atr_14", None)
         analyses: dict[str, TechAnalysisResult] = {}
         failed_symbols: list[str] = []
         for item in items:
             try:
                 analysis = TechAnalysisResult(**item)
+                # Carry ATR through from the input data (LLM doesn't emit it).
+                atr = input_indicators_by_sym.get(analysis.symbol)
+                if atr is not None:
+                    analysis.atr_14 = atr
                 analyses[analysis.symbol] = analysis
             except Exception as e:
                 bad_symbol = str((item or {}).get("symbol", "?")) if isinstance(item, dict) else "?"

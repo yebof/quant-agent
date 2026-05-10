@@ -269,13 +269,23 @@ class PortfolioConstructor:
         analysis: TechAnalysisResult | None,
         entry_price: float,
     ) -> float | None:
-        """Priority: target's suggested stop → TA's stop → 2*ATR → fallback %."""
+        """Priority: target's suggested stop → TA's stop → ATR-based → fallback %.
+
+        The ATR-based middle tier is meaningful for volatile small-caps:
+        a hardcoded 5 % stop on a name with ATR(14) = 8 % of price gets
+        thrashed by normal noise. `entry - 2 * ATR` is the standard
+        volatility-aware default; matches the prompt's recommendation
+        to TechAnalyst.
+        """
         if target.suggested_stop_price and target.suggested_stop_price > 0:
             return float(target.suggested_stop_price)
         if analysis and analysis.stop_loss and analysis.stop_loss > 0:
             return float(analysis.stop_loss)
-        # ATR-based default (indicator context lives in the analysis, which is
-        # per-symbol; a fresh analysis call would provide ATR. If absent,
-        # fall through.)
-        # Without access to ATR here, use a naive % fallback.
+        # Volatility-aware fallback when LLM didn't supply a stop.
+        if analysis and analysis.atr_14 and analysis.atr_14 > 0:
+            atr_stop = entry_price - self.cfg.default_stop_atr_multiple * analysis.atr_14
+            if atr_stop > 0:
+                return round(atr_stop, 2)
+        # Naive % fallback if ATR also unavailable (e.g. brand-new symbol
+        # with <14 bars of history).
         return round(entry_price * (1 - self.cfg.fallback_stop_pct), 2)
