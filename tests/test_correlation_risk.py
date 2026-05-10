@@ -50,6 +50,36 @@ def test_correlation_matrix_skips_sparse_symbols():
     assert "B" in matrix["A"]  # the pair correlation exists
 
 
+def test_correlation_matrix_logs_excluded_symbols(caplog):
+    """When a symbol gets silently dropped (insufficient bars), the operator
+    + the downstream Risk Manager need to see which holdings lost correlation
+    coverage. Without this WARN log, a freshly-listed ETF could bypass the
+    cluster check unnoticed — exactly the kind of silent gap the audit
+    flagged after the 2026-05-11 universe expansion added CHPX (a newly
+    launched ETF with very short price history).
+    """
+    import logging
+
+    healthy_a = _bars([100.0 + i for i in range(30)])
+    sparse_b = _bars([100.0, 101.0])         # only 2 bars
+    sparse_c = _bars([200.0])                # only 1 bar
+    with caplog.at_level(logging.WARNING, logger="src.data.correlation"):
+        build_correlation_matrix({
+            "A": healthy_a,
+            "BAD_B": sparse_b,
+            "BAD_C": sparse_c,
+        })
+
+    warning_lines = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("excluded from matrix" in m for m in warning_lines), (
+        f"expected a WARN log naming excluded symbols; got {warning_lines}"
+    )
+    # The dropped symbols must appear in the warning so they can be
+    # correlated against the trade book.
+    joined = " ".join(warning_lines)
+    assert "BAD_B" in joined and "BAD_C" in joined
+
+
 def test_highly_correlated_peers_threshold():
     """Only pairs at or above threshold are returned."""
     matrix = {

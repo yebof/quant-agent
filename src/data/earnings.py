@@ -28,9 +28,13 @@ SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 USER_AGENT = "quant-agent research@example.com"  # SEC requires contact info
 REQUEST_DELAY = 0.12  # SEC rate limit: 10 req/s
 
-# ETFs don't have SEC filings
+# ETFs don't have SEC 10-Q/10-K filings — skip them at the entry point to
+# avoid wasting CIK lookups + retry budget on something that will always
+# fail. Keep this list in sync with `config/settings.yaml:trading.universe`
+# whenever a new ETF is added there.
 ETFS = {"SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLV", "XLI", "XLP",
-        "XLY", "XLU", "XLRE", "XLB", "SMH", "DRAM", "SH", "SDS", "PSQ", "SQQQ"}
+        "XLY", "XLU", "XLRE", "XLB", "SMH", "SOXX", "DRAM", "CHPX",
+        "SH", "SDS", "PSQ", "SQQQ"}
 
 
 @dataclass
@@ -174,7 +178,15 @@ class EarningsDataProvider:
         return self._ticker_to_cik.get(ticker.upper())
 
     def _get_recent_filings(self, cik: str, ticker: str) -> list[FilingInfo]:
-        """Get recent 10-Q/10-K filings from SEC EDGAR."""
+        """Get recent 10-Q/10-K filings from SEC EDGAR.
+
+        Note on MLPs (master limited partnerships, e.g. EPD): they are SEC
+        registrants and DO file 10-Q/10-K via the partnership entity —
+        no special handling required. The Schedule K-1 some operators
+        associate with MLPs is a tax document mailed to unit holders, not
+        a substitute for the corporate filing. EPD shows up on EDGAR with
+        regular quarterly 10-Qs that this method will pick up.
+        """
         padded_cik = cik.zfill(10)
         url = f"{SEC_BASE}/submissions/CIK{padded_cik}.json"
         try:

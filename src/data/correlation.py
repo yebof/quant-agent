@@ -38,13 +38,28 @@ def build_correlation_matrix(
     """Return a nested dict {sym1: {sym2: correlation}} for the given symbol → bars map.
 
     Uses pairwise-complete observations. Symbols with insufficient data (< 10
-    days of returns) are skipped silently — they simply won't appear in the map.
+    days of returns) are excluded from the matrix — they simply won't appear
+    in the result map. Excluded symbols are logged at WARNING so the operator
+    (and the LLM Risk Manager downstream, via prompt rendering) can see which
+    holdings lost correlation coverage for the day. Without this log, a
+    newly-launched ETF (e.g. CHPX with <10 bars at universe-add time) would
+    silently bypass the correlation-cluster check that catches AI / mega-cap
+    concentration when sector caps miss it.
     """
-    returns = {}
+    returns: dict[str, pd.Series] = {}
+    excluded: list[str] = []
     for sym, bars in symbols_bars.items():
         r = _returns_from_bars(bars)
         if r is not None:
             returns[sym] = r
+        else:
+            excluded.append(sym)
+    if excluded:
+        logger.warning(
+            "correlation: %d symbol(s) excluded from matrix (insufficient bars, "
+            "<10 returns): %s",
+            len(excluded), ", ".join(sorted(excluded)),
+        )
     if len(returns) < 2:
         return {}
     df = pd.DataFrame(returns)
