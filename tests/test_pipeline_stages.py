@@ -35,6 +35,36 @@ def _buy(symbol, alloc):
     )
 
 
+def _pm_rc():
+    """Minimal valid PM reasoning_chain — every required step a non-empty
+    string per PR #89 min_length=1 enforcement."""
+    from src.models import ReasoningChain
+    return ReasoningChain(
+        macro_filter="x", news_check="x", earnings_check="x",
+        signal_conflicts="x", sizing_logic="x",
+        portfolio_balance="x", cash_target="x",
+    )
+
+
+def _risk_rc():
+    """Minimal valid RM reasoning_chain — every required step a non-empty
+    string per PR #89 min_length=1 enforcement."""
+    from src.models import RiskReasoningChain
+    return RiskReasoningChain(
+        rr_audit="x", signal_fidelity="x", correlation_check="x",
+        event_risk="x", sizing_sanity="x", overall="x",
+    )
+
+
+def _tech_rc():
+    """Minimal valid Tech reasoning_chain."""
+    from src.models import TechReasoningChain
+    return TechReasoningChain(
+        trend="x", momentum="x", volatility="x",
+        volume="x", support_resistance="x",
+    )
+
+
 def _hold(symbol):
     from src.models import TradeDecision
     return TradeDecision(
@@ -63,6 +93,7 @@ def test_apply_scale_all_buys_zero_drops_every_buy():
 
     verdict = RiskVerdict(
         approved=True, scale_all_buys=0.0,
+        reasoning_chain=_risk_rc(),
         reasoning="risk-off — kill all BUYs",
     )
     decisions = [_buy("SPY", 10), _buy("QQQ", 8), _hold("MSFT"), _sell("NVDA")]
@@ -80,7 +111,7 @@ def test_apply_scale_all_buys_partial_scales_buy_allocations():
     from src.models import RiskVerdict
     from src.pipeline_stages import _apply_scale_all_buys
 
-    verdict = RiskVerdict(approved=True, scale_all_buys=0.5, reasoning="trim")
+    verdict = RiskVerdict(approved=True, scale_all_buys=0.5, reasoning_chain=_risk_rc(), reasoning="trim")
     decisions = [_buy("SPY", 10), _buy("QQQ", 8), _hold("MSFT")]
 
     scaled, scale = _apply_scale_all_buys(decisions, verdict)
@@ -97,7 +128,7 @@ def test_apply_scale_all_buys_one_is_no_op():
     from src.models import RiskVerdict
     from src.pipeline_stages import _apply_scale_all_buys
 
-    verdict = RiskVerdict(approved=True, scale_all_buys=1.0, reasoning="ok")
+    verdict = RiskVerdict(approved=True, scale_all_buys=1.0, reasoning_chain=_risk_rc(), reasoning="ok")
     decisions = [_buy("SPY", 10), _buy("QQQ", 8)]
 
     scaled, scale = _apply_scale_all_buys(decisions, verdict)
@@ -154,6 +185,7 @@ def test_execution_stage_skips_buy_when_entry_price_more_than_5pct_off_market():
     ctx.last_equity = 100_000.0
     ctx.positions = []
     ctx.portfolio_decision = PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         decisions=[
             # LLM says entry $80, market is $100 → 20% off → must skip.
             TradeDecision(
@@ -197,6 +229,7 @@ def test_execution_stage_allows_buy_when_entry_price_within_5pct():
     ctx.last_equity = 100_000.0
     ctx.positions = []
     ctx.portfolio_decision = PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         decisions=[
             # LLM says $98, market $100 → 2% off → proceed.
             TradeDecision(
@@ -263,6 +296,7 @@ def test_execution_stage_blocks_buys_when_daily_loss_breached_during_run():
         ),
     ]
     ctx.portfolio_decision = PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         decisions=[
             TradeDecision(
                 action="SELL", symbol="JPM", allocation_pct=100,
@@ -322,6 +356,7 @@ def test_execution_stage_allows_buys_when_daily_loss_not_breached_after_refresh(
     ctx.last_equity = 100_000.0
     ctx.positions = []
     ctx.portfolio_decision = PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         decisions=[
             TradeDecision(
                 action="BUY", symbol="SPY", allocation_pct=10,
@@ -362,6 +397,7 @@ def test_execution_stage_skips_buy_when_entry_price_above_market_by_more_than_5p
     ctx.last_equity = 100_000.0
     ctx.positions = []
     ctx.portfolio_decision = PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         decisions=[
             # LLM says $115, market $100 → 15% above → skip.
             TradeDecision(
@@ -579,7 +615,7 @@ def test_morning_research_stage_tech_uses_prior_macro_snapshot(mock_compute_indi
             "NVDA": TechAnalysisResult(
                 symbol="NVDA", rating="buy", conviction="high",
                 entry_price=100.0, reference_target=110.0, stop_loss=95.0,
-                reasoning="fresh setup",
+                reasoning="fresh setup", reasoning_chain=_tech_rc(),
             )
         },
         agent_result,

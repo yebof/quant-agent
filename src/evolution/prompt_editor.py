@@ -203,9 +203,22 @@ class PromptEditor:
         modified_paths: set[Path] = set()
 
         for learning in reflection.proposed_learnings:
-            # Per-cycle cap: when a NEW agent would push us past the limit,
-            # reject BEFORE any mutation. Already-edited agents can take more
-            # learnings if somehow proposed (schema normally prevents; belt).
+            # Per-cycle cap semantics (intentional, not a bug):
+            #
+            #   The cap counts DISTINCT agents touched per apply_reflection
+            #   call, NOT total learnings. A single agent can legitimately
+            #   accumulate multiple learnings in one quarter (e.g. two
+            #   complementary rules for portfolio_manager), and that should
+            #   pass even when the cap is reached — the cap is meant to
+            #   prevent broad sweeping changes across the agent fleet, not
+            #   prevent depth on one agent.
+            #
+            #   The schema's `QuarterlyMetaReflection.proposed_learnings`
+            #   max_length=3 still bounds the total, so the worst-case shape
+            #   here is 3 learnings all targeting the same agent — which is
+            #   acceptable.
+            #
+            #   Reject only when a NEW agent would push past the limit:
             if (learning.agent_name not in agents_edited
                     and len(agents_edited) >= self.config.max_agents_per_cycle):
                 report.rejected.append(Rejection(

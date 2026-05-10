@@ -636,23 +636,29 @@ def test_save_and_load_insights_roundtrip_structured_fields(tmp_path):
 
 def test_risk_verdict_accepts_reason_category():
     """RiskVerdict parses the new reason_category enum; default is 'clean'."""
-    from src.models import RiskVerdict
+    from src.models import RiskVerdict, RiskReasoningChain
+
+    def _rc():
+        return RiskReasoningChain(
+            rr_audit="x", signal_fidelity="x", correlation_check="x",
+            event_risk="x", sizing_sanity="x", overall="x",
+        )
 
     # Default when field omitted
-    v1 = RiskVerdict(approved=True, reasoning="fine")
+    v1 = RiskVerdict(approved=True, reasoning_chain=_rc(), reasoning="fine")
     assert v1.reason_category == "clean"
 
     # All enum values parse
     for cat in ("oversized", "rr_fail", "concentration", "correlation_risk",
                 "event_risk", "macro_misalign", "data_degraded",
                 "signal_fidelity", "other", "clean"):
-        v = RiskVerdict(approved=True, reasoning="x", reason_category=cat)
+        v = RiskVerdict(approved=True, reasoning_chain=_rc(), reasoning="x", reason_category=cat)
         assert v.reason_category == cat
 
     # Unknown category rejected
     import pytest
     with pytest.raises(Exception):  # pydantic ValidationError
-        RiskVerdict(approved=True, reasoning="x", reason_category="weird")
+        RiskVerdict(approved=True, reasoning_chain=_rc(), reasoning="x", reason_category="weird")
 
 
 def test_pm_decisions_builder_parses_own_history(tmp_path):
@@ -919,11 +925,16 @@ def test_projected_portfolio_flags_sector_overweight(tmp_path):
                  market_value=3000, unrealized_pnl=0, sector="Technology"),
     ]
     # Three Tech BUY candidates
+    from src.models import TechReasoningChain
+    _trc = TechReasoningChain(
+        trend="x", momentum="x", volatility="x",
+        volume="x", support_resistance="x",
+    )
     analyses = [
         TechAnalysisResult(
             symbol=sym, rating="buy", conviction="high",
             entry_price=100, stop_loss=95, reference_target=110,
-            reasoning="test",
+            reasoning="test", reasoning_chain=_trc,
         )
         for sym in ("NVDA", "AMD", "AAPL")
     ]

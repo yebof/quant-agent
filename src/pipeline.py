@@ -4565,6 +4565,16 @@ class TradingPipeline:
             logger.info("Earnings preprocess skipped: market closed for non-trading day")
             return {"status": "market_holiday", "run_id": run_id}
 
+        # Drain orphaned protection-restore intents from any prior session
+        # that died mid-finalize. earnings_preprocess (08:00-09:15 ET) is the
+        # first session of the trading day, so if an overnight evening run
+        # left state in `pending_protection_restores`, this is the earliest
+        # opportunity to recover before the 09:30 ET open. Without this call
+        # an unprotected position would ride the open-gap with no stop —
+        # matches the drain pattern used in run_morning / run_position_review
+        # / run_intra_check / run_evening.
+        self._drain_pending_protection_restores()
+
         try:
             reports = self.earnings_provider.check_and_fetch(
                 self.config.trading.universe,

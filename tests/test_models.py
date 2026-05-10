@@ -7,10 +7,27 @@ from src.models import (
     TechAnalysisResult,
     TradeDecision,
     PortfolioDecision,
+    ReasoningChain,
     RiskVerdict,
+    RiskReasoningChain,
     Position,
     AgentLog,
 )
+
+
+def _pm_rc() -> ReasoningChain:
+    return ReasoningChain(
+        macro_filter="x", news_check="x", earnings_check="x",
+        signal_conflicts="x", sizing_logic="x",
+        portfolio_balance="x", cash_target="x",
+    )
+
+
+def _risk_rc() -> RiskReasoningChain:
+    return RiskReasoningChain(
+        rr_audit="x", signal_fidelity="x", correlation_check="x",
+        event_risk="x", sizing_sanity="x", overall="x",
+    )
 
 
 def test_ohlcv_creation():
@@ -87,6 +104,7 @@ def test_trade_decision_rejects_buy_take_profit_at_or_below_entry():
 
 def test_portfolio_decision():
     pd = PortfolioDecision(
+        reasoning_chain=_pm_rc(),
         decisions=[
             TradeDecision(
                 action="BUY",
@@ -106,6 +124,7 @@ def test_portfolio_decision():
 def test_risk_verdict():
     rv = RiskVerdict(
         approved=True,
+        reasoning_chain=_risk_rc(),
         modifications=[],
         reasoning="All checks passed",
     )

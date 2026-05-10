@@ -1,7 +1,16 @@
 """PortfolioConstructor — target state → concrete orders."""
 
-from src.models import Position, TargetPosition, TechAnalysisResult
+from src.models import Position, TargetPosition, TechAnalysisResult, TechReasoningChain
 from src.portfolio_constructor import PortfolioConstructor, ConstructorConfig
+
+
+def _tech_rc() -> TechReasoningChain:
+    """Minimal valid 5-step CoT — every field is `min_length=1`-enforced
+    after the PR #89 audit fix, so test fixtures must populate them."""
+    return TechReasoningChain(
+        trend="x", momentum="x", volatility="x",
+        volume="x", support_resistance="x",
+    )
 
 
 def _pos(symbol: str, qty: float, avg_entry: float, current_price: float,
@@ -18,6 +27,7 @@ def _analysis(symbol: str, entry: float, stop: float, target: float) -> TechAnal
     return TechAnalysisResult(
         symbol=symbol, rating="buy", entry_price=entry,
         stop_loss=stop, reference_target=target, reasoning="test",
+        reasoning_chain=_tech_rc(),
     )
 
 
@@ -211,6 +221,66 @@ def test_construct_orders_falls_back_to_fallback_stop_when_no_hint():
     assert len(decisions) == 1
     # Fallback: 100 × (1 - 0.05) = 95
     assert decisions[0].stop_loss == 95.0
+
+
+def test_resolve_stop_atr_fallback_when_llm_stop_missing():
+    """Volatility-aware fallback: when `analysis.stop_loss` is None but
+    `analysis.atr_14` is available, `_resolve_stop` returns `entry − 2*ATR`
+    instead of the hardcoded 5 % fallback.
+
+    In practice the `TechAnalysisResult._validate_rating_price_consistency`
+    validator forces `stop_loss > 0` for BUY/SELL ratings — so this path is
+    rarely reached in production today. The defensive code matters when
+    that validator gets relaxed (e.g. for an LLM that emits valid neutral-
+    rated targets that PM still wants to size into), and the test pins the
+    behaviour so it doesn't bit-rot. We test `_resolve_stop` directly with
+    a SimpleNamespace stand-in to bypass the model validator.
+    """
+    from types import SimpleNamespace
+    constructor = PortfolioConstructor(
+        config=ConstructorConfig(
+            fallback_stop_pct=0.05,
+            default_stop_atr_multiple=2.0,
+        ),
+    )
+    target = TargetPosition(
+        symbol="NVDA", target_weight_pct=5.0,
+        conviction="medium", thesis="vol-aware stop",
+    )
+    # ATR 8.0 on a $100 stock — high-vol small-cap profile.
+    fake_analysis = SimpleNamespace(stop_loss=None, atr_14=8.0)
+    stop = constructor._resolve_stop(target, fake_analysis, entry_price=100.0)
+    # 100 − 2*8 = 84 (volatility-aware), NOT 95 (hardcoded 5 %).
+    assert stop == 84.0
+
+
+def test_resolve_stop_llm_stop_wins_over_atr():
+    """LLM-supplied stop_loss takes precedence over ATR fallback."""
+    from types import SimpleNamespace
+    constructor = PortfolioConstructor(config=ConstructorConfig())
+    target = TargetPosition(
+        symbol="NVDA", target_weight_pct=5.0,
+        conviction="medium", thesis="x",
+    )
+    fake_analysis = SimpleNamespace(stop_loss=90.0, atr_14=8.0)
+    stop = constructor._resolve_stop(target, fake_analysis, entry_price=100.0)
+    assert stop == 90.0
+
+
+def test_resolve_stop_falls_through_to_pct_when_no_atr():
+    """When neither LLM stop nor ATR is available, fall through to the
+    hardcoded % — same as the pre-audit behaviour."""
+    from types import SimpleNamespace
+    constructor = PortfolioConstructor(
+        config=ConstructorConfig(fallback_stop_pct=0.05),
+    )
+    target = TargetPosition(
+        symbol="NVDA", target_weight_pct=5.0,
+        conviction="medium", thesis="x",
+    )
+    fake_analysis = SimpleNamespace(stop_loss=None, atr_14=None)
+    stop = constructor._resolve_stop(target, fake_analysis, entry_price=100.0)
+    assert stop == 95.0  # 100 × (1 - 0.05)
 
 
 def test_construct_orders_empty_targets_returns_empty():

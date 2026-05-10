@@ -3,7 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 from src.agents.portfolio_manager import PortfolioManagerAgent
-from src.models import Position, TechAnalysisResult
+from src.models import Position, TechAnalysisResult, TechReasoningChain
 from src.pipeline import TradingPipeline
 from src.pipeline_context import PMFacts
 from src.storage.db import Database
@@ -22,6 +22,10 @@ def _ta(symbol: str, age: int | None = None) -> TechAnalysisResult:
     t = TechAnalysisResult(
         symbol=symbol, rating="buy", entry_price=100,
         stop_loss=95, reference_target=110, reasoning="test",
+        reasoning_chain=TechReasoningChain(
+            trend="x", momentum="x", volatility="x",
+            volume="x", support_resistance="x",
+        ),
     )
     t.signal_age_days = age
     return t
