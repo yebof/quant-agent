@@ -114,12 +114,58 @@ class NewsDataProvider:
                 return None
         return None
 
+    @staticmethod
+    def _normalize_link(link: str) -> str:
+        """Normalize an article URL for cross-source dedup.
+
+        Strip query parameters (utm_*, ?ref=, ?source=) and fragments,
+        lowercase the host, drop trailing slashes. Same article syndicated
+        across Reuters / CNBC / AP carries a distinct URL per-outlet, BUT
+        many outlets republish from the same wire source (AP / Reuters
+        feed) with identical underlying URLs differing only in tracking
+        params. Stripping those catches the exact-duplicate case before
+        the noisier Jaccard pass.
+        """
+        if not link:
+            return ""
+        try:
+            from urllib.parse import urlsplit, urlunsplit
+            parts = urlsplit(link)
+            host = (parts.netloc or "").lower()
+            path = (parts.path or "").rstrip("/")
+            # Drop query (tracking params) and fragment entirely. If two
+            # articles legitimately differ only by a query param, we'd
+            # rather lose one than have both pollute the prompt.
+            return urlunsplit((parts.scheme.lower(), host, path, "", ""))
+        except Exception:
+            return link.strip().lower()
+
     def _deduplicate(self, items: list[NewsItem]) -> list[NewsItem]:
-        """Remove near-duplicate headlines using word-level Jaccard similarity."""
+        """Remove duplicates: first by normalized URL (catches exact
+        cross-source republishes), then by word-level Jaccard on title
+        (catches near-duplicates with different URLs).
+
+        Word-Jaccard alone misses URL-identical duplicates because the
+        Reuters / CNBC / AP boilerplate dilutes title intersection below
+        the 0.7 threshold (e.g., "Stocks rise on Fed pause" vs "Markets
+        rally as Fed signals pause" both link to the same AP wire URL
+        but score Jaccard ~0.3). URL pre-dedup catches these cheaply.
+        """
+        # Pass 1: URL dedup
+        url_deduped: list[NewsItem] = []
+        seen_urls: set[str] = set()
+        for item in items:
+            key = self._normalize_link(item.link)
+            if key and key in seen_urls:
+                continue
+            if key:
+                seen_urls.add(key)
+            url_deduped.append(item)
+
+        # Pass 2: word-Jaccard on title for near-duplicates
         unique: list[NewsItem] = []
         seen_word_sets: list[set[str]] = []
-
-        for item in items:
+        for item in url_deduped:
             words = set(item.title.lower().split())
             if not words:
                 continue

@@ -24,16 +24,33 @@ class MacroDataProvider:
         prev = socket.getdefaulttimeout()
         socket.setdefaulttimeout(_FRED_TIMEOUT_S)
         try:
-            return self.fred.get_series(series_id, **kwargs)
+            result = self.fred.get_series(series_id, **kwargs)
         except Exception as e:
             logger.warning("FRED API error for %s: %s", series_id, e)
             return pd.Series(dtype=float)
         finally:
             socket.setdefaulttimeout(prev)
+        if result is None or len(result) == 0:
+            # FRED responded successfully but returned 0 rows. Distinct from
+            # the exception path (logged above) — usually a misconfigured
+            # series_id, a discontinued series, or temporarily missing
+            # observation_start window. Surface so macro_analyst's
+            # `staleness_days: None` is actionable instead of opaque.
+            logger.warning(
+                "FRED returned 0 observations for %s (kwargs=%s) — "
+                "regime detection will see None freshness",
+                series_id, kwargs,
+            )
+        return result
 
     @staticmethod
     def _staleness_days(series: pd.Series) -> int | None:
         """Business days between the latest observation and today. None if series empty.
+
+        None always means "no data at all" (FRED returned 0 rows) — never
+        means "data exists but freshness unknown". _safe_get_series logs
+        a WARNING on the empty-series path so the operator can see why a
+        downstream staleness_days came back None.
 
         "Today" is the ET trading-day date — not the host-local date. CLAUDE.md
         invariant: any host TZ must produce the same data. Using `date.today()`

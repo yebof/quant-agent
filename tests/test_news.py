@@ -54,6 +54,45 @@ def test_news_provider_deduplicate():
     assert len(deduped) == 2
 
 
+def test_news_provider_dedup_catches_url_match_across_sources():
+    """Same wire article republished across outlets carries identical URLs
+    (after stripping utm/tracking). Title-Jaccard alone misses these
+    because outlet-specific boilerplate dilutes intersection below 0.7.
+    URL pre-dedup pass catches them."""
+    provider = NewsDataProvider()
+    same_url = "https://apnews.com/article/fed-rate-pause-2026"
+    items = [
+        NewsItem(title="Reuters: Fed pauses rate hikes amid soft data",
+                 summary="", source="Reuters",
+                 published=datetime(2026, 4, 12, tzinfo=timezone.utc),
+                 link=same_url + "?utm_source=reuters"),
+        NewsItem(title="CNBC: Markets cheer as Fed signals hold",
+                 summary="", source="CNBC",
+                 published=datetime(2026, 4, 12, tzinfo=timezone.utc),
+                 link=same_url + "?ref=cnbc"),
+        NewsItem(title="Completely different topic",
+                 summary="", source="BBC",
+                 published=datetime(2026, 4, 12, tzinfo=timezone.utc),
+                 link="https://bbc.com/news/x"),
+    ]
+    deduped = provider._deduplicate(items)
+    # First Reuters + BBC unique-different remain; CNBC duplicate URL drops.
+    assert len(deduped) == 2
+    sources = {it.source for it in deduped}
+    assert sources == {"Reuters", "BBC"}
+
+
+def test_news_provider_normalize_link_strips_query_and_fragment():
+    """utm_source / ?ref= / #anchor must not defeat URL dedup."""
+    provider = NewsDataProvider()
+    base = "https://example.com/article/abc"
+    assert provider._normalize_link(base + "?utm_source=x") == base
+    assert provider._normalize_link(base + "#section-1") == base
+    assert provider._normalize_link(base + "/") == base  # trailing slash
+    assert provider._normalize_link("HTTPS://Example.COM/article/abc") == base
+    assert provider._normalize_link("") == ""
+
+
 def test_news_provider_format_max_items():
     provider = NewsDataProvider()
     items = [
