@@ -258,6 +258,47 @@ def test_get_top_movers_with_non_positive_n_returns_empty(mock_tc_cls):
     assert broker.get_top_movers(n=-3) == []
 
 
+@patch("alpaca.data.historical.screener.ScreenerClient")
+@patch("src.execution.broker.TradingClient")
+def test_get_top_movers_filters_warrants_units_and_rights(mock_tc_cls, mock_screener_cls):
+    """R6 audit (May 2026): logs were flooded with yfinance ERROR 404s for
+    Alpaca top_movers like DSX.WS, BKKT.WS, JOBY.WS (warrants) and various
+    .U units. These are non-equity instruments yfinance can't price.
+    Filter them at the broker boundary so missed_opportunities never even
+    asks yfinance about them. Pin: n=3 with 3 non-equity + 3 equity
+    movers returns the 3 equity ones."""
+    mock_tc_cls.return_value = MagicMock()
+
+    def _mover(sym, pct=10.0, price=50.0):
+        m = MagicMock()
+        m.symbol = sym
+        m.percent_change = pct
+        m.price = price
+        return m
+
+    movers = [
+        _mover("DSX.WS", pct=80),   # warrant — filter
+        _mover("VST",    pct=22),   # equity — keep
+        _mover("JOBY.WS", pct=50),  # warrant — filter
+        _mover("OKLO",   pct=18),   # equity — keep
+        _mover("ACME.U", pct=12),   # unit — filter
+        _mover("MP",     pct=9),    # equity — keep
+        _mover("XYZ.RT", pct=8),    # right — filter
+    ]
+    movers_response = MagicMock()
+    movers_response.gainers = movers
+    mock_screener = MagicMock()
+    mock_screener.get_market_movers.return_value = movers_response
+    mock_screener_cls.return_value = mock_screener
+
+    broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
+    out = broker.get_top_movers(n=3)
+    syms = [m["symbol"] for m in out]
+    assert syms == ["VST", "OKLO", "MP"], (
+        f"top_movers must drop .WS / .U / .RT non-equity; got {syms}"
+    )
+
+
 @patch("src.execution.broker.TradingClient")
 def test_cancel_open_entry_orders_preserves_sell_protection(mock_tc_cls):
     buy_order = MagicMock()

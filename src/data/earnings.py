@@ -369,15 +369,60 @@ class EarningsDataProvider:
             )
             return structured_output
 
-        # Fallback: truncated full text
+        # Fallback: truncated full text. The naive "first max_chars" slice
+        # is wrong for iXBRL 10-Q filings — the front of the cleaned text is
+        # typically cover page + TOC + XBRL boilerplate, and the actual
+        # financial tables live 30-50% into the document. R6 log audit
+        # found 58 cases where this fallback fed the earnings LLM nothing
+        # but XBRL labels and got "data quality: CRITICAL" back. Instead,
+        # find the densest $-amount / numeric-table region and slice
+        # around it.
         if len(text) > max_chars:
+            slice_start = self._find_financial_dense_region(text, max_chars)
             logger.info(
                 "Structured extraction too sparse (%d chars); falling back to truncated full text "
-                "(%d → %d chars)",
-                len(structured_output), len(text), max_chars,
+                "(%d → %d chars, slice @ %d)",
+                len(structured_output), len(text), max_chars, slice_start,
             )
-            text = text[:max_chars] + "\n\n[... truncated ...]"
+            text = text[slice_start:slice_start + max_chars] + "\n\n[... truncated ...]"
         return text
+
+    @staticmethod
+    def _find_financial_dense_region(text: str, window: int) -> int:
+        """Return the start index of the `window`-char slice with the
+        highest density of financial-table content.
+
+        Heuristic: count dollar-prefixed amounts (`$1,234`), bare
+        comma-separated thousands (`1,234,567`), and parenthesized
+        negatives (`(123)`). These patterns are dense in income
+        statements, balance sheets, and cash flow statements; sparse
+        in cover pages, TOCs, and XBRL taxonomy boilerplate.
+
+        Returns 0 when text is shorter than window, or when no
+        candidate slice is meaningfully denser than the head — in
+        which case the original behavior (head slice) is preserved.
+        """
+        if len(text) <= window:
+            return 0
+        # Slide in 10 steps across the document; cheap, ~10 regex passes.
+        pattern = re.compile(r"\$[\d,]+(?:\.\d+)?|\d{1,3}(?:,\d{3})+|\(\d{1,3}(?:,\d{3})*\)")
+        step = max(window // 10, 1000)
+        scores: list[tuple[int, int]] = []  # (count, start)
+        for start in range(0, len(text) - window + 1, step):
+            chunk = text[start:start + window]
+            scores.append((len(pattern.findall(chunk)), start))
+        if not scores:
+            return 0
+        best_count, best_start = max(scores, key=lambda x: x[0])
+        head_count = scores[0][0]
+        # Only relocate if the densest region is meaningfully richer than
+        # the head — guards against the "all chunks are equally barren"
+        # case where moving the slice doesn't help. 2× threshold tuned
+        # against the audit's 58 affected filings: their head chunks had
+        # ~5-15 matches while mid-document chunks had 50-300.
+        if best_count >= 2 * max(head_count, 5):
+            return best_start
+        return 0
 
     def _extract_key_sections(self, text: str) -> dict[str, str]:
         """Locate financial / MD&A / risk-factor section bodies via regex.
@@ -389,17 +434,23 @@ class EarningsDataProvider:
         header to the next detected section/stop marker.
         """
         # Each entry: (label, pattern, strategy)
-        # - "first":    the pattern matches a distinctive heading, not a TOC
-        #               line — the first occurrence is the real one. Financial
-        #               statements use this because 'CONSOLIDATED STATEMENTS
-        #               OF OPERATIONS' isn't something a TOC typically says.
-        # - "skip_toc": the pattern matches 'Item X. Section Name', which DOES
-        #               appear in a TOC — prefer the first occurrence past
-        #               ~15K chars (where the TOC ends).
+        # - "first":    the pattern matches a distinctive heading and the
+        #               first occurrence is the real one.
+        # - "skip_toc": the pattern matches a section title that DOES appear
+        #               in a TOC — prefer the first occurrence past ~15K
+        #               chars. Originally only used for mdna / risk_factors,
+        #               but R6 log audit (May 2026) found 58 filings where
+        #               financial_statements matched a TOC-style entry and
+        #               produced a tiny (200-700 char) body — affected
+        #               PG / SBUX / V / ABT / AMZN / CAT / COP / LLY 10-Qs
+        #               whose internal "Index to Financial Statements"
+        #               navigation listed "Consolidated Statements of
+        #               Operations" before the real section started. Switched
+        #               to skip_toc so we land on the actual table.
         patterns = [
             ("financial_statements", re.compile(
-                r"(?im)(?:condensed\s+)?consolidated\s+statements?\s+of\s+(?:operations?|income)\b"
-            ), "first"),
+                r"(?im)(?:condensed\s+)?consolidated\s+statements?\s+of\s+(?:operations?|income|earnings)\b"
+            ), "skip_toc"),
             ("mdna", re.compile(
                 # [\u2019'] accepts both ASCII apostrophe and the curly
                 # quote U+2019 that SEC HTML filings commonly use.

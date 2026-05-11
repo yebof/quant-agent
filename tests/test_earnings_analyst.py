@@ -154,6 +154,97 @@ def test_extract_text_falls_back_to_truncated_when_sections_sparse(tmp_path):
     assert "[... truncated ...]" in out
 
 
+def test_extract_text_skips_toc_for_financial_statements(tmp_path):
+    """R6 audit (May 2026): logs showed 58 filings where the regex for
+    'Consolidated Statements of Operations' matched the internal TOC /
+    Index to Financial Statements before reaching the actual table.
+    Result was ~553 chars of TOC entries vs 10,000+ chars of real data.
+
+    Pin: when a TOC entry occurs BEFORE the real section, skip_toc
+    strategy picks the later (real) one. Affected real-world filings:
+    PG / SBUX / V / ABT / AMZN / CAT / COP / LLY 10-Qs."""
+    from src.data.earnings import EarningsDataProvider
+
+    # TOC entry (within first 15K chars) then later real section past 15K.
+    # The early "Consolidated Statements of Operations" is a TOC pointer
+    # with only ~200 chars of body before the next "Item" stop marker —
+    # short enough to be dropped by the >=150 char threshold normally, but
+    # NOT short enough if any "Item X" stop is found just after.
+    early_toc = (
+        "<html><body>"
+        "<h1>Procter & Gamble 10-Q</h1>\n"
+        "INDEX TO CONSOLIDATED FINANCIAL STATEMENTS\n"
+        "Consolidated Statements of Operations\n"
+        "(page 3)\n"
+        # Filler to push the real section past 15K
+        + ("Lorem cover-page boilerplate text padding the front. " * 350)
+        # Real financial statement past the 15K threshold
+        + "\nCONSOLIDATED STATEMENTS OF OPERATIONS\n"
+        + ("Net sales $21,737 Cost of products sold $10,392 "
+           "Operating income $5,148 Net earnings $4,103 Diluted EPS $1.66. " * 30)
+        + "\nItem 2. Management's Discussion and Analysis\n"
+        + ("Sales growth was driven by Beauty +6% and Health +8%. " * 30)
+        + "\nItem 3. Quantitative disclosures\n"
+        "</body></html>"
+    )
+    html_path = tmp_path / "pg.html"
+    html_path.write_bytes(early_toc.encode())
+
+    p = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
+    out = p._extract_text(str(html_path), max_chars=30000)
+    # The body of the financial_statements section must include the real
+    # numerics, not just the TOC pointer.
+    assert "Net sales $21,737" in out
+    assert "Diluted EPS $1.66" in out
+    assert "=== FINANCIAL STATEMENTS ===" in out
+
+
+def test_extract_text_finds_financial_dense_region_on_fallback(tmp_path):
+    """When structured extraction completely fails (filing layout that
+    doesn't match any regex), fall back to the financial-data-rich
+    region of the text rather than the front (which is typically
+    cover page + XBRL boilerplate for iXBRL 10-Qs)."""
+    from src.data.earnings import EarningsDataProvider
+
+    # Front-loaded XBRL/cover boilerplate (no $-amount density), then a
+    # rich financial table in the middle. No section headers anywhere
+    # to defeat structured extraction entirely.
+    boilerplate_front = (
+        "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax "
+        "contextRef=ctx_2026_q1 dimension=member dei:DocumentType "
+        "ifrs-full:Assets fair-value-hierarchy Level1 Level2 Level3 "
+    ) * 200
+    rich_middle = (
+        "Net sales $45,123 Operating income $12,456 Net income $9,876 "
+        "Total assets $250,000 Cash $30,000 Diluted EPS $4.32 "
+        "Free cash flow $11,234 Capital expenditures $(1,500) "
+    ) * 100
+    quiet_tail = "Signatures. Exhibit list. Other boilerplate. " * 200
+
+    body = boilerplate_front + rich_middle + quiet_tail
+    html_path = tmp_path / "ixbrl.html"
+    html_path.write_bytes(f"<html><body>{body}</body></html>".encode())
+
+    p = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
+    out = p._extract_text(str(html_path), max_chars=10000)
+    # Output must contain the rich-middle financial numbers, NOT the
+    # XBRL boilerplate that dominated the front.
+    assert "Net sales $45,123" in out
+    assert "Diluted EPS $4.32" in out
+
+
+def test_find_financial_dense_region_preserves_head_when_no_obvious_winner(tmp_path):
+    """Tuning guard: if every chunk has similar low financial density
+    (e.g., filing is genuinely all narrative — possibly a stub or an
+    amendment with no statements), don't relocate. Returning 0 keeps
+    backward compat behavior."""
+    from src.data.earnings import EarningsDataProvider
+
+    flat = "narrative text with no dollar figures or financial tables. " * 2000
+    idx = EarningsDataProvider._find_financial_dense_region(flat, window=5000)
+    assert idx == 0
+
+
 def test_earnings_analyst_accepts_valid_analysis(agent, report):
     agent.run = MagicMock(
         return_value=AgentResult(
