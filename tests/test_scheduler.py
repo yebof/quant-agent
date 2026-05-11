@@ -65,7 +65,7 @@ def test_scheduler_intra_check_fires_every_30_min_during_market_hours(mock_pipel
     breaker's purpose. Pin the multi-tick schedule so a settings-yaml
     edit can't accidentally degrade circuit-breaker coverage."""
     from datetime import datetime
-    from zoneinfo import ZoneInfo
+    from src.trading_calendar import ET as et
 
     cfg = MagicMock()
     cfg.trading.schedule = SimpleNamespace(
@@ -83,7 +83,6 @@ def test_scheduler_intra_check_fires_every_30_min_during_market_hours(mock_pipel
 
     intra_job = next(j for j in scheduler.scheduler.get_jobs() if j.id == "intra_check")
     trigger = intra_job.trigger
-    et = ZoneInfo("US/Eastern")
 
     # Walk the trigger from 08:00 ET Monday and collect ALL firings until
     # the end of the day. Must align EXACTLY with SESSION_WINDOWS["intra_check"]

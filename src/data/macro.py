@@ -15,6 +15,22 @@ logger = logging.getLogger(__name__)
 _FRED_TIMEOUT_S = 15.0
 
 
+def _et_lookback_start(days: int) -> pd.Timestamp:
+    """Pandas timestamp `days` days before the current ET trading day,
+    used as the `observation_start` for FRED queries.
+
+    Previously these sites used ``pd.Timestamp.now() - pd.Timedelta(days=N)``
+    which is host-TZ-naive: a Linux-UTC host and a Mac-ET host would
+    compute different lookback boundaries for the same calendar day.
+    FRED has daily resolution so the practical drift is at most one
+    daily observation — but the CLAUDE.md invariant is "any host TZ
+    must produce the same data", and the staleness_days computation
+    in this module already uses et_today() for the upper bound. Anchoring
+    the lookback to et_today() too keeps the window symmetric.
+    """
+    return pd.Timestamp(et_today()) - pd.Timedelta(days=days)
+
+
 class MacroDataProvider:
     def __init__(self, api_key: str):
         self.fred = Fred(api_key=api_key)
@@ -70,7 +86,7 @@ class MacroDataProvider:
     def get_vix(self, lookback_days: int = 30) -> dict:
         series = self._safe_get_series(
             "VIXCLS",
-            observation_start=pd.Timestamp.now() - pd.Timedelta(days=lookback_days),
+            observation_start=_et_lookback_start(lookback_days),
         )
         series = series.dropna()
         if series.empty:
@@ -92,11 +108,11 @@ class MacroDataProvider:
     def get_treasury_yields(self) -> dict:
         us2y_series = self._safe_get_series(
             "DGS2",
-            observation_start=pd.Timestamp.now() - pd.Timedelta(days=14),
+            observation_start=_et_lookback_start(14),
         ).dropna()
         us10y_series = self._safe_get_series(
             "DGS10",
-            observation_start=pd.Timestamp.now() - pd.Timedelta(days=14),
+            observation_start=_et_lookback_start(14),
         ).dropna()
         us2y = float(us2y_series.iloc[-1]) if not us2y_series.empty else None
         us10y = float(us10y_series.iloc[-1]) if not us10y_series.empty else None
@@ -118,7 +134,7 @@ class MacroDataProvider:
         """
         series = self._safe_get_series(
             "DFF",
-            observation_start=pd.Timestamp.now() - pd.Timedelta(days=30),
+            observation_start=_et_lookback_start(30),
         ).dropna()
         if series.empty:
             return {"current": None, "change_30d": None, "staleness_days": None}
@@ -138,7 +154,7 @@ class MacroDataProvider:
         def _latest_yoy_mom(series_id: str) -> tuple[float | None, float | None, pd.Series]:
             s = self._safe_get_series(
                 series_id,
-                observation_start=pd.Timestamp.now() - pd.Timedelta(days=500),
+                observation_start=_et_lookback_start(500),
             ).dropna()
             if len(s) < 13:
                 return None, None, s
@@ -166,7 +182,7 @@ class MacroDataProvider:
         """
         series = self._safe_get_series(
             "UNRATE",
-            observation_start=pd.Timestamp.now() - pd.Timedelta(days=500),
+            observation_start=_et_lookback_start(500),
         ).dropna()
         if series.empty:
             return {"current": None, "change_3m": None, "change_12m": None, "staleness_days": None}
@@ -191,7 +207,7 @@ class MacroDataProvider:
         """
         series = self._safe_get_series(
             "BAMLH0A0HYM2",
-            observation_start=pd.Timestamp.now() - pd.Timedelta(days=60),
+            observation_start=_et_lookback_start(60),
         ).dropna()
         if series.empty:
             return {"current_bps": None, "change_30d_bps": None, "staleness_days": None}
