@@ -253,6 +253,68 @@ def test_outlook_calibration_empty_when_no_history():
     assert calib["samples"] == []
 
 
+def test_outlook_calibration_bullish_below_neutral_band_is_a_miss():
+    """Edge case: bullish bias on a day that returned +0.1% (positive but
+    inside the ±0.3% neutral band) must NOT count as matched — bullish
+    means clearly up, not "barely positive". Without this guard, the
+    bullish hit-rate would be inflated by flat-day flukes."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = MagicMock()
+    pipeline.db.get_recent_insights.return_value = [
+        {"date": "2026-04-14", "tomorrow_bias": "bullish", "tomorrow_conviction": "medium"},
+    ]
+    pipeline.db.get_daily_pnl.return_value = [
+        {"date": "2026-04-15", "daily_return_pct": 0.1},  # inside ±0.3 band
+    ]
+    calib = pipeline._build_recent_outlook_calibration(lookback=10)
+    assert calib["n"] == 1
+    assert calib["samples"][0]["matched"] is False
+    assert calib["bullish_hit_rate_pct"] == 0.0
+
+
+def test_outlook_calibration_pairs_friday_prediction_with_monday_actual():
+    """Friday evening's tomorrow_bias predicts Monday's session (weekend
+    intervenes). Pairing logic must walk forward up to +4 days to find
+    the next daily_pnl row, not silently drop the sample."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = MagicMock()
+    pipeline.db.get_recent_insights.return_value = [
+        # Friday evening
+        {"date": "2026-04-17", "tomorrow_bias": "bullish", "tomorrow_conviction": "high"},
+    ]
+    pipeline.db.get_daily_pnl.return_value = [
+        # No Saturday / Sunday rows — next trading day is Monday.
+        {"date": "2026-04-20", "daily_return_pct": 0.9},
+    ]
+    calib = pipeline._build_recent_outlook_calibration(lookback=10)
+    assert calib["n"] == 1, (
+        "Friday prediction must pair with Monday actual via the +1..+4d "
+        "forward walk; got no samples"
+    )
+    assert calib["samples"][0]["matched"] is True
+
+
+def test_outlook_calibration_respects_lookback_limit():
+    """With 12 insights and lookback=5, only 5 samples land in the output —
+    the rolling window must NOT silently grow when more insights exist."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = MagicMock()
+    insights = [
+        {"date": f"2026-04-{day:02d}", "tomorrow_bias": "bullish",
+         "tomorrow_conviction": "high"}
+        for day in range(1, 13)
+    ]
+    pnls = [
+        {"date": f"2026-04-{day + 1:02d}", "daily_return_pct": 1.0}
+        for day in range(1, 13)
+    ]
+    pipeline.db.get_recent_insights.return_value = insights
+    pipeline.db.get_daily_pnl.return_value = pnls
+    calib = pipeline._build_recent_outlook_calibration(lookback=5)
+    assert calib["n"] == 5
+    assert len(calib["samples"]) == 5
+
+
 def test_outlook_calibration_stratifies_by_conviction():
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.db = MagicMock()

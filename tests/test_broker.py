@@ -414,6 +414,86 @@ def test_submit_order_quantizes_sub_penny_limit_price(mock_tc_cls):
 
 
 @patch("src.execution.broker.TradingClient")
+def test_submit_order_buy_without_stop_loss_uses_plain_limit_not_oto(mock_tc_cls):
+    """If stop_loss_price is None (TA couldn't compute ATR / illiquid name),
+    submit_order must submit a plain LIMIT order — NOT an OTO bracket with
+    a None stop, which would crash Alpaca's serializer. The BUY proceeds
+    without broker-attached protection; pipeline's next session re-adds
+    protection if needed."""
+    from alpaca.trading.requests import LimitOrderRequest
+
+    mock_client = MagicMock()
+    mock_client.submit_order.return_value = MagicMock(
+        id="ord-no-stop", status="accepted", symbol="ILLIQ",
+    )
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.submit_order(
+        symbol="ILLIQ", qty=10, side="buy",
+        limit_price=50.0,
+        stop_loss_price=None,
+    )
+    assert result["status"] == "accepted"
+    req = mock_client.submit_order.call_args[0][0]
+    assert isinstance(req, LimitOrderRequest)
+    # No OTO bracket — order_class is not set / no stop_loss leg.
+    assert getattr(req, "order_class", None) is None
+    assert getattr(req, "stop_loss", None) is None
+
+
+@patch("src.execution.broker.TradingClient")
+def test_submit_order_buy_with_zero_stop_loss_skips_oto(mock_tc_cls):
+    """stop_loss_price=0 is treated the same as None (degenerate ATR
+    output) — no OTO bracket. Without this guard the OTO leg would be
+    submitted with stop_price=0 and broker would reject the whole order,
+    losing the BUY too."""
+    from alpaca.trading.requests import LimitOrderRequest
+
+    mock_client = MagicMock()
+    mock_client.submit_order.return_value = MagicMock(
+        id="ord-zero", status="accepted", symbol="X",
+    )
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    broker.submit_order(
+        symbol="X", qty=5, side="buy",
+        limit_price=100.0,
+        stop_loss_price=0.0,
+    )
+    req = mock_client.submit_order.call_args[0][0]
+    assert getattr(req, "order_class", None) is None
+    assert getattr(req, "stop_loss", None) is None
+
+
+@patch("src.execution.broker.TradingClient")
+def test_submit_order_sell_ignores_stop_loss_price(mock_tc_cls):
+    """SELL-side orders don't attach a protective stop — exiting a position
+    doesn't need one. If a caller passes stop_loss_price by mistake (e.g.,
+    morning's SELL helper plumbed it through), the OTO leg must NOT be
+    attached. Without this guard the broker would error out and the SELL
+    would never submit."""
+    from alpaca.trading.requests import LimitOrderRequest
+
+    mock_client = MagicMock()
+    mock_client.submit_order.return_value = MagicMock(
+        id="ord-sell", status="accepted", symbol="NVDA",
+    )
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    broker.submit_order(
+        symbol="NVDA", qty=10, side="sell",
+        limit_price=420.0,
+        stop_loss_price=400.0,  # accidentally provided
+    )
+    req = mock_client.submit_order.call_args[0][0]
+    assert getattr(req, "order_class", None) is None
+    assert getattr(req, "stop_loss", None) is None
+
+
+@patch("src.execution.broker.TradingClient")
 def test_submit_order_keeps_four_decimals_for_sub_dollar_stocks(mock_tc_cls):
     """Penny stocks under $1 use $0.0001 ticks — quantize must not over-round."""
     from alpaca.trading.requests import LimitOrderRequest

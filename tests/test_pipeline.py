@@ -7,7 +7,7 @@ from src.models import (
     TechAnalysisResult, PortfolioDecision, TradeDecision, RiskVerdict, Position,
     NewsAnalysisResult, TargetPosition,
     MacroAnalysis, MacroReasoningChain, MacroPositionGuidance,
-    PositionReview, PositionReasoningChain,
+    PositionReview, PositionReasoningChain, PositionAction,
     ReasoningChain, RiskReasoningChain, TechReasoningChain,
 )
 
@@ -2441,3 +2441,350 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
     assert buy_kw["limit_price"] == 100.0
     assert buy_kw["stop_loss_price"] == 95.0
     assert buy_kw.get("reference_price") is not None
+
+
+# ============================================================================
+# Same-day trim discipline — end-to-end through _midday_execute_llm_actions.
+# Existing tests pin the keyword matcher and morning-trades fetch contract;
+# these pin the BEHAVIOR: a SELL/REDUCE on an already-trimmed symbol with a
+# soft reason must NOT reach the broker, while one with a hard trigger or
+# a TRAIL_STOP must pass through. Codified after the 2026-05-04 AMZN
+# 41→21→11 share double-trim incident.
+# ============================================================================
+
+def _mk_midday_pipeline(position: Position) -> TradingPipeline:
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    pipeline.broker.submit_order.return_value = {
+        "id": "ord-1", "status": "accepted", "symbol": position.symbol,
+    }
+    pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline.broker.replace_stop_loss.return_value = {
+        "id": "stop-1", "status": "accepted",
+    }
+    pipeline.db = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._full_sell_qty = lambda q: q
+    pipeline._reduce_sell_qty = lambda q: q * 0.5
+    pipeline._finalize_protection_after_sell = MagicMock(return_value=(True, []))
+    return pipeline
+
+
+def test_midday_blocks_second_sell_on_soft_reason_for_already_trimmed_symbol():
+    """First SELL on AMZN today succeeded; midday/close LLM emits another
+    SELL with a soft reason (`TARGET_BREACH`, valuation stretch, etc.).
+    Pin: broker.submit_order is NOT called — discipline holds."""
+    position = Position(
+        symbol="AMZN", qty=20.0, avg_entry=180.0, current_price=210.0,
+        market_value=4200.0, unrealized_pnl=600.0,
+        unrealized_intraday_pnl=0.0, sector="Consumer Cyclical",
+    )
+    pipeline = _mk_midday_pipeline(position)
+    review = PositionReview(
+        reasoning_chain=_review_rc(),
+        actions=[PositionAction(
+            action="SELL", symbol="AMZN",
+            reason="TARGET_BREACH — up 16% since entry, valuation stretched",
+        )],
+        overall_assessment="trim winner",
+        risk_level="low",
+    )
+    orders = pipeline._midday_execute_llm_actions(
+        positions=[position], review=review, run_id="r-1",
+        already_trimmed_today={"AMZN"},
+    )
+    assert orders == []
+    pipeline.broker.submit_order.assert_not_called()
+    pipeline.db.insert_trade.assert_not_called()
+
+
+def test_midday_allows_second_sell_on_hard_trigger_for_already_trimmed_symbol():
+    """Same scenario but the LLM explicitly cites a hard trigger
+    (thesis_invalid_if, HIGH state-change reversal, bearish earnings,
+    daily-loss circuit breaker, correlation breach, stop hit). Pin:
+    discipline yields, broker.submit_order IS called."""
+    position = Position(
+        symbol="AMZN", qty=20.0, avg_entry=180.0, current_price=210.0,
+        market_value=4200.0, unrealized_pnl=600.0,
+        unrealized_intraday_pnl=0.0, sector="Consumer Cyclical",
+    )
+    pipeline = _mk_midday_pipeline(position)
+    review = PositionReview(
+        reasoning_chain=_review_rc(),
+        actions=[PositionAction(
+            action="SELL", symbol="AMZN",
+            reason="thesis_invalid_if triggered — guidance cut, earnings call missed",
+        )],
+        overall_assessment="exit on broken thesis",
+        risk_level="high",
+    )
+    orders = pipeline._midday_execute_llm_actions(
+        positions=[position], review=review, run_id="r-1",
+        already_trimmed_today={"AMZN"},
+    )
+    assert len(orders) == 1
+    pipeline.broker.submit_order.assert_called_once()
+
+
+def test_midday_blocks_second_reduce_on_soft_reason_for_already_trimmed_symbol():
+    """REDUCE is on the same discipline as SELL — soft reason on an
+    already-trimmed name must not stack a second trim."""
+    position = Position(
+        symbol="AMZN", qty=20.0, avg_entry=180.0, current_price=210.0,
+        market_value=4200.0, unrealized_pnl=600.0,
+        unrealized_intraday_pnl=0.0, sector="Consumer Cyclical",
+    )
+    pipeline = _mk_midday_pipeline(position)
+    review = PositionReview(
+        reasoning_chain=_review_rc(),
+        actions=[PositionAction(
+            action="REDUCE", symbol="AMZN",
+            reason="momentum slowing slightly, +13% on day",
+        )],
+        overall_assessment="trim again",
+        risk_level="low",
+    )
+    orders = pipeline._midday_execute_llm_actions(
+        positions=[position], review=review, run_id="r-1",
+        already_trimmed_today={"AMZN"},
+    )
+    assert orders == []
+    pipeline.broker.submit_order.assert_not_called()
+
+
+def test_midday_allows_trail_stop_on_already_trimmed_symbol():
+    """TRAIL_STOP isn't a sell of shares — adjusting the protective stop
+    is fine even after a same-day trim. Pin: replace_stop_loss IS called
+    regardless of trim history."""
+    position = Position(
+        symbol="AMZN", qty=20.0, avg_entry=180.0, current_price=210.0,
+        market_value=4200.0, unrealized_pnl=600.0,
+        unrealized_intraday_pnl=0.0, sector="Consumer Cyclical",
+    )
+    pipeline = _mk_midday_pipeline(position)
+    review = PositionReview(
+        reasoning_chain=_review_rc(),
+        actions=[PositionAction(
+            action="TRAIL_STOP", symbol="AMZN",
+            reason="lock in some of the +16% move",
+            new_stop_price=195.0,
+        )],
+        overall_assessment="tighten stop",
+        risk_level="low",
+    )
+    orders = pipeline._midday_execute_llm_actions(
+        positions=[position], review=review, run_id="r-1",
+        already_trimmed_today={"AMZN"},
+    )
+    assert len(orders) == 1
+    pipeline.broker.replace_stop_loss.assert_called_once()
+
+
+def test_midday_first_sell_of_day_passes_through():
+    """No prior trim on this symbol today → SELL with even a soft reason
+    is allowed (first one is fine; only the SECOND on the same day with
+    a soft reason is the mechanical-loop bug we guard against)."""
+    position = Position(
+        symbol="NVDA", qty=10.0, avg_entry=400.0, current_price=420.0,
+        market_value=4200.0, unrealized_pnl=200.0,
+        unrealized_intraday_pnl=0.0, sector="Technology",
+    )
+    pipeline = _mk_midday_pipeline(position)
+    review = PositionReview(
+        reasoning_chain=_review_rc(),
+        actions=[PositionAction(
+            action="SELL", symbol="NVDA",
+            reason="momentum cooling, take some off",
+        )],
+        overall_assessment="trim winner",
+        risk_level="low",
+    )
+    orders = pipeline._midday_execute_llm_actions(
+        positions=[position], review=review, run_id="r-1",
+        already_trimmed_today=set(),  # empty — first time today
+    )
+    assert len(orders) == 1
+    pipeline.broker.submit_order.assert_called_once()
+
+
+def test_symbols_already_trimmed_today_recognises_force_delever_action():
+    """force_delever writes action='FORCE_DELEVER'. The same-day-trim
+    discipline must treat it as a sell-side action so a force-deleverage
+    earlier today blocks an additional REDUCE / SELL of the same symbol
+    by the position reviewer."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = MagicMock()
+    pipeline.db.get_trades.return_value = [
+        {"action": "FORCE_DELEVER", "symbol": "NVDA", "fill_status": "filled"},
+        {"action": "TRAIL_STOP", "symbol": "AAPL", "fill_status": "filled"},
+        {"action": "SELL", "symbol": "TSLA", "fill_status": "rejected"},
+    ]
+    trimmed = pipeline._symbols_already_trimmed_today()
+    # NVDA (FORCE_DELEVER) blocks; AAPL (TRAIL_STOP) is not a sell-of-shares;
+    # TSLA (rejected) leaves the symbol fair-game for re-attempt.
+    assert trimmed == {"NVDA"}
+
+
+# ============================================================================
+# FORCE_DELEVER persistence + inverse-ETF deprioritization
+# ============================================================================
+
+def test_force_delever_persists_exact_action_string_to_trades_table():
+    """The same-day-trim discipline filters trades by action string. If
+    force_delever wrote anything other than 'FORCE_DELEVER' (e.g.,
+    'force_delever' lowercased, or 'FORCE-DELEVER' hyphenated) the
+    discipline would miss it and allow a same-day double-trim on a
+    symbol force-sold for margin reasons. Pin the exact string."""
+    from src.pipeline_context import RunContext
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    pipeline.broker.submit_order.return_value = {
+        "id": "ord-1", "status": "accepted", "symbol": "NVDA",
+    }
+    pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline.broker.get_account.return_value = {
+        "cash": 5000.0, "portfolio_value": 5000.0, "last_equity": 5000.0,
+    }
+    pipeline.broker.get_positions.return_value = []
+    pipeline.db = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._full_sell_qty = lambda q: q
+    pipeline._finalize_protection_after_sell = MagicMock(return_value=(True, []))
+    pipeline.config = MagicMock()
+    pipeline.config.risk.allow_margin = False
+
+    losing_position = Position(
+        symbol="NVDA", qty=10.0, avg_entry=500.0, current_price=400.0,
+        market_value=4000.0, unrealized_pnl=-1000.0,
+        unrealized_intraday_pnl=0.0, sector="Technology",
+    )
+    ctx = RunContext(run_id="r-1", session="morning")
+    ctx.cash = -500.0  # deficit, triggers de-lever
+    ctx.positions = [losing_position]
+
+    pipeline._force_delever(ctx)
+
+    assert pipeline.db.insert_trade.called, "force_delever must persist a trade row"
+    insert_kwargs = pipeline.db.insert_trade.call_args.kwargs
+    assert insert_kwargs["action"] == "FORCE_DELEVER", (
+        f"action string drift would break same-day-trim discipline; "
+        f"got {insert_kwargs['action']!r}"
+    )
+
+
+def test_force_delever_sells_long_before_inverse_etf_hedge():
+    """Mixed account: long NVDA losing money + SH (inverse-S&P hedge)
+    losing money on a rally. Naive biggest-loser-first would pick the
+    one with the most negative P&L first; if that's SH, force_delever
+    would cut the HEDGE and leave the long naked — opposite of risk
+    reduction. The tiered sort sells longs FIRST, then inverse ETFs
+    only when no longs remain or the deficit isn't cleared yet."""
+    from src.pipeline_context import RunContext
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    pipeline.broker.submit_order.return_value = {
+        "id": "ord-1", "status": "accepted",
+    }
+    pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline.broker.get_account.return_value = {
+        "cash": 0.0, "portfolio_value": 6000.0, "last_equity": 6000.0,
+    }
+    pipeline.broker.get_positions.return_value = []
+    pipeline.db = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._full_sell_qty = lambda q: q
+    pipeline._finalize_protection_after_sell = MagicMock(return_value=(True, []))
+    pipeline.config = MagicMock()
+    pipeline.config.risk.allow_margin = False
+
+    # SH (inverse hedge) is the BIGGER loser on a rally day.
+    sh_hedge = Position(
+        symbol="SH", qty=100.0, avg_entry=20.0, current_price=18.0,
+        market_value=1800.0, unrealized_pnl=-200.0,
+        unrealized_intraday_pnl=0.0, sector="ETF",
+    )
+    # NVDA long, smaller loss.
+    nvda_long = Position(
+        symbol="NVDA", qty=10.0, avg_entry=420.0, current_price=400.0,
+        market_value=4000.0, unrealized_pnl=-200.0,  # tie on P&L
+        unrealized_intraday_pnl=0.0, sector="Technology",
+    )
+    ctx = RunContext(run_id="r-1", session="morning")
+    ctx.cash = -300.0  # deficit small enough that ONE position clears it
+    ctx.positions = [sh_hedge, nvda_long]
+
+    pipeline._force_delever(ctx)
+
+    # First (and only) SELL must be on the LONG (NVDA), not the HEDGE (SH).
+    first_sell_kwargs = pipeline.broker.submit_order.call_args_list[0].kwargs
+    assert first_sell_kwargs["symbol"] == "NVDA", (
+        f"force_delever must prefer longs over inverse-ETF hedges to avoid "
+        f"un-hedging the book; first sold symbol={first_sell_kwargs['symbol']!r}"
+    )
+    # SH must not be touched while a long was available.
+    sold_symbols = [
+        c.kwargs["symbol"] for c in pipeline.broker.submit_order.call_args_list
+    ]
+    assert "SH" not in sold_symbols
+
+
+# ============================================================================
+# NaN market_value guard in SELL pre-sum
+# ============================================================================
+
+def test_filter_hard_risk_decisions_skips_nan_market_value_in_sell_presum(tmp_path):
+    """If broker returns NaN market_value (rare market-open glitch), the
+    SELL pre-sum used to add NaN to sell_proceeds → effective_cash=NaN →
+    every BUY hard-rule check passed (NaN > limit is False). Pin: NaN
+    SELL is dropped from the pre-sum so cash budget stays conservative
+    and BUYs go through the hard-rule path on real cash, not phantom."""
+    import math as _math
+    from src.config import RiskConfig
+    from src.risk.rules import RiskRuleEngine
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.risk_engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=20, max_total_position_pct=90,
+        max_daily_loss_pct=3, max_sector_pct=40,
+        allow_margin=False, require_stop_loss=True,
+    ))
+
+    nan_position = Position(
+        symbol="GLITCH", qty=10.0, avg_entry=100.0, current_price=float("nan"),
+        market_value=float("nan"), unrealized_pnl=0.0,
+        unrealized_intraday_pnl=0.0, sector="Technology",
+    )
+    sell = TradeDecision(
+        action="SELL", symbol="GLITCH", allocation_pct=50.0,
+        entry_price=0.0, stop_loss=0.0, take_profit=0.0,
+        reasoning="trim half",
+    )
+    buy = TradeDecision(
+        action="BUY", symbol="AAPL", allocation_pct=10.0,
+        entry_price=180.0, stop_loss=170.0, take_profit=200.0,
+        reasoning="add",
+    )
+    allowed, _violations, _reasons = pipeline._filter_hard_risk_decisions(
+        decisions=[sell, buy],
+        positions=[nan_position],
+        total_value=10000.0,
+        daily_pnl=0.0,
+        baseline=10000.0,
+        cash=500.0,
+        macro_target_invested_pct=None,
+        correlation_matrix={},
+    )
+    # SELL with NaN market_value is dropped from the pre-sum, so
+    # effective_cash = 500 + 0 = 500 (not NaN). The BUY for $1000
+    # (10% of $10k) exceeds 500 cash → cash_only rule blocks the BUY.
+    buy_in_allowed = any(d.action == "BUY" for d in allowed)
+    assert not buy_in_allowed, (
+        "BUY must not slip through when SELL's market_value was NaN — "
+        "effective_cash should not have been NaN-poisoned"
+    )
+    # The SELL itself still goes through (not its job to know its proceeds
+    # for cash-budget purposes; broker just executes).
+    assert any(d.action == "SELL" for d in allowed)
