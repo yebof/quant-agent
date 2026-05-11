@@ -26,7 +26,7 @@ LLM multi-agent quantitative trading system for US equities. Eight specialized d
 
 - **Timezone-resilient by construction.** A single `src/trading_calendar.py` module is the source of truth for ET session windows, fill timestamps, and date keys. The OS-level scheduler (systemd `quant-agent@%i.timer` on Linux, launchd plist on macOS) fires at correct US-market times regardless of the operator's host timezone — the wrapper checks ET wall clock at fire time and skips if outside the window, so the system runs correctly when the operator is in SGT, GMT, or PT. A bash test pins the wrapper's window table against the Python authoritative source.
 
-- **Tested.** 820 tests pin every invariant, including regression tests for every fix in the public commit history. Per-entry isolation (one bad LLM sub-item must not drop the whole report) is now standard across all 9 agents — a discipline that surfaced after a single malformed `MissedOpportunity` entry took down a complete evening report; adding a 10th agent would inherit the same pattern.
+- **Tested.** 874 tests pin every invariant, including regression tests for every fix in the public commit history. Per-entry isolation (one bad LLM sub-item must not drop the whole report) is now standard across all 9 agents — a discipline that surfaced after a single malformed `MissedOpportunity` entry took down a complete evening report; adding a 10th agent would inherit the same pattern.
 
 ## Architecture
 
@@ -200,6 +200,25 @@ EOF
 
 - `QUANT_AGENT_MAX_RETRIES` (default `7`) — base agent LLM-call retry budget. Backoff is **exponential floor + full positive jitter**: each sleep is in `[2^attempt, 2*2^attempt)`. With N=7 the worst-case total window is ~140s (6 sleeps in `[1,2)+[2,4)+[4,8)+[8,16)+[16,32)+[32,64)` ≈ up to 126s, plus 7 fast-fail call latencies). Evolution: `3 → 5 (DNS hiccup, 2026-04-23) → 7+jitter (sustained 30s OpenAI outages, 2026-04-28+29)`. Jitter is the load-bearing piece — without it, every retry attempt fires at deterministic offsets and a 30s outage swallows all of them; with jitter, individual attempts spread over a wider window so at least one tends to land outside any short outage. Drop to 2-3 for fast tests, raise to 10 if your provider chronically misbehaves.
 
+- `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` — enable Telegram session-status push. If either is missing the notifier no-ops silently; trading runs unchanged. Set both to wire it up:
+
+  1. Create a bot via [@BotFather](https://t.me/BotFather): `/newbot` → name → username → it hands you a token like `12345:ABC...`.
+  2. Start a chat with your bot (send any message — `/start` is fine — so it can DM you back).
+  3. Get your chat_id: `curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[0].message.chat.id'`. For a group, add the bot to the group then send a message; chat_id is negative.
+  4. Add to `.env`:
+     ```
+     TELEGRAM_BOT_TOKEN=12345:ABC...
+     TELEGRAM_CHAT_ID=987654321
+     ```
+  5. (Optional) Set `TELEGRAM_DISABLED=1` to mute without removing the creds.
+
+  **Per-mode noise policy** (so the operator gets signal, not noise):
+  - `morning` / `midday` / `close` / `evening`: always notify on completion (status + run_id + orders + degraded-data flag + elapsed).
+  - `earnings_preprocess`: notify only when filings were analyzed; silent on `nothing_new` / `market_holiday` / transient SEC `fetch_error`.
+  - `intra_check`: silent on the 14 OK ticks per trading day; notifies loudly when the circuit breaker fires (`emergency_sold` / `hard_risk_block`).
+  - `meta`: silent on `not_quarter_end`; notifies on actual reflection runs.
+  - Any session that raises an exception: always notifies, regardless of mode policy.
+
 ### Production deployment
 
 Either OS-level scheduler can drive the 6 sessions; both wrap `scripts/run_if_et_window.sh` so the actual ET-window / last-run / cross-mode-lock logic is shared.
@@ -282,6 +301,7 @@ quant-agent/
 │   ├── pipeline.py                # Orchestrator (morning/midday/close/evening/earnings_preprocess/intra_check/meta)
 │   ├── pipeline_stages.py         # MorningResearch / Decision / Risk / Execution stage classes
 │   ├── pipeline_context.py        # RunContext dataclass — explicit shared state across stages
+│   ├── notifier.py                # Telegram session-status push (opt-in via env vars; per-mode noise policy)
 │   ├── portfolio_constructor.py   # Deterministic Target → TradeDecision translator (risk-budget sizing)
 │   ├── trading_calendar.py        # ET timezone + SESSION_WINDOWS + session_date_key (single source of truth)
 │   ├── scheduler.py               # APScheduler — only used by --mode live (dev/legacy)
@@ -305,7 +325,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 820 tests
+├── tests/                         # 874 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -316,7 +336,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 820 tests
+pytest tests/ -v    # 874 tests
 ```
 
 ## Data Sources

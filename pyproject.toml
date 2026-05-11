@@ -21,6 +21,11 @@ dependencies = [
     "feedparser>=6.0",
     "beautifulsoup4>=4.12.0",
     "openai>=1.30.0",
+    # `requests` is already pulled in transitively by alpaca-py / yfinance /
+    # anthropic, but src/notifier.py (Telegram push) uses it directly, so
+    # declare it explicitly to avoid silent breakage if those upstreams
+    # ever drop the dep.
+    "requests>=2.31.0",
     # Python's zoneinfo falls back to the system tzdata. Linux cloud images
     # (incl. Ubuntu server) often ship without /usr/share/zoneinfo/US/Eastern,
     # which breaks every `ZoneInfo("US/Eastern")` in trading_calendar / APScheduler.
