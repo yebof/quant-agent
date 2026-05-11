@@ -303,3 +303,86 @@ def test_prune_agent_logs(db):
     rows = db.conn.execute("SELECT agent_name FROM agent_logs").fetchall()
     names = {r[0] for r in rows}
     assert names == {"recent_agent"}
+
+
+def test_initialize_sets_synchronous_normal_under_wal(db):
+    """WAL + synchronous=NORMAL is the trading-appropriate fsync mode:
+    WAL synced on every commit, main DB synced only at checkpoint.
+    Pin: pragma is actually applied at initialize() time."""
+    val = db.conn.execute("PRAGMA synchronous").fetchone()[0]
+    # SQLite returns 1 for NORMAL, 2 for FULL, 0 for OFF, 3 for EXTRA.
+    assert val == 1, f"expected synchronous=NORMAL (1), got {val}"
+
+
+def test_initialize_creates_timestamp_indexes_for_prune(db):
+    """prune_trades / prune_agent_logs / prune_pending_protection_restores
+    all scan WHERE <ts_col> < ?. Indexes turn full-table scans into
+    O(log n). Pin: indexes exist after init."""
+    rows = db.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
+    ).fetchall()
+    names = {r[0] for r in rows}
+    assert "idx_trades_timestamp" in names
+    assert "idx_agent_logs_timestamp" in names
+    assert "idx_pending_protection_restores_created_at" in names
+
+
+def test_prune_pending_protection_restores_drops_stale_rows(db):
+    """A drain row that survives ~30 calendar days is operationally
+    stuck (broker GC'd the order, position liquidated elsewhere, or
+    malformed specs). Pin: prune deletes rows older than keep_days
+    and logs each at INFO; rows within window are retained."""
+    import json as _json
+
+    # Insert two rows.
+    fresh_id = db.insert_pending_protection_restore(
+        symbol="NVDA", sell_order_id="ord-fresh",
+        position_qty_before_sell=100.0,
+        specs_json=_json.dumps([{"id": "s1", "qty": 100, "stop_price": 95.0}]),
+    )
+    stale_id = db.insert_pending_protection_restore(
+        symbol="AAPL", sell_order_id="ord-stale",
+        position_qty_before_sell=50.0,
+        specs_json=_json.dumps([{"id": "s2", "qty": 50, "stop_price": 170.0}]),
+    )
+    # Backdate the stale row by 45 days.
+    db.conn.execute(
+        "UPDATE pending_protection_restores "
+        "SET created_at = datetime('now', '-45 days') WHERE id = ?",
+        (stale_id,),
+    )
+    db.conn.commit()
+
+    deleted = db.prune_pending_protection_restores(keep_days=30)
+    assert deleted == 1
+
+    remaining = db.get_pending_protection_restores()
+    assert len(remaining) == 1
+    assert remaining[0]["id"] == fresh_id
+    assert remaining[0]["symbol"] == "NVDA"
+
+
+def test_prune_pending_protection_restores_is_noop_when_table_empty(db):
+    """Defensive: empty table → 0 deleted, no SQL errors."""
+    deleted = db.prune_pending_protection_restores(keep_days=30)
+    assert deleted == 0
+
+
+def test_prune_pending_protection_restores_keeps_rows_within_window(db):
+    """Rows newer than keep_days survive prune untouched."""
+    import json as _json
+
+    db.insert_pending_protection_restore(
+        symbol="NVDA", sell_order_id="ord-1",
+        position_qty_before_sell=100.0,
+        specs_json=_json.dumps([{"id": "s1", "qty": 100, "stop_price": 95.0}]),
+    )
+    db.insert_pending_protection_restore(
+        symbol="AAPL", sell_order_id="ord-2",
+        position_qty_before_sell=50.0,
+        specs_json=_json.dumps([{"id": "s2", "qty": 50, "stop_price": 170.0}]),
+    )
+
+    deleted = db.prune_pending_protection_restores(keep_days=30)
+    assert deleted == 0
+    assert len(db.get_pending_protection_restores()) == 2
