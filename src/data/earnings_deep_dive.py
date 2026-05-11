@@ -47,23 +47,41 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[: max_chars - 1] + "…"
 
 
-def _extract_json_block(markdown: str) -> dict | None:
+def _extract_json_block(markdown: str, *, path: Path | None = None) -> dict | None:
     """Find the first ```json fenced block and parse it.
 
     Analysis files emit exactly one such block. Defensive against:
-      - No json block (corrupt file / wrong format) → None
-      - Invalid JSON in block → None (log warning)
+      - No json block (corrupt file / wrong format) → None at ERROR
+      - Invalid JSON in block → None at ERROR (with file path + snippet)
       - Multiple json blocks → take the first (our writer produces one)
+
+    Failures are ERROR-level not WARN: the file is on disk because we
+    confirmed a filing analysis earlier; a parse miss here means evening
+    silently loses that symbol's 10-Q context for thesis_health_review,
+    so an operator needs to see it surfaced loudly.
     """
+    path_str = str(path) if path is not None else "<unknown>"
     match = _JSON_BLOCK_RE.search(markdown)
     if match is None:
+        logger.error(
+            "earnings_deep_dive: no ```json fenced block found in %s — "
+            "evening will skip this symbol's deep-dive",
+            path_str,
+        )
         return None
+    body = match.group("body")
     try:
-        return json.loads(match.group("body"))
+        return json.loads(body)
     except json.JSONDecodeError as exc:
-        logger.warning(
-            "earnings_deep_dive: JSON block in markdown failed to parse: %s",
-            exc,
+        # Capture a head/tail snippet to disambiguate root cause (LLM
+        # truncation = tail garbage; LLM hallucination = head garbage)
+        # without dumping the full block.
+        head = body[:200].replace("\n", "\\n")
+        tail = body[-200:].replace("\n", "\\n") if len(body) > 400 else ""
+        logger.error(
+            "earnings_deep_dive: JSON block in %s failed to parse (%s) — "
+            "head=%r tail=%r — evening will skip this symbol's deep-dive",
+            path_str, exc, head, tail,
         )
         return None
 
@@ -145,7 +163,7 @@ def load_earnings_deep_dive(
         )
         return None
 
-    data = _extract_json_block(markdown)
+    data = _extract_json_block(markdown, path=path)
     if not isinstance(data, dict):
         return None
 
