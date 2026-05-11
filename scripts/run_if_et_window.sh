@@ -37,7 +37,10 @@ else
     fi
 fi
 PYTHON="${PYTHON_OVERRIDE:-${PROJECT_ROOT}/.venv/bin/python}"
-TIMEOUT="${TIMEOUT_OVERRIDE:-/opt/homebrew/bin/timeout}"
+# `timeout` is on PATH on Linux (coreutils). On macOS, install via `brew install
+# coreutils` and either put $(brew --prefix coreutils)/libexec/gnubin on PATH or
+# set TIMEOUT_OVERRIDE=/opt/homebrew/bin/timeout.
+TIMEOUT="${TIMEOUT_OVERRIDE:-timeout}"
 LAST_RUN_DIR="${LAST_RUN_DIR_OVERRIDE:-${HOME}/.cache/quant-agent}"
 MIN_GAP_SEC="${MIN_GAP_SEC_OVERRIDE:-3600}"  # don't fire same mode twice within an hour
 SESSION_LOCK_DIR="${LAST_RUN_DIR}/active-session.lock"
