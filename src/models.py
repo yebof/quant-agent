@@ -223,7 +223,12 @@ class TargetPosition(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
 
     symbol: str
-    target_weight_pct: float = Field(ge=0.0, le=25.0)
+    # 20% upper bound aligns with config/settings.yaml:max_position_pct=20
+    # and config/prompts/portfolio_manager.md's "single-name cap is 20%"
+    # directive. Before this tightening the schema accepted up to 25%;
+    # LLM could lawfully emit 22% targets that risk_engine.check() then
+    # hard-rejected, wasting a reasoning cycle and bloating the audit log.
+    target_weight_pct: float = Field(ge=0.0, le=20.0)
     conviction: Literal["high", "medium", "low"] = "medium"
     thesis: str
     thesis_invalid_if: str = ""

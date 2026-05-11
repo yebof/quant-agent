@@ -337,6 +337,18 @@ class MorningResearchStage:
         ctx.earnings_results = earnings_results
 
         ctx.data_status = data_status
+        # Single grep-able summary line. Each agent's failure already logs
+        # at ERROR individually, but a downstream operator scanning the
+        # journal for "why did morning trade zero today?" wants one row
+        # listing all degraded inputs side-by-side. The 2+ failure
+        # advisory in RiskStage handles the runtime defensive response;
+        # this log handles the postmortem readability.
+        degraded = [k for k, v in data_status.items() if v not in ("ok", "empty")]
+        if degraded:
+            logger.error(
+                "Morning research degraded: %s | full status=%s",
+                ",".join(sorted(degraded)), data_status,
+            )
         return ctx
 
 

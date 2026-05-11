@@ -1,4 +1,5 @@
 import logging
+import math
 import uuid
 from datetime import date
 from pathlib import Path
@@ -441,6 +442,20 @@ class TradingPipeline:
                 # credit phantom SELL proceeds to the BUY cash budget, allowing
                 # a BUY that actually draws margin at execution time.
                 if d.allocation_pct <= 0:
+                    continue
+                # Alpaca occasionally returns NaN market_value during market-open
+                # glitches or for assets with missing prices. Without this guard
+                # `sell_proceeds += NaN * frac` poisons effective_cash to NaN,
+                # which silently passes every subsequent BUY hard-rule check
+                # (`NaN > limit` is False in Python comparisons). Skip the
+                # SELL from the pre-sum — its proceeds aren't safely
+                # knowable, so the BUY cash budget shouldn't pre-credit them.
+                if not math.isfinite(held.market_value):
+                    logger.warning(
+                        "SELL pre-sum: skipping %s — broker returned non-finite "
+                        "market_value=%s; cash budget will be conservative",
+                        d.symbol, held.market_value,
+                    )
                     continue
                 frac = 1.0 if d.allocation_pct >= 100 else d.allocation_pct / 100.0
                 sell_proceeds += held.market_value * frac
@@ -3987,13 +4002,32 @@ class TradingPipeline:
             )
             return []
 
-        # Biggest loser first (most negative unrealized_pnl); larger positions
-        # first as a tiebreaker to clear the deficit in fewer orders; symbol
-        # alphabetical as a final tiebreaker so two positions with identical
-        # P&L + market_value (rare but possible) pick a deterministic winner.
+        # Two-tier ordering: prefer longs over inverse-ETF hedges before
+        # falling back to the loss-magnitude rule.
+        #
+        # Inverse ETFs (SH / SDS / PSQ / SQQQ) have `_effective_multiplier < 0`
+        # — they HEDGE long exposure. A "biggest-loser-first" pass that
+        # ignores direction can pick a hedge in any market where the long
+        # book is profitable (the hedge tends to lose precisely when the
+        # rest is winning). Selling the hedge first leaves the remaining
+        # longs naked, AMPLIFYING directional exposure — the opposite of
+        # what cash-only de-lever is trying to do (which is "shrink risk
+        # to fit cash"). Cash-flow-wise both raise cash equally, but
+        # risk-wise they're opposite.
+        #
+        # Tier key (lower = sells earlier):
+        #   0 → long (effective_mul > 0)
+        #   1 → inverse-ETF hedge (effective_mul < 0)
+        # Within each tier, classic biggest-loser-first ordering:
+        #   - most negative unrealized_pnl
+        #   - then larger market_value (clear deficit in fewer orders)
+        #   - then symbol alphabetical (deterministic across runs)
+        from src.risk.rules import _effective_multiplier
+        def _tier(p):
+            return 0 if _effective_multiplier(p.symbol) > 0 else 1
         targets = sorted(
             sellable,
-            key=lambda p: (p.unrealized_pnl, -p.market_value, p.symbol),
+            key=lambda p: (_tier(p), p.unrealized_pnl, -p.market_value, p.symbol),
         )
 
         orders: list[dict] = []
@@ -4220,22 +4254,32 @@ class TradingPipeline:
 
             if not portfolio_decision:
                 logger.info("Portfolio manager: parse failed, no decision object")
-                return {"status": "no_trades", "orders": [], "run_id": run_id}
+                return {
+                    "status": "no_trades", "orders": [], "run_id": run_id,
+                    "data_status": dict(ctx.data_status),
+                }
             if not portfolio_decision.decisions:
                 logger.info("Portfolio manager + Constructor: no trades suggested")
-                return {"status": "no_trades", "orders": [], "run_id": run_id}
+                return {
+                    "status": "no_trades", "orders": [], "run_id": run_id,
+                    "data_status": dict(ctx.data_status),
+                }
 
             # Phase 4 #1: risk stage — hard filter + earnings cap + RM review + mods.
             early_exit = self._risk_stage(ctx)
             if early_exit is not None:
                 early_exit["run_id"] = run_id
+                early_exit["data_status"] = dict(ctx.data_status)
                 return early_exit
 
             # Phase 4 #1: execution stage — HOLDs logged, SELLs then BUYs submitted.
             orders = self._execution_stage(ctx)
 
             logger.info("=== Morning run complete: %d orders executed ===", len(orders))
-            return {"status": "executed", "orders": orders, "run_id": run_id}
+            return {
+                "status": "executed", "orders": orders, "run_id": run_id,
+                "data_status": dict(ctx.data_status),
+            }
         finally:
             # Phase 3: ask broker which of today's submitted orders actually filled.
             # Unfilled ones get flagged so PM memory / calibration skip them.
