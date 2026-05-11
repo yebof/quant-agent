@@ -386,3 +386,34 @@ def test_prune_pending_protection_restores_keeps_rows_within_window(db):
     deleted = db.prune_pending_protection_restores(keep_days=30)
     assert deleted == 0
     assert len(db.get_pending_protection_restores()) == 2
+
+
+def test_prune_methods_reject_keep_days_zero_or_negative(db):
+    """`datetime('now', '-0 days')` == 'now', which deletes EVERY row.
+    A keep_days=0 typo would wipe years of trade history. All three
+    prune methods must refuse non-positive values rather than silently
+    nuking the table."""
+    import pytest as _pytest
+
+    # Seed a row in each table so we can confirm nothing was deleted.
+    db.insert_trade(symbol="SPY", action="BUY", qty=1, price=500,
+                    reasoning="seed", run_id="r0")
+    db.insert_agent_log(agent_name="x", run_id="r0", input_summary="",
+                        output_summary="", full_response="", model="m", tokens_used=0)
+    import json as _json
+    db.insert_pending_protection_restore(
+        symbol="X", sell_order_id="o0", position_qty_before_sell=1.0,
+        specs_json=_json.dumps([{"qty": 1, "stop_price": 1.0}]),
+    )
+
+    for kd in (0, -1, -365):
+        with _pytest.raises(ValueError):
+            db.prune_trades(keep_days=kd)
+        with _pytest.raises(ValueError):
+            db.prune_agent_logs(keep_days=kd)
+        with _pytest.raises(ValueError):
+            db.prune_pending_protection_restores(keep_days=kd)
+
+    # Seeded rows must still be there.
+    assert len(db.get_trades(symbol="SPY")) == 1
+    assert len(db.get_pending_protection_restores()) == 1

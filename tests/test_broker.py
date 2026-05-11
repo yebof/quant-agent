@@ -468,6 +468,79 @@ def test_submit_order_buy_with_zero_stop_loss_skips_oto(mock_tc_cls):
 
 
 @patch("src.execution.broker.TradingClient")
+def test_quantize_price_returns_none_on_nan_or_inf(mock_tc_cls):
+    """NaN/Inf prices can appear from broker glitches or torn computations.
+    Previous behavior: `NaN <= 0` is False so the function fell through to
+    `round(NaN, ...)` = NaN and the NaN propagated all the way to Alpaca's
+    submit_order, which broker-rejects silently and pollutes logs. Pin:
+    quantize returns None on non-finite input so the caller's existing
+    `if price is not None` checks skip the order or fall back to market."""
+    from src.execution.broker import _quantize_price
+
+    assert _quantize_price(float("nan")) is None
+    assert _quantize_price(float("inf")) is None
+    assert _quantize_price(float("-inf")) is None
+    # None still returns None.
+    assert _quantize_price(None) is None
+    # Zero / negative preserved unchanged (pre-existing semantics — callers
+    # branch on them, e.g. submit_order falls back to MarketOrderRequest
+    # when limit_price <= 0 or None).
+    assert _quantize_price(0.0) == 0.0
+    assert _quantize_price(-1.0) == -1.0
+    # Valid prices still quantize correctly.
+    assert _quantize_price(106.515) == 106.52
+    assert _quantize_price(0.123456) == 0.1235
+
+
+@patch("src.execution.broker.TradingClient")
+def test_is_trading_day_caches_calendar_lookups(mock_tc_cls):
+    """is_trading_day is called many times per session (scheduler, agent
+    helpers, session entries). Without caching every call hits Alpaca's
+    calendar endpoint — wasted latency + rate-limit risk. Pin: repeated
+    calls for the same date hit the broker exactly once."""
+    from datetime import date as _date
+
+    mock_client = MagicMock()
+    mock_client.get_calendar.return_value = [object()]  # truthy = trading day
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    target = _date(2026, 4, 20)
+    assert broker.is_trading_day(target) is True
+    assert broker.is_trading_day(target) is True
+    assert broker.is_trading_day(target) is True
+    # 3 calls, but only 1 broker hit.
+    assert mock_client.get_calendar.call_count == 1
+
+    # Different date misses the cache.
+    other = _date(2026, 4, 21)
+    broker.is_trading_day(other)
+    assert mock_client.get_calendar.call_count == 2
+
+
+@patch("src.execution.broker.TradingClient")
+def test_is_trading_day_does_not_cache_failed_lookup(mock_tc_cls):
+    """A broker-side hiccup (timeout, 503) on the calendar lookup makes
+    is_trading_day defensively return False — but the next call should
+    retry, not silently keep returning False all day. Pin: failed
+    lookups don't poison the cache."""
+    from datetime import date as _date
+
+    mock_client = MagicMock()
+    mock_client.get_calendar.side_effect = [
+        RuntimeError("transient broker hiccup"),
+        [object()],  # second call succeeds
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    target = _date(2026, 4, 20)
+    assert broker.is_trading_day(target) is False  # transient failure
+    assert broker.is_trading_day(target) is True  # retried, succeeded
+    assert mock_client.get_calendar.call_count == 2
+
+
+@patch("src.execution.broker.TradingClient")
 def test_submit_order_sell_ignores_stop_loss_price(mock_tc_cls):
     """SELL-side orders don't attach a protective stop — exiting a position
     doesn't need one. If a caller passes stop_loss_price by mistake (e.g.,

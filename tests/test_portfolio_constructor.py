@@ -288,3 +288,30 @@ def test_construct_orders_empty_targets_returns_empty():
     assert constructor.construct_orders(
         targets=[], positions=[], analyses=[], total_value=100_000,
     ) == []
+
+
+def test_construct_orders_skips_sell_when_position_market_value_is_nan():
+    """Broker price glitch can produce qty>0 with market_value=NaN
+    (current_price came back NaN, then qty * NaN = NaN). Without this
+    guard, current_pct = NaN / total_value * 100 = NaN, the partial
+    fraction math is NaN, alloc becomes NaN, and a NaN allocation_pct
+    gets sent to the broker. R4 audit finding — pin the guard."""
+    constructor = PortfolioConstructor()
+    nan_position = Position(
+        symbol="GLITCH", qty=100, avg_entry=100.0, current_price=float("nan"),
+        market_value=float("nan"),  # broker glitch
+        unrealized_pnl=0.0,
+        sector="Technology",
+    )
+    targets = [TargetPosition(
+        symbol="GLITCH", target_weight_pct=5.0,
+        conviction="medium", thesis="trim to 5%",
+    )]
+
+    decisions = constructor.construct_orders(
+        targets=targets, positions=[nan_position],
+        analyses=[], total_value=100_000,
+    )
+    # The SELL is dropped — no NaN-tainted orders leak to the broker.
+    sells = [d for d in decisions if d.action == "SELL"]
+    assert sells == []
