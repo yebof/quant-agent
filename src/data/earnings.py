@@ -154,12 +154,57 @@ class EarningsDataProvider:
         self.save_manifest()
         return abandoned
 
-    def _sec_get(self, url: str) -> bytes:
-        """GET with SEC-required headers and rate limiting."""
+    def _sec_get(self, url: str, max_retries: int = 3) -> bytes:
+        """GET with SEC-required headers, rate limiting, and retry on
+        transient SEC errors.
+
+        SEC enforces 10 req/sec via 429 (rate-limited) and returns 503
+        when the service is overloaded. Before this retry loop, both
+        errors raised HTTPError uncaught — caller's broad `except
+        Exception` turned them into a silent empty filing list, which
+        propagated to evening's `thesis_health_review` as missing 10-Q
+        context (the core input for value-investing thesis decisions).
+
+        Retries 429 / 503 / transient URLError with exponential backoff
+        (1s, 2s, 4s). 404 / 400 / other 4xx-5xx propagate immediately —
+        those mean the URL itself is wrong (bad CIK, missing filing),
+        not a transient rate-limit, and retrying wastes the budget.
+        """
         req = Request(url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"})
-        time.sleep(REQUEST_DELAY)
-        with urlopen(req, timeout=15) as resp:
-            return resp.read()
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            time.sleep(REQUEST_DELAY)
+            try:
+                with urlopen(req, timeout=15) as resp:
+                    return resp.read()
+            except HTTPError as e:
+                last_exc = e
+                if e.code in (429, 503):
+                    backoff = 1.0 * (2 ** attempt)  # 1s → 2s → 4s
+                    logger.warning(
+                        "SEC %d on attempt %d/%d for %s — backing off %.1fs",
+                        e.code, attempt + 1, max_retries, url, backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
+                # Non-transient HTTP error: don't retry, surface immediately.
+                raise
+            except URLError as e:
+                # Network blip (DNS / connection reset / timeout). Retry
+                # since these are typically transient.
+                last_exc = e
+                backoff = 1.0 * (2 ** attempt)
+                logger.warning(
+                    "SEC URLError on attempt %d/%d for %s: %s — backing off %.1fs",
+                    attempt + 1, max_retries, url, e, backoff,
+                )
+                time.sleep(backoff)
+                continue
+        # All retries exhausted; surface the last exception so caller
+        # (currently inside a broad except Exception) can log it.
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"SEC fetch failed for {url} without exception")
 
     def _get_cik(self, ticker: str) -> str | None:
         """Look up CIK number for a ticker symbol."""

@@ -343,3 +343,101 @@ def test_load_earnings_analyses_never_confirms_or_spawns_threads(tmp_path):
     aapl_entries = [r for r in results if r["symbol"] == "AAPL"]
     assert len(aapl_entries) == 1
     assert aapl_entries[0]["analysis"] is not None
+
+
+# === SEC _sec_get retry behavior ===
+# Prior bug: 429 / 503 raised HTTPError uncaught → caller's broad except
+# turned the filing list into [] silently → evening's thesis_health_review
+# lost 10-Q context (the core value-investing input). Pin the retry loop
+# so transient SEC errors back off and succeed instead of failing silent.
+
+def test_sec_get_retries_on_429(tmp_path, monkeypatch):
+    from urllib.error import HTTPError
+    from io import BytesIO
+    from src.data.earnings import EarningsDataProvider
+
+    monkeypatch.setattr("src.data.earnings.time.sleep", lambda *_a, **_k: None)
+    call_log: list[str] = []
+
+    def fake_urlopen(req, timeout):
+        call_log.append("call")
+        if len(call_log) < 3:
+            raise HTTPError(req.full_url, 429, "Too Many Requests", {}, BytesIO(b""))
+        # 3rd attempt succeeds
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"ok": true}'
+        return _Resp()
+    monkeypatch.setattr("src.data.earnings.urlopen", fake_urlopen)
+
+    provider = EarningsDataProvider(data_dir=str(tmp_path))
+    out = provider._sec_get("https://data.sec.gov/x")
+    assert out == b'{"ok": true}'
+    assert len(call_log) == 3
+
+
+def test_sec_get_retries_on_503(tmp_path, monkeypatch):
+    from urllib.error import HTTPError
+    from io import BytesIO
+    from src.data.earnings import EarningsDataProvider
+
+    monkeypatch.setattr("src.data.earnings.time.sleep", lambda *_a, **_k: None)
+    call_log: list[str] = []
+
+    def fake_urlopen(req, timeout):
+        call_log.append("call")
+        if len(call_log) < 2:
+            raise HTTPError(req.full_url, 503, "Service Unavailable", {}, BytesIO(b""))
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"ok": 1}'
+        return _Resp()
+    monkeypatch.setattr("src.data.earnings.urlopen", fake_urlopen)
+
+    provider = EarningsDataProvider(data_dir=str(tmp_path))
+    out = provider._sec_get("https://data.sec.gov/x")
+    assert out == b'{"ok": 1}'
+    assert len(call_log) == 2
+
+
+def test_sec_get_raises_after_max_retries(tmp_path, monkeypatch):
+    """All retries exhausted → surface the HTTPError so caller's broad
+    except still logs it (rather than silently swallowing data loss)."""
+    from urllib.error import HTTPError
+    from io import BytesIO
+    from src.data.earnings import EarningsDataProvider
+    import pytest
+
+    monkeypatch.setattr("src.data.earnings.time.sleep", lambda *_a, **_k: None)
+
+    def fake_urlopen(req, timeout):
+        raise HTTPError(req.full_url, 429, "Too Many Requests", {}, BytesIO(b""))
+    monkeypatch.setattr("src.data.earnings.urlopen", fake_urlopen)
+
+    provider = EarningsDataProvider(data_dir=str(tmp_path))
+    with pytest.raises(HTTPError):
+        provider._sec_get("https://data.sec.gov/x", max_retries=2)
+
+
+def test_sec_get_does_not_retry_on_404(tmp_path, monkeypatch):
+    """404 means the URL is wrong (bad CIK / missing filing), not a
+    transient rate-limit. Retrying wastes the budget — surface immediately."""
+    from urllib.error import HTTPError
+    from io import BytesIO
+    from src.data.earnings import EarningsDataProvider
+    import pytest
+
+    monkeypatch.setattr("src.data.earnings.time.sleep", lambda *_a, **_k: None)
+    call_log: list[str] = []
+
+    def fake_urlopen(req, timeout):
+        call_log.append("call")
+        raise HTTPError(req.full_url, 404, "Not Found", {}, BytesIO(b""))
+    monkeypatch.setattr("src.data.earnings.urlopen", fake_urlopen)
+
+    provider = EarningsDataProvider(data_dir=str(tmp_path))
+    with pytest.raises(HTTPError):
+        provider._sec_get("https://data.sec.gov/x")
+    assert len(call_log) == 1  # no retry on 404
