@@ -418,7 +418,12 @@ def test_pipeline_symbol_guard_blocks_off_universe_and_unanalyzed_buys():
     assert any("QQQ has no supporting analyst output" in reason for reason in blocked)
 
 
-def test_pipeline_ignores_invalid_risk_modification():
+def test_pipeline_drops_decision_when_risk_modification_invalid():
+    """When RM proposes a mod that fails schema validation, the underlying
+    decision must be DROPPED, not left at its original (un-tightened) value.
+    RM's intent is always protective; if we can't apply the change, we can't
+    assume the un-modified decision is safe. Pre-fix this used to silently
+    execute the original allocation, dropping RM's protective intent."""
     pipeline = TradingPipeline.__new__(TradingPipeline)
     decision = TradeDecision(
         action="BUY", symbol="SPY", allocation_pct=10,
@@ -429,14 +434,47 @@ def test_pipeline_ignores_invalid_risk_modification():
             symbol="SPY",
             field="allocation_pct",
             original_value=10,
-            new_value=150,
+            new_value=150,  # invalid: allocation_pct must be ≤ 100
             reason="bad mod",
         )
     ]
 
     updated = pipeline._apply_risk_modifications([decision], modifications)
 
-    assert updated[0].allocation_pct == 10
+    # The SPY decision is dropped — RM tried to change it, schema rejected
+    # the change, so we don't execute the trade at all.
+    assert updated == []
+
+
+def test_pipeline_drops_only_the_decision_with_bad_mod_keeps_rest():
+    """A bad mod on SPY must not affect the QQQ decision — only the symbol
+    whose mod failed gets dropped, the rest of the morning still executes."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    spy = TradeDecision(
+        action="BUY", symbol="SPY", allocation_pct=10,
+        entry_price=500, stop_loss=480, take_profit=530, reasoning="t",
+    )
+    qqq = TradeDecision(
+        action="BUY", symbol="QQQ", allocation_pct=8,
+        entry_price=400, stop_loss=388, take_profit=420, reasoning="t",
+    )
+    modifications = [
+        RiskModification(
+            symbol="SPY", field="allocation_pct",
+            original_value=10, new_value=150, reason="bad",
+        ),
+        # Valid mod on QQQ: tighten allocation 8 -> 5
+        RiskModification(
+            symbol="QQQ", field="allocation_pct",
+            original_value=8, new_value=5, reason="tighten",
+        ),
+    ]
+
+    updated = pipeline._apply_risk_modifications([spy, qqq], modifications)
+
+    syms = [d.symbol for d in updated]
+    assert syms == ["QQQ"]
+    assert updated[0].allocation_pct == 5
 
 
 def test_fractional_sell_helpers_preserve_position_size():

@@ -11,6 +11,9 @@ from src.util.time import et_today
 logger = logging.getLogger(__name__)
 
 _VALUATION_TIMEOUT_S = 10  # per-symbol ceiling on yfinance .info hang
+_DOWNLOAD_TIMEOUT_S = 30   # per-call ceiling on yf.download() hang — same risk as .info,
+                            # without this a network stall hangs the whole session window
+                            # until the launchd outer kill (~20min) fires.
 
 # Keyed by the canonical sector name used everywhere else (yfinance + MacroSectorGuidance enum).
 SECTOR_ETFS = {
@@ -44,11 +47,18 @@ class MarketDataProvider:
     def get_ohlcv(self, symbol: str, lookback_days: int = 120) -> list[OHLCV]:
         end = et_today()  # yfinance end (exclusive) — use ET to match US-market sessions
         start = end - timedelta(days=lookback_days)
+
+        def _download():
+            return yf.download(symbol, start=str(start), end=str(end), progress=False)
+
+        df = None
         try:
-            df = yf.download(symbol, start=str(start), end=str(end), progress=False)
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                df = ex.submit(_download).result(timeout=_DOWNLOAD_TIMEOUT_S)
+        except FuturesTimeout:
+            logger.warning("yfinance download timed out for %s after %ds", symbol, _DOWNLOAD_TIMEOUT_S)
         except Exception as e:
             logger.warning("yfinance download crashed for %s: %s", symbol, e)
-            df = None
         if df is None or df.empty:
             # yfinance returned nothing — try fallback before giving up.
             if self._fallback_bars is not None:
@@ -167,8 +177,20 @@ class MarketDataProvider:
 
     def get_sector_performance(self, period: str = "5d") -> dict[str, float]:
         etf_symbols = list(SECTOR_ETFS.values())
-        df = yf.download(etf_symbols, period=period, progress=False)
-        if df.empty:
+
+        def _download():
+            return yf.download(etf_symbols, period=period, progress=False)
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                df = ex.submit(_download).result(timeout=_DOWNLOAD_TIMEOUT_S)
+        except FuturesTimeout:
+            logger.warning("yfinance sector_performance timed out after %ds", _DOWNLOAD_TIMEOUT_S)
+            return {}
+        except Exception as e:
+            logger.warning("yfinance sector_performance crashed: %s", e)
+            return {}
+        if df is None or df.empty:
             return {}
         result = {}
         for sector, etf in SECTOR_ETFS.items():

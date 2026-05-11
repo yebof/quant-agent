@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import date
 
 import yfinance as yf
@@ -23,6 +24,7 @@ _INDEX_ETFS = {"SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "IVV"}
 # for hours under launchd — observed 2026-04-17 when the evening job sat for
 # 13+ hours at the very first broker call.
 _BROKER_HTTP_TIMEOUT = 30.0
+_SECTOR_LOOKUP_TIMEOUT_S = 10  # per-symbol ceiling on yfinance .info hang in _get_sector
 
 
 def _quantize_price(price: float | None) -> float | None:
@@ -100,11 +102,21 @@ def _get_sector(symbol: str) -> str:
         if symbol.upper() in _INDEX_ETFS:
             _sector_cache[symbol] = "Broad"
             return "Broad"
+
+        def _fetch():
+            try:
+                return yf.Ticker(symbol).info or {}
+            except Exception:
+                return {}
+
         try:
-            info = yf.Ticker(symbol).info
-            raw = info.get("sector", "")
-        except Exception:
-            raw = ""
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                info = ex.submit(_fetch).result(timeout=_SECTOR_LOOKUP_TIMEOUT_S)
+        except FuturesTimeout:
+            logger.warning("yfinance sector lookup timed out for %s", symbol)
+            info = {}
+
+        raw = info.get("sector", "") if isinstance(info, dict) else ""
         canonical = _canonicalize_sector(raw)
         if canonical != "Unknown":
             _sector_cache[symbol] = canonical

@@ -524,7 +524,16 @@ class TradingPipeline:
     }
 
     def _apply_risk_modifications(self, decisions: list[TradeDecision], modifications) -> list[TradeDecision]:
-        updated_decisions = list(decisions)
+        """Apply RM-proposed field modifications to decisions.
+
+        When a mod fails Pydantic validation, the decision is **dropped** rather
+        than left at its original (un-tightened) value. RM's job is to be more
+        protective; if their proposed change can't be applied, we cannot assume
+        the un-modified decision is safe — the safest invariant is "RM tried to
+        change this, we couldn't, so don't execute it". Previously a break left
+        the original decision in place, silently dropping RM's protective intent.
+        """
+        updated_decisions: list[TradeDecision | None] = list(decisions)
         modifiable_fields = {"allocation_pct", "entry_price", "stop_loss", "take_profit"}
 
         for mod in modifications:
@@ -537,7 +546,7 @@ class TradingPipeline:
                 continue
 
             for idx, decision in enumerate(updated_decisions):
-                if decision.symbol != mod.symbol:
+                if decision is None or decision.symbol != mod.symbol:
                     continue
 
                 candidate = decision.model_dump()
@@ -546,9 +555,11 @@ class TradingPipeline:
                     updated_decision = TradeDecision(**candidate)
                 except ValidationError as exc:
                     logger.warning(
-                        "Risk mod rejected for %s.%s %.4f -> %.4f: %s",
+                        "Risk mod rejected for %s.%s %.4f -> %.4f: %s — "
+                        "DROPPING decision (RM intended a protection we cannot apply)",
                         mod.symbol, mod.field, mod.original_value, mod.new_value, exc,
                     )
+                    updated_decisions[idx] = None
                     break
 
                 logger.info(
@@ -560,7 +571,7 @@ class TradingPipeline:
             else:
                 logger.warning("Risk mod ignored: no matching decision for '%s'", mod.symbol)
 
-        return updated_decisions
+        return [d for d in updated_decisions if d is not None]
 
     @staticmethod
     def _has_actionable_signal_fn(indicators, symbol: str, bars, positions) -> bool:
@@ -3301,9 +3312,10 @@ class TradingPipeline:
                 return None
             return round((current_equity - start_value) / start_value * 100, 2)
 
-        # rows are ordered newest-first (DESC)
-        rolling_5d = _pct_change(4)   # compare to 5 trading days ago
-        rolling_20d = _pct_change(19)  # compare to 20 trading days ago
+        # rows are ordered newest-first (DESC); rows[N] = N trading days ago.
+        # rows[0] is today, so "5 trading days ago" is rows[5], not rows[4].
+        rolling_5d = _pct_change(5)
+        rolling_20d = _pct_change(20)
 
         in_drawdown = False
         if rolling_5d is not None and rolling_5d < -3.0:
