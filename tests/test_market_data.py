@@ -108,6 +108,33 @@ def test_get_ohlcv_empty(mock_download):
     assert bars == []
 
 
+@patch("src.data.market.yf.download")
+def test_get_ohlcv_drops_nan_rows(mock_download):
+    """yfinance can return rows with NaN OHLCV during halts / pre-IPO /
+    transient gaps. NaN must be dropped at the boundary so downstream TA
+    (RSI / Bollinger / MACD) never sees nan-tainted bars."""
+    import numpy as np
+    dates = pd.date_range(start="2026-03-01", periods=4, freq="B")
+    data = pd.DataFrame(
+        {
+            "Open": [500.0, np.nan, 501.0, 505.0],
+            "High": [510.0, np.nan, 507.0, 512.0],
+            "Low": [498.0, np.nan, 499.0, 503.0],
+            "Close": [505.0, np.nan, 506.0, 510.0],
+            # Volume NaN on a different row — would have crashed int(NaN)
+            # before the fix.
+            "Volume": [1000000, 1100000, np.nan, 1200000],
+        },
+        index=dates,
+    )
+    mock_download.return_value = data
+    provider = MarketDataProvider()
+    bars = provider.get_ohlcv("HALTED", lookback_days=10)
+    assert len(bars) == 2  # only rows 0 and 3 are fully clean
+    assert bars[0].close == 505.0
+    assert bars[1].close == 510.0
+
+
 @patch("src.data.market.yf.Ticker")
 def test_get_valuation_metrics_returns_rounded_numbers(mock_ticker):
     """Happy path: yfinance .info has all 3 fields; return rounded to 2dp."""

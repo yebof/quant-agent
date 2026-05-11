@@ -76,8 +76,24 @@ class MarketDataProvider:
         # yfinance may return MultiIndex columns for single ticker
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+        # Drop NaN rows BEFORE constructing OHLCV records. yfinance batch
+        # downloads (and single-symbol calls during halts / pre-IPO dates /
+        # transient outages) can return rows where one or more OHLCV cells
+        # are NaN. `int(NaN)` raises ValueError and `float(NaN)` silently
+        # propagates `nan` into downstream TA indicators (RSI / Bollinger /
+        # MACD all accept NaN and return NaN-tainted values that the LLM
+        # then treats as real signal). Filter at the boundary so callers
+        # always see clean bars or an empty list.
+        required_cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]
+        clean_df = df.dropna(subset=required_cols) if required_cols else df
+        if len(clean_df) < len(df):
+            logger.warning(
+                "yfinance returned %d row(s) with NaN OHLCV for %s — dropped; "
+                "%d clean rows remain",
+                len(df) - len(clean_df), symbol, len(clean_df),
+            )
         bars = []
-        for idx, row in df.iterrows():
+        for idx, row in clean_df.iterrows():
             bars.append(
                 OHLCV(
                     date=idx.date(),
@@ -205,9 +221,15 @@ class MarketDataProvider:
                         close = df[etf]["Close"]
                 else:
                     close = df["Close"]
+                # Drop NaN before slicing — a delisted / paused ETF in a
+                # batch download can return a column with leading/trailing
+                # NaN. iloc[0] or iloc[-1] would then yield NaN and silently
+                # report a NaN sector return.
+                close = close.dropna()
                 if len(close) >= 2:
                     pct = ((close.iloc[-1] - close.iloc[0]) / close.iloc[0]) * 100
-                    result[sector] = round(float(pct), 2)
+                    if pd.notna(pct):
+                        result[sector] = round(float(pct), 2)
             except (KeyError, IndexError):
                 continue
         return result
