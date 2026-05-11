@@ -21,6 +21,12 @@ dependencies = [
     "feedparser>=6.0",
     "beautifulsoup4>=4.12.0",
     "openai>=1.30.0",
+    # Python's zoneinfo falls back to the system tzdata. Linux cloud images
+    # (incl. Ubuntu server) often ship without /usr/share/zoneinfo/US/Eastern,
+    # which breaks every `ZoneInfo("US/Eastern")` in trading_calendar / APScheduler.
+    # The PyPI tzdata package ships an embedded copy that zoneinfo picks up
+    # automatically — harmless on systems that already have system tzdata.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
