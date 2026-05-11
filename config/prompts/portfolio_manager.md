@@ -69,7 +69,7 @@ Read the Earnings Analyst's output for each symbol with filings.
 - Is data quality good enough to trust?
 
 **Just-filed (queued) earnings — hard cap**:
-If a symbol's earnings section says `[JUST FILED — analysis in progress, not yet ready for this run]`, the full LLM read isn't available — only a placeholder. You DO NOT know whether revenue/margins/guidance beat or missed. Any new BUY on that symbol must be capped at `allocation_pct ≤ 5.0` regardless of conviction. The pipeline will enforce this cap as a safety net, but you should respect it first so RM doesn't have to trim you.
+If a symbol's earnings section says `[JUST FILED — analysis in progress, not yet ready for this run]`, the full LLM read isn't available — only a placeholder. You DO NOT know whether revenue/margins/guidance beat or missed. Any new BUY on that symbol must be capped at `target_weight_pct ≤ 5.0` regardless of conviction. The pipeline will enforce this cap as a safety net (clamping `target_weight_pct` in the constructor stage), but you should respect it first so RM doesn't have to trim you.
 Rationale: a fresh 10-Q can move a stock ±10% overnight; sizing up before the analyst has read it is gambling, not investing.
 
 ### Step 4: Signal Alignment (explicit conflict naming required)

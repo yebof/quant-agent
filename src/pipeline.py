@@ -2954,14 +2954,19 @@ class TradingPipeline:
                 value_entry_candidate=value_entry_candidate,
             ))
 
+        # Drop names we actually held during the window before sorting and
+        # truncating. The prompt instructs the LLM to recognize HELD rows
+        # and not classify them as "missed", but the LLM-only fence is
+        # fragile: a hiccup could let evening emit `value_entry_missed`
+        # on a name we literally bought today (held_during_window=True).
+        # Pre-filter in Python so even a confused LLM can't surface a
+        # held name. Held positions still get full coverage via
+        # thesis_health_review — they don't need a "missed" entry.
+        snapshots = [s for s in snapshots if not s.held_during_window]
+
         def _priority_key(s) -> tuple:
             any_signal = s.had_ta_signal or s.had_news_signal or s.had_earnings_signal
-            if not s.held_during_window and any_signal:
-                group = 0
-            elif not s.held_during_window:
-                group = 1
-            else:
-                group = 2
+            group = 0 if any_signal else 1
             return (group, -abs(s.move_pct))
 
         snapshots.sort(key=_priority_key)

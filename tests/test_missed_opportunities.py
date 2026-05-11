@@ -140,9 +140,12 @@ def test_digest_merges_universe_and_top_movers_with_source_tags(_sec):
 
 
 @patch("src.execution.broker._get_sector", return_value="Technology")
-def test_digest_marks_held_when_current_position(_sec):
-    """Symbols in `current_position_symbols` must be flagged
-    held_during_window=True, regardless of trade history."""
+def test_digest_excludes_held_when_current_position(_sec):
+    """Held symbols are filtered out of the digest entirely (R5 audit):
+    relying on the LLM to recognize a HELD flag is fragile — defense in
+    depth requires dropping held names in Python before they reach the
+    LLM. Held positions still get full coverage via thesis_health_review;
+    they don't need a "missed" row."""
     p = _pipeline_with(
         universe=["HELD", "NOTHELD"],
         market_closes_by_symbol={
@@ -154,16 +157,18 @@ def test_digest_marks_held_when_current_position(_sec):
         lookback_days=5, move_threshold_pct=8.0,
         current_position_symbols={"HELD"},
     )
-    by = {s.symbol: s for s in out}
-    assert by["HELD"].held_during_window is True
-    assert by["NOTHELD"].held_during_window is False
+    syms = {s.symbol for s in out}
+    assert "HELD" not in syms
+    assert "NOTHELD" in syms
 
 
 @patch("src.execution.broker._get_sector", return_value="Technology")
-def test_digest_marks_held_when_recent_trade(_sec):
-    """A symbol with an executed BUY in the last `lookback_days * 2 + 2`
-    calendar days counts as held — we don't call "we missed it" if we
-    actually traded it recently."""
+def test_digest_excludes_held_when_recent_trade(_sec):
+    """A symbol we BOUGHT today (or in the recent trade window) must be
+    filtered out of the digest. The audit scenario is the most
+    concerning: buy at open, runs +8% intraday, would have appeared as
+    a "missed opportunity" we literally just took. Pre-filter prevents
+    that contradiction reaching the LLM."""
     from src.trading_calendar import et_today
     recent_ts = et_today().isoformat() + " 10:30:00"
     p = _pipeline_with(
@@ -180,16 +185,16 @@ def test_digest_marks_held_when_recent_trade(_sec):
     out = p._build_missed_opportunities_digest(
         lookback_days=5, move_threshold_pct=8.0,
     )
-    by = {s.symbol: s for s in out}
-    assert by["R"].held_during_window is True
-    assert by["X"].held_during_window is False
+    syms = {s.symbol for s in out}
+    assert "R" not in syms  # recently traded → filtered out
+    assert "X" in syms
 
 
 @patch("src.execution.broker._get_sector", return_value="Technology")
-def test_digest_sort_priority_not_held_signal_first(_sec):
-    """Order matters — evening LLM reads top of list first. Real 'we saw it
-    didn't act' misses (not-held + signal) beat raw 'theme blindspot'
-    (not-held + no-signal), which beat 'held for context' (we own it)."""
+def test_digest_sort_priority_signal_first_after_held_filter(_sec):
+    """After held names are filtered, the remaining sort is:
+    not-held + signal → not-held + no-signal, ordered by |move_pct|
+    within each group. HELD_SYM doesn't appear in the output at all."""
     import json as _json
     tech_json = _json.dumps({
         "analyses": [
@@ -204,7 +209,7 @@ def test_digest_sort_priority_not_held_signal_first(_sec):
         market_closes_by_symbol={
             "SIGNAL_NOTHELD": [100, 104, 107, 109, 112, 115],  # +15%
             "BLIND_NOTHELD":  [100, 105, 110, 115, 120, 125],  # +25% (biggest)
-            "HELD_SYM":       [100, 108, 115, 118, 122, 130],  # +30% (biggest)
+            "HELD_SYM":       [100, 108, 115, 118, 122, 130],  # +30% (biggest, but held)
         },
         tech_rows=[
             {"timestamp": today_iso + " 09:35:00",
@@ -215,13 +220,14 @@ def test_digest_sort_priority_not_held_signal_first(_sec):
         lookback_days=5, move_threshold_pct=8.0,
         current_position_symbols={"HELD_SYM"},
     )
-    order = [s.symbol for s in out]
-    assert order[0] == "SIGNAL_NOTHELD", (
-        f"not-held+signal should win regardless of move size; got {order}"
+    syms = [s.symbol for s in out]
+    assert "HELD_SYM" not in syms, (
+        f"held name must be filtered out, not just sorted last; got {syms}"
     )
-    assert order[-1] == "HELD_SYM", (
-        f"held should sink to bottom; got {order}"
-    )
+    # SIGNAL_NOTHELD (had signal) beats BLIND_NOTHELD (no signal) regardless
+    # of move size — that's the "we should have noticed" priority.
+    assert syms[0] == "SIGNAL_NOTHELD"
+    assert syms[-1] == "BLIND_NOTHELD"
 
 
 @patch("src.execution.broker._get_sector", return_value="Technology")

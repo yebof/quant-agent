@@ -840,6 +840,19 @@ class BuyGrade(BaseModel):
                 "BuyGrade with grade='wrong' requires loss_root_cause so the "
                 "quarterly meta-reflector can aggregate patterns"
             )
+        # A 'wrong' grade also needs thesis_trajectory so position_reviewer
+        # can distinguish "bought expensive" (intact thesis, price-only
+        # mistake — re-entry candidate when price comes back) from
+        # "fundamentals broke" (broken thesis — stay out). Without both
+        # fields together, the loss-autopsy loop loses half its information
+        # and the next-day prompt can't apply the value-investor lens.
+        # Optional on correct/premature for back-compat.
+        if self.grade == "wrong" and self.thesis_trajectory is None:
+            raise ValueError(
+                "BuyGrade with grade='wrong' requires thesis_trajectory so "
+                "position_reviewer can distinguish a value re-entry candidate "
+                "(intact thesis) from a stay-out signal (broken thesis)"
+            )
         if (self.loss_root_cause == "macro_warning_ignored"
                 and not (self.missed_warning_ref or "").strip()):
             raise ValueError(

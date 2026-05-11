@@ -166,11 +166,13 @@ def test_buy_grade_wrong_requires_loss_root_cause():
     prompt edits."""
     from src.models import BuyGrade
 
-    # Valid: grade=wrong WITH loss_root_cause
+    # Valid: grade=wrong WITH both loss_root_cause AND thesis_trajectory
+    # (both required on 'wrong' grades — see _loss_fields_required validator)
     bg = BuyGrade(
         symbol="NVDA", buy_date="2026-04-15", buy_price=200, current_price=180,
         pct_move_since_buy=-10.0, grade="wrong",
         reason="chased the top", loss_root_cause="greed_top_chasing",
+        thesis_trajectory="intact",
     )
     assert bg.loss_root_cause == "greed_top_chasing"
 
@@ -179,6 +181,24 @@ def test_buy_grade_wrong_requires_loss_root_cause():
         BuyGrade(
             symbol="NVDA", buy_date="2026-04-15", buy_price=200, current_price=180,
             pct_move_since_buy=-10.0, grade="wrong", reason="bad call",
+            thesis_trajectory="intact",
+        )
+
+
+def test_buy_grade_wrong_requires_thesis_trajectory():
+    """R5 audit: a 'wrong' grade without thesis_trajectory means
+    position_reviewer can't distinguish 'bought expensive' (intact
+    thesis → re-entry candidate later) from 'fundamentals broke'
+    (stay out). Both loss_root_cause AND thesis_trajectory must be
+    present on losing grades."""
+    from src.models import BuyGrade
+
+    with pytest.raises(ValidationError, match="thesis_trajectory"):
+        BuyGrade(
+            symbol="NVDA", buy_date="2026-04-15", buy_price=200, current_price=180,
+            pct_move_since_buy=-10.0, grade="wrong", reason="bad call",
+            loss_root_cause="greed_top_chasing",
+            # thesis_trajectory missing
         )
 
 
@@ -214,6 +234,7 @@ def test_buy_grade_macro_warning_ignored_requires_evidence_ref():
             pct_move_since_buy=-15.0, grade="wrong",
             reason="ignored credit spread warning",
             loss_root_cause="macro_warning_ignored",
+            thesis_trajectory="broken",
         )
 
     # Valid: cite the specific warning
@@ -222,6 +243,7 @@ def test_buy_grade_macro_warning_ignored_requires_evidence_ref():
         pct_move_since_buy=-15.0, grade="wrong",
         reason="ignored macro warning",
         loss_root_cause="macro_warning_ignored",
+        thesis_trajectory="broken",
         missed_warning_ref="news 2026-04-03 HIGH state_change: credit spreads +80bps widening",
     )
     assert "credit spreads" in bg.missed_warning_ref
@@ -235,6 +257,7 @@ def test_buy_grade_market_relative_move_pct_optional():
         symbol="NVDA", buy_date="2026-04-15", buy_price=200, current_price=180,
         pct_move_since_buy=-10.0, grade="wrong", reason="tape turned",
         loss_root_cause="systemic_drawdown",
+        thesis_trajectory="intact",
         market_relative_move_pct=-0.5,  # we fell 10%, market fell 9.5%
     )
     assert bg.market_relative_move_pct == -0.5
