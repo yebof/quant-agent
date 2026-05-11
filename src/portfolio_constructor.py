@@ -153,6 +153,22 @@ class PortfolioConstructor:
     ) -> TradeDecision | None:
         if position is None or position.qty <= 0:
             return None
+        # Defensive: position.market_value can be NaN during broker price
+        # glitches (qty > 0 but current_price NaN → market_value NaN).
+        # Without this guard `current_pct` (computed upstream as
+        # market_value / total_value * 100) is NaN, the partial-fraction
+        # math `(NaN - target_pct) / NaN` is NaN, alloc becomes NaN, and
+        # the BUY downstream sends a NaN qty to the broker. Pipeline.py:446
+        # has the symmetric guard on the SELL pre-sum path; this is the
+        # same fix in the constructor path. R4 audit finding.
+        import math as _math
+        if not _math.isfinite(current_pct) or current_pct <= 0:
+            logger.warning(
+                "Constructor: SELL %s skipped — current_pct=%s "
+                "(market_value=%s likely NaN/zero from broker glitch)",
+                target.symbol, current_pct, position.market_value,
+            )
+            return None
         if target_pct == 0:
             # Full close
             alloc = 100.0

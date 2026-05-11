@@ -627,6 +627,11 @@ class Database:
         Kept long for audit purposes — still finite to bound table size over a
         decade-plus horizon. Returns count deleted.
         """
+        if keep_days <= 0:
+            # `datetime('now', '-0 days')` == 'now' → deletes the entire
+            # trades audit log. Refuse rather than silently destroy
+            # potentially years of broker history.
+            raise ValueError(f"prune_trades: keep_days must be > 0, got {keep_days}")
         with self._lock:
             cursor = self.conn.execute(
                 "DELETE FROM trades WHERE timestamp < datetime('now', ?)",
@@ -649,6 +654,13 @@ class Database:
         noise — drain can't help. Logs the symbols pruned at INFO so
         manual review remains possible. Returns count deleted.
         """
+        if keep_days <= 0:
+            # `datetime('now', '-0 days')` == 'now' → deletes EVERYTHING.
+            # Caller almost certainly passed a typo / config bug. Refuse
+            # rather than silently wipe a recovery queue.
+            raise ValueError(
+                f"prune_pending_protection_restores: keep_days must be > 0, got {keep_days}"
+            )
         with self._lock:
             stale = self.conn.execute(
                 "SELECT id, symbol, sell_order_id, created_at "
@@ -680,6 +692,8 @@ class Database:
         on what decisions worked while still bounding table size. agent_logs.full_response
         runs ~20-40KB per row with ~15-25 rows/day, so 730 days is ~200-300MB total.
         """
+        if keep_days <= 0:
+            raise ValueError(f"prune_agent_logs: keep_days must be > 0, got {keep_days}")
         with self._lock:
             cursor = self.conn.execute(
                 "DELETE FROM agent_logs WHERE timestamp < datetime('now', ?)",

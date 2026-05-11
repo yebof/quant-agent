@@ -33,8 +33,22 @@ def _quantize_price(price: float | None) -> float | None:
     The quote-midpoint in `get_latest_price` can produce sub-penny values like
     $106.515; submitting that raw triggers Alpaca error 42210000 and the order
     is rejected. Observed 2026-04-17 morning: UPS BUY @ $106.515 rejected.
+
+    NaN/Inf handling: NaN comparisons all return False, so the original
+    `price <= 0` guard fell through to `round(nan, ...)` = nan. The NaN
+    then propagated all the way to Alpaca's submit_order, which silently
+    broker-rejects the order and corrupts audit logs. Treat NaN/Inf as
+    None (no quotable price) — callers' existing
+    `price is not None and price > 0` checks then skip the order or
+    fall back to market. Zero/negative values are preserved unchanged
+    (pre-existing semantics: caller decides what to do with them).
     """
-    if price is None or price <= 0:
+    if price is None:
+        return None
+    import math as _math
+    if not _math.isfinite(price):
+        return None
+    if price <= 0:
         return price
     return round(price, 2 if price >= 1.0 else 4)
 
@@ -130,6 +144,12 @@ class AlpacaBroker:
         self.client = TradingClient(api_key, secret_key, paper=paper)
         _install_http_timeout(self.client)
         self._data_client = None
+        # Per-date cache for is_trading_day. Trading-day status is set by
+        # the exchange calendar months in advance — invariant within the
+        # day — so a per-date dict that grows unbounded over a multi-year
+        # process lifetime is still fine (1 entry per calendar day ≈ a
+        # few KB / year).
+        self._trading_day_cache: dict[date, bool] = {}
 
     def get_account(self) -> dict:
         acct = self.client.get_account()
@@ -166,19 +186,33 @@ class AlpacaBroker:
     def is_trading_day(self, on_date: date | None = None) -> bool:
         from src.util.time import et_today
         target_date = on_date or et_today()  # ET trading-day, not host-local
+        # Per-date result cache. is_trading_day is hit on every session
+        # entry, in scheduler `_run_safe`, in some agent helpers — easily
+        # 20+ Alpaca calendar lookups per session for a fact that's
+        # invariant within the day. The result is also stable: a date
+        # either is or isn't a trading day, decided by the exchange
+        # calendar months in advance, so per-date cache is safe.
+        cached = self._trading_day_cache.get(target_date)
+        if cached is not None:
+            return cached
         try:
             from alpaca.trading.requests import GetCalendarRequest
 
             calendar = self.client.get_calendar(
                 GetCalendarRequest(start=target_date, end=target_date)
             )
-            return bool(calendar)
+            result = bool(calendar)
         except Exception as exc:
             logger.warning(
                 "Failed to confirm trading calendar for %s; assuming market closed: %s",
                 target_date, exc,
             )
+            # Do NOT cache a failed lookup — caller's session is already
+            # aborted (we returned False) but a transient API hiccup
+            # shouldn't poison the cache for the rest of the day.
             return False
+        self._trading_day_cache[target_date] = result
+        return result
 
     def is_last_trading_day_of_quarter(self, on_date: date | None = None) -> bool:
         """True when `on_date` (default today-ET) is the last OPEN session
