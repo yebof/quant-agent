@@ -623,6 +623,47 @@ class TradingPipeline:
         "done_for_day", "replaced",
     }
 
+    def _current_position_qty_for_finalize(self, symbol: str) -> float | None:
+        """Re-read broker position for finalize residual / restore math.
+
+        intra_check is exempt from the cross-mode session lock, so an
+        EMERGENCY_SELL on the same symbol can reduce position between
+        when this SELL submitted and when this finalize runs. The cached
+        ``position_qty_before_sell`` no longer reflects reality —
+        ``position_qty_before_sell - my_fill_qty`` over-states residual
+        and the resulting reprotect / restore would submit for more
+        shares than exist (broker rejects on insufficient qty, finalize
+        bails, drain persists a row, drain replays same wrong math,
+        row stays stuck forever).
+
+        Returns:
+            >0 — broker reports this many shares held now
+            0  — symbol no longer held (concurrent path fully exited)
+            None — could not determine (broker error, mocked test path)
+        """
+        try:
+            positions = self.broker.get_positions()
+        except Exception as exc:
+            logger.warning(
+                "get_positions failed during finalize for %s: %s — "
+                "falling back to cached residual math",
+                symbol, exc,
+            )
+            return None
+        if not isinstance(positions, list):
+            return None
+        for p in positions:
+            sym = getattr(p, "symbol", None)
+            if sym == symbol:
+                qty = getattr(p, "qty", None)
+                if qty is None:
+                    return None
+                try:
+                    return float(qty)
+                except (TypeError, ValueError):
+                    return None
+        return 0.0
+
     def _finalize_protection_after_sell(
         self,
         order_id: str,
@@ -747,6 +788,43 @@ class TradingPipeline:
             fill_qty = 0.0
 
         if fill_qty <= 0:
+            # Concurrent-SELL guard: a parallel intra_check EMERGENCY_SELL
+            # (exempt from cross-mode lock) may have reduced or zeroed
+            # position while this SELL sat unfilled. If broker now shows
+            # 0 shares we'd be restoring stops on a phantom position;
+            # broker rejects → finalize bails → drain replays same math →
+            # row stuck forever. Re-read position and skip / clip
+            # accordingly.
+            current_qty = self._current_position_qty_for_finalize(symbol)
+            if current_qty == 0:
+                logger.info(
+                    "SELL on %s had no fill, but broker reports position=0 "
+                    "— concurrent path fully exited; skipping restore",
+                    symbol,
+                )
+                return True, []
+            if current_qty is not None:
+                total_spec_qty = sum(float(s.get("qty", 0) or 0) for s in cancelled_specs)
+                if current_qty + 1e-6 < total_spec_qty:
+                    # Concurrent SELL reduced position below original
+                    # stop coverage. Restoring all specs would over-protect
+                    # → broker rejects. Collapse to a single reprotect at
+                    # the most-protective stop_price for the actual qty.
+                    logger.warning(
+                        "SELL on %s had no fill, but broker position=%.4f "
+                        "< original spec qty=%.4f — concurrent path reduced "
+                        "position; collapsing restore to single reprotect",
+                        symbol, current_qty, total_spec_qty,
+                    )
+                    if not self._reprotect_residual_after_partial_sell(
+                        symbol, current_qty, cancelled_specs,
+                    ):
+                        if not from_drain:
+                            self._persist_orphaned_protection_restore(
+                                order_id, symbol, current_qty, cancelled_specs,
+                            )
+                        return False, list(cancelled_specs)
+                    return True, []
             try:
                 restored, failed_specs = self.broker._restore_stop_orders(
                     symbol, cancelled_specs,
@@ -786,7 +864,28 @@ class TradingPipeline:
                 return False, list(failed_specs)
             return True, []
 
-        actual_residual = position_qty_before_sell - fill_qty
+        computed_residual = position_qty_before_sell - fill_qty
+        # Concurrent-SELL guard: same reasoning as the fill_qty<=0 branch.
+        # cached `position_qty_before_sell - fill_qty` can over-state
+        # residual if intra_check liquidated some shares while this SELL
+        # was in flight. Clip to actual broker position.
+        current_qty = self._current_position_qty_for_finalize(symbol)
+        if current_qty == 0:
+            logger.info(
+                "Finalize for %s: cached residual=%.4f but broker shows "
+                "position=0 — concurrent path fully exited; skipping reprotect",
+                symbol, computed_residual,
+            )
+            return True, []
+        if current_qty is not None and current_qty + 1e-6 < computed_residual:
+            logger.warning(
+                "Finalize for %s: clipping residual from %.4f to %.4f "
+                "(broker position decreased — concurrent SELL took shares)",
+                symbol, computed_residual, current_qty,
+            )
+            actual_residual = current_qty
+        else:
+            actual_residual = computed_residual
         if actual_residual <= 0:
             return True, []  # full exit — no residual to re-protect
 
@@ -799,7 +898,7 @@ class TradingPipeline:
             # the recovery intent was silently lost.
             if not from_drain:
                 self._persist_orphaned_protection_restore(
-                    order_id, symbol, position_qty_before_sell, cancelled_specs,
+                    order_id, symbol, actual_residual, cancelled_specs,
                 )
             return False, list(cancelled_specs)
         return True, []
