@@ -24,14 +24,16 @@ LLM multi-agent quantitative trading system for US equities. Eight specialized d
 
 - **Same-day trim discipline.** A symbol that already received a sell-side action earlier today (auto-take-profit / morning emergency / midday REDUCE / force-delever) is off-limits for additional REDUCE/SELL on a second session unless the LLM cites a hard trigger in its `reason` (`thesis_invalid_if`, HIGH bearish state-change reversal, bearish earnings filing, daily-loss circuit breaker, correlation cluster breach, stop hit). Soft signals like TARGET_BREACH alone, slowing pace, geopolitical noise, or valuation stretch do **not** qualify — they were already priced into the earlier trim, and re-applying them is the mechanical loop that produced one 73 % single-day cut on a still-strengthening name before this rule landed. Enforced at both prompt + executor layers.
 
-- **Timezone-resilient by construction.** A single `src/trading_calendar.py` module is the source of truth for ET session windows, fill timestamps, and date keys. The launchd-driven scheduler fires at correct US-market times regardless of the operator's host timezone — the wrapper checks ET wall clock at fire time and skips if outside the window, so the system runs correctly when the operator is in SGT, GMT, or PT. A bash test pins the wrapper's window table against the Python authoritative source.
+- **Timezone-resilient by construction.** A single `src/trading_calendar.py` module is the source of truth for ET session windows, fill timestamps, and date keys. The OS-level scheduler (systemd `quant-agent@%i.timer` on Linux, launchd plist on macOS) fires at correct US-market times regardless of the operator's host timezone — the wrapper checks ET wall clock at fire time and skips if outside the window, so the system runs correctly when the operator is in SGT, GMT, or PT. A bash test pins the wrapper's window table against the Python authoritative source.
 
-- **Tested.** 798 tests pin every invariant, including regression tests for every fix in the public commit history. Per-entry isolation (one bad LLM sub-item must not drop the whole report) is now standard across all 9 agents — a discipline that surfaced after a single malformed `MissedOpportunity` entry took down a complete evening report; adding a 10th agent would inherit the same pattern.
+- **Tested.** 820 tests pin every invariant, including regression tests for every fix in the public commit history. Per-entry isolation (one bad LLM sub-item must not drop the whole report) is now standard across all 9 agents — a discipline that surfaced after a single malformed `MissedOpportunity` entry took down a complete evening report; adding a 10th agent would inherit the same pattern.
 
 ## Architecture
 
-Six sessions per trading day (ET, Mon-Fri), launchd-scheduled, with
-their own cadence + scope:
+Six sessions per trading day (ET, Mon-Fri), driven by a 30-min OS-level
+timer (systemd on Linux / launchd on macOS) that wraps each session
+with `scripts/run_if_et_window.sh` for ET-window gating and a cross-mode
+session lock. Each session has its own cadence + scope:
 
 ```
 08:00-09:15  earnings_preprocess  (once/day, pre-market)
@@ -87,9 +89,9 @@ their own cadence + scope:
                 17.5h until next intraday control — if a thesis trigger is
                 firing, act NOW. But "near close" is never itself a trigger.
                 Good stocks are meant to be held through the night.
-                Window width ≥ launchd's 30-min StartInterval so any phase
-                of the tick lands inside it (PR #41 lesson — earlier 25-min
-                window let bad phases miss the close two days running).
+                Window width ≥ the OS timer's 30-min tick interval so any
+                phase of the tick lands inside it (PR #41 lesson — earlier
+                25-min window let bad phases miss the close two days running).
 
 20:00-22:00  evening              (once/day, post-market)
              ├─ Reconcile all submitted orders → terminal status
@@ -198,21 +200,42 @@ EOF
 
 - `QUANT_AGENT_MAX_RETRIES` (default `7`) — base agent LLM-call retry budget. Backoff is **exponential floor + full positive jitter**: each sleep is in `[2^attempt, 2*2^attempt)`. With N=7 the worst-case total window is ~140s (6 sleeps in `[1,2)+[2,4)+[4,8)+[8,16)+[16,32)+[32,64)` ≈ up to 126s, plus 7 fast-fail call latencies). Evolution: `3 → 5 (DNS hiccup, 2026-04-23) → 7+jitter (sustained 30s OpenAI outages, 2026-04-28+29)`. Jitter is the load-bearing piece — without it, every retry attempt fires at deterministic offsets and a 30s outage swallows all of them; with jitter, individual attempts spread over a wider window so at least one tends to land outside any short outage. Drop to 2-3 for fast tests, raise to 10 if your provider chronically misbehaves.
 
-### macOS Sequoia setup (launchd automation only)
+### Production deployment
 
-If you deploy via `scripts/install_plists.sh` so the 6 sessions fire on schedule, macOS Sequoia has two extra hurdles that are easy to miss:
+Either OS-level scheduler can drive the 6 sessions; both wrap `scripts/run_if_et_window.sh` so the actual ET-window / last-run / cross-mode-lock logic is shared.
+
+**Linux (systemd, recommended for headless server / Tailscale-reachable hosts)**
+
+The repo ships with a template unit + timer at `~/.config/systemd/user/quant-agent@.service` / `quant-agent@.timer`. Enable all 6 instances and turn on user-lingering so they fire when the user isn't logged in:
+
+```bash
+systemctl --user enable --now \
+  quant-agent@earnings_preprocess.timer \
+  quant-agent@morning.timer \
+  quant-agent@intra_check.timer \
+  quant-agent@midday.timer \
+  quant-agent@close.timer \
+  quant-agent@evening.timer
+loginctl enable-linger "$USER"
+```
+
+`TimeoutStartSec=1500` on the service is the systemd safety net above the wrapper's own `timeout --kill-after=30 1200` (so the wrapper kills Python before systemd kills the wrapper). The timer's `Persistent=true` catches up after reboots.
+
+**macOS (launchd, legacy path — works but Sequoia has two extra hurdles)**
+
+If you deploy via `scripts/install_plists.sh`, Sequoia adds:
 
 1. **Full Disk Access for `/bin/bash`** — System Settings → Privacy & Security → Full Disk Access → `+` → ⌘+Shift+G → `/bin/bash` → enable. Without this, launchd-spawned bash can't read `.env` or the project files in `~/Documents/`. Symptom: `Operation not permitted` (errno 8) flooding `logs/launchd_*.log`.
 
-2. **Plugged-in power on trading nights** — if the laptop hibernates (critical battery), launchd's `StartInterval` jobs don't fire and you'll lose the session. For evening runs specifically, `sudo pmset -c sleep 0` keeps the Mac awake on AC.
+2. **Plugged-in power on trading nights** — if the laptop hibernates (critical battery), launchd's `StartInterval` jobs don't fire and you'll lose the session. `sudo pmset -c sleep 0` keeps the Mac awake on AC.
 
-If you only use the CLI modes (`python main.py --mode morning` etc.), neither applies.
+If you only use the CLI modes (`python main.py --mode morning` etc.), neither of the above applies.
 
 ### Quarterly prompt auto-evolution
 
 Set `evolution.enabled: true` in `config/settings.yaml` (default is `false`) to let the meta-reflector **write to prompt files** at end-of-quarter:
 
-- Runs only when you invoke `python main.py --mode meta` (launchd doesn't schedule this — it's a manual trigger on the last trading day of each quarter)
+- Runs only when you invoke `python main.py --mode meta` (no OS timer schedules this — manual trigger on the last trading day of each quarter)
 - Appends proposed Learnings bullets to the 6 editable agent prompts (tech / news / macro / earnings / portfolio_manager / evening_analyst)
 - **`risk_manager` and `position_reviewer` are schema-protected** — the `MetaReflectionAgentName` literal in `src/models.py` doesn't include them, so even with `enabled: true` the reflector can't touch them
 - 10 invariants enforce safety (full list in `src/evolution/prompt_editor.py` module docstring). User-visible ones: per-agent **FIFO cap** (10 Learnings, oldest auto-evicted), **Jaccard dedup** (0.6 threshold), **prohibited-words regex** (never / always / override / ignore all — these directly conflict with hard-invariant wording in core prompts), **per-cycle agent cap** (max 3 distinct agents edited per quarterly run), **atomic file writes** (tmp + os.replace), **audit log** at `data/evolution/edits.jsonl` with both accepted and rejected attempts + reasons, and `auto_commit: true` so each quarter's edits land as one `chore(prompts):` commit — `git revert <sha>` is your one-shot rollback
@@ -227,26 +250,25 @@ source .env
 python main.py --mode morning    # Analyze + trade
 python main.py --mode midday     # Position review + trailing stops
 python main.py --mode evening    # PnL report + insights for tomorrow
-python main.py --mode live       # Scheduler (all three on cron, weekdays)
+python main.py --mode live       # APScheduler in-process (dev/legacy; production
+                                 # uses systemd/launchd timers, not this)
 ```
 
-Automated via macOS launchd — plist files in `~/Library/LaunchAgents/com.quant-agent.*.plist`.
-
-**Timezone-resilient scheduling**: plists fire every 30 minutes (`StartInterval=1800`); a bash wrapper `scripts/run_if_et_window.sh` checks whether the current **US/Eastern** time is inside the target window and whether the mode already ran in the last hour. Runs the right session at the right ET moment regardless of the host's timezone (handy when traveling). Windows (Mon-Fri ET, authoritative Python table at `src/trading_calendar.py` `SESSION_WINDOWS`, locked to the bash wrapper by `test_trading_calendar.py`):
+**Automated scheduling**: the production path is a 30-min OS-level timer (systemd `quant-agent@.timer` on Linux, launchd plist on macOS) that calls `scripts/run_if_et_window.sh <mode>` for each session. The wrapper checks the current **US/Eastern** wall clock against the target window, applies the cross-mode session lock (one heavy LLM session at a time, except `intra_check` which is exempt), and skips if the mode already ran today. Runs the right session at the right ET moment regardless of the host's timezone — handy when traveling. Windows (Mon-Fri ET, authoritative Python table at `src/trading_calendar.py` `SESSION_WINDOWS`, locked to the bash wrapper by `test_trading_calendar.py`):
 - `earnings_preprocess` 08:00-09:15 ET — pre-market LLM analysis of fresh 10-Q/10-K filings
 - `morning` 09:30-12:00 ET — research + trading
 - `intra_check` 09:30-16:00 ET — every 30min tick; stateless circuit-breaker (no LLM)
 - `midday` 13:00-14:30 ET — position review + real trailing stops (patient disposition)
-- `close` 15:30-16:00 ET — position review (act-on-trigger; window ≥ launchd 30min tick so it never misses)
+- `close` 15:30-16:00 ET — position review (act-on-trigger; window ≥ 30-min OS-timer tick so it never misses)
 - `evening` 20:00-22:00 ET — daily P&L + insights for next morning
 
 ## Trading Universe
 
-77 symbols across 10 sectors:
+97 symbols (source of truth: `config/settings.yaml:trading.universe`):
 - **Index ETFs**: SPY, QQQ, IWM, DIA
 - **Sector ETFs**: XLF, XLE, XLV, XLI, XLP, XLY, XLU, XLRE, XLB, SMH, DRAM
 - **Inverse ETFs**: SH, SDS, PSQ, SQQQ (leverage-corrected in risk engine)
-- **Individual stocks**: AAPL, MSFT, GOOGL, AMZN, NVDA, META, AVGO, JPM, CAT, etc.
+- **Individual stocks**: AAPL, MSFT, GOOGL, AMZN, NVDA, META, AVGO, JPM, CAT, plus ~80 single names across tech, energy / oil, infrastructure, consumer, healthcare, financials, and power-transition themes
 
 ## Project Structure
 
@@ -262,7 +284,8 @@ quant-agent/
 │   ├── pipeline_context.py        # RunContext dataclass — explicit shared state across stages
 │   ├── portfolio_constructor.py   # Deterministic Target → TradeDecision translator (risk-budget sizing)
 │   ├── trading_calendar.py        # ET timezone + SESSION_WINDOWS + session_date_key (single source of truth)
-│   ├── scheduler.py               # APScheduler + launchd
+│   ├── scheduler.py               # APScheduler — only used by --mode live (dev/legacy)
+│                                  #   Production uses systemd timers (Linux) or launchd (macOS).
 │   ├── config.py                  # Pydantic config with API key validation
 │   ├── models.py                  # Data models (ReasoningChain, MacroNarrative, etc.)
 │   ├── agents/                    # 8 daily LLM agents + 1 quarterly meta_reflector
@@ -282,7 +305,7 @@ quant-agent/
 │   │   └── rules.py               # Hard risk engine (leverage-adjusted)
 │   └── storage/
 │       └── db.py                  # SQLite (trades, positions, logs, PnL, insights)
-├── tests/                         # 798 tests
+├── tests/                         # 820 tests
 ├── data/
 │   ├── quant_agent.db             # SQLite audit trail
 │   ├── earnings/                  # Cached SEC filing analyses
@@ -293,7 +316,7 @@ quant-agent/
 ## Tests
 
 ```bash
-pytest tests/ -v    # 798 tests
+pytest tests/ -v    # 820 tests
 ```
 
 ## Data Sources
@@ -308,12 +331,13 @@ pytest tests/ -v    # 798 tests
 
 ## Storage
 
-**SQLite** (`data/quant_agent.db`, WAL mode):
-- Trades (with stop/target, reasoning, actual submitted fill price)
+**SQLite** (`data/quant_agent.db`, WAL mode + `synchronous=NORMAL`, indexed for prune):
+- Trades (with stop/target, reasoning, actual submitted fill price) — `idx_trades_timestamp` keeps the 5-year prune fast
 - Position snapshots (synced each midday — rows for closed symbols are purged)
-- Agent logs for all 8 LLM agents including earnings (full input/output, tokens, model — auto-pruned after 2 years for quarter-over-quarter learning)
+- Agent logs for all 8 daily LLM agents (full input/output, tokens, model — `idx_agent_logs_timestamp` keeps the 2-year prune fast for quarter-over-quarter learning)
 - Daily P&L records
 - Evening insights (cross-session memory)
+- `pending_protection_restores` — orphaned protective-stop recovery queue, drained at every session entry and TTL-pruned after 30 days
 
 **File-based** (`data/news/`):
 - `macro_narrative.json` — persistent grand backdrop, evolves daily
