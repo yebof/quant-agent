@@ -26,6 +26,8 @@ LLM multi-agent quantitative trading system for US equities. Eight specialized d
 
 - **Timezone-resilient by construction.** A single `src/trading_calendar.py` module is the source of truth for ET session windows, fill timestamps, and date keys. The OS-level scheduler (systemd `quant-agent@%i.timer` on Linux, launchd plist on macOS) fires at correct US-market times regardless of the operator's host timezone — the wrapper checks ET wall clock at fire time and skips if outside the window, so the system runs correctly when the operator is in SGT, GMT, or PT. A bash test pins the wrapper's window table against the Python authoritative source.
 
+- **Telegram session-status push (opt-in).** Every session emits a structured status message — orders, R/R-weighted sizing, degraded-data flags, daily P&L, tomorrow's bias, or the exact exception trace on failure — to a Telegram chat you control. Set `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` to enable; missing creds make the notifier a silent no-op and trading is unchanged. Per-mode noise policy hides the 14 silent `intra_check` ticks per day and pre-market `nothing_new` earnings polls while always surfacing emergency liquidations, hard-risk blocks, exceptions, and the substantive morning / midday / close / evening completions. The notifier is wired into `main.py`'s `finally` block so even a `SystemExit` from a wrapper kill still produces a push before the process exits — and HTTP failures to Telegram are swallowed so an outage on their side can never cascade into a trading failure.
+
 - **Tested.** 874 tests pin every invariant, including regression tests for every fix in the public commit history. Per-entry isolation (one bad LLM sub-item must not drop the whole report) is now standard across all 9 agents — a discipline that surfaced after a single malformed `MissedOpportunity` entry took down a complete evening report; adding a 10th agent would inherit the same pattern.
 
 ## Architecture
@@ -171,7 +173,7 @@ SELL allocation_pct semantics, ET-everywhere timezone, etc.).
 - Python 3.11+
 - [Alpaca](https://alpaca.markets/) account (paper trading supported)
 - [FRED](https://fred.stlouisfed.org/docs/api/api_key.html) API key
-- OpenAI or Anthropic API key
+- [Anthropic](https://console.anthropic.com/) API key (default since 2026-05-11 — all 9 agents on `claude-opus-4-7`) and/or [OpenAI](https://platform.openai.com/) API key (model-name routing: any agent set to `gpt-*` / `o1-*` / `o3-*` / `o4-*` in `config/settings.yaml` uses OpenAI; everything else uses Anthropic)
 
 ### Install
 
@@ -183,18 +185,23 @@ pip install -e ".[dev]"
 
 ### Configure
 
-1. Create `.env`:
+1. Create `.env` (set `chmod 600` after — these are secrets):
 ```bash
 cat > .env << 'EOF'
-OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...                  # optional — only needed if any agent stays on a gpt-*/o*-* model
 FRED_API_KEY=...
 ALPACA_API_KEY=...
 ALPACA_SECRET_KEY=...
+
+# Optional: Telegram session-status push (see "Optional env vars" below)
+# TELEGRAM_BOT_TOKEN=...
+# TELEGRAM_CHAT_ID=...
 EOF
+chmod 600 .env
 ```
 
-2. Edit `config/settings.yaml` — models per agent, risk parameters, trading universe, schedule
+2. Edit `config/settings.yaml` — models per agent, risk parameters, trading universe, schedule. Default after 2026-05-11 is `claude-opus-4-7` for all 9 agents; flip individual agents to a `gpt-*` model name to route them through OpenAI instead.
 
 ### Optional env vars
 

@@ -9,7 +9,9 @@ pytest tests/ -v                                    # 全量测试
 python main.py --mode morning|midday|evening|live   # 手动跑
 ```
 
-生产路径走 launchd（`~/Library/LaunchAgents/com.quant-agent.*.plist`），不走 `--mode live`。
+生产路径走 OS-level timer，不走 `--mode live`：
+- **Linux（当前部署，2026-05-11 起）**：systemd 用户 timer `~/.config/systemd/user/quant-agent@.timer` + service template，`Linger=yes` 让 user 退出登录后 timer 仍触发。状态：`systemctl --user list-timers 'quant-agent@*'`、日志：`journalctl --user -u 'quant-agent@*.service'`
+- **macOS（legacy）**：launchd `~/Library/LaunchAgents/com.quant-agent.*.plist`，配套 `scripts/install_plists.sh` 安装/重载。**2026-05-11 起 Mac 路径已停用**（迁到 Linux server）；plist 文件保留作 fallback，详细注意事项见下面 "macOS Sequoia" 段
 
 ## 架构速览
 
@@ -17,7 +19,8 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 - 双层风控：硬规则引擎（cash_only / 仓位 / 暴露 / 日损 / 板块 / 相关性 / earnings-queued） + LLM RiskManager 审核 + `_force_delever()` 硬兜底
 - **6 个 session**（ET Mon-Fri）：earnings_preprocess 08:00-09:15（唯一跑 earnings LLM）、morning 09:30-12:00（full team）、intra_check 09:30-16:00 每 30min tick（熔断器，零 LLM）、midday 13:00-14:30（position_reviewer patient）、close 15:30-16:00（position_reviewer act-on-trigger；窗口 ≥ launchd 30min tick 保证任何 phase 都能打中）、evening 20:00-22:00（report + outlook）。**季度末额外一次 meta**：`--mode meta` / `run_quarterly_meta_reflection`，跑 `quarterly_digest` 聚合 90 天事实 + `meta_reflector` LLM 7 步 CoT + `prompt_editor` 4 道保险 apply
 - 数据源：yfinance、FRED、RSS、SEC EDGAR
-- 配置：`config/settings.yaml` + `.env`；按 agent 独立选 OpenAI / Anthropic 模型
+- 配置：`config/settings.yaml` + `.env`；按 agent 独立选 OpenAI / Anthropic 模型。**2026-05-11 起所有 9 个 agent 用 `claude-opus-4-7`**（OpenAI quota 耗尽后切的；切回去一条 `sed` 命令）。Provider 路由按 model name 前缀判断：`gpt-` / `o1-` / `o3-` / `o4-` 走 OpenAI，其它走 Anthropic（`src/agents/base.py:_OPENAI_PREFIXES`）
+- **Telegram 推送**：开/关由 `.env` 控制，缺 `TELEGRAM_BOT_TOKEN` 或 `TELEGRAM_CHAT_ID` 时 notifier 静默 no-op，trading 不受影响。每个 session 在 `main.py` finally 块里调一次 `notifier.send(format_session_result(...))`；噪声策略：morning/midday/close/evening 总推；earnings_preprocess 只在真分析了 filing 时推；intra_check 只在 emergency 触发时推（14 次/天 OK tick 静默）；meta 只在真季末跑时推；**任何 session 抛异常都强制推**绕过噪声策略。文档见 `src/notifier.py` docstring 和 README "Optional env vars" 段
 
 ### Agent CoT 结构（schema-enforced 必填字段数；违反 → ValidationError）
 | Agent | CoT 步数 | 备注 |
@@ -55,17 +58,23 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 
 ### 时区
 - ET 统一走 `src/trading_calendar.py`（`et_today` / `et_now` / `session_date_key` / `in_session_window` / `SESSION_WINDOWS`）。`src/util/time.py` 是向后兼容 shim，新代码直接 import `src.trading_calendar`。`daily_pnl` 主键、`insights` 查询、`broker.is_trading_day`、news/macro 快照目录、earnings cutoff、market OHLCV 全部 ET——任何 host TZ 都要出同样数据
-- launchd 每 30 分钟触发 `scripts/run_if_et_window.sh`，wrapper 看 **ET 时间**判断窗口 + last-run 文件去重。窗口对应 `SESSION_WINDOWS`（Python 权威源，bash 表由 `test_trading_calendar.py` 锁定一致）：earnings_preprocess 08:00-09:15、morning 09:30-12:00、**intra_check 09:30-16:00（全交易时段每 30 分钟 tick 都跑，stateless 熔断器；last-run 去重 + cross-mode session lock 对它都不生效）**、midday 13:00-14:30、close 15:30-16:00、evening 20:00-22:00（Mon-Fri ET）。**每个窗口宽度必须 ≥ launchd StartInterval (1800s = 30min)**，否则 tick 相位不凑巧会整天错过窗口（2026-04-23/24 close 连续两天因原 25 min 窗口而 miss 的教训）。用户经常出差，不同时区必须都正确。**midday + close 都跑 position_reviewer（同一 agent，`session_type` 分流：midday = patient，close = act-on-trigger；都只卖不买，核心原则"好股长持"）**
+- OS-level timer（Linux systemd / macOS launchd）每 30 分钟触发 `scripts/run_if_et_window.sh`，wrapper 看 **ET 时间**判断窗口 + last-run 文件去重。窗口对应 `SESSION_WINDOWS`（Python 权威源，bash 表由 `test_trading_calendar.py` 锁定一致）：earnings_preprocess 08:00-09:15、morning 09:30-12:00、**intra_check 09:30-16:00（全交易时段每 30 分钟 tick 都跑，stateless 熔断器；last-run 去重 + cross-mode session lock 对它都不生效）**、midday 13:00-14:30、close 15:30-16:00、evening 20:00-22:00（Mon-Fri ET）。**每个窗口宽度必须 ≥ OS timer 30min tick interval**（systemd `OnCalendar=*:00,30:00` / launchd `StartInterval=1800`），否则 tick 相位不凑巧会整天错过窗口（2026-04-23/24 close 连续两天因原 25 min 窗口而 miss 的教训）。用户经常出差，不同时区必须都正确。**midday + close 都跑 position_reviewer（同一 agent，`session_type` 分流：midday = patient，close = act-on-trigger；都只卖不买，核心原则"好股长持"）**
 - **Cross-mode session lock**（`scripts/run_if_et_window.sh` 的 `acquire_session_lock`）—— 5 个重 LLM session（earnings_preprocess / morning / midday / close / evening）通过 `~/.cache/quant-agent/active-session.lock/` mkdir-as-mutex 串行化：同一时刻只允许一个 python trading session 跑，防长 morning 拖到 midday 时撞车。Stale-lock 1800s 自愈（与外层 1200s kill 配合，30min 后必定干净）。**intra_check 是被显式豁免的**——和 last-run guard 的豁免一条逻辑：stateless 熔断器必须每 tick 都跑，否则 morning 跑久时 flash-crash 防护就哑火，这是熔断器存在的全部意义被否定。修改 lock 逻辑时**永远先确认 intra_check 仍能穿过**（test：`test_run_if_et_window_intra_check_bypasses_session_lock`）
 
 ### 生产侧防挂死 / 防拒单（都有血泪）
-- 所有 Alpaca SDK 调用通过 `_install_http_timeout()` 注入 30s HTTP timeout；launchd wrapper 外层 `/opt/homebrew/bin/timeout --kill-after=30 1200 ...` 20 分钟兜底（`scripts/run_if_et_window.sh`）——**双层**，防再次出现 13 小时 hang（2026-04-17 事故）。**20 分钟不是随意选的**：morning 正常路径 = tech_analyst 3 chunks × 140-180s + news/macro 并行 + PM 50s + RM + exec，慢 OpenAI 日可达 10-11 min（2026-04-24 Fri 实测），600s 原值连续三次 tick 撞死 status 124。20min 是"1.5-2x 最坏耗时"的 ceiling，既能保护真挂死场景，又不把正常跑击杀
+- 所有 Alpaca SDK 调用通过 `_install_http_timeout()` 注入 30s HTTP timeout；wrapper 外层 `timeout --kill-after=30 1200 ...` 20 分钟兜底（Linux：`/usr/bin/timeout`；macOS：`/opt/homebrew/bin/timeout` via brew coreutils；wrapper 用 `TIMEOUT_OVERRIDE` env 选）——**双层**，防再次出现 13 小时 hang（2026-04-17 事故）。systemd `quant-agent@.service` 还有第三层 `TimeoutStartSec=1500` 安全网，让 systemd 在 wrapper 自己的 1200+30s kill 之外再多 270s 兜底。**20 分钟不是随意选的**：morning 正常路径 = tech_analyst 3 chunks × 140-180s + news/macro 并行 + PM 50s + RM + exec，慢 OpenAI 日可达 10-11 min（2026-04-24 Fri 实测），600s 原值连续三次 tick 撞死 status 124。20min 是"1.5-2x 最坏耗时"的 ceiling，既能保护真挂死场景，又不把正常跑击杀
 - **LLM client 也要钉 HTTP timeout**：`src/agents/base.py:_LLM_HTTP_TIMEOUT = 300.0` 传给 `OpenAI()` / `Anthropic()` 构造器。SDK 默认 600s 会让单次 stalled SSE 流吃掉整个 session 窗口。**300s 不是随便选的**：tech_analyst `max_tokens=128000` + 25 symbols/chunk 历史正常耗时就是 60-180s，2026-04-24 OpenAI 慢到单 chunk >180s；太紧（60s 初版）会砍掉本来能成功返回的调用 → 触发 retry spiral 撞穿 launchd 600s outer kill。300s 覆盖了"慢的一天"的正常耗时尾部 + buffer，还比 SDK 默认低一半。和 `_BROKER_HTTP_TIMEOUT` 是一条纪律（2026-04-23 morning DNS 事故 + 2026-04-24 morning OpenAI 慢响应事故的合订本——timeout 必须 > slowest legit latency）
 - `broker.submit_order` 提交前 `_quantize_price()` 按 Alpaca tick 归整（≥$1 → 0.01、<$1 → 0.0001）——防 sub-penny reject（2026-04-17 UPS 事故）
 - 预处理 LLM 分析失败调 `record_failure()`；连 3 次失败就 abandon + 标 `abandoned=True`，不再重分析——防 LLM 失败循环烧 token
 - **macOS Sequoia launchd + `com.apple.provenance`**：plist 的 `ProgramArguments` **必须**以 `/bin/bash` 开头，后面把 wrapper 作为参数传（不能直接 exec wrapper）。launchd 只 exec 系统 binary `/bin/bash`，provenance 不会挡；bash 读 wrapper 当文本源走，provenance 也不管。配套 `scripts/install_plists.sh` 会一键重写 + reload，编辑 wrapper 后务必重跑（2026-04-17 周五事故，launchd 5 个 job 全 exit 126 + 没跑）
 - **macOS TCC / Full Disk Access**：launchd 派生的 bash 默认没权限读 `~/Documents/` 下的文件。wrapper 通过 `install_plists.sh` 装到 `~/Library/Application Support/quant-agent/` 绕开第一层；但 wrapper 仍要 `source ${PROJECT_ROOT}/.env` 和执行 `~/Documents/.../main.py` 及其 src/ config/ data/ 读取——这些都在 Documents 保护目录里。解法：**System Settings → Privacy & Security → Full Disk Access → `+` → ⌘+Shift+G → `/bin/bash` → 开启**。不加这个，launchd 日志会反复看到 `Operation not permitted`（errno 8）并且 session 全部哑火（2026-04-20 周一事故）
-- **Mac hibernate 丢 session**：电池低时 macOS 进 hibernate，launchd 的 StartInterval 任务不触发。若交易日晚上笔记本掉电 hibernate 到 evening 窗口之后，当晚 evening 不跑 → 没生成 insights → 次日 PM 缺衔接信号。交易日建议插电 + `sudo pmset -c sleep 0`，或手工 `python main.py --mode evening` 补跑（evening 窗外也能跑，但记得它不经 wrapper 所以不更新 `~/.cache/quant-agent/last-evening`）（2026-04-21 周二事故）
+- **Mac hibernate 丢 session**：电池低时 macOS 进 hibernate，launchd 的 StartInterval 任务不触发。若交易日晚上笔记本掉电 hibernate 到 evening 窗口之后，当晚 evening 不跑 → 没生成 insights → 次日 PM 缺衔接信号。交易日建议插电 + `sudo pmset -c sleep 0`，或手工 `python main.py --mode evening` 补跑（evening 窗外也能跑，但记得它不经 wrapper 所以不更新 `~/.cache/quant-agent/last-evening`）（2026-04-21 周二事故）。**注意**：迁到 Linux server 后这条不适用——`Linger=yes` + 服务器常开电源就没这个问题，留作 Mac fallback 时的参考。
+
+### Telegram 推送 / 可观测性
+- `src/notifier.py:TelegramNotifier`，在 `main.py` finally 块里调用 `format_session_result(mode, result, elapsed, error=...)` 推送。**Hook 必须在 finally 里**，不能在 try 内部——否则 session 抛异常时收不到 FAILED 推送（这是日志之外操作员唯一的实时信号）
+- 错误必须 swallow：`notifier.send()` 内部 `except Exception` 兜住所有 HTTP / 网络 / Telegram-端报错；main.py finally 块再包一层 try/except 防 notifier 自己挂。**`notify` 失败永远不能让 session 失败**，这条比"得到通知"重要
+- 噪声策略由 `format_session_result` 返回 `None` 实现（caller 看 `None` 就 skip send）。policy 见模块 docstring；改这条策略前先想清楚"这个 silence 是不是把真信号也吞了"——典型反例：earnings_preprocess 当时把 `analysis_error` 也 silence 过，结果 OpenAI quota 耗尽那天 13 个 filing 全 retry 烧 token 但没人收到通知（2026-05-11 修，`analysis_error` 现在推）
+- Telegram bot token 等同密码：写 `.env` 用 `chmod 600`，**不要**贴 git / issue / 公开 chat。token 万一外泄（推送的截图 / 误贴 ssh log）马上去 BotFather 发 `/revoke` 生新的
 
 ## 开发规范
 
@@ -74,6 +83,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 - 任何进 trades / positions 表的写入必须先过 `_order_accepted()`
 - **Env vars（可选调节）**：
   - `QUANT_AGENT_MAX_RETRIES` — base agent LLM 调用重试次数（**默认 7，带 jitter**）。退避用 `_retry_backoff_seconds()`：每次睡 `[2^attempt, 2*2^attempt)` 秒（exponential floor + full positive jitter），6 次 sleep 总最坏 ~126s，加 7 次 fast-fail call 延迟 ~14s，~140s 窗口。**演化**：3→5 (2026-04-23 DNS 抖动) → 7+jitter (2026-04-28+29 RM 阶段连续两天 30s 网络中断把 5 retry 全吞)。jitter 是关键 — 没 jitter 时所有 retry 时机确定，30s outage 必吞所有 5 次 retry；有 jitter 后 retry 时机随机散开，至少有概率落在 outage 之后
-  - `.env` 的必需项：`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` / `FRED_API_KEY`
+  - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — 可选；都给上才启用 Telegram 推送，缺一个就静默 no-op。`TELEGRAM_DISABLED=1` 是 kill switch（不删 token 直接关）
+  - `.env` 的必需项：`ANTHROPIC_API_KEY` (当前 provider) / `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` / `FRED_API_KEY`。`OPENAI_API_KEY` 在 2026-05-11 切到 Claude 之后变成可选——任何 `gpt-/o1-/o3-/o4-` 前缀的 model name 还是会路由到 OpenAI（保留是为了将来 fallback）
 - **长期反思（quarterly auto-evolution）**：`evolution.enabled=true` 时，每季末 `--mode meta` 会让 `PromptEditor` 按 `reflection.json` 的提案真实写入 6 个 editable agent 的 prompt 文件的 `## Learnings (system-evolved)` 段。`risk_manager` + `position_reviewer` 被 `MetaReflectionAgentName` schema literal 硬挡，`evolution.enabled=true` 也改不了。4 层护栏：FIFO cap / Jaccard dedup / prohibited-words regex / git auto-commit（`git revert <sha>` 一条命令整季回滚）
 - **记忆**：操作员长期偏好 / 决策背景由 Claude Code 在本机 `~/.claude/projects/<project-hash>/memory/` 维护（每个 fork 独立）。Claude Code 文档：<https://docs.claude.com/en/docs/claude-code/memory>
