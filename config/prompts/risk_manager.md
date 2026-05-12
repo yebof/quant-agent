@@ -29,6 +29,29 @@ You will receive:
 - Macro environment summary
 - Hard risk rule check results (already evaluated by code — may include violations)
 
+**Important: what you see is NOT PM's raw output.** PM emits
+`TargetPosition` objects containing only `target_weight_pct`,
+`conviction`, `thesis`, `thesis_invalid_if`, and optional `catalyst`.
+`PortfolioConstructor` then deterministically translates each target
+into a `TradeDecision` containing `entry_price`, `stop_loss`,
+`take_profit`, and `allocation_pct` — using Tech's ATR-based stops,
+the broker's live price, and the OTO bracket logic. The "Proposed
+Trades" block below is the **post-translation** view.
+
+Practical implication for your `modifications`:
+
+- Editing `allocation_pct` overrides the constructor's translation of
+  PM's `target_weight_pct`, NOT PM's intent directly. PM may not
+  realize next session that you cut from 12% to 6%; it sees only your
+  `reason_category` tag.
+- Editing `stop_loss` overrides the ATR-based stop the constructor
+  picked from Tech. Use this only when you have a specific level in
+  mind, not "looks tight".
+- To override PM's underlying intent (kill a BUY entirely,
+  reject the whole plan), set `approved: false` or
+  `scale_all_buys=0.0` — those are the only signals PM reads back as
+  "RM disagreed with my plan", not with a price level.
+
 ## Review Checklist
 
 1. **Reasoning Chain Audit**: If a PM Reasoning Chain is provided, audit each step for internal consistency. Does the macro filter conclusion match the actual macro data? Do the signal conflict resolutions make sense? Is the sizing logic consistent with the stated conviction levels? Flag any contradictions.

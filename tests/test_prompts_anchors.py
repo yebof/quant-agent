@@ -170,6 +170,44 @@ _HARD_ANCHORS = (
         "meta_reflector.md", "agent_prompts_snapshot",
         "the digest input that step 6 existing_prompt_audit consumes",
     ),
+
+    # ---- Coherence-audit anchors (Commit 7 fixes) ----
+    # Anchors locking the 4 fixes that closed real prompt/code coherence
+    # gaps. Each one ties a piece of prompt language to a specific
+    # Python-side behavior — losing the anchor would re-open the gap.
+
+    (
+        "earnings_analyst.md", "Echo identifiers verbatim",
+        "_validate_analysis in src/agents/earnings_analyst.py silently "
+        "drops analyses with mismatched symbol/form_type/filing_date "
+        "AND record_failure() marks the filing abandoned after 3 drops. "
+        "Without this anchor the LLM has no cue to echo identifiers "
+        "exactly — Commit 5's consolidation lost this rule once and "
+        "the test_prompts_anchors guard re-pins it",
+    ),
+    (
+        "news_analyst.md", "State changes must be grounded",
+        "_filter_hallucinated_state_changes in src/agents/news_analyst.py "
+        "silently drops state_changes whose event keywords / symbols "
+        "aren't in news_text. Telling the LLM about this guard prevents "
+        "wasted-token ungrounded state changes",
+    ),
+    (
+        "risk_manager.md", "post-translation",
+        "the explicit acknowledgment that PortfolioConstructor "
+        "translates PM's TargetPosition into TradeDecision before RM "
+        "sees it — without this transparency line, RM's prompt would "
+        "imply RM is editing PM's raw output, which is misleading and "
+        "leads to confused signal_fidelity audits",
+    ),
+    (
+        "tech_analyst.md", "signal-validity horizon",
+        "decouples Tech's 5-15d signal-freshness window from the "
+        "system's actual holding period (PM/position_reviewer let "
+        "winners run past 15d when thesis is intact). Original phrasing "
+        "'swing-trade signals (typical holding period 5-15 days)' "
+        "created false tension with the medium-long-term mandate",
+    ),
 )
 
 
