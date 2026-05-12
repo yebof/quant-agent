@@ -295,6 +295,84 @@ def test_format_evening_shows_negative_daily_pnl():
     assert "-0.35%" in msg
 
 
+def test_format_includes_session_cost_when_db_has_rows(tmp_path, monkeypatch):
+    """When a run_id matches rows in agent_logs with cost_usd populated,
+    the notifier should surface 💵 cost: $X.XX (N calls)."""
+    monkeypatch.chdir(tmp_path)
+    # Build a minimal DB matching the schema notifier reads from.
+    import sqlite3
+    db_dir = tmp_path / "data"
+    db_dir.mkdir()
+    conn = sqlite3.connect(str(db_dir / "quant_agent.db"))
+    conn.execute("""
+        CREATE TABLE agent_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_name TEXT, run_id TEXT, cost_usd REAL
+        )
+    """)
+    conn.executemany(
+        "INSERT INTO agent_logs (agent_name, run_id, cost_usd) VALUES (?, ?, ?)",
+        [
+            ("tech_analyst",     "run-cost-demo", 3.45),
+            ("portfolio_manager","run-cost-demo", 0.90),
+            ("risk_manager",     "run-cost-demo", 0.18),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = {
+        "status": "executed", "run_id": "run-cost-demo",
+        "orders": [{"symbol": "NVDA", "side": "buy", "qty": 5,
+                    "limit_price": 420, "stop_loss_price": 400}],
+    }
+    msg = format_session_result("morning", result, 600.0)
+    assert msg is not None
+    assert "💵 cost: $4.53" in msg  # 3.45 + 0.90 + 0.18
+    assert "(3 calls)" in msg
+
+
+def test_format_omits_cost_line_when_no_db(tmp_path, monkeypatch):
+    """No DB file → cost line is omitted (not '$?.??' noise)."""
+    monkeypatch.chdir(tmp_path)
+    result = {"status": "executed", "run_id": "run-x", "orders": []}
+    msg = format_session_result("morning", result, 60.0)
+    assert msg is not None
+    assert "💵 cost" not in msg
+
+
+def test_format_flags_cost_unknown_when_any_row_has_null_cost(tmp_path, monkeypatch):
+    """Mixed-pricing-coverage row set: at least one agent's model isn't
+    in cost_table.PRICING and stored NULL. The session push should
+    surface the gap rather than fake a partial sum."""
+    monkeypatch.chdir(tmp_path)
+    import sqlite3
+    db_dir = tmp_path / "data"
+    db_dir.mkdir()
+    conn = sqlite3.connect(str(db_dir / "quant_agent.db"))
+    conn.execute("""
+        CREATE TABLE agent_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_name TEXT, run_id TEXT, cost_usd REAL
+        )
+    """)
+    conn.executemany(
+        "INSERT INTO agent_logs (agent_name, run_id, cost_usd) VALUES (?, ?, ?)",
+        [
+            ("tech_analyst", "run-mixed", 3.45),
+            ("portfolio_manager", "run-mixed", None),  # unknown model
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = {"status": "executed", "run_id": "run-mixed", "orders": []}
+    msg = format_session_result("morning", result, 60.0)
+    assert msg is not None
+    assert "$?.??" in msg
+    assert "see cost_table.py" in msg
+
+
 def test_format_evening_position_snapshot_skips_gracefully_without_db(tmp_path, monkeypatch):
     """No data/quant_agent.db in the cwd → position snapshot section
     is skipped silently rather than crashing the message."""

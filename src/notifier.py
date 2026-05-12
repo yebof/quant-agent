@@ -164,6 +164,15 @@ def format_session_result(
         f"run_id: {run_id}",
     ]
 
+    # Per-session LLM cost (looked up from agent_logs by run_id). Shows
+    # for every mode that ran agents — operator wants to see the
+    # dollar spend alongside the orders. Returns None silently if no
+    # DB or no rows; we omit the line rather than render "$?.??" mid
+    # success-message noise.
+    cost_line = _session_cost_line(run_id)
+    if cost_line:
+        lines.append(cost_line)
+
     # === Mode-specific body ===
     if mode in ("morning", "midday", "close", "once"):
         _append_trade_session_body(lines, result)
@@ -253,6 +262,54 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
     outlook = _attr_or_key(analysis, "tomorrow_outlook") or ""
     if outlook:
         lines.append(f"   {outlook[:280]}")
+
+
+def _session_cost_line(run_id: str | None) -> str | None:
+    """Return '💵 cost: $X.XX (N calls)' for a session's run_id, or
+    None when the lookup can't produce a clean answer.
+
+    Reasons for returning None (and not displaying anything):
+      - No run_id (mode didn't set one — e.g. live scheduler startup ping)
+      - DB file not at default path (test environments)
+      - No agent_log rows for this run_id (session crashed before any
+        LLM call landed — error path notification already covers this)
+      - Some row has cost_usd=NULL (model missing from cost_table) —
+        showing partial sum would understate; better to render nothing
+        and let the operator notice the gap when they hit the
+        agent_logs table directly.
+    """
+    if not run_id or run_id == "?":
+        return None
+    try:
+        import sqlite3
+        from pathlib import Path
+        db_path = Path("data/quant_agent.db")
+        if not db_path.exists():
+            return None
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT cost_usd FROM agent_logs WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("session cost lookup failed for %s: %s", run_id, exc)
+        return None
+    if not rows:
+        return None
+    if any(r[0] is None for r in rows):
+        # Unknown model in pricing table for at least one call →
+        # cannot honestly sum. Surface a hint instead of a fake number.
+        return f"💵 cost: $?.?? ({len(rows)} calls — see cost_table.py)"
+    total = sum(float(r[0]) for r in rows)
+    # Cents-or-better precision for human readability; sub-cent
+    # sessions (rare, e.g. intra_check with 0 LLM calls — but those
+    # don't reach this code path anyway) use 4-decimal.
+    if total < 0.01:
+        return f"💵 cost: ${total:.4f} ({len(rows)} calls)"
+    return f"💵 cost: ${total:,.2f} ({len(rows)} calls)"
 
 
 def _append_position_snapshot(lines: list[str], total_value: float | None) -> None:

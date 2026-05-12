@@ -3510,6 +3510,9 @@ class TradingPipeline:
                 full_response=result.raw_text,
                 model=self.config.llm.news_analyst_model,
                 tokens_used=result.tokens_used,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                cost_usd=result.cost_usd,
             )
             return intel_report
         except Exception as e:
@@ -4671,6 +4674,9 @@ class TradingPipeline:
                 full_response=md_result.raw_text,
                 model=self.config.llm.position_reviewer_model,
                 tokens_used=md_result.tokens_used,
+                input_tokens=md_result.input_tokens,
+                output_tokens=md_result.output_tokens,
+                cost_usd=md_result.cost_usd,
             )
 
             # Risk check: if daily loss limit breached, force-sell all. Else:
@@ -4810,6 +4816,9 @@ class TradingPipeline:
                     full_response=agent_result.raw_text,
                     model=self.config.llm.earnings_analyst_model,
                     tokens_used=agent_result.tokens_used,
+                    input_tokens=agent_result.input_tokens,
+                    output_tokens=agent_result.output_tokens,
+                    cost_usd=agent_result.cost_usd,
                 )
             except Exception as e:
                 logger.error("Earnings preprocess: log insert failed for %s: %s", sym, e)
@@ -5169,6 +5178,9 @@ class TradingPipeline:
             full_response=ev_result.raw_text,
             model=self.config.llm.evening_analyst_model,
             tokens_used=ev_result.tokens_used,
+            input_tokens=ev_result.input_tokens,
+            output_tokens=ev_result.output_tokens,
+            cost_usd=ev_result.cost_usd,
         )
 
         # Save daily_pnl + insights atomically (Phase 4 #5). If the LLM
@@ -5354,6 +5366,9 @@ class TradingPipeline:
                     full_response=ev_result.raw_text,
                     model=self.config.llm.meta_reflector_model,
                     tokens_used=ev_result.tokens_used,
+                    input_tokens=ev_result.input_tokens,
+                    output_tokens=ev_result.output_tokens,
+                    cost_usd=ev_result.cost_usd,
                 )
             except Exception as exc:
                 logger.warning("meta_reflector agent_log insert failed: %s", exc)

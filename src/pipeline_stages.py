@@ -274,6 +274,9 @@ class MorningResearchStage:
                 full_response=ma_result.raw_text,
                 model=self.config.llm.macro_analyst_model,
                 tokens_used=ma_result.tokens_used,
+                input_tokens=ma_result.input_tokens,
+                output_tokens=ma_result.output_tokens,
+                cost_usd=ma_result.cost_usd,
             )
             ctx.macro_summary = macro_summary
             ctx.macro_analysis = macro_analysis
@@ -319,6 +322,9 @@ class MorningResearchStage:
                     full_response=ta_result.raw_text,
                     model=self.config.llm.tech_analyst_model,
                     tokens_used=ta_result.tokens_used,
+                    input_tokens=ta_result.input_tokens,
+                    output_tokens=ta_result.output_tokens,
+                    cost_usd=ta_result.cost_usd,
                 )
             logger.info("Technical analysis complete: %d symbols in 1 LLM call", len(analyses))
         except Exception as e:
@@ -453,6 +459,9 @@ class DecisionStage:
             full_response=pm_result.raw_text,
             model=pipeline.config.llm.portfolio_manager_model,
             tokens_used=pm_result.tokens_used,
+            input_tokens=pm_result.input_tokens,
+            output_tokens=pm_result.output_tokens,
+            cost_usd=pm_result.cost_usd,
         )
 
         if not portfolio_decision:
@@ -636,6 +645,9 @@ class RiskStage:
             full_response=rm_result.raw_text,
             model=pipeline.config.llm.risk_manager_model,
             tokens_used=rm_result.tokens_used,
+            input_tokens=rm_result.input_tokens,
+            output_tokens=rm_result.output_tokens,
+            cost_usd=rm_result.cost_usd,
         )
 
         if not verdict or not verdict.approved:

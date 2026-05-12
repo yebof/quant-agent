@@ -95,6 +95,15 @@ class AgentResult:
     tokens_used: int
     model: str
     user_message: str = ""
+    # Per-call cost tracking — populated by `run()` when the model's
+    # pricing is known in `src/cost_table.py`. None when the model name
+    # isn't in the pricing table; callers must NOT default to 0 in that
+    # case (would silently understate aggregate cost). Split input/output
+    # token counts retained so cost can be recomputed if pricing changes
+    # post-hoc.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float | None = None
 
     # Top-level keys we recognize as "this looks like a real agent output."
     # When the LLM prose includes an extra JSON fragment (self-correction,
@@ -230,10 +239,26 @@ class BaseAgent(ABC):
                 time.sleep(wait)
 
         tokens = input_tokens + output_tokens
-        logger.info("Agent %s completed, input_tokens: %d, output_tokens: %d, total: %d",
-                     self.name, input_tokens, output_tokens, tokens)
+        # Cost computation — uses src.cost_table.PRICING. Returns None
+        # when model is unknown so the operator sees `$?.??` and knows
+        # to update the table (vs silently understating with $0.00).
+        from src.cost_table import estimate_cost, fmt_cost
+        cost = estimate_cost(self.model, input_tokens, output_tokens)
+        logger.info(
+            "Agent %s completed | tokens in=%d out=%d total=%d | cost=%s | model=%s",
+            self.name, input_tokens, output_tokens, tokens,
+            fmt_cost(cost), self.model,
+        )
         logger.info("Agent %s output:\n%s", self.name, raw_text)
-        return AgentResult(raw_text=raw_text, tokens_used=tokens, model=self.model, user_message=user_message)
+        return AgentResult(
+            raw_text=raw_text,
+            tokens_used=tokens,
+            model=self.model,
+            user_message=user_message,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost,
+        )
 
     def _call_anthropic(self, user_message: str) -> tuple[str, int, int]:
         response = self.client.messages.create(

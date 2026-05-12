@@ -184,6 +184,15 @@ class Database:
             "missed_opportunities_json",
             "missed_opportunities_json TEXT DEFAULT '[]'",
         )
+        # Per-call LLM cost tracking (2026-05-13). input_tokens /
+        # output_tokens stored separately so cost can be recomputed if
+        # pricing changes; cost_usd is the snapshot at insert time.
+        # cost_usd is REAL (not cent integers) — SQLite handles small
+        # floats fine and per-call costs span 4 orders of magnitude
+        # ($0.0001 / macro to $1.00+ / tech full chunk).
+        _ensure_column("agent_logs", "input_tokens", "input_tokens INTEGER")
+        _ensure_column("agent_logs", "output_tokens", "output_tokens INTEGER")
+        _ensure_column("agent_logs", "cost_usd", "cost_usd REAL")
         # codex r7 P1 #3: pending_protection_restores table for older DBs
         # that pre-date the orphaned-stop-restore queue. Idempotent.
         try:
@@ -605,14 +614,41 @@ class Database:
 
     def insert_agent_log(self, agent_name: str, run_id: str, input_summary: str,
                          output_summary: str, full_response: str, model: str,
-                         tokens_used: int, input_message: str = ""):
+                         tokens_used: int, input_message: str = "",
+                         input_tokens: int | None = None,
+                         output_tokens: int | None = None,
+                         cost_usd: float | None = None):
         with self._lock:
             self.conn.execute(
                 """INSERT INTO agent_logs (agent_name, run_id, input_summary, input_message,
-                   output_summary, full_response, model, tokens_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (agent_name, run_id, input_summary, input_message, output_summary, full_response, model, tokens_used),
+                   output_summary, full_response, model, tokens_used,
+                   input_tokens, output_tokens, cost_usd)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (agent_name, run_id, input_summary, input_message, output_summary,
+                 full_response, model, tokens_used,
+                 input_tokens, output_tokens, cost_usd),
             )
             self.conn.commit()
+
+    def sum_session_cost(self, run_id: str) -> tuple[float | None, int]:
+        """Total cost + per-call count for a session's run_id.
+
+        Returns (cost_usd_or_none, num_calls). cost is None when ANY
+        agent in the session had an unknown-model cost — better to
+        flag the gap than report a partial sum that looks correct.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT cost_usd FROM agent_logs WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+        if not rows:
+            return (None, 0)
+        if any(r[0] is None for r in rows):
+            # Partial coverage — return None so caller renders '$?.??'
+            # rather than a misleading sum-of-known-only.
+            return (None, len(rows))
+        return (sum(float(r[0]) for r in rows), len(rows))
 
     def get_agent_logs(self, run_id: str) -> list[dict]:
         with self._lock:

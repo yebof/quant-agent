@@ -388,6 +388,60 @@ def test_prune_pending_protection_restores_keeps_rows_within_window(db):
     assert len(db.get_pending_protection_restores()) == 2
 
 
+def test_sum_session_cost_aggregates_per_run_id(db):
+    """Per-call costs land in agent_logs.cost_usd. The per-session sum
+    feeds the Telegram push and any cost-monitoring tools."""
+    db.insert_agent_log(
+        agent_name="tech_analyst", run_id="run-sum",
+        input_summary="x", output_summary="y", full_response="",
+        model="claude-opus-4-7", tokens_used=110_000,
+        input_tokens=80_000, output_tokens=30_000, cost_usd=3.45,
+    )
+    db.insert_agent_log(
+        agent_name="portfolio_manager", run_id="run-sum",
+        input_summary="x", output_summary="y", full_response="",
+        model="claude-opus-4-7", tokens_used=52_000,
+        input_tokens=50_000, output_tokens=2_000, cost_usd=0.90,
+    )
+    # Different run_id — must not be included.
+    db.insert_agent_log(
+        agent_name="risk_manager", run_id="run-other",
+        input_summary="x", output_summary="y", full_response="",
+        model="claude-opus-4-7", tokens_used=10_000,
+        input_tokens=8_000, output_tokens=2_000, cost_usd=0.27,
+    )
+    total, count = db.sum_session_cost("run-sum")
+    assert count == 2
+    assert abs(total - 4.35) < 0.001
+
+
+def test_sum_session_cost_returns_none_when_any_row_has_null(db):
+    """If any agent in the session ran on a model not in cost_table.PRICING,
+    its row stored NULL. Summing the known-only rows would silently
+    understate — return None instead so the caller flags the gap."""
+    db.insert_agent_log(
+        agent_name="tech_analyst", run_id="run-mixed",
+        input_summary="x", output_summary="y", full_response="",
+        model="claude-opus-4-7", tokens_used=100_000,
+        input_tokens=80_000, output_tokens=20_000, cost_usd=2.70,
+    )
+    db.insert_agent_log(
+        agent_name="portfolio_manager", run_id="run-mixed",
+        input_summary="x", output_summary="y", full_response="",
+        model="some-future-model", tokens_used=52_000,
+        input_tokens=50_000, output_tokens=2_000, cost_usd=None,
+    )
+    total, count = db.sum_session_cost("run-mixed")
+    assert total is None
+    assert count == 2
+
+
+def test_sum_session_cost_zero_rows_returns_none(db):
+    total, count = db.sum_session_cost("no-such-run")
+    assert total is None
+    assert count == 0
+
+
 def test_prune_methods_reject_keep_days_zero_or_negative(db):
     """`datetime('now', '-0 days')` == 'now', which deletes EVERY row.
     A keep_days=0 typo would wipe years of trade history. All three
