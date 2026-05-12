@@ -242,8 +242,21 @@ class BaseAgent(ABC):
         # Cost computation — uses src.cost_table.PRICING. Returns None
         # when model is unknown so the operator sees `$?.??` and knows
         # to update the table (vs silently understating with $0.00).
+        # Also returns None when token counts are both 0 — that
+        # represents "we got a response but no usage data", which the
+        # operator should investigate rather than see logged as a
+        # confident $0.00 entry that gets summed into daily totals.
         from src.cost_table import estimate_cost, fmt_cost
-        cost = estimate_cost(self.model, input_tokens, output_tokens)
+        if input_tokens == 0 and output_tokens == 0:
+            cost = None
+            logger.warning(
+                "Agent %s completed with zero tokens reported — flagging cost as unknown. "
+                "Either the SDK didn't return usage data, or the call somehow consumed nothing. "
+                "Check the LLM response and update _extract_*_usage if there's a new shape.",
+                self.name,
+            )
+        else:
+            cost = estimate_cost(self.model, input_tokens, output_tokens)
         logger.info(
             "Agent %s completed | tokens in=%d out=%d total=%d | cost=%s | model=%s",
             self.name, input_tokens, output_tokens, tokens,
@@ -267,14 +280,11 @@ class BaseAgent(ABC):
             system=self.system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
+        in_tok, out_tok = _extract_anthropic_usage(response, self.name)
         if not response.content or not hasattr(response.content[0], "text"):
             logger.warning("Anthropic returned empty content (stop_reason=%s)", response.stop_reason)
-            return ("", response.usage.input_tokens, response.usage.output_tokens)
-        return (
-            response.content[0].text,
-            response.usage.input_tokens,
-            response.usage.output_tokens,
-        )
+            return ("", in_tok, out_tok)
+        return (response.content[0].text, in_tok, out_tok)
 
     def _call_openai(self, user_message: str) -> tuple[str, int, int]:
         response = self.client.chat.completions.create(
@@ -289,9 +299,73 @@ class BaseAgent(ABC):
         if not content:
             refusal = getattr(response.choices[0].message, "refusal", None)
             logger.warning("OpenAI returned empty content (refusal=%s)", refusal)
-        usage = response.usage
-        return (
-            content,
-            usage.prompt_tokens if usage else 0,
-            usage.completion_tokens if usage else 0,
+        in_tok, out_tok = _extract_openai_usage(response, self.name)
+        return (content, in_tok, out_tok)
+
+
+# === Provider-specific usage extraction ===
+# Both helpers (a) handle the rare case where `response.usage` is missing
+# (some SDK error paths), (b) emit a WARNING when usage data is absent
+# so the operator notices instead of silently logging $0 cost, and
+# (c) for Anthropic, fold in the cache_creation / cache_read token
+# fields. Currently we don't use prompt caching, so cache_* fields are
+# always 0 and the sum equals input_tokens. If caching is ever enabled,
+# this layer would need a corresponding rate adjustment in cost_table
+# (cache writes = 1.25x input rate, cache reads = 0.1x) — until then
+# the simple sum is harmless and forward-compatible.
+
+def _coerce_token_count(value) -> int:
+    """Return value as int iff it really IS an int (numpy.int64 subclasses
+    int, so those work too). Anything else — None, MagicMock auto-attrs,
+    a stray dict, a string — coerces to 0.
+
+    This is defensive against two cases that have actually shown up:
+      (1) tests using ``MagicMock`` without an explicit spec — attribute
+          access auto-creates a child MagicMock whose ``__int__`` returns
+          1, which would silently add +1 to every uncovered token field
+          (caught by the R7 self-audit: existing tests started failing
+          with 'assert 2502 == 2500' after we began summing the cache
+          fields, because the cache fields weren't set in the mocks).
+      (2) future SDK changes that turn a numeric field into a string
+          or object — better to under-count than crash, since the
+          run() layer flags 0+0 tokens as cost=unknown anyway.
+    """
+    # bool is a subclass of int but we never want to treat True/False as
+    # token counts of 1/0.
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    return 0
+
+
+def _extract_anthropic_usage(response, agent_name: str) -> tuple[int, int]:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        logger.warning(
+            "Anthropic response for %s missing usage object — cost will be flagged as unknown",
+            agent_name,
         )
+        return (0, 0)
+    in_tok = _coerce_token_count(getattr(usage, "input_tokens", 0))
+    cache_create = _coerce_token_count(getattr(usage, "cache_creation_input_tokens", 0))
+    cache_read = _coerce_token_count(getattr(usage, "cache_read_input_tokens", 0))
+    out_tok = _coerce_token_count(getattr(usage, "output_tokens", 0))
+    # Sum across cache fields so token COUNT is correct even with caching.
+    # Cost rates will need a separate refactor if caching is enabled
+    # (cache write = 1.25x input rate, cache read = 0.1x).
+    return (in_tok + cache_create + cache_read, out_tok)
+
+
+def _extract_openai_usage(response, agent_name: str) -> tuple[int, int]:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        logger.warning(
+            "OpenAI response for %s missing usage object — cost will be flagged as unknown",
+            agent_name,
+        )
+        return (0, 0)
+    return (
+        _coerce_token_count(getattr(usage, "prompt_tokens", 0)),
+        _coerce_token_count(getattr(usage, "completion_tokens", 0)),
+    )

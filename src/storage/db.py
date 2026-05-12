@@ -79,6 +79,15 @@ class Database:
                 full_response TEXT,
                 model TEXT,
                 tokens_used INTEGER,
+                -- Per-call cost tracking (added 2026-05-13). NULL when the
+                -- agent's model isn't in src.cost_table.PRICING or when
+                -- the SDK didn't return usage data. tokens_used is kept
+                -- for backward-compat readers; the input/output split is
+                -- the authoritative source for cost recomputation if
+                -- pricing changes after-the-fact.
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cost_usd REAL,
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
 

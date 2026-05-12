@@ -41,7 +41,13 @@ def test_estimate_cost_negative_tokens_returns_none():
 
 def test_estimate_cost_zero_tokens_is_zero():
     """A model call that returned 0 tokens (very rare, broker hiccup
-    or empty content path) costs $0 — not None."""
+    or empty content path) costs $0 — not None.
+
+    NOTE: at the calling layer (base.py:run), 0+0 tokens is treated
+    as "missing usage data" and cost is forced to None at THAT
+    layer — see the WARN log. This test pins estimate_cost itself
+    to return 0.0 for 0/0 input (mathematically correct);
+    the surface-API semantics are tested elsewhere."""
     assert estimate_cost("claude-opus-4-7", 0, 0) == 0.0
 
 
@@ -71,3 +77,62 @@ def test_fmt_cost_dollar_plus_uses_two_decimals_with_separator():
     assert fmt_cost(1.234) == "$1.23"
     assert fmt_cost(14.789) == "$14.79"
     assert fmt_cost(1234.5) == "$1,234.50"
+
+
+# === Defensive token extraction (R7 audit follow-up) ===
+
+def test_extract_anthropic_usage_handles_missing_usage_object():
+    """Some Anthropic SDK error paths return a response with no .usage
+    attribute. Old code crashed AttributeError on response.usage.input_tokens.
+    Pin: helper returns (0, 0) and the run() layer then flags cost=None."""
+    from src.agents.base import _extract_anthropic_usage
+    from unittest.mock import MagicMock
+
+    response_no_usage = MagicMock(spec=["content", "stop_reason"])
+    # MagicMock(spec=[...]) raises AttributeError for any other attr,
+    # mimicking a usage-less response.
+    assert _extract_anthropic_usage(response_no_usage, "test_agent") == (0, 0)
+
+
+def test_extract_anthropic_usage_sums_cache_tokens():
+    """When prompt caching is enabled in a future change, Anthropic
+    splits input tokens into input_tokens (uncached) +
+    cache_creation_input_tokens + cache_read_input_tokens. The token
+    COUNT we record needs all three for correct total accounting,
+    even though cost-rate math would later need separate handling."""
+    from src.agents.base import _extract_anthropic_usage
+    from types import SimpleNamespace
+
+    response = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=5000,
+            cache_creation_input_tokens=2000,
+            cache_read_input_tokens=8000,
+            output_tokens=1000,
+        ),
+    )
+    in_tok, out_tok = _extract_anthropic_usage(response, "test_agent")
+    assert in_tok == 5000 + 2000 + 8000  # all three input fields summed
+    assert out_tok == 1000
+
+
+def test_extract_openai_usage_handles_missing_usage_object():
+    """OpenAI: response.usage can be None on some error paths. Pre-fix
+    code silently returned (0, 0) and then cost=$0 landed in DB →
+    silently understated daily totals. Now we still return (0, 0)
+    but emit a WARN and the run() layer flags cost=None."""
+    from src.agents.base import _extract_openai_usage
+    from types import SimpleNamespace
+
+    response = SimpleNamespace(usage=None)
+    assert _extract_openai_usage(response, "test_agent") == (0, 0)
+
+
+def test_extract_openai_usage_normal_path():
+    from src.agents.base import _extract_openai_usage
+    from types import SimpleNamespace
+
+    response = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=5000, completion_tokens=1000),
+    )
+    assert _extract_openai_usage(response, "test_agent") == (5000, 1000)
