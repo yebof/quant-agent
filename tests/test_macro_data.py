@@ -180,6 +180,21 @@ def test_staleness_uses_et_date_not_host_local():
     assert days == 3, f"expected 3 days, got {days}"
 
 
+def test_macro_provider_rejects_empty_api_key():
+    """MacroDataProvider must fail at construction when FRED_API_KEY is
+    unset / empty / whitespace. Without this guard, every FRED series
+    fetch silently fails inside macro_analyst.run, macro_summary becomes
+    all-None, and PM decides with regime='unknown' — degraded data
+    quietly contaminating decisions instead of crashing loud at startup.
+    """
+    import pytest
+
+    with pytest.raises(ValueError, match="FRED_API_KEY"):
+        MacroDataProvider(api_key="")
+    with pytest.raises(ValueError, match="FRED_API_KEY"):
+        MacroDataProvider(api_key="   ")  # whitespace alone counts as empty
+
+
 def test_staleness_returns_zero_when_observation_is_today_in_et():
     """Same observation date as et_today → zero staleness, even if the host
     calendar would say it's tomorrow (e.g., SGT after midnight)."""

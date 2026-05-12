@@ -800,7 +800,23 @@ class ExecutionStage:
                 logger.error("Order failed for %s %s: %s", decision.action, decision.symbol, e)
 
         for order_id in sell_order_ids:
-            status = pipeline.broker.wait_for_order_terminal(order_id)
+            # ExecutionStage was the lone SELL path missing this guard
+            # — every other SELL path (force_delever / midday_emergency /
+            # midday_llm / intra_check / take_profit) wraps the wait in
+            # try/except. An uncaught exception here (broker 5xx, DNS
+            # blip mid-poll) propagates past the finalize loop below,
+            # leaving positions with cancelled stops and no recovery
+            # path: pending_protection_restores never gets written
+            # because the persist-on-fail logic lives inside finalize.
+            try:
+                status = pipeline.broker.wait_for_order_terminal(order_id)
+            except Exception as e:
+                logger.warning(
+                    "ExecutionStage: wait_for_order_terminal failed for %s: %s "
+                    "— treating as unknown status so finalize still runs",
+                    order_id, e,
+                )
+                status = None
             if status != "filled":
                 logger.warning(
                     "Sell order %s did not fill before buy phase (status=%s); buys will use current cash only",

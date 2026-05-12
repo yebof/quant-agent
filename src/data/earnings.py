@@ -154,7 +154,12 @@ class EarningsDataProvider:
         self.save_manifest()
         return abandoned
 
-    def _sec_get(self, url: str, max_retries: int = 3) -> bytes:
+    def _sec_get(
+        self,
+        url: str,
+        max_retries: int = 3,
+        total_timeout_s: float = 45.0,
+    ) -> bytes:
         """GET with SEC-required headers, rate limiting, and retry on
         transient SEC errors.
 
@@ -169,10 +174,31 @@ class EarningsDataProvider:
         (1s, 2s, 4s). 404 / 400 / other 4xx-5xx propagate immediately —
         those mean the URL itself is wrong (bad CIK, missing filing),
         not a transient rate-limit, and retrying wastes the budget.
+
+        `total_timeout_s` caps the worst-case time the loop can spend.
+        Without it, 3 retries on a sustained SEC outage could burn
+        REQUEST_DELAY(0.12s) + urlopen(15s) + backoff(1+2+4s) = ~21s × 3
+        = ~63s per URL. With 77 stocks × 2 calls (submissions + filing
+        body) that's hours of session time on a bad SEC day. 45s default
+        keeps any single URL's worst-case bounded and lets the outer
+        per-symbol `try: except Exception` move on.
         """
+        start = time.time()
         req = Request(url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"})
         last_exc: Exception | None = None
         for attempt in range(max_retries):
+            elapsed = time.time() - start
+            if elapsed > total_timeout_s:
+                logger.warning(
+                    "SEC fetch exceeded total_timeout_s=%.0fs for %s "
+                    "after %d attempts (elapsed=%.1fs)",
+                    total_timeout_s, url, attempt, elapsed,
+                )
+                if last_exc is not None:
+                    raise last_exc
+                raise TimeoutError(
+                    f"SEC fetch exceeded {total_timeout_s}s for {url}"
+                )
             time.sleep(REQUEST_DELAY)
             try:
                 with urlopen(req, timeout=15) as resp:

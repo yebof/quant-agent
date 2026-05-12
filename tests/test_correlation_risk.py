@@ -130,6 +130,75 @@ def test_correlation_cluster_advisory_fires():
     assert "correlation_cluster" in rules, f"expected advisory, got {rules}"
 
 
+def test_correlation_cluster_uses_gross_multiplier_for_leveraged_etfs():
+    """Inverse / leveraged ETFs (SQQQ -3x, SDS -2x) consume their abs
+    leverage of notional regardless of direction. The correlation cluster
+    cap must count that gross exposure, same as sector and position caps
+    already do.
+
+    Pre-fix this rule used raw market_value (1x), undercounting any
+    cluster that contained an inverse / leveraged ETF — for SQQQ that's
+    a 3x undercount that could let a high-concentration tech cluster
+    through unflagged while the LLM was making "diversified" claims.
+    """
+    engine = RiskRuleEngine(RiskConfig(
+        max_position_pct=80, max_total_position_pct=300,
+        max_daily_loss_pct=3, max_sector_pct=90, require_stop_loss=True,
+    ))
+    # Held: SQQQ $10k (3x inverse → gross 30k), SDS $5k (2x inverse →
+    # gross 10k), GOOGL $20k (1x). Total raw 35k, total gross 60k.
+    positions = [
+        Position(symbol="SQQQ", qty=100, avg_entry=100, current_price=100,
+                 market_value=10_000, unrealized_pnl=0, sector="Broad"),
+        Position(symbol="SDS", qty=50, avg_entry=100, current_price=100,
+                 market_value=5_000, unrealized_pnl=0, sector="Broad"),
+        Position(symbol="GOOGL", qty=20, avg_entry=1000, current_price=1000,
+                 market_value=20_000, unrealized_pnl=0,
+                 sector="Communication Services"),
+    ]
+    # GOOGL highly correlated with both inverse ETFs (by absolute return —
+    # tech moves drive both index longs and inverse bets).
+    corr_matrix = {
+        "GOOGL": {"SQQQ": 0.85, "SDS": 0.82, "JPM": 0.3},
+    }
+    decision = TradeDecision(
+        action="BUY", symbol="GOOGL", allocation_pct=10,
+        entry_price=1000, stop_loss=950, take_profit=1100,
+        reasoning="theme continuation",
+    )
+    with patch(
+        "src.execution.broker._get_sector",
+        side_effect=lambda s: {
+            "GOOGL": "Communication Services",
+            "SQQQ": "Broad", "SDS": "Broad",
+        }.get(s, "Unknown"),
+    ):
+        violations = engine.check(
+            decision=decision, positions=positions,
+            total_value=100_000, daily_pnl=0,
+            correlation_matrix=corr_matrix,
+            max_correlated_cluster_pct=40.0,
+        )
+
+    # Post-fix cluster math:
+    #   peer_value = SQQQ × 3 + SDS × 2 = 30k + 10k = 40k
+    #   gross_new = GOOGL × 1 = 10k
+    #   cluster_pct = (40 + 10) / 100 = 50%
+    # 50% > 40% cap → advisory fires.
+    # Pre-fix would have computed peer_value = 10k + 5k = 15k (raw,
+    # no gross_mul), cluster_pct = 25%, no advisory → silent miss.
+    rules = [v.rule for v in violations]
+    assert "correlation_cluster" in rules, (
+        f"expected correlation_cluster advisory "
+        f"(cluster gross = 50% > 40% cap); got {rules}"
+    )
+    cluster_violation = next(v for v in violations if v.rule == "correlation_cluster")
+    assert cluster_violation.value >= 45.0, (
+        f"violation value should reflect gross sum (~50%), not raw "
+        f"market_value (~25%); got {cluster_violation.value}"
+    )
+
+
 def test_correlation_cluster_silent_when_below_threshold():
     """If peers are lightly correlated, no cluster advisory."""
     engine = RiskRuleEngine(RiskConfig(

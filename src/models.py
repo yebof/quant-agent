@@ -11,6 +11,40 @@ def _normalize_symbol(value: str) -> str:
     return symbol
 
 
+def _normalize_enum_case_fields(
+    values,
+    *,
+    lower_fields: tuple[str, ...] = (),
+    upper_fields: tuple[str, ...] = (),
+):
+    """Case-fold dict fields before Pydantic Literal validation.
+
+    Pydantic ``Literal["high", "medium", "low"]`` is exact-match —
+    ``"HIGH"`` or ``"Medium"`` raises ValidationError, which on the
+    tech_analyst path silently drops that symbol's analysis (the
+    chunk-level except catches and logs but does not surface
+    upstream). Most prompts give examples in the expected case but
+    LLMs occasionally drift, especially after a long CoT. Folding
+    input case before the Literal check turns a cosmetic drift from
+    "whole symbol lost" into a no-op.
+
+    Only touches string values; non-string inputs (None / numbers /
+    lists / dicts) pass through unchanged so Pydantic's own type
+    errors still surface for genuinely malformed inputs.
+    """
+    if not isinstance(values, dict):
+        return values
+    for name in lower_fields:
+        v = values.get(name)
+        if isinstance(v, str):
+            values[name] = v.strip().lower()
+    for name in upper_fields:
+        v = values.get(name)
+        if isinstance(v, str):
+            values[name] = v.strip().upper()
+    return values
+
+
 class OHLCV(BaseModel):
     date: date
     open: float
@@ -111,6 +145,13 @@ class TechAnalysisResult(BaseModel):
     def normalize_symbol(cls, value: str) -> str:
         return _normalize_symbol(value)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        return _normalize_enum_case_fields(
+            values, lower_fields=("rating", "conviction"),
+        )
+
     @model_validator(mode="after")
     def _validate_rating_price_consistency(self):
         """Enforce price fields match the rating's actionability.
@@ -162,6 +203,12 @@ class TradeDecision(BaseModel):
     @classmethod
     def normalize_symbol(cls, value: str) -> str:
         return _normalize_symbol(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        # action is UPPERCASE per Literal — fold LLM drift like "buy".
+        return _normalize_enum_case_fields(values, upper_fields=("action",))
 
     @model_validator(mode="after")
     def validate_buy_prices(self):
@@ -243,6 +290,11 @@ class TargetPosition(BaseModel):
     def normalize_symbol(cls, value: str) -> str:
         return _normalize_symbol(value)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        return _normalize_enum_case_fields(values, lower_fields=("conviction",))
+
 
 class PortfolioDecision(BaseModel):
     reasoning_chain: ReasoningChain
@@ -304,6 +356,11 @@ class RiskVerdict(BaseModel):
     ] = "clean"
     reasoning: str
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        return _normalize_enum_case_fields(values, lower_fields=("reason_category",))
+
 
 class MacroObservation(BaseModel):
     indicator: str
@@ -350,6 +407,13 @@ class MacroSectorGuidance(BaseModel):
     stance: Literal["overweight", "neutral", "underweight"]
     reason: str
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        # `sector` is canonicalized via _SECTOR_ALIASES in MacroAnalysis's
+        # _sanitize_sector_guidance; only `stance` needs case-folding.
+        return _normalize_enum_case_fields(values, lower_fields=("stance",))
+
 
 class MacroPositionGuidance(BaseModel):
     target_invested_pct: float = Field(ge=0, le=100)
@@ -385,6 +449,16 @@ class MacroAnalysis(BaseModel):
     bear_triggers: list[str] = []
     alignment_with_news: str = ""
     summary: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        # Three top-level enums on MacroAnalysis are LLM-emitted lowercase.
+        # Runs before _sanitize_sector_guidance and the Literal check.
+        return _normalize_enum_case_fields(
+            values,
+            lower_fields=("regime", "confidence", "equity_outlook"),
+        )
 
     @model_validator(mode="before")
     @classmethod
@@ -472,6 +546,11 @@ class StateChange(BaseModel):
     affected_symbols: list[str] = []
     conviction: Literal["high", "medium", "low"]
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        return _normalize_enum_case_fields(values, lower_fields=("conviction",))
+
 
 class StockNewsItem(BaseModel):
     headline: str
@@ -486,6 +565,13 @@ class StockNewsItem(BaseModel):
             raise ValueError("headline cannot be empty")
         return v
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        return _normalize_enum_case_fields(
+            values, lower_fields=("sentiment", "conviction"),
+        )
+
 
 class NewsIntelligenceReport(BaseModel):
     macro_narrative: MacroNarrative
@@ -494,6 +580,13 @@ class NewsIntelligenceReport(BaseModel):
     pm_briefing: str
     market_sentiment: Literal["bullish", "bearish", "neutral"]
     confidence: Literal["high", "medium", "low"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        return _normalize_enum_case_fields(
+            values, lower_fields=("market_sentiment", "confidence"),
+        )
 
 
 class Position(BaseModel):
@@ -574,6 +667,13 @@ class EarningsInvestmentImplications(BaseModel):
     bull_case: str = "not disclosed"
     bear_case: str = "not disclosed"
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        return _normalize_enum_case_fields(
+            values, lower_fields=("sentiment", "conviction"),
+        )
+
 
 class EarningsAnalysis(BaseModel):
     symbol: str
@@ -622,6 +722,12 @@ class PositionAction(BaseModel):
     def normalize_symbol(cls, value: str) -> str:
         return _normalize_symbol(value)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        # Action is UPPERCASE per Literal — fold LLM drift like "sell".
+        return _normalize_enum_case_fields(values, upper_fields=("action",))
+
     @model_validator(mode="after")
     def _trail_stop_requires_new_price(self):
         if self.action == "TRAIL_STOP" and (self.new_stop_price is None or self.new_stop_price <= 0):
@@ -669,6 +775,11 @@ class PositionReview(BaseModel):
     actions: list[PositionAction] = []
     overall_assessment: str = Field(min_length=1)
     risk_level: Literal["low", "moderate", "elevated", "high"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        return _normalize_enum_case_fields(values, lower_fields=("risk_level",))
 
 
 class EveningReasoningChain(BaseModel):
@@ -771,6 +882,13 @@ class SellGrade(BaseModel):
     def _sym(cls, v: str) -> str:
         return _normalize_symbol(v)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        return _normalize_enum_case_fields(
+            values, lower_fields=("grade", "thesis_trajectory_at_sell"),
+        )
+
 
 # Root-cause taxonomy for losing BUYs. Used by evening_analyst when a
 # buy_grade is "wrong" so the quarterly meta-reflector can aggregate
@@ -832,6 +950,14 @@ class BuyGrade(BaseModel):
     @classmethod
     def _sym(cls, v: str) -> str:
         return _normalize_symbol(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        return _normalize_enum_case_fields(
+            values,
+            lower_fields=("grade", "thesis_trajectory", "loss_root_cause"),
+        )
 
     @model_validator(mode="after")
     def _loss_fields_required(self) -> "BuyGrade":
@@ -1054,6 +1180,20 @@ class MissedOpportunity(BaseModel):
 
 
 class EveningReport(BaseModel):
+    # Three Literal enums (risk_rating + tomorrow_bias + tomorrow_conviction)
+    # are case-folded BEFORE Pydantic validates — LLMs occasionally drift to
+    # uppercase variants like "MODERATE" which would otherwise reject the
+    # whole evening output. See _normalize_enum_case_fields docstring.
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enum_case(cls, values):
+        return _normalize_enum_case_fields(
+            values,
+            lower_fields=(
+                "risk_rating", "tomorrow_bias", "tomorrow_conviction",
+            ),
+        )
+
     reasoning_chain: EveningReasoningChain
     daily_summary: str = Field(min_length=1)
     lessons: str = Field(min_length=1)

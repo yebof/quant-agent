@@ -421,6 +421,55 @@ def test_sec_get_raises_after_max_retries(tmp_path, monkeypatch):
         provider._sec_get("https://data.sec.gov/x", max_retries=2)
 
 
+def test_sec_get_aborts_when_total_timeout_exceeded(tmp_path, monkeypatch):
+    """`_sec_get` must abort the retry loop when total_timeout_s elapses
+    even if max_retries hasn't fired. Prevents a sustained SEC 503 from
+    snowballing one URL into 60+ seconds — for the 77-stock earnings
+    preprocess that scales to minutes of wasted budget, pushing into the
+    morning window. The check fires at the START of each iteration so a
+    single in-flight urlopen + sleep already consumed counts against
+    next attempt's budget.
+    """
+    from urllib.error import HTTPError
+    from io import BytesIO
+    from src.data.earnings import EarningsDataProvider
+    import pytest
+
+    # Fake wallclock so the budget check fires without real waiting.
+    fake_clock = {"t": 0.0}
+    monkeypatch.setattr(
+        "src.data.earnings.time.sleep",
+        lambda s: fake_clock.__setitem__("t", fake_clock["t"] + s),
+    )
+    monkeypatch.setattr("src.data.earnings.time.time", lambda: fake_clock["t"])
+
+    call_log: list[str] = []
+
+    def fake_urlopen(req, timeout):
+        call_log.append("call")
+        raise HTTPError(req.full_url, 503, "overloaded", {}, BytesIO(b""))
+    monkeypatch.setattr("src.data.earnings.urlopen", fake_urlopen)
+
+    provider = EarningsDataProvider(data_dir=str(tmp_path))
+    # total_timeout_s=2.0: attempt 1 sleeps REQUEST_DELAY≈0.12 + 1s backoff → t≈1.12.
+    # Attempt 2 budget check: 1.12 < 2.0, continue, +0.12 + 2s backoff → t≈3.24.
+    # Attempt 3 budget check: 3.24 > 2.0 → ABORT, raise the last HTTPError.
+    # Total: 2 urlopen calls (not 3 = max_retries).
+    with pytest.raises(HTTPError):
+        provider._sec_get(
+            "https://data.sec.gov/x",
+            max_retries=3,
+            total_timeout_s=2.0,
+        )
+    assert len(call_log) == 2, (
+        f"expected exactly 2 attempts (3rd aborted by total_timeout_s); "
+        f"got {len(call_log)}"
+    )
+    assert fake_clock["t"] > 2.0, (
+        "fake wallclock should have ticked past the budget"
+    )
+
+
 def test_get_recent_filings_tolerates_misaligned_arrays(tmp_path, monkeypatch):
     """SEC submissions JSON returns parallel arrays. An upstream
     truncation could leave them desynced. Pin: zip-based iteration

@@ -33,6 +33,19 @@ def _et_lookback_start(days: int) -> pd.Timestamp:
 
 class MacroDataProvider:
     def __init__(self, api_key: str):
+        # Fail fast on missing/empty FRED_API_KEY. Without this guard, an
+        # unset key silently fails on every series fetch inside
+        # macro_analyst's run, leaving macro_summary as all-None — and
+        # the symptom (PM sees `regime: unknown`, downgrades exposure) is
+        # hours away from the root cause (wrong .env). Better to crash
+        # at construction so the operator notices immediately at startup.
+        if not api_key or not api_key.strip():
+            raise ValueError(
+                "FRED_API_KEY is empty or unset. Set it in .env — macro "
+                "analysis cannot proceed without FRED access. Pass an "
+                "explicit non-empty string here only if you intend to "
+                "exercise the offline / mock path."
+            )
         self.fred = Fred(api_key=api_key)
 
     def _safe_get_series(self, series_id: str, **kwargs) -> pd.Series:

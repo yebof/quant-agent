@@ -158,6 +158,121 @@ def test_agent_log():
     assert log.agent_name == "tech_analyst"
 
 
+# === Enum case normalization (LLM drift defense) ===
+
+def test_tech_analysis_result_normalizes_uppercase_enums():
+    """LLM drift: 'BUY' / 'HIGH' instead of 'buy' / 'high' must not silently
+    drop the symbol's analysis. Pydantic Literal is exact-match; without
+    the model_validator(mode="before") helper, the chunk-level except in
+    tech_analyst catches the ValidationError and skips the symbol, losing
+    a batch when the LLM drifts even one letter.
+    """
+    from src.models import TechAnalysisResult
+
+    r = TechAnalysisResult(
+        symbol="NVDA",
+        rating="BUY",         # uppercase drift
+        conviction="HIGH",
+        entry_price=150.0,
+        stop_loss=140.0,
+        reference_target=180.0,
+        reasoning_chain={
+            "trend": "x", "momentum": "x", "volatility": "x",
+            "volume": "x", "support_resistance": "x",
+        },
+        reasoning="x",
+    )
+    assert r.rating == "buy"
+    assert r.conviction == "high"
+    # Also tolerate stray whitespace (LLM emitting "  buy  ").
+    r2 = TechAnalysisResult(
+        symbol="NVDA",
+        rating="  Buy  ", conviction="  Medium  ",
+        entry_price=150.0, stop_loss=140.0, reference_target=180.0,
+        reasoning_chain={
+            "trend": "x", "momentum": "x", "volatility": "x",
+            "volume": "x", "support_resistance": "x",
+        },
+        reasoning="x",
+    )
+    assert r2.rating == "buy"
+    assert r2.conviction == "medium"
+
+
+def test_trade_decision_normalizes_lowercase_action():
+    """LLM drift on TradeDecision.action: 'buy' instead of 'BUY'. The
+    Literal expects UPPERCASE; the validator folds for us so a one-letter
+    case drift doesn't reject the whole PM output."""
+    from src.models import TradeDecision
+
+    d = TradeDecision(
+        action="buy", symbol="NVDA", allocation_pct=10,
+        entry_price=150, stop_loss=140, take_profit=170,
+        reasoning="x",
+    )
+    assert d.action == "BUY"
+
+
+def test_macro_analysis_normalizes_regime_and_outlook():
+    """MacroAnalysis.regime + confidence + equity_outlook are LLM-emitted
+    every morning. Case drift here loses the whole macro analysis →
+    PM stalls with data_status=parse_error. Most painful failure mode."""
+    from src.models import MacroAnalysis
+
+    a = MacroAnalysis.model_validate({
+        "reasoning_chain": {
+            "volatility_analysis": "x",
+            "yield_curve_analysis": "x",
+            "monetary_policy_analysis": "x",
+            "inflation_labor_credit": "x",
+            "cross_signal_synthesis": "x",
+            "sector_implications": "x",
+        },
+        "regime": "Risk-On",
+        "confidence": "HIGH",
+        "equity_outlook": "Bullish",
+        "position_guidance": {
+            "target_invested_pct": 70,
+            "cash_recommendation_pct": 30,
+            "reasoning": "x",
+        },
+        "summary": "x",
+    })
+    assert a.regime == "risk-on"
+    assert a.confidence == "high"
+    assert a.equity_outlook == "bullish"
+
+
+def test_evening_report_normalizes_all_three_enums():
+    """EveningReport has three Literal enums — risk_rating, tomorrow_bias,
+    tomorrow_conviction. Any one drifting in case used to reject the whole
+    evening output → no insights row → next-day PM missing the cross-
+    session memory layer."""
+    from src.models import EveningReport, EveningReasoningChain
+
+    chain = EveningReasoningChain(
+        performance_attribution="x",
+        outlook_retrospection="x",
+        thesis_health_review="x",
+        decision_quality_review="x",
+        calibration_meta="x",
+        market_regime_read="x",
+        tomorrow_preparation="x",
+    )
+    rpt = EveningReport(
+        reasoning_chain=chain,
+        daily_summary="x",
+        lessons="x",
+        tomorrow_outlook="x",
+        risk_rating="MODERATE",
+        tomorrow_bias="BULLISH",
+        tomorrow_conviction="HIGH",
+    )
+    assert rpt.risk_rating == "moderate"
+    assert rpt.tomorrow_bias == "bullish"
+    assert rpt.tomorrow_conviction == "high"
+
+
 # === BuyGrade loss-autopsy fields ===
 
 def test_buy_grade_wrong_requires_loss_root_cause():
