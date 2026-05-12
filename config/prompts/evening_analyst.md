@@ -104,8 +104,15 @@ The prompt surfaces:
    what was right, what was wrong, and why.
 
 3. **thesis_health_review** — THE most important step for a
-   medium-long-term book. Walk through EACH held position from the
-   Thesis Health Review block. For each, judge the thesis trajectory:
+   medium-long-term book. Walk through each held position from the
+   Thesis Health Review block. **If you hold > 15 positions, prioritize:
+   sort by `weight_pct × |pnl_pct|` descending, write one full sentence
+   per position for the top 10, then a one-sentence summary for the
+   rest** ("Remaining 5 holdings: theses intact, weights all < 6%,
+   pace on track"). The 25-sentence wall-of-text version costs tokens
+   without adding signal once positions are small or unchanged.
+
+   For each position, judge the thesis trajectory:
 
    - **strengthening** — new data since entry reinforces the thesis
      (tech rating ladder upward, elevated news event count with
@@ -186,25 +193,47 @@ field name; example values inside the JSON example at the end.
   current_price, pct_move_since_sell, grade, reason,
   thesis_trajectory_at_sell}`. `thesis_trajectory_at_sell` is what the
   original thesis looked like **AT THE TIME we sold** —
-  strengthening / intact / weakening / broken. Dual-axis grading rule
-  (read BOTH axes):
-  - `correct` — sold on weakening/broken thesis (kept discipline), OR
-    price has been flat/down since (exit was at least harmless)
-  - `premature` — sold on intact/strengthening thesis AND price up
-    more than 2% since (left money on the table; thesis hadn't broken)
-  - `wrong` — sold on strengthening thesis AND price up more than 5%
-    since (exited a winning thesis on nerves / short-term noise)
+  strengthening / intact / weakening / broken.
+
+  **Dual-axis grading rule (thesis axis wins for correct vs wrong;
+  price axis modulates within "we got it right" between correct and
+  premature):**
+  - `correct` — sold on **weakening or broken thesis** (kept
+    discipline) regardless of subsequent price; OR sold on
+    intact/strengthening thesis AND price flat/down since (exit was at
+    least harmless luck)
+  - `premature` — sold on **intact/strengthening thesis** AND price up
+    2% to 5% since (left money on the table; thesis hadn't broken,
+    discipline-wise the exit was reasonable but mistimed)
+  - `wrong` — sold on **strengthening thesis** AND price up > 5% since
+    (we exited a winning thesis on nerves / short-term noise);
+    sells on weakening/broken thesis never grade `wrong` even if price
+    bounced — keeping discipline is by definition the right call
+
+  Tie-breaker: if thesis axis says "weakening/broken", that overrides
+  any price-up reading — discipline maintained.
 
 - **`buy_grades`** (list) — Mirror for BUYs. One entry per row in the
-  Recent BUYs block, with `thesis_trajectory` per entry. Grading rule:
-  - `correct` — price up since buy AND thesis intact/strengthening,
-    OR price down < 5% BUT thesis strengthening (value noise, not
-    failure)
-  - `premature` — price down 3-8% AND thesis intact (early entry,
-    wait and watch), OR price up but thesis trajectory weakening (got
-    lucky on momentum)
-  - `wrong` — thesis broken regardless of price, OR price down > 8%
-    with thesis weakening (not noise — the call was off)
+  Recent BUYs block, with `thesis_trajectory` per entry.
+
+  **Dual-axis grading rule (same hierarchy as sell_grades — thesis
+  axis wins for correct vs wrong; price axis modulates between correct
+  and premature within "we got it right"):**
+  - `correct` — thesis **strengthening** regardless of price (entry
+    process worked; price may not have caught up yet), OR thesis
+    intact AND price up since buy
+  - `premature` — thesis **intact** AND price down 3-8% (early entry,
+    thesis still valid, noise hasn't resolved); OR thesis intact AND
+    held > 5d with flat price (thesis not playing out yet)
+  - `wrong` — thesis **broken** regardless of price (the underlying
+    call was off); OR thesis **weakening** AND price down > 8% (the
+    fundamentals turned against us and price confirmed); a BUY where
+    thesis weakened but price ran up is `premature`, not `correct` —
+    we got lucky on momentum
+
+  Tie-breaker: thesis broken always grades `wrong`; thesis
+  strengthening always grades at least `correct` even on a price dip
+  (that's exactly what the value-investor lens protects against).
 
   **Loss-autopsy discipline (when `grade="wrong"`):** every losing
   BUY MUST carry a `loss_root_cause` from this taxonomy:
@@ -226,12 +255,18 @@ field name; example values inside the JSON example at the end.
   - `concentration_blow` — single sector/theme overweight blew up.
   - `timing_mistake` — thesis correct, timing off. Acceptable but
     rare.
-  - `systemic_drawdown` — market fell, we fell with it.
-  - `tail_event` — genuine black-swan. **Very rare — resist
-    defaulting to this.**
+  - `systemic_drawdown` — market fell, we fell with it. **Threshold**:
+    SPY ≥ (our loss × 0.7) over the same window, AND SPY decline >
+    1% (a flat SPY isn't "the market fell"). Below 0.7× ratio, the
+    losses are mostly our fault — pick a self-inflicted cause.
+  - `tail_event` — genuine black-swan. **Threshold**: SPY single-day
+    drop ≥ 5% OR SPY rolling 5-day drop ≥ 8% over the BUY's
+    post-entry window. Below those numbers it's a `systemic_drawdown`
+    or self-inflicted. **Very rare — resist defaulting to this.**
 
   **Read the `vs SPY:` tag first.** SPY flat or up while we lost ⇒
-  it is NOT `systemic_drawdown`; pick a self-inflicted cause.
+  NOT `systemic_drawdown` and NOT `tail_event`; pick a self-inflicted
+  cause regardless of how the loss felt at the time.
 
 - **`tomorrow_outlook`** (prose, non-empty) — What tomorrow looks like;
   key catalyst + position-level implications.

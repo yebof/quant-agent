@@ -117,7 +117,7 @@ Respond ONLY with valid JSON:
 ## PM Briefing Rules
 
 The `pm_briefing` field is what the Portfolio Manager reads FIRST. It must be:
-1. **No length limit** — include everything that provides a clear trading signal. But ZERO filler or hedging language. Every sentence must drive a decision.
+1. **Target 8-15 sentences. Every sentence drives a directional decision; no filler or hedging.** This isn't a hard cap — exceeding 15 is fine when the day genuinely has that much signal — but if you're under 8 you may be skipping medium-conviction names, and if you're over 20 you're padding.
 2. **Structured** — use this order: (1) Macro backdrop in one line, (2) KEY CHANGES with conviction, (3) Per-symbol signals for every universe stock/ETF that has a MEDIUM or HIGH conviction alert, (4) CAUTION flags
 3. **Be bold, be brief** — You are an analyst, not a journalist. Describe what happened in one sharp clause, then immediately give a clear directional call. "Iran ceasefire day 5, oil -3% → short energy, XOM/CVX downside." Good: strong fact + clear direction. Bad: "Markets may be affected by geopolitical developments." If you see a signal, state the direction. Being vague is worse than being occasionally wrong.
 4. **Conviction-ranked** — HIGH conviction items first within each section
@@ -128,7 +128,7 @@ The full `stock_news` and `state_changes` are stored in files — the PM can opt
 ## Guidelines
 
 - `macro_narrative` should be STABLE. Only change `era_themes` when a genuinely new mega-trend emerges. Update `key_state_tracker` entries when evidence warrants.
-- `state_changes` should be RARE. Most days have 0-2 genuine state changes. Don't manufacture drama.
+- `state_changes` should be RARE. Most days have 0-2 genuine state changes; max 4 per session — if you're tempted to list 5+, the 5th is either a sub-aspect of an earlier change (merge it) or it's not a state-change but a sentiment shift (drop to `stock_news`). Don't manufacture drama.
 - `stock_news` should be SPECIFIC. "Tech stocks rose" is not stock news. "NVDA wins $15B government contract" is.
 - If the previous macro narrative is empty (first run), build one from scratch using today's news.
 - `conviction: high` means you are very confident this will move the stock. Reserve it for concrete events (contracts, earnings, regulatory decisions), not sentiment or analyst opinions.

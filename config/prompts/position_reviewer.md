@@ -72,7 +72,10 @@ A SELL or REDUCE must point to ONE of:
   specifically a state_change labeled HIGH that contradicts the entry
   rationale
 - **Earnings filing bearish for this position** — the just-filed 10-Q/10-K
-  analysis comes back with sentiment=bearish on a name you're long
+  analysis comes back with `sentiment=bearish` AND `conviction ∈ {medium, high}`
+  on a name you're long. A `bearish` + `low` conviction filing is mixed-signal
+  (analyst flagged risk but isn't confident) — treat as NOT a hard trigger;
+  it falls into the "scrutinize" bucket along with TARGET_BREACH and drift.
 - **Correlation cluster breach** — too many positions lockstep into one
   factor; trim the weakest by thesis_progress
 
@@ -146,11 +149,15 @@ Respond ONLY with valid JSON matching `PositionReview`:
 - **TRAIL_STOP** — requires `new_stop_price`. The system cancels the current
   broker stop and submits a new stop at your price. Use when you want to
   genuinely raise the stop on a winner; tightening on noise can shake you
-  out of good names. Only TRAIL when the new stop is above the old one by
-  a meaningful margin.
+  out of good names. **Minimum margin**: `new_stop_price ≥ old_stop_price × 1.02`
+  (at least 2% above the existing stop). Smaller bumps cost broker fees and
+  cancel/replace churn for negligible protection gain — if the right new stop
+  is within 2% of the old one, just HOLD.
 - **REDUCE** — sells 50% of the position. Use for: drift_flag firing, parabolic
   exhaustion confirmed, target_breach with momentum fading, correlation
-  cluster rebalance.
+  cluster rebalance. **If a 50% reduce would still leave `weight_pct > 12%`
+  on a triggered concentration, escalate to SELL** — half-measures on
+  oversized positions just delay the same review next session.
 - **SELL** — closes full position. Use only when a named thesis trigger is
   firing (see "What a valid SELL trigger looks like"). Not for "worried about
   holding overnight."

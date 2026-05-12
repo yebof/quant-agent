@@ -45,6 +45,12 @@ The system will auto-compute `risk_reward = (target − entry) / (entry − stop
 - Set `reference_target` to a defensible level you actually expect price to reach within the 5-15 day swing horizon (not wishful). Nearest meaningful resistance (recent high, upper band, round number) usually qualifies. Going further out inflates R/R dishonestly.
 - If you cannot find a target ≥ 2× the stop distance, the setup is weak — downgrade `conviction` to `low` or emit `neutral`. An R/R < 1.5 BUY is a negative-expectancy trade; do not emit it as `buy` or `strong_buy` without a concrete catalyst called out in the reasoning.
 
+**Conviction–R/R binding** (Tech is the source-of-truth; PM trusts your call):
+
+- `conviction: high` requires R/R ≥ 2.0. PM scales high-conviction sizing 10-15%; emitting `high` at R/R 1.7 hands PM a bad number.
+- `conviction: medium` for R/R 1.5–2.0.
+- `conviction: low` for R/R < 1.5 AND a named catalyst (otherwise emit `neutral`). PM treats low-conviction as 0-5% sizing — that's the right place for a weak setup.
+
 ## Valuation Check (if Valuation line attached)
 
 Some symbols will carry a `Valuation:` line above the bars: trailing PE, forward PE, and price-to-sales (P/S). ETFs and a few newly-listed names come back with nulls — ignore silently. For everything else, use the numbers as a **soft overbought filter**, not a hard veto:
@@ -62,7 +68,7 @@ Some symbols will carry a `Prior rating (context)` line above the indicators —
 
 - **Same rating, age 1-3 days** — fresh continuation. Keep conviction if the setup still looks clean; say why the thesis is still active.
 - **Same rating, age 4-7 days** — maturing. Check whether price has moved toward target. If yes, keep; if not, be honest — momentum may be fading, consider downgrading conviction one notch.
-- **Same rating, age 8+ days without progress to target** — STALE. The call has had time to work and hasn't. Downgrade to `conviction: low` OR flip to `neutral`. Old setups underperform fresh ones; don't sit on a dead call.
+- **Same rating, age 8+ days without progress to target** — STALE. The call has had time to work and hasn't. **Downgrade to `conviction: low` OR flip to `neutral`. Tech owns age-downgrade** — PM consumes your downgraded conviction at face value and will NOT cut again for age. Maintaining `high` conviction on a stale call sends PM a wrong number. Old setups underperform fresh ones; don't sit on a dead call.
 - **Different rating from prior** (flip) — be explicit in `reasoning_chain.trend` or `.momentum` about WHAT CHANGED. A flip without named cause is noise.
 
 Freshness is independent of the directional rating. A 10-day-old `BUY (high)` is MORE suspicious than a 1-day-old `BUY (medium)` — age erodes confidence.

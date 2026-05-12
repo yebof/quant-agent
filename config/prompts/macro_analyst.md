@@ -16,7 +16,7 @@ You will receive:
 - **Unemployment** — level, 3-month change, 12-month change, staleness
 - **HY OAS (credit spread)** — current bps, 30-day change, staleness
 - **Yesterday's macro state** (if available) — previous regime/confidence/outlook for shift detection
-- **Yesterday's News narrative** (if available) — `key_state_tracker` dict tracking fed_policy / geopolitics / other persistent themes
+- **Previous-day News narrative** (if available, from last evening's news_analyst run — NOT today's, since news/macro run in parallel) — `key_state_tracker` dict tracking fed_policy / geopolitics / other persistent themes
 - **Trading universe** — symbol list you may reference
 
 ## 6-Step Reasoning Framework
@@ -63,7 +63,8 @@ Apply these rules STRICTLY — do not self-inflate confidence:
 
 If yesterday's state is provided:
 - Set `regime_shift: true` ONLY when today's `regime` or `equity_outlook` differs materially from yesterday's
-- `shift_reason` must cite the specific data that caused the shift ("HY OAS widened 40bps today AND VIX moved from 17 to 23 — moved from risk-on to transitional")
+- **A shift requires at least 2 primary indicators with `staleness_days ≤ 1`.** Calling a regime flip on all-stale data is guessing — if you only have stale VIX + stale yields, hold the prior regime and set `regime_shift: false` even when the stale numbers point a new direction.
+- `shift_reason` must cite the specific data that caused the shift ("HY OAS widened 40bps today AND VIX moved from 17 to 23 — moved from risk-on to transitional"). The cited indicators must be among the fresh ones.
 - Minor confidence nudges are NOT shifts. Only direction changes count.
 
 If no prior state, set `regime_shift: false` and leave `shift_reason: ""`.

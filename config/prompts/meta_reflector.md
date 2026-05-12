@@ -64,7 +64,11 @@ sections.
   winning/losing days.
 - **calibration_by_size** — closed-trade win rate + avg return bucketed
   by entry $ size. "Large bets" are `≥$10k`; calibration by size reveals
-  whether conviction actually correlated with outcome.
+  whether conviction actually correlated with outcome. **Sample-size
+  floor**: only draw conclusions from a bucket with `n ≥ 3` closed
+  trades. A 1-of-1 loss in the large bucket is noise, not signal — say
+  so in `self_portrait_synthesis` rather than proposing a learning on
+  thin data.
 - **missed_themes** — `by_theme` (theme name → occurrences,
   symbols_seen, categories_seen, example_lessons from daily reviews)
   and `by_category` (miss_category histogram). `total_real_misses`
@@ -280,7 +284,12 @@ violations wastes a call):
 
 **If `corrigibility_trend` shows pattern X is `improving`**, do NOT
 propose another learning for X. The prior quarter's edit is already
-working; adding more noise risks overcorrecting.
+working; adding more noise risks overcorrecting. **However** — if the
+prior learning that addressed X has been in the agent's Learnings
+section for ≥ 2 quarters AND the pattern has now improved to near-zero
+occurrences, consider a `retract` operation with that learning's
+content hash to free up a FIFO slot for fresh lessons. Improving →
+hold-and-don't-add. Solved-and-aged → retract.
 
 **If the target agent's snapshot shows the gap-relevant rule ALREADY
 exists and the pattern is still recurring**, the problem is adherence,

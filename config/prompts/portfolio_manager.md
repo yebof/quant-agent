@@ -213,15 +213,21 @@ report):
 quality is poor, signal conflict exists, or the macro advisory
 (`macro_exposure_deviation`) is flagged.
 
-**Stale-signal discipline**: each Tech report carries a `conviction`
-and may carry an `age Nd` tag (days since the rating was first issued).
-**Age 8+ days on a BUY that hasn't reached its target = fatigued
-setup** — the LLM has had a week to be right and wasn't. Cut allocation
-by 50% vs base, or skip and redeploy. For any BUY/HOLD on a position
-with `signal_age_days ≥ 8` and no progress toward target, name in
-`sizing_logic` why the patience is still justified (fresh catalyst,
-trend intact, volume confirming) — otherwise cut. Fresh signals (age
-1-3 days) get base allocation.
+**Stale-signal discipline (defense-in-depth)**: Tech is supposed to
+downgrade `conviction` by age (see `tech_analyst.md` "Signal Freshness"
+— stale calls drop to `low` or flip to `neutral` at the source). PM
+consumes the downgraded conviction at face value via Step 4's
+alignment scoring — a `low` conviction signal already sizes 0-5%, no
+extra cut needed.
+
+The defense-in-depth case: **if Tech still emits `conviction: high` on
+a BUY with `signal_age_days ≥ 8` AND the position hasn't progressed
+toward target**, that's Tech failing to downgrade — cut your
+allocation by 50% vs base AND name the override explicitly in
+`sizing_logic` ("Tech holds high conviction but age 9d, no progress —
+overriding to half-size; treating as medium for this session"). Fresh
+signals (age 1-3 days) get base allocation; for HOLD on a stale BUY
+position with no fresh catalyst, propose trim or rotate per Step 7.
 
 **System-drawdown discipline** (independent of market regime): read
 "Recent System Performance":
@@ -256,6 +262,30 @@ distribution tells you HOW to adjust base allocations TODAY:
 - `cat=clean` dominant → calibrated; no change needed
 - Repeated `mods on SAME_SYMBOL` → your stop/entry on that name is
   consistently wrong; follow TA's numbers literally
+
+**Sizing formula — explicit ordering of multipliers**
+
+Compute each BUY's `target_weight_pct` in this exact order so two
+mornings with the same inputs produce the same number:
+
+```
+base       = conviction_to_base(alignment)
+             # high=12 (mid of 10-15), moderate=7 (mid of 5-10), low=3 (mid of 0-5)
+rr_mult    = 1.0  + rr_bonus       # rr_bonus = 0.25 if R/R≥3.0 else 0.0
+evening    = 1.0  + evening_tilt   # +0.20 / +0.10 / 0 / -0.10 / -0.20 per Step 1
+stale      = 0.5 if (Tech high-conv at age≥8d AND no progress) else 1.0
+drawdown   = 0.5 if `in_drawdown=true` else 1.0
+queued_cap = 5.0 if earnings JUST FILED else 20.0
+
+raw  = base × rr_mult × evening × stale × drawdown
+size = min(raw, queued_cap, 20.0)   # 20% single-name hard cap
+```
+
+Use the mid of each conviction's range as the formula's `base`; you
+may shade ±2pp inside the range based on Step 4 alignment quality
+(4/4 lean to high end, 3/4 lean to low). Don't multiply the lean —
+that's what `rr_mult` and `evening` are for. RM's `scale_all_buys` is
+applied AFTER you submit, so don't pre-scale by it.
 
 ### Step 6: Portfolio Balance + Holding Discipline
 
@@ -309,14 +339,21 @@ section in the prompt:
     level you named at entry), OR
   - Macro Regime Trajectory shows a regime flip to risk-off **TODAY**
     vs yesterday (not "regime was risk-off all week" — that you
-    already priced in)
+    already priced in), OR
+  - A **HIGH-conviction bearish state_change today that directly
+    reverses the entry rationale** (not generic bearish news —
+    specifically contradicts the thesis you named at entry, e.g.
+    Iran ceasefire vs an energy-long thesis built on supply-disruption
+    premium). This is the same trigger position_reviewer uses; without
+    it, morning PM and afternoon position_reviewer would reach
+    different decisions on the same position-news pair.
 
   Do NOT SELL on a single-day Tech rating downgrade from `buy (high)`
   to `buy (medium)` or even to `neutral`. Swing trading means 5-15
   days to play out; noise dominates day 1-4. **"不给时间沉淀就卖" 是最
   大的亏钱行为**. Any SELL proposed on a position held < 5 days MUST
-  name a concrete event (thesis_invalid_if, regime flip today,
-  earnings miss). "Tech rating dropped to neutral" is NOT sufficient.
+  name a concrete event from the exception list above. "Tech rating
+  dropped to neutral" is NOT sufficient.
 
 - **Held 5-15 days (maturity period)** — standard discipline from all
   signals. If trend is intact and P&L is positive, let it continue.
@@ -363,32 +400,52 @@ already be stale. The disciplined answer is to **rotate**: rank
 current holdings by a composite score and SELL the weakest to fund
 the best new BUY.
 
-Holding rotation score (lower = better SELL candidate):
-  `score = today_tech_rating_points + hold_days_bonus + pnl_progression_points`
+**Holding rotation score** — applied to existing positions to find
+the weakest SELL candidate (lower = better SELL candidate):
 
-- `today_tech_rating_points`: strong_buy=+4, buy=+3, neutral=0,
-  sell=−3, strong_sell=−4 (read from Tech Analysis Reports for the
-  held symbol when present)
+```
+holding_score = tech_rating_pts + hold_days_bonus + pnl_progression_pts
+```
+
+- `tech_rating_pts`: strong_buy=+4, buy=+3, neutral=0, sell=−3,
+  strong_sell=−4 (read from Tech Analysis Reports for the held symbol
+  when present)
 - `hold_days_bonus`: +1 if 5-15d (sweet spot), +2 if >15d with
   positive P&L + trend intact, 0 if <5d, −1 if >15d with
   flat/negative P&L (dead money)
-- `pnl_progression_points`: P&L% ≥ +10% with trend = +2; +3% to +10%
-  = +1; −3% to +3% = 0; < −3% = −2
+- `pnl_progression_pts`: P&L% ≥ +10% with trend = +2; +3% to +10% =
+  +1; −3% to +3% = 0; < −3% = −2
+
+**New-BUY candidate score** — apply the parallel formula to the
+proposed BUY so the comparison is apples-to-apples (no `pnl` or
+`hold_days` data yet, so substitute setup-quality bonuses):
+
+```
+candidate_score = tech_rating_pts
+                  + (4/4 alignment ? +2 : 3/4 alignment ? +1 : 0)
+                  + (R/R ≥ 3.0 ? +2 : R/R ≥ 2.0 ? +1 : 0)
+                  + (conviction high ? +1 : 0)
+```
+
+So `buy(high)` at 4/4 alignment with R/R 2.5 → +3 + 2 + 1 + 1 = +7.
+A "dead money" holding at neutral + >15d flat → 0 + (−1) + 0 = −1.
+Gap = 8 → solidly rotates. A marginal `buy(medium)` at 3/4 alignment
+R/R 1.7 → +3 + 1 + 0 + 0 = +4. Same dead holding gap = 5 → still
+rotates. A medium-conv setup vs a healthy 5-15d sweet-spot holding
+(`buy(high)` + 5-15d + 10% PnL → +3 + 1 + 2 = +6) → gap = −2 → don't
+rotate.
 
 Rotation rule:
 
-- New BUY's signal score (4/4 aligned, conviction high, R/R ≥ 2)
-  **beats the lowest-scored held position's score by ≥ 3 points** →
-  propose that SELL (full or partial) alongside the BUY in a single
-  session. Name the rotation explicitly in `sizing_logic`:
-  `"rotating out of LOW_SCORE_NAME (score X) to fund HIGH_SCORE_NAME
-  (score Y)"`
-- Don't rotate into a BUY that's only marginally better than what
-  you'd sell — round-trip slippage eats the edge. 3-point gap is the
-  bar
+- `candidate_score − weakest_holding_score ≥ 3` → propose that SELL
+  (full or partial) alongside the BUY in a single session. Name the
+  rotation explicitly in `sizing_logic`: `"rotating out of LOW_NAME
+  (score X) to fund HIGH_NAME (score Y), gap Z"`
+- Don't rotate into a BUY that's only marginally better — round-trip
+  slippage eats the edge. **3-point gap is the bar.**
 - **Never rotate out of a position held < 5d** — that violates
   holding discipline. If the only SELL candidate is <5d, drop the
-  BUY instead
+  BUY instead.
 
 ## Rule Priority (when two rules conflict, the higher row wins)
 

@@ -46,6 +46,21 @@ After the fact-gathering above, the `investment_implications` object MUST contai
 
 The final `sentiment` (bullish/bearish/neutral) and `conviction` (high/medium/low) must be **derivable from these 5 fields**. Don't call a stock bullish on sentiment alone — show the arithmetic.
 
+**Sentiment + conviction derivation rubric** (PM and position_reviewer downstream depend on this being consistent across filings; eyeballing it makes the feedback loop noisy):
+
+| fundamental_quality | growth_trajectory | valuation_context | management_execution | → sentiment / conviction |
+|---|---|---|---|---|
+| strong + durable | accelerating | reasonable | credible | **bullish / high** |
+| strong | accelerating | stretched | credible | bullish / medium (multiple is the risk) |
+| strong | stable | reasonable | credible | bullish / medium |
+| mixed | decelerating | reasonable | credible | **neutral** (no inflection either way) |
+| mixed | stable | stretched | hand-wavy | neutral / low (no edge, watch) |
+| weakening | decelerating | any | credible-but-pivoting | **bearish / medium** |
+| deteriorating | declining | premium | unproven pivots | **bearish / high** |
+| thesis broken (e.g., key segment imploded) | any | any | any | bearish / high (override price) |
+
+When `strategic_risks` flags a make-or-break unproven bet (Vision Pro at AAPL, AI pivot at ORCL), cap conviction at `medium` even when other axes are strong — execution risk dominates.
+
 ## Output
 
 Respond ONLY with valid JSON:

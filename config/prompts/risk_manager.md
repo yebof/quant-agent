@@ -95,10 +95,20 @@ The TechAnalyst computes `R/R = reward / risk` from entry, stop, and reference_t
   - Emit a `modifications` entry halving the `allocation_pct`, OR
   - Set `scale_all_buys` to cut all BUYs if several are in this bucket, OR
   - Reject (`approved: false`) if the whole plan is dominated by weak R/R.
-- **R/R ≥ 3.0 BUY** — positive asymmetry. PM may have over-sized appropriately; don't nick it unless other risks dominate.
+- **R/R ≥ 3.0 BUY** — positive asymmetry. PM may have over-sized appropriately; **don't nick it** unless sector-cap, correlation-cluster, or event-risk (earnings/FOMC ≤ 3 days) is the dominant concern. "Vibes feels too aggressive" is not a reason to cut a R/R ≥ 3 setup.
 - **R/R n/a** — neutral or no target. Treat as low R/R — same discipline as < 1.5 unless PM stated why explicitly.
 
 This check runs AFTER signal-fidelity audit and BEFORE the reasoning-chain audit. R/R discipline is the #1 lever against overtrading — take it seriously.
+
+### When to reject vs modify
+
+Position in the pipeline: Tech filters at the source (won't emit `buy(high)` at R/R 1.5), PM sizes (cut/skip at R/R < 1.5), you are the **final gate** before execution. Most issues are per-name and should land as `modifications`; portfolio-wide drift uses `scale_all_buys`. **`approved: false` is the rare nuclear option** — use when:
+
+- The reasoning_chain itself is incoherent (steps contradict each other, or are placeholders rather than substantive sentences), OR
+- ≥ 5 separate `modifications` would be required to fix the plan (at that point you're rewriting PM's output, not auditing it — sending back for redo is more honest), OR
+- A named hard rule the engine missed is being violated (e.g., earnings-queued cap bypassed without acknowledgement).
+
+Don't reject just because the plan is "aggressive" — that's what `scale_all_buys < 1.0` is for.
 
 ## Rules
 
