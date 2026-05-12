@@ -123,6 +123,44 @@ def test_position_reviewer_contract_says_sell_only() -> None:
     )
 
 
+def test_evening_prompt_teaches_risk_rating_escalation() -> None:
+    """evening_analyst.md is the only operator-attention channel. Its
+    prompt must teach the escalation rules so the LLM doesn't bury a
+    thesis_trajectory=broken holding at risk_rating=moderate (which
+    would silently skip the Telegram OPERATOR ATTENTION banner in
+    src/notifier.py:_append_evening_body).
+
+    Pairs with test_format_evening_prepends_operator_attention_banner_*
+    in test_notifier.py — the contract chain is:
+
+      evening prompt: thesis_broken → risk_rating ≥ elevated
+                          ↓
+      schema: EveningReport.risk_rating Literal[low|moderate|elevated|high]
+                          ↓
+      notifier: risk_rating in {elevated, high} → 🚨 banner + expanded actions
+    """
+    path = PROMPT_DIR / "evening_analyst.md"
+    text = path.read_text()
+    # The phrase "operator-attention channel" anchors the prompt rule
+    # to the notifier-side behavior — if a future edit drops the phrase,
+    # the rule has likely lost its motivation paragraph too.
+    assert "operator-attention channel" in text.lower() or "OPERATOR ATTENTION" in text, (
+        "evening_analyst.md must connect risk_rating to the operator-"
+        "attention channel so the LLM understands the Telegram banner "
+        "implication. Without it, the LLM may treat risk_rating as "
+        "purely descriptive and drift to comfortable defaults."
+    )
+    # Three concrete floors that mirror the test assertions in
+    # test_notifier.py — if the prompt loses these, the chain breaks.
+    for anchor in ("thesis_trajectory=broken", "macro_warning_ignored", "elevated"):
+        assert anchor in text, (
+            f"evening_analyst.md must name `{anchor}` in the risk_rating "
+            f"escalation rules. The notifier-side test asserts the "
+            f"banner fires on elevated/high — if the prompt doesn't "
+            f"teach when to set them, the system has no escalation."
+        )
+
+
 def test_meta_reflector_contract_names_protected_agents() -> None:
     """meta_reflector.md contract must name risk_manager and
     position_reviewer as schema-protected so the LLM does not waste

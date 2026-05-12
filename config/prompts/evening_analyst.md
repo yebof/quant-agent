@@ -308,6 +308,28 @@ field name; example values inside the JSON example at the end.
   phrases like "watch the tape".
 - **`risk_rating`** — `low` | `moderate` | `elevated` | `high`. Overall
   book risk posture after today's moves.
+
+  **Escalation rules — `risk_rating` is the operator-attention channel.**
+  The Telegram push prepends a `🚨 OPERATOR ATTENTION` banner and
+  expands `suggested_actions` when this is `elevated` or `high`, so
+  these levels are a real signal, not narrative tone. Floors:
+  - **Any held position with `thesis_trajectory=broken`** → at least
+    `elevated`. Match `suggested_actions` with a concrete exit
+    instruction for that name ("Sell XOM tomorrow open — thesis
+    broken on 4th consecutive EIA build").
+  - **Any BUY in `buy_grades` with `loss_root_cause=macro_warning_
+    ignored`** → at least `elevated`. The system ignored a visible
+    warning; surface the pattern so the operator can decide whether
+    to tighten coverage.
+  - **Two or more `thesis_trajectory=broken` holdings** OR (daily P&L
+    ≤ −2% AND a `macro_warning_ignored` loss today) → `high`. The
+    book has multiple defenses failing simultaneously.
+  - Otherwise grade by overall book risk posture as before
+    (`low` / `moderate`).
+  These thresholds are floors — go higher when other signals warrant.
+  Going LOWER than the floor (e.g. burying a `thesis_trajectory=broken`
+  position at `risk_rating=moderate`) hides the only push-time hint the
+  operator gets and is a discipline violation.
 - **`suggested_actions`** (0-4 items) — Specific actions for tomorrow.
   "Tighten IWM stop to $248"; "Watch NVDA for entry below $280"; "Exit
   XOM on any bounce > $110". Skip if nothing specific.

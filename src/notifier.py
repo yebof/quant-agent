@@ -226,6 +226,18 @@ def _append_trade_session_body(lines: list[str], result: dict) -> None:
 
 
 def _append_evening_body(lines: list[str], result: dict) -> None:
+    # Operator escalation banner — prepended before daily P&L when
+    # evening flagged elevated/high risk_rating. evening's contract
+    # (config/prompts/evening_analyst.md) maps thesis_trajectory=broken
+    # holdings and macro_warning_ignored loss patterns to risk_rating
+    # >= elevated; this is the operator's only push-time hint that the
+    # autonomous loop has surfaced something needing human eyes.
+    # Banner goes in BEFORE Daily P&L so it's the first thing read.
+    analysis = result.get("analysis")
+    risk_for_banner = _attr_or_key(analysis, "risk_rating")
+    if isinstance(risk_for_banner, str) and risk_for_banner.lower() in ("elevated", "high"):
+        lines.append(f"🚨 OPERATOR ATTENTION — risk_rating={risk_for_banner}")
+
     # Daily P&L summary — the headline of the evening push. Operator
     # wants to know "did I make money today" without grepping logs.
     daily_pnl = result.get("daily_pnl")
@@ -271,6 +283,22 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
     outlook = _attr_or_key(analysis, "tomorrow_outlook") or ""
     if outlook:
         lines.append(f"   {outlook[:280]}")
+
+    # When risk_rating is elevated/high, surface the specific
+    # `suggested_actions` evening proposed so the operator can act
+    # without opening the DB. Cap at 5 entries + 200 chars each so a
+    # verbose LLM doesn't blow past Telegram's 4096-char limit; the
+    # MAX_MESSAGE_CHARS truncation would clip the elapsed-line tail
+    # otherwise.
+    risk_for_actions = _attr_or_key(analysis, "risk_rating")
+    if isinstance(risk_for_actions, str) and risk_for_actions.lower() in ("elevated", "high"):
+        actions = _attr_or_key(analysis, "suggested_actions") or []
+        if isinstance(actions, list) and actions:
+            lines.append("⚡ Suggested actions:")
+            for act in actions[:5]:
+                if not isinstance(act, str):
+                    continue
+                lines.append(f"   • {act[:200]}")
 
 
 def _session_cost_line(run_id: str | None) -> str | None:

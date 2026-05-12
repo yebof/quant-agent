@@ -295,6 +295,101 @@ def test_format_evening_shows_negative_daily_pnl():
     assert "-0.35%" in msg
 
 
+def test_format_evening_prepends_operator_attention_banner_on_elevated():
+    """risk_rating=elevated is the evening agent's escalation channel
+    for thesis-broken holdings / macro-warning-ignored losses. The
+    notifier MUST prepend a visible banner so the operator notices in
+    the Telegram push without reading prose."""
+    result = {
+        "status": "analyzed", "run_id": "run-e",
+        "daily_pnl": -200.0, "total_value": 100_000.0,
+        "analysis": {"risk_rating": "elevated", "tomorrow_bias": "bearish"},
+    }
+    msg = format_session_result("evening", result, 30.0)
+    assert msg is not None
+    assert "🚨 OPERATOR ATTENTION" in msg, (
+        "elevated risk_rating must trigger the OPERATOR ATTENTION "
+        "banner in the Telegram body — it's the only push-time signal "
+        "the operator gets for system-flagged risk."
+    )
+    assert "risk_rating=elevated" in msg
+
+
+def test_format_evening_prepends_operator_attention_banner_on_high():
+    """risk_rating=high is the strongest escalation evening can emit
+    (multiple broken theses or macro warning + daily loss). Banner
+    must fire."""
+    result = {
+        "status": "analyzed", "run_id": "run-e",
+        "analysis": {"risk_rating": "high"},
+    }
+    msg = format_session_result("evening", result, 30.0)
+    assert msg is not None
+    assert "🚨 OPERATOR ATTENTION" in msg
+    assert "risk_rating=high" in msg
+
+
+def test_format_evening_no_operator_banner_on_moderate():
+    """risk_rating=moderate is the everyday baseline — the banner
+    MUST NOT fire, or the operator habituates to it and the signal
+    becomes noise."""
+    result = {
+        "status": "analyzed", "run_id": "run-e",
+        "analysis": {"risk_rating": "moderate"},
+    }
+    msg = format_session_result("evening", result, 30.0)
+    assert msg is not None
+    assert "🚨 OPERATOR ATTENTION" not in msg, (
+        "moderate risk_rating must NOT trigger the operator banner. "
+        "If every evening has this banner, it stops being a signal."
+    )
+
+
+def test_format_evening_expands_suggested_actions_on_elevated():
+    """When risk_rating is elevated, the specific suggested_actions
+    list must be expanded inline so the operator can act without
+    opening the DB."""
+    result = {
+        "status": "analyzed", "run_id": "run-e",
+        "analysis": {
+            "risk_rating": "elevated",
+            "suggested_actions": [
+                "Sell XOM tomorrow open — thesis broken on 4th EIA build",
+                "Tighten IWM stop to $248",
+                "Watch NVDA for entry below $280",
+            ],
+        },
+    }
+    msg = format_session_result("evening", result, 30.0)
+    assert msg is not None
+    assert "⚡ Suggested actions:" in msg
+    assert "Sell XOM tomorrow open" in msg
+    assert "Tighten IWM stop" in msg
+    assert "Watch NVDA" in msg
+
+
+def test_format_evening_does_not_expand_suggested_actions_on_moderate():
+    """On moderate risk_rating, the existing tomorrow_outlook line is
+    enough — keep suggested_actions out of the message body to control
+    noise. Operators still see them via the DB / morning PM consumption."""
+    result = {
+        "status": "analyzed", "run_id": "run-e",
+        "analysis": {
+            "risk_rating": "moderate",
+            "suggested_actions": [
+                "Trim AAPL by 2%",
+                "Tighten IWM stop to $248",
+            ],
+            "tomorrow_outlook": "Steady tape.",
+        },
+    }
+    msg = format_session_result("evening", result, 30.0)
+    assert msg is not None
+    assert "⚡ Suggested actions:" not in msg
+    # The Tomorrow line still surfaces the prose outlook as before.
+    assert "Steady tape" in msg
+
+
 def test_format_includes_session_cost_when_db_has_rows(tmp_path, monkeypatch):
     """When a run_id matches rows in agent_logs with cost_usd populated,
     the notifier should surface 💵 cost: $X.XX (N calls)."""
