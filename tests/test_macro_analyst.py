@@ -246,3 +246,218 @@ def test_macro_analyze_survives_one_malformed_observation(mock_cls):
     assert analysis.regime == "risk-on"
     assert len(analysis.key_observations) == 1
     assert analysis.key_observations[0].indicator == "VIX"
+
+
+# ===========================================================================
+# Sanity-check tests — _apply_sanity_checks soft floors
+# ===========================================================================
+#
+# The prompt teaches stricter rules than we enforce here (see the docstring
+# on `_apply_sanity_checks`); the literal "ANY stale → MUST be low" would
+# peg confidence at 'low' essentially every session because BLS/BEA
+# inflation + unemployment prints are monthly and almost always show
+# staleness_days > 3. The sanity check enforces only the two most
+# flagrant violations the LLM occasionally makes:
+#   - confidence='high' with stale/null indicators → downgrade to 'medium'
+#   - regime_shift=True with < 2 fresh indicators → clear it
+# Existing tests assert confidence='medium' with stale indicators stays
+# unchanged — the sanity check must not regress that.
+
+_ALL_FRESH_MACRO = {
+    "vix":           {"current": 19.5, "mean_5d": 20.1, "trend": "falling",
+                      "staleness_days": 0},
+    "treasury":      {"us2y": 4.5, "us10y": 4.3, "spread_2_10": -0.2,
+                      "inverted": True, "staleness_days": 0},
+    "fed_funds_rate": {"current": 3.60, "change_30d": 0.0, "staleness_days": 0},
+    "inflation":     {"headline_cpi_yoy": 3.0, "core_cpi_yoy": 2.8,
+                      "staleness_days": 1},
+    "unemployment":  {"current": 4.1, "change_3m": 0.1, "staleness_days": 1},
+    "credit_spread": {"current_bps": 380, "change_30d_bps": 0,
+                      "staleness_days": 0},
+}
+
+
+def _llm_response_dict(confidence: str, regime_shift: bool, shift_reason: str = ""):
+    """Build a minimal valid LLM-emitted MacroAnalysis dict with the
+    confidence + regime_shift values under test. Everything else is
+    canned constants the schema accepts."""
+    return {
+        "reasoning_chain": {
+            "volatility_analysis": "VIX low.",
+            "yield_curve_analysis": "Curve normalizing.",
+            "monetary_policy_analysis": "DFF flat.",
+            "inflation_labor_credit": "Sticky but cooling.",
+            "cross_signal_synthesis": "Aligned risk-on.",
+            "sector_implications": "Tech OW.",
+        },
+        "regime": "risk-on",
+        "confidence": confidence,
+        "equity_outlook": "bullish",
+        "regime_shift": regime_shift,
+        "shift_reason": shift_reason,
+        "key_observations": [
+            {"indicator": "VIX", "reading": "19.5", "interpretation": "OK"}
+        ],
+        "sector_guidance": [
+            {"sector": "Technology", "stance": "overweight", "reason": "AI"}
+        ],
+        "risk_factors": ["Core CPI sticky"],
+        "position_guidance": {
+            "target_invested_pct": 75.0,
+            "cash_recommendation_pct": 25.0,
+            "reasoning": "Hold buffer.",
+        },
+        "bull_triggers": ["Core CPI MoM < 0.2%"],
+        "bear_triggers": ["HY OAS > 450bps"],
+        "alignment_with_news": "Consistent.",
+        "summary": "Moderately supportive.",
+    }
+
+
+def _mock_macro_llm(mock_cls, response_dict: dict):
+    """Wire the Anthropic mock to return the given response dict."""
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.content = [MagicMock(text=json.dumps(response_dict))]
+    mock_resp.usage.input_tokens = 1000
+    mock_resp.usage.output_tokens = 500
+    mock_client.messages.create.return_value = mock_resp
+    mock_cls.return_value = mock_client
+
+
+@patch("anthropic.Anthropic")
+def test_sanity_check_downgrades_high_confidence_when_indicator_stale(mock_cls, caplog):
+    """LLM self-inflates to confidence='high' but inflation is stale 10d.
+    Sanity check must downgrade to 'medium' per the prompt's
+    Confidence Calibration rule ('high' requires all indicators
+    fresh)."""
+    _mock_macro_llm(mock_cls, _llm_response_dict(confidence="high", regime_shift=False))
+
+    agent = MacroAnalystAgent(api_key="test", model="claude-sonnet-4-6")
+    import logging
+    with caplog.at_level(logging.WARNING):
+        analysis, _ = agent.analyze(macro_summary=MACRO_SUMMARY, universe=["SPY"])
+
+    assert analysis is not None
+    assert analysis.confidence == "medium", (
+        "high confidence with stale inflation (10d) / unemployment (15d) "
+        "must be downgraded to 'medium' by the sanity check"
+    )
+    # Warning log surfaces which indicators triggered the downgrade so
+    # the operator can spot when the LLM is misbehaving.
+    assert any(
+        "confidence='high'" in r.message and "inflation" in r.message
+        for r in caplog.records
+    ), "downgrade must log which indicators triggered it"
+
+
+@patch("anthropic.Anthropic")
+def test_sanity_check_downgrades_high_confidence_when_indicator_null(mock_cls):
+    """LLM emits 'high' but VIX is missing entirely. Treated as
+    not-provably-fresh → downgrade to 'medium'."""
+    macro = {**MACRO_SUMMARY}
+    del macro["vix"]
+    _mock_macro_llm(mock_cls, _llm_response_dict(confidence="high", regime_shift=False))
+
+    agent = MacroAnalystAgent(api_key="test", model="claude-sonnet-4-6")
+    analysis, _ = agent.analyze(macro_summary=macro, universe=["SPY"])
+
+    assert analysis is not None
+    assert analysis.confidence == "medium"
+
+
+@patch("anthropic.Anthropic")
+def test_sanity_check_leaves_medium_confidence_unchanged_with_stale(mock_cls):
+    """LLM emits 'medium' with stale inflation/unemployment. The
+    sanity check only acts on 'high' violations; medium passes through
+    unchanged. This pins the soft interpretation of the prompt rule —
+    the literal 'ANY stale → low' would peg every session at low
+    because monthly indicators are usually stale.
+    """
+    _mock_macro_llm(mock_cls, _llm_response_dict(confidence="medium", regime_shift=False))
+
+    agent = MacroAnalystAgent(api_key="test", model="claude-sonnet-4-6")
+    analysis, _ = agent.analyze(macro_summary=MACRO_SUMMARY, universe=["SPY"])
+
+    assert analysis is not None
+    assert analysis.confidence == "medium", (
+        "medium confidence with stale indicators must NOT be modified "
+        "— the sanity check only catches the 'high' violation"
+    )
+
+
+@patch("anthropic.Anthropic")
+def test_sanity_check_keeps_high_confidence_when_all_fresh(mock_cls):
+    """Happy path: all indicators have staleness_days <= 3 and LLM
+    emits 'high'. Sanity check leaves it alone."""
+    _mock_macro_llm(mock_cls, _llm_response_dict(confidence="high", regime_shift=False))
+
+    agent = MacroAnalystAgent(api_key="test", model="claude-sonnet-4-6")
+    analysis, _ = agent.analyze(macro_summary=_ALL_FRESH_MACRO, universe=["SPY"])
+
+    assert analysis is not None
+    assert analysis.confidence == "high", (
+        "all-fresh indicators must allow high confidence to pass through"
+    )
+
+
+@patch("anthropic.Anthropic")
+def test_sanity_check_clears_regime_shift_with_insufficient_fresh_indicators(mock_cls, caplog):
+    """LLM declares regime_shift=True but only 1 indicator has
+    staleness_days <= 1 in MACRO_SUMMARY (vix=0; treasury=0; ...; but
+    inflation=10, unemployment=15 are not fresh). Need >= 2 fresh to
+    justify a flip — and MACRO_SUMMARY has 4 fresh (vix, treasury,
+    fed_funds_rate, credit_spread all =0). Tweak the input so only 1
+    is fresh, then assert regime_shift gets cleared."""
+    macro = {
+        **MACRO_SUMMARY,
+        "treasury": {**MACRO_SUMMARY["treasury"], "staleness_days": 5},
+        "fed_funds_rate": {**MACRO_SUMMARY["fed_funds_rate"], "staleness_days": 5},
+        "credit_spread": {**MACRO_SUMMARY["credit_spread"], "staleness_days": 5},
+        # Only vix has staleness_days=0; inflation+unemployment already stale.
+    }
+    _mock_macro_llm(
+        mock_cls,
+        _llm_response_dict(
+            confidence="medium", regime_shift=True,
+            shift_reason="VIX jumped from 17 to 23",
+        ),
+    )
+
+    agent = MacroAnalystAgent(api_key="test", model="claude-sonnet-4-6")
+    import logging
+    with caplog.at_level(logging.WARNING):
+        analysis, _ = agent.analyze(macro_summary=macro, universe=["SPY"])
+
+    assert analysis is not None
+    assert analysis.regime_shift is False, (
+        "regime_shift=True must be cleared when < 2 indicators are fresh"
+    )
+    assert analysis.shift_reason == "", (
+        "shift_reason must also be cleared so PM doesn't read a stale flip narrative"
+    )
+    assert any(
+        "regime_shift=True" in r.message and "fresh" in r.message
+        for r in caplog.records
+    ), "clear must log the gate that fired"
+
+
+@patch("anthropic.Anthropic")
+def test_sanity_check_keeps_regime_shift_with_two_fresh_indicators(mock_cls):
+    """LLM declares regime_shift=True with 2+ fresh indicators in
+    MACRO_SUMMARY (vix=0, treasury=0, fed_funds_rate=0, credit_spread=0
+    — 4 fresh, well above the >= 2 threshold). Pass through."""
+    _mock_macro_llm(
+        mock_cls,
+        _llm_response_dict(
+            confidence="medium", regime_shift=True,
+            shift_reason="VIX + HY both jumped today",
+        ),
+    )
+
+    agent = MacroAnalystAgent(api_key="test", model="claude-sonnet-4-6")
+    analysis, _ = agent.analyze(macro_summary=MACRO_SUMMARY, universe=["SPY"])
+
+    assert analysis is not None
+    assert analysis.regime_shift is True
+    assert analysis.shift_reason == "VIX + HY both jumped today"

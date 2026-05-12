@@ -142,7 +142,98 @@ Walk through the 6-step reasoning chain, then emit the full JSON schema (includi
         except ValidationError as e:
             logger.error("Macro analysis failed validation: %s", e)
             return None, result
+        analysis = self._apply_sanity_checks(analysis, macro_summary)
         return analysis, result
+
+    @staticmethod
+    def _apply_sanity_checks(
+        analysis: MacroAnalysis,
+        macro_summary: dict,
+    ) -> MacroAnalysis:
+        """Soft Python-side floor for two `macro_analyst.md` discipline
+        rules the LLM occasionally violates by self-inflating.
+
+        The prompt teaches stricter rules than what we enforce here —
+        the prompt says "ANY indicator with staleness_days > 3, or
+        null: confidence MUST be 'low'". In practice the BLS / BEA
+        release cadence means inflation + unemployment are basically
+        ALWAYS staleness>3d (monthly prints arriving 2-6 weeks after
+        the reference month). Enforcing the literal rule would peg
+        confidence at "low" essentially every session and make the
+        signal useless. So we enforce only the two most flagrant
+        violations:
+
+        1. `confidence == "high"` requires ALL six primary indicators
+           to have `staleness_days <= 3` AND be non-null in
+           `macro_summary`. Any null / stale → downgrade to "medium".
+           ("high" is the LLM's most-impactful confidence call; PM's
+           Step 1 evening-tilt scales sizing by it, so a self-inflated
+           "high" with stale data leaks into position size.)
+
+        2. `regime_shift == True` requires ≥ 2 primary indicators with
+           `staleness_days <= 1` per the prompt's "Regime-Shift
+           Detection" rule. Below that, clear `regime_shift` and
+           `shift_reason` — calling a flip on stale data is guessing,
+           and PM treats `regime_shift=true` as a "size appropriately
+           and name the flip" trigger.
+
+        Logs a warning on each override so the operator can see WHICH
+        side of the gate misbehaved (LLM ignored prompt rule vs the
+        sanity check fired correctly).
+        """
+        primary_keys = (
+            "vix", "treasury", "fed_funds_rate",
+            "inflation", "unemployment", "credit_spread",
+        )
+
+        # Build staleness map. Missing dict / non-int staleness → None
+        # (treated as "not provably fresh", which fails the high/shift
+        # gates). Mirrors the user-message builder's `_stale()` helper
+        # which uses the same `isinstance(s, int)` check.
+        staleness: dict[str, int | None] = {}
+        for key in primary_keys:
+            d = macro_summary.get(key)
+            if not isinstance(d, dict) or not d:
+                staleness[key] = None
+                continue
+            s = d.get("staleness_days")
+            staleness[key] = s if isinstance(s, int) else None
+
+        null_or_stale = [
+            k for k, v in staleness.items()
+            if v is None or v > 3
+        ]
+
+        # Rule 1: high confidence requires all indicators fresh and present.
+        if analysis.confidence == "high" and null_or_stale:
+            logger.warning(
+                "Macro sanity-check: LLM emitted confidence='high' but "
+                "indicator(s) %s have staleness_days > 3 or are null/"
+                "missing — downgrading to 'medium' per macro_analyst.md "
+                "Confidence Calibration rule.",
+                ", ".join(null_or_stale),
+            )
+            analysis.confidence = "medium"
+
+        # Rule 2: regime_shift requires >= 2 fresh indicators.
+        if analysis.regime_shift:
+            fresh = [
+                k for k, v in staleness.items()
+                if isinstance(v, int) and v <= 1
+            ]
+            if len(fresh) < 2:
+                logger.warning(
+                    "Macro sanity-check: LLM set regime_shift=True but only "
+                    "%d indicator(s) are fresh (staleness_days <= 1)%s — "
+                    "clearing regime_shift per macro_analyst.md Regime-Shift "
+                    "Detection rule ('shift requires >= 2 fresh indicators').",
+                    len(fresh),
+                    f" ({', '.join(fresh)})" if fresh else "",
+                )
+                analysis.regime_shift = False
+                analysis.shift_reason = ""
+
+        return analysis
 
     @staticmethod
     def _drop_invalid_key_observations(parsed: dict) -> dict:
