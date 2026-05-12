@@ -762,6 +762,16 @@ class AlpacaBroker:
             "id": str(order.id),
             "status": str(order.status),
             "symbol": order.symbol,
+            # Echo back the parameters so downstream consumers (notifier,
+            # audit log, finalize) can render orders without having to
+            # join against the trades table for what was JUST submitted.
+            # Pre-2026-05-12 this dict was {id, status, symbol} only and
+            # the notifier could only show "BUY NVDA qty=?" — now it can
+            # show "BUY NVDA qty=27 @$238.63 SL=$230".
+            "side": side.lower(),
+            "qty": qty,
+            "limit_price": limit_price,
+            "stop_loss_price": stop_loss_price if use_stop else None,
         }
 
     def close_position(self, symbol: str) -> dict:

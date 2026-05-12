@@ -186,13 +186,18 @@ def _append_trade_session_body(lines: list[str], result: dict) -> None:
         buys = [o for o in orders if _order_side(o) == "buy"]
         sells = [o for o in orders if _order_side(o) == "sell"]
         lines.append(f"orders: {len(orders)}  (BUY {len(buys)} / SELL {len(sells)})")
-        for o in buys[:5]:
-            lines.append(f"  BUY  {_order_summary(o)}")
-        for o in sells[:5]:
-            lines.append(f"  SELL {_order_summary(o)}")
-        omitted = max(0, len(buys) - 5) + max(0, len(sells) - 5)
+        # Show every order on its own line — operator wants to know what
+        # was actually traded, not just a count. SELLs first (closing
+        # context), then BUYs (opening context). 10-per-side cap is a
+        # safety against unusual sessions; 99% of days are <10 each
+        # and the full list fits in one Telegram message (4096 char limit).
+        for o in sells[:10]:
+            lines.append(f"  SELL  {_order_summary(o)}")
+        for o in buys[:10]:
+            lines.append(f"  BUY   {_order_summary(o)}")
+        omitted = max(0, len(buys) - 10) + max(0, len(sells) - 10)
         if omitted:
-            lines.append(f"  (+{omitted} more)")
+            lines.append(f"  (+{omitted} more — see audit log)")
     else:
         lines.append("orders: 0")
 
@@ -203,17 +208,105 @@ def _append_trade_session_body(lines: list[str], result: dict) -> None:
 
 
 def _append_evening_body(lines: list[str], result: dict) -> None:
+    # Daily P&L summary — the headline of the evening push. Operator
+    # wants to know "did I make money today" without grepping logs.
+    daily_pnl = result.get("daily_pnl")
+    total_value = result.get("total_value")
+    daily_ret = result.get("daily_return_pct")
+    if daily_pnl is not None and total_value is not None:
+        # daily_return_pct from pipeline is in % already (e.g. -0.35
+        # for a 0.35% loss), but historical rows pre-2026 may have had
+        # different scaling — compute fresh for the message either way.
+        if total_value > 0:
+            ret_pct = (daily_pnl / total_value) * 100
+        else:
+            ret_pct = 0.0
+        # Format signs as prefix (-$373.46 not $-373.46) — the latter
+        # reads as "dollar minus 373" which is awkward.
+        if daily_pnl >= 0:
+            pnl_str = f"+${daily_pnl:,.2f}"
+            ret_str = f"+{ret_pct:.2f}%"
+        else:
+            pnl_str = f"-${abs(daily_pnl):,.2f}"
+            ret_str = f"{ret_pct:.2f}%"  # already has leading minus
+        lines.append(f"💰 Daily P&L: {pnl_str} ({ret_str})")
+        lines.append(f"   Equity: ${total_value:,.2f}")
+
+    # Position snapshot: total invested + cash + top winners/losers.
+    # Helper queries the live DB so this works regardless of how the
+    # evening result dict is constructed.
+    _append_position_snapshot(lines, total_value)
+
     analysis = result.get("analysis")
     risk = _attr_or_key(analysis, "risk_rating")
-    if risk:
-        lines.append(f"risk: {risk}")
     bias = _attr_or_key(analysis, "tomorrow_bias")
     conv = _attr_or_key(analysis, "tomorrow_conviction")
-    if bias or conv:
-        lines.append(f"tomorrow: bias={bias or '?'} conviction={conv or '?'}")
+    if risk or bias or conv:
+        bits = []
+        if risk:
+            bits.append(f"risk={risk}")
+        if bias:
+            bits.append(f"bias={bias}")
+        if conv:
+            bits.append(f"conv={conv}")
+        lines.append("🔮 Tomorrow: " + "  ".join(bits))
     outlook = _attr_or_key(analysis, "tomorrow_outlook") or ""
     if outlook:
-        lines.append(f"outlook: {outlook[:300]}")
+        lines.append(f"   {outlook[:280]}")
+
+
+def _append_position_snapshot(lines: list[str], total_value: float | None) -> None:
+    """Render top-3 winners + top-3 losers by unrealized P&L from the
+    live positions table. Read-only DB hit; degrades gracefully on any
+    error (the rest of the message still goes out)."""
+    try:
+        import sqlite3
+        from pathlib import Path
+        # Default path — same as Database default. If the pipeline
+        # config changed it, this snippet won't reflect that; we
+        # accept that limitation rather than threading config in.
+        db_path = Path("data/quant_agent.db")
+        if not db_path.exists():
+            return
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT symbol, qty, avg_entry, current_price, "
+                "market_value, unrealized_pnl FROM positions "
+                "WHERE qty > 0 ORDER BY unrealized_pnl DESC"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("evening position snapshot failed: %s", exc)
+        return
+    if not rows:
+        return
+    invested = sum(r[4] for r in rows if r[4] is not None)
+    cash_pct = None
+    if total_value and total_value > 0:
+        cash_pct = max(0.0, (total_value - invested) / total_value * 100)
+    summary = f"   Positions: {len(rows)}  invested ${invested:,.0f}"
+    if cash_pct is not None:
+        summary += f"  ({100 - cash_pct:.0f}% deployed / {cash_pct:.0f}% cash)"
+    lines.append(summary)
+
+    def _row_line(r: tuple) -> str:
+        sym, qty, avg, curr, mv, pnl = r
+        pct = ((curr / avg - 1) * 100) if avg else 0
+        sign = "+" if pnl >= 0 else ""
+        return f"   {sym:<6} {sign}${pnl:>+8,.0f}  ({sign}{pct:+.1f}%)"
+
+    winners = [r for r in rows if r[5] > 0][:3]
+    if winners:
+        lines.append("📈 Top winners:")
+        for r in winners:
+            lines.append(_row_line(r))
+    losers = [r for r in rows if r[5] < 0][-3:][::-1]
+    if losers:
+        lines.append("📉 Underwater:")
+        for r in losers:
+            lines.append(_row_line(r))
 
 
 def _append_earnings_body(lines: list[str], result: dict) -> None:
@@ -290,13 +383,45 @@ def _order_side(order: Any) -> str:
 
 
 def _order_summary(order: Any) -> str:
+    """Render one order line like 'NVDA   qty=5  @$420.50  SL=$405.00'.
+
+    Falls back gracefully when fields are missing (older broker
+    response shapes, or close_position which only returns id/status)."""
     if not isinstance(order, dict):
-        return str(order)[:40]
-    sym = order.get("symbol", "?")
+        return str(order)[:60]
+    sym = str(order.get("symbol", "?"))
+    parts: list[str] = [f"{sym:<6}"]
     qty = order.get("qty") or order.get("filled_qty")
     if qty is not None:
-        return f"{sym} qty={qty}"
-    return f"{sym}"
+        parts.append(f"qty={_fmt_qty(qty)}")
+    # Prefer the limit_price (what we asked broker to fill at). If not
+    # present (market order / older path), fall back to a generic price.
+    lim = order.get("limit_price") or order.get("price")
+    if lim is not None and lim > 0:
+        parts.append(f"@${_fmt_price(lim)}")
+    sl = order.get("stop_loss_price")
+    if sl is not None and sl > 0:
+        parts.append(f"SL=${_fmt_price(sl)}")
+    return "  ".join(parts)
+
+
+def _fmt_qty(qty: Any) -> str:
+    try:
+        q = float(qty)
+    except (TypeError, ValueError):
+        return str(qty)
+    # Integer-valued quantities (the common case for stocks) render
+    # without the trailing '.0'; fractional shares keep precision.
+    return f"{int(q)}" if q == int(q) else f"{q:g}"
+
+
+def _fmt_price(price: Any) -> str:
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return str(price)
+    # Sub-dollar penny stocks keep 4 decimals; everything else 2.
+    return f"{p:.4f}" if p < 1.0 else f"{p:,.2f}"
 
 
 def _fmt_elapsed(seconds: float) -> str:

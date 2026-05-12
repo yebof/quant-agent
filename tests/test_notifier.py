@@ -145,6 +145,77 @@ def test_format_morning_executed_shows_orders_and_status():
     assert "degraded" not in msg  # all data ok
 
 
+def test_format_morning_shows_per_order_detail_with_price_and_stop():
+    """Each order line should render symbol + qty + limit price + stop_loss
+    (when present) so the operator doesn't need to ssh in to see what
+    was actually traded. Drives the post-2026-05-12 enriched format."""
+    result = {
+        "status": "executed",
+        "run_id": "run-rich",
+        "orders": [
+            # Rich shape from the post-fix broker.submit_order
+            {
+                "symbol": "BA", "side": "buy", "qty": 27,
+                "limit_price": 238.63, "stop_loss_price": 230.00,
+            },
+            {
+                "symbol": "MP", "side": "sell", "qty": 63,
+                "limit_price": 66.62, "stop_loss_price": None,
+            },
+        ],
+        "data_status": {"macro": "ok", "news": "ok", "tech": "ok", "earnings": "ok"},
+    }
+    msg = format_session_result("morning", result, 590.0)
+    assert msg is not None
+    # SELL listed first (closing context before opening), then BUY.
+    assert "SELL  MP" in msg
+    assert "BUY   BA" in msg
+    assert "qty=27" in msg
+    assert "qty=63" in msg
+    assert "@$238.63" in msg
+    assert "@$66.62" in msg
+    assert "SL=$230.00" in msg
+    # SELL has no SL (we don't attach stops on exits) — must not render
+    # a misleading "SL=$0" or "SL=None".
+    sell_line = [l for l in msg.split("\n") if "SELL  MP" in l][0]
+    assert "SL=" not in sell_line
+
+
+def test_format_morning_renders_all_orders_not_just_count():
+    """All orders shown (10/side cap). Previous version capped at 5/side
+    which dropped detail on heavy-volume days."""
+    result = {
+        "status": "executed", "run_id": "run-many",
+        "orders": [
+            {"symbol": f"SYM{i:02d}", "side": "buy", "qty": i,
+             "limit_price": 100.0 + i, "stop_loss_price": 95.0 + i}
+            for i in range(1, 8)
+        ],
+        "data_status": {"macro": "ok"},
+    }
+    msg = format_session_result("morning", result, 60.0)
+    assert msg is not None
+    for i in range(1, 8):
+        assert f"SYM{i:02d}" in msg
+    # 7 orders, all rendered. No "(+N more)" omission marker.
+    assert "more" not in msg
+
+
+def test_format_morning_caps_at_ten_per_side_with_omission_marker():
+    """Edge case for unusual heavy session: 15 BUYs → 10 shown + omission."""
+    result = {
+        "status": "executed", "run_id": "run-mass",
+        "orders": [
+            {"symbol": f"S{i:02d}", "side": "buy", "qty": 1,
+             "limit_price": 100, "stop_loss_price": 95}
+            for i in range(15)
+        ],
+    }
+    msg = format_session_result("morning", result, 60.0)
+    assert msg is not None
+    assert "(+5 more — see audit log)" in msg
+
+
 def test_format_morning_no_trades_shows_zero_orders():
     result = {"status": "no_trades", "run_id": "run-x", "orders": []}
     msg = format_session_result("morning", result, 65.7)
@@ -176,10 +247,71 @@ def test_format_evening_shows_risk_and_outlook():
     result = {"status": "analyzed", "run_id": "run-e", "analysis": analysis}
     msg = format_session_result("evening", result, 30.0)
     assert msg is not None
-    assert "risk: moderate" in msg
+    # Tomorrow line groups risk / bias / conv together.
+    assert "🔮 Tomorrow" in msg
+    assert "risk=moderate" in msg
     assert "bias=bullish" in msg
-    assert "conviction=high" in msg
+    assert "conv=high" in msg
     assert "AI capex" in msg
+
+
+def test_format_evening_shows_daily_pnl_when_present():
+    """Daily P&L is the headline of the evening summary — operator
+    wants to know 'did I make money today' without grepping logs."""
+    result = {
+        "status": "analyzed",
+        "run_id": "run-e",
+        "daily_pnl": 1234.56,
+        "total_value": 107278.55,
+        "daily_return_pct": 1.15,
+        "analysis": {
+            "risk_rating": "moderate",
+            "tomorrow_bias": "neutral",
+            "tomorrow_conviction": "medium",
+            "tomorrow_outlook": "Steady tape.",
+        },
+    }
+    msg = format_session_result("evening", result, 45.0)
+    assert msg is not None
+    assert "💰 Daily P&L" in msg
+    assert "+$1,234.56" in msg
+    # Return % is computed from daily_pnl/total_value, not whatever the
+    # daily_return_pct field stored (which had a 100x scale bug
+    # historically; the formatter sidesteps it by recomputing).
+    assert "+1.15%" in msg or "+1.16%" in msg
+    assert "$107,278.55" in msg
+
+
+def test_format_evening_shows_negative_daily_pnl():
+    result = {
+        "status": "analyzed", "run_id": "run-e",
+        "daily_pnl": -373.46, "total_value": 107278.55,
+        "analysis": {"risk_rating": "elevated"},
+    }
+    msg = format_session_result("evening", result, 30.0)
+    assert msg is not None
+    assert "💰 Daily P&L" in msg
+    assert "-$373.46" in msg
+    assert "-0.35%" in msg
+
+
+def test_format_evening_position_snapshot_skips_gracefully_without_db(tmp_path, monkeypatch):
+    """No data/quant_agent.db in the cwd → position snapshot section
+    is skipped silently rather than crashing the message."""
+    monkeypatch.chdir(tmp_path)
+    result = {
+        "status": "analyzed", "run_id": "run-e",
+        "daily_pnl": 100.0, "total_value": 100000.0,
+        "analysis": {"risk_rating": "moderate", "tomorrow_bias": "neutral"},
+    }
+    msg = format_session_result("evening", result, 30.0)
+    assert msg is not None
+    # The other sections must still be present.
+    assert "💰 Daily P&L" in msg
+    assert "Tomorrow" in msg
+    # Position snapshot absent (no DB).
+    assert "Top winners" not in msg
+    assert "Underwater" not in msg
 
 
 def test_format_earnings_preprocess_with_analysis_notifies():
