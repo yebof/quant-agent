@@ -76,6 +76,17 @@ def _apply_litellm_data(data: dict) -> int:
     number of models updated. Models that aren't in LiteLLM keep
     their fallback values — operator can extend _PRICING_FALLBACK
     for those, or LiteLLM may add them in a future commit."""
+    # Defensive: cache file could have been hand-edited to `[]` for
+    # debugging, or upstream LiteLLM schema could silently switch from
+    # dict to list. Either crashes the caller chain (_load_cache or
+    # refresh_pricing → main.py startup). Returning 0 lets the fallback
+    # PRICING dict stay in effect.
+    if not isinstance(data, dict):
+        logger.warning(
+            "LiteLLM payload not a dict (got %s) — skipping update",
+            type(data).__name__,
+        )
+        return 0
     updated = 0
     # Iterate over our known keys plus any LiteLLM key that overlaps.
     # Use _PRICING_FALLBACK as the set of "models we care about" so
@@ -235,6 +246,11 @@ def fmt_cost(cost_usd: float | None) -> str:
     """
     if cost_usd is None:
         return "$?.??"
+    # Render exact-zero as "$0.00" — same shape as everything ≥$0.01.
+    # The 4-decimal sub-cent branch below would yield "$0.0000" which
+    # looks inconsistent next to "$0.30 (3 calls)" in a Telegram line.
+    if cost_usd == 0.0:
+        return "$0.00"
     if cost_usd < 0.01:
         return f"${cost_usd:.4f}"
     return f"${cost_usd:,.2f}"

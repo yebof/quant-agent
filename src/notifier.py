@@ -18,11 +18,20 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+# Default DB path, anchored to the project root rather than CWD. The
+# notifier is invoked both from launchd/systemd (which set the project
+# root as WorkingDirectory) and from manual `python /abs/path/main.py`
+# from somewhere else — the latter used to silently miss the cost line
+# and position snapshot because `Path("data/...")` resolved relative to
+# the caller's CWD.
+_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "quant_agent.db"
 
 
 class TelegramNotifier:
@@ -282,11 +291,9 @@ def _session_cost_line(run_id: str | None) -> str | None:
         return None
     try:
         import sqlite3
-        from pathlib import Path
-        db_path = Path("data/quant_agent.db")
-        if not db_path.exists():
+        if not _DB_PATH.exists():
             return None
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(str(_DB_PATH))
         try:
             rows = conn.execute(
                 "SELECT cost_usd FROM agent_logs WHERE run_id = ?",
@@ -318,14 +325,12 @@ def _append_position_snapshot(lines: list[str], total_value: float | None) -> No
     error (the rest of the message still goes out)."""
     try:
         import sqlite3
-        from pathlib import Path
         # Default path — same as Database default. If the pipeline
         # config changed it, this snippet won't reflect that; we
         # accept that limitation rather than threading config in.
-        db_path = Path("data/quant_agent.db")
-        if not db_path.exists():
+        if not _DB_PATH.exists():
             return
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(str(_DB_PATH))
         try:
             rows = conn.execute(
                 "SELECT symbol, qty, avg_entry, current_price, "

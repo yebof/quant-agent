@@ -112,7 +112,17 @@ def main():
         raise
     finally:
         elapsed = time.monotonic() - start
-        message = format_session_result(args.mode, result, elapsed, error=error)
+        # format_session_result reads from the DB (cost line + position
+        # snapshot). DB lock contention, a corrupted run_id, or any
+        # other ad-hoc failure here would raise — and a raise inside
+        # `finally` replaces the in-flight pipeline exception, so the
+        # operator sees the notifier failure instead of the real one.
+        # Wrap so the original `error` always propagates intact.
+        try:
+            message = format_session_result(args.mode, result, elapsed, error=error)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("format_session_result raised in finally: %s", exc)
+            message = None
         if message:
             # Wrapped in its own try/except inside send(), but be doubly
             # defensive: notifier code in finally must NEVER mask the

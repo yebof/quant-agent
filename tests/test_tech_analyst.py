@@ -223,11 +223,25 @@ def test_tech_analyst_auto_chunks_large_batch(mock_cls, sample_indicators, sampl
 
 @patch("anthropic.Anthropic")
 def test_tech_analyst_chunked_merged_cost_sums_when_model_priced(
-    mock_cls, sample_indicators, sample_bars,
+    mock_cls, sample_indicators, sample_bars, monkeypatch,
 ):
     """Pin the happy path: when the configured model IS in cost_table.PRICING
     (e.g. claude-opus-4-7), the merged AgentResult.cost_usd is the sum
-    of per-chunk costs — not None and not the cost of just the first chunk."""
+    of per-chunk costs — not None and not the cost of just the first chunk.
+
+    Uses a test-fixture PRICING with known rates (input=$10/M, output=$50/M)
+    instead of reading the live PRICING dict for both sides of the
+    comparison. Tautological pattern: if PRICING were zeroed out,
+    expected=$0 and actual=$0 — test would pass while production silently
+    misreports cost. Fixed fixture rates make a real math regression visible.
+    """
+    # Pin pricing for this test; monkeypatch auto-reverts at test exit.
+    from src import cost_table
+    monkeypatch.setitem(
+        cost_table.PRICING, "claude-opus-4-7",
+        {"input": 10.0, "output": 50.0},
+    )
+
     syms = [f"SYM{i:02d}" for i in range(50)]
     data = [
         {"symbol": s,
@@ -254,12 +268,8 @@ def test_tech_analyst_chunked_merged_cost_sums_when_model_priced(
     agent = TechAnalystAgent(api_key="test", model="claude-opus-4-7")
     _, merged = agent.analyze_batch(data)
 
-    # Use current PRICING rates (cache-or-fallback) so the test
-    # doesn't rot when LiteLLM updates upstream prices.
-    from src.cost_table import PRICING
-    rates = PRICING["claude-opus-4-7"]
-    per_chunk = (80_000 * rates["input"] + 12_000 * rates["output"]) / 1_000_000
-    expected = per_chunk * 2  # 2 chunks
+    # 2 chunks × (80_000 × $10/M + 12_000 × $50/M) = 2 × $1.40 = $2.80
+    expected = 2 * (80_000 * 10.0 + 12_000 * 50.0) / 1_000_000
     assert merged.cost_usd is not None
     assert abs(merged.cost_usd - expected) < 0.01
     assert merged.input_tokens == 80_000 * 2

@@ -345,3 +345,42 @@ def test_refresh_pricing_returns_false_when_no_cache_and_network_fails(tmp_path,
     monkeypatch.setattr("requests.get", _explode)
 
     assert cost_table.refresh_pricing(force=True) is False
+
+
+def test_apply_litellm_data_rejects_non_dict_payload(monkeypatch):
+    """LiteLLM's main-branch JSON IS a dict at the top level. If a future
+    refactor on their end (or a corrupted local cache like
+    `echo "[]" > data/pricing_cache.json`) yields a list/null/string
+    instead, the iterator `data.get(name)` raises AttributeError and
+    crashes the caller chain — and `_load_cache()` runs at module
+    import, so this would brick main.py startup. Pin: non-dict is a
+    silent skip with a warning, PRICING stays at fallback."""
+    from src.cost_table import _apply_litellm_data, PRICING
+
+    original = {k: dict(v) for k, v in PRICING.items()}
+    try:
+        # All four realistic non-dict shapes JSON can decode to.
+        assert _apply_litellm_data([]) == 0
+        assert _apply_litellm_data([{"x": 1}]) == 0
+        assert _apply_litellm_data(None) == 0
+        assert _apply_litellm_data("garbage") == 0
+        assert _apply_litellm_data(42) == 0
+        # PRICING untouched by any of the failed calls.
+        assert PRICING == original
+    finally:
+        PRICING.clear()
+        PRICING.update(original)
+
+
+def test_fmt_cost_zero_uses_two_decimal_consistent_with_cents():
+    """fmt_cost(0.0) must render as "$0.00" — same shape as everything
+    ≥$0.01. Pre-fix it returned "$0.0000" because 0.0 < 0.01 fell into
+    the sub-cent branch, which looked inconsistent next to "$0.30 (3 calls)"
+    in Telegram lines. Sub-cent POSITIVE values keep 4-decimal precision."""
+    from src.cost_table import fmt_cost
+    assert fmt_cost(0.0) == "$0.00"
+    # Sub-cent positives keep precision so $0.0001 doesn't round to $0.00.
+    assert fmt_cost(0.0001) == "$0.0001"
+    assert fmt_cost(0.005) == "$0.0050"
+    # Boundary: exactly $0.01 uses 2-decimal.
+    assert fmt_cost(0.01) == "$0.01"

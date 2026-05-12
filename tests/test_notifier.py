@@ -298,7 +298,12 @@ def test_format_evening_shows_negative_daily_pnl():
 def test_format_includes_session_cost_when_db_has_rows(tmp_path, monkeypatch):
     """When a run_id matches rows in agent_logs with cost_usd populated,
     the notifier should surface 💵 cost: $X.XX (N calls)."""
-    monkeypatch.chdir(tmp_path)
+    # Redirect the notifier's DB lookup at the module-level constant.
+    # (Pre-2026-05-13 the notifier used Path("data/..."), so chdir
+    # alone worked; the fix anchored the path to project root, so we
+    # now monkeypatch the constant directly.)
+    db_path = tmp_path / "data" / "quant_agent.db"
+    monkeypatch.setattr("src.notifier._DB_PATH", db_path)
     # Build a minimal DB matching the schema notifier reads from.
     import sqlite3
     db_dir = tmp_path / "data"
@@ -334,7 +339,12 @@ def test_format_includes_session_cost_when_db_has_rows(tmp_path, monkeypatch):
 
 def test_format_omits_cost_line_when_no_db(tmp_path, monkeypatch):
     """No DB file → cost line is omitted (not '$?.??' noise)."""
-    monkeypatch.chdir(tmp_path)
+    # Point the notifier at a non-existent DB path under tmp_path so
+    # this test doesn't accidentally read the real project DB.
+    monkeypatch.setattr(
+        "src.notifier._DB_PATH",
+        tmp_path / "data" / "quant_agent.db",
+    )
     result = {"status": "executed", "run_id": "run-x", "orders": []}
     msg = format_session_result("morning", result, 60.0)
     assert msg is not None
@@ -345,7 +355,8 @@ def test_format_flags_cost_unknown_when_any_row_has_null_cost(tmp_path, monkeypa
     """Mixed-pricing-coverage row set: at least one agent's model isn't
     in cost_table.PRICING and stored NULL. The session push should
     surface the gap rather than fake a partial sum."""
-    monkeypatch.chdir(tmp_path)
+    db_path = tmp_path / "data" / "quant_agent.db"
+    monkeypatch.setattr("src.notifier._DB_PATH", db_path)
     import sqlite3
     db_dir = tmp_path / "data"
     db_dir.mkdir()
@@ -374,9 +385,12 @@ def test_format_flags_cost_unknown_when_any_row_has_null_cost(tmp_path, monkeypa
 
 
 def test_format_evening_position_snapshot_skips_gracefully_without_db(tmp_path, monkeypatch):
-    """No data/quant_agent.db in the cwd → position snapshot section
-    is skipped silently rather than crashing the message."""
-    monkeypatch.chdir(tmp_path)
+    """No DB at the resolved path → position snapshot section is
+    skipped silently rather than crashing the message."""
+    monkeypatch.setattr(
+        "src.notifier._DB_PATH",
+        tmp_path / "data" / "quant_agent.db",  # does not exist
+    )
     result = {
         "status": "analyzed", "run_id": "run-e",
         "daily_pnl": 100.0, "total_value": 100000.0,
@@ -390,6 +404,32 @@ def test_format_evening_position_snapshot_skips_gracefully_without_db(tmp_path, 
     # Position snapshot absent (no DB).
     assert "Top winners" not in msg
     assert "Underwater" not in msg
+
+
+def test_db_path_is_absolute_anchored_to_project_root():
+    """_DB_PATH must be anchored to the project root, not CWD.
+
+    Pre-fix bug: notifier used Path("data/quant_agent.db") which
+    resolves relative to whatever directory the caller's CWD happened
+    to be. launchd/systemd set WorkingDirectory so it worked there,
+    but `python /abs/path/main.py --mode evening` from another dir
+    would silently lose the cost line and position snapshot.
+
+    Pin: _DB_PATH must be absolute and live under the project tree
+    so the path is stable regardless of CWD.
+    """
+    from src import notifier
+    assert notifier._DB_PATH.is_absolute(), (
+        f"_DB_PATH must be absolute, got {notifier._DB_PATH}"
+    )
+    # The path should resolve under the project root — i.e. live in
+    # the same tree as notifier.py.
+    notifier_root = notifier._DB_PATH.parent.parent
+    src_dir = (notifier_root / "src").resolve()
+    assert src_dir.exists(), (
+        f"_DB_PATH={notifier._DB_PATH} should resolve under a project "
+        f"tree with a src/ directory; checked {src_dir}"
+    )
 
 
 def test_format_earnings_preprocess_with_analysis_notifies():
