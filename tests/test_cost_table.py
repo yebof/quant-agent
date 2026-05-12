@@ -237,6 +237,99 @@ def test_refresh_pricing_falls_back_to_cache_when_network_fails(tmp_path, monkey
         cost_table.PRICING.update(original)
 
 
+def test_apply_litellm_data_rejects_zero_rates(monkeypatch):
+    """A LiteLLM entry with input or output rate = 0 must be rejected.
+    Free-tier models in our config would otherwise silently report
+    $0 cost, hiding real usage from cost monitoring (and from the
+    operator's Telegram push). If LiteLLM ever flags a model as
+    free during a paid-tier transition, the fallback rate wins
+    until operator updates _PRICING_FALLBACK explicitly."""
+    from src.cost_table import _apply_litellm_data, PRICING
+
+    original = {k: dict(v) for k, v in PRICING.items()}
+    try:
+        zero_rates = {
+            "claude-opus-4-7": {
+                "input_cost_per_token": 0.0,
+                "output_cost_per_token": 0.0,
+            },
+            "claude-haiku-4-5": {
+                "input_cost_per_token": 1e-6,
+                "output_cost_per_token": 0.0,  # only output is 0
+            },
+        }
+        n = _apply_litellm_data(zero_rates)
+        assert n == 0
+        # Both fallbacks intact.
+        assert PRICING["claude-opus-4-7"] == original["claude-opus-4-7"]
+        assert PRICING["claude-haiku-4-5"] == original["claude-haiku-4-5"]
+    finally:
+        PRICING.clear()
+        PRICING.update(original)
+
+
+def test_apply_litellm_data_rejects_bool_rates(monkeypatch):
+    """`True == 1` and `isinstance(True, int) == True` in Python. If a
+    LiteLLM corruption produced True/False in a rate field, our code
+    must reject it instead of coercing to a 1.0/0.0 cost rate."""
+    from src.cost_table import _apply_litellm_data, PRICING
+
+    original = {k: dict(v) for k, v in PRICING.items()}
+    try:
+        bool_rates = {
+            "claude-opus-4-7": {
+                "input_cost_per_token": True,
+                "output_cost_per_token": 5e-6,
+            },
+        }
+        n = _apply_litellm_data(bool_rates)
+        assert n == 0
+        assert PRICING["claude-opus-4-7"] == original["claude-opus-4-7"]
+    finally:
+        PRICING.clear()
+        PRICING.update(original)
+
+
+def test_refresh_pricing_atomic_write(tmp_path, monkeypatch):
+    """Cache write must be atomic — a process-kill mid-write must not
+    leave the cache file half-serialised. Pin: write goes via .tmp +
+    rename so either the new content is fully visible or the old
+    content is still in place."""
+    import json as _json
+    from src import cost_table
+
+    cache = tmp_path / "pricing_cache.json"
+    monkeypatch.setattr(cost_table, "_CACHE_PATH", cache)
+
+    fake_payload = {
+        "claude-opus-4-7": {
+            "input_cost_per_token": 5e-6,
+            "output_cost_per_token": 25e-6,
+        },
+    }
+
+    # Mock requests.get to return our fake payload.
+    import requests
+    class _R:
+        def raise_for_status(self): pass
+        def json(self): return fake_payload
+    monkeypatch.setattr("requests.get", lambda *a, **k: _R())
+
+    original = {k: dict(v) for k, v in cost_table.PRICING.items()}
+    try:
+        ok = cost_table.refresh_pricing(force=True)
+        assert ok is True
+        # Cache file exists and is valid JSON.
+        assert cache.exists()
+        loaded = _json.loads(cache.read_text())
+        assert loaded == fake_payload
+        # .tmp file should NOT linger (os.replace moved it).
+        assert not cache.with_suffix(cache.suffix + ".tmp").exists()
+    finally:
+        cost_table.PRICING.clear()
+        cost_table.PRICING.update(original)
+
+
 def test_refresh_pricing_returns_false_when_no_cache_and_network_fails(tmp_path, monkeypatch):
     """No cache + no network = honest False return so the operator
     knows the fetch didn't update anything. PRICING stays at

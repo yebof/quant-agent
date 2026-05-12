@@ -88,7 +88,20 @@ def _apply_litellm_data(data: dict) -> int:
         out_rate = entry.get("output_cost_per_token")
         if not (isinstance(in_rate, (int, float)) and isinstance(out_rate, (int, float))):
             continue
-        if in_rate < 0 or out_rate < 0:
+        # bool is a subclass of int — guard against `True/False` rates.
+        if isinstance(in_rate, bool) or isinstance(out_rate, bool):
+            continue
+        # Reject non-positive rates. A paid LLM in our config can't be
+        # legitimately $0 — if LiteLLM lists a "free" model with 0/0
+        # rates, accepting it would silently zero out cost reporting
+        # for any agent using that model. Operator should hand-curate
+        # the rare free-tier case via _PRICING_FALLBACK instead.
+        if in_rate <= 0 or out_rate <= 0:
+            logger.warning(
+                "LiteLLM rate for %s has non-positive value(s) "
+                "(input=%s, output=%s) — skipping (would zero cost reporting)",
+                our_name, in_rate, out_rate,
+            )
             continue
         # LiteLLM stores per-TOKEN; convert to per-MILLION-tokens.
         PRICING[our_name] = {
@@ -161,7 +174,16 @@ def refresh_pricing(force: bool = False) -> bool:
         return False
     try:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CACHE_PATH.write_text(json.dumps(data))
+        # Atomic write: dump to .tmp first, then rename. Prevents a
+        # process-kill mid-write from leaving the cache file half-
+        # serialised (next process would try to JSON-parse garbage,
+        # log a warning, and fall through to network fetch — not
+        # broken, just noisy). os.replace is atomic on POSIX +
+        # within the same filesystem (which we always are here since
+        # tmp + target are in the same data/ dir).
+        tmp_path = _CACHE_PATH.with_suffix(_CACHE_PATH.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(data))
+        os.replace(str(tmp_path), str(_CACHE_PATH))
     except Exception as exc:
         logger.warning("pricing cache write failed: %s", exc)
     n = _apply_litellm_data(data)
