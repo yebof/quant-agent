@@ -302,6 +302,89 @@ def test_risk_rules_warn_when_baseline_missing(caplog):
     assert any("baseline missing" in rec.message for rec in caplog.records)
 
 
+def test_trading_config_rejects_empty_universe():
+    """Empty universe → no data, no analyses, no trades all session.
+    Pre-fix this loaded silently; catch at config load so a typo in
+    settings.yaml doesn't silently degrade the day to no-op."""
+    import pytest
+    from src.config import TradingConfig, ScheduleConfig
+
+    schedule = ScheduleConfig(morning="06:00", midday="12:00", evening="16:30")
+    with pytest.raises(ValueError, match="at least 1 item"):
+        TradingConfig(universe=[], lookback_days=60, schedule=schedule)
+
+
+def test_trading_config_rejects_non_positive_lookback():
+    """lookback_days <= 0 fails opaquely in pandas slicing downstream;
+    floor at 1 (one day of bars is the absolute minimum for any indicator).
+    """
+    import pytest
+    from src.config import TradingConfig, ScheduleConfig
+
+    schedule = ScheduleConfig(morning="06:00", midday="12:00", evening="16:30")
+    with pytest.raises(ValueError, match="greater than or equal to 1"):
+        TradingConfig(universe=["SPY"], lookback_days=0, schedule=schedule)
+    with pytest.raises(ValueError, match="greater than or equal to 1"):
+        TradingConfig(universe=["SPY"], lookback_days=-5, schedule=schedule)
+
+
+def test_risk_config_rejects_max_daily_loss_pct_boundary():
+    """max_daily_loss_pct must be in (0, 100]:
+    - 0 hard-blocks all trading on first micro-loss (the abs() check
+      makes every -$0.01 a violation)
+    - >100 is semantic nonsense (can't lose more than 100% of account)
+    Boundary 100 is allowed: rare but legal "full-account loss" cap.
+    """
+    import pytest
+    from src.config import RiskConfig
+
+    base_kwargs = dict(
+        max_position_pct=20, max_total_position_pct=90,
+        max_sector_pct=40, require_stop_loss=True,
+    )
+    with pytest.raises(ValueError, match="greater than 0"):
+        RiskConfig(**base_kwargs, max_daily_loss_pct=0.0)
+    with pytest.raises(ValueError, match="greater than 0"):
+        RiskConfig(**base_kwargs, max_daily_loss_pct=-1.0)
+    with pytest.raises(ValueError, match="less than or equal to 100"):
+        RiskConfig(**base_kwargs, max_daily_loss_pct=150.0)
+    cfg = RiskConfig(**base_kwargs, max_daily_loss_pct=100.0)
+    assert cfg.max_daily_loss_pct == 100.0
+
+
+def test_risk_config_rejects_position_and_sector_bound_violations():
+    """max_position_pct and max_sector_pct also bounded to (0, 100]
+    for the same reasons (0 blocks any BUY; >100 is nonsense single-name).
+    max_total_position_pct only floored at >0 — leverage can push it
+    above 100 when allow_margin=true."""
+    import pytest
+    from src.config import RiskConfig
+
+    def kw(**overrides):
+        base = dict(
+            max_position_pct=20, max_total_position_pct=90,
+            max_daily_loss_pct=3, max_sector_pct=40,
+            require_stop_loss=True,
+        )
+        base.update(overrides)
+        return base
+
+    with pytest.raises(ValueError):
+        RiskConfig(**kw(max_position_pct=0))
+    with pytest.raises(ValueError):
+        RiskConfig(**kw(max_position_pct=150))
+    with pytest.raises(ValueError):
+        RiskConfig(**kw(max_sector_pct=0))
+    with pytest.raises(ValueError):
+        RiskConfig(**kw(max_sector_pct=200))
+    with pytest.raises(ValueError):
+        RiskConfig(**kw(max_total_position_pct=0))
+    # 150% total exposure is legal when allow_margin=true (just the
+    # config check; runtime risk engine still has its own caps).
+    cfg = RiskConfig(**kw(max_total_position_pct=150))
+    assert cfg.max_total_position_pct == 150
+
+
 def test_load_config_preserves_allow_margin_from_yaml(tmp_path):
     """Regression: the allow_margin flag must survive the settings.yaml → RiskConfig
     round-trip. Class-default False can mask a loader bug where the key is

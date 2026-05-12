@@ -60,6 +60,21 @@ def main():
     config = load_config(config_path)
     logger.info("Config loaded. Universe: %s, Paper: %s", config.trading.universe, config.alpaca.paper)
 
+    # Loud startup warning when running against the live Alpaca endpoint.
+    # Operators flipping `alpaca.paper: false` in the YAML is the single
+    # action that converts every subsequent BUY/SELL into a real-money
+    # order — make sure they SEE the change at every startup, not just
+    # the first one. Telegram operators who never look at logs still see
+    # the order list itself, but a launchd one-off run is the dangerous
+    # case (no Telegram, no live tail) where a misconfigured config
+    # could silently flip paper → live with no human-visible signal.
+    if not config.alpaca.paper:
+        logger.warning(
+            "LIVE TRADING ENABLED (alpaca.paper=false). Real-money orders "
+            "will be submitted via the Alpaca API key from .env. To revert "
+            "to paper trading, set `alpaca.paper: true` in your config."
+        )
+
     # Refresh LLM pricing from LiteLLM's public JSON if our cache is
     # stale (>24h). Best-effort: fetch failure or no-network falls back
     # to the in-memory PRICING dict (cache or hardcoded baseline).

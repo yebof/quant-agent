@@ -408,8 +408,7 @@ def _append_meta_body(lines: list[str], result: dict) -> None:
 
 def _status_emoji(status: str) -> str:
     if status in (
-        "executed", "analyzed", "reviewed", "preprocessed",
-        "reflected", "digest_only",
+        "executed", "analyzed", "reviewed", "preprocessed", "reflected",
     ):
         return "🟢"
     if status in (
@@ -417,7 +416,12 @@ def _status_emoji(status: str) -> str:
         "market_holiday", "early_close",
     ):
         return "⚪"
-    if status in ("emergency_sold", "hard_risk_block"):
+    # `digest_only` is intentionally classified as a warning, not success:
+    # quarterly meta-reflection's digest got written but the LLM
+    # reflection step itself failed (LLM exception / parse error). The
+    # learning loop is half-broken until next quarter — operator should
+    # notice via 🟡 rather than skim past a green check.
+    if status in ("emergency_sold", "hard_risk_block", "digest_only"):
         return "🟡"
     if "error" in status or status in ("rejected", "failed"):
         return "🔴"

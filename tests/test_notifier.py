@@ -511,6 +511,23 @@ def test_format_meta_reflected_notifies():
     assert "applied=3" in msg
 
 
+def test_format_meta_digest_only_uses_yellow_warning_emoji():
+    """`digest_only` means quarterly meta-reflection wrote the digest
+    file but the LLM reflection step itself failed (Anthropic timeout
+    / parse error). The learning loop is half-broken until next quarter
+    — operator must see a 🟡 warning, not a 🟢 success that they skim
+    past in the Telegram feed.
+    """
+    result = {
+        "status": "digest_only", "run_id": "meta-q1",
+        "period": "2026-Q1",
+    }
+    msg = format_session_result("meta", result, 30.0)
+    assert msg is not None
+    assert "🟡" in msg, f"digest_only should render warning emoji, got: {msg}"
+    assert "🟢" not in msg
+
+
 def test_format_exception_path_includes_error_type_and_message():
     """Errors always notify — and 'always' means the per-mode noise
     policy is bypassed."""

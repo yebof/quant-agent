@@ -109,10 +109,10 @@ class LLMConfig(BaseModel):
 
 
 class RiskConfig(BaseModel):
-    max_position_pct: float
-    max_total_position_pct: float
-    max_daily_loss_pct: float
-    max_sector_pct: float
+    max_position_pct: float = Field(gt=0, le=100)
+    max_total_position_pct: float = Field(gt=0)
+    max_daily_loss_pct: float = Field(gt=0, le=100)
+    max_sector_pct: float = Field(gt=0, le=100)
     require_stop_loss: bool
     # Cash-only default. When False: no BUY may drive `cash` below zero, and
     # any session that starts with `cash < 0` must de-lever (SELL) before any
@@ -133,8 +133,16 @@ class ScheduleConfig(BaseModel):
 
 
 class TradingConfig(BaseModel):
-    universe: list[str]
-    lookback_days: int
+    # Universe must be non-empty — empty list silently produces zero
+    # data, zero analyses, zero trades for the whole session. Catch
+    # at config load instead of letting it surface as a degraded
+    # day with no obvious cause.
+    universe: list[str] = Field(min_length=1)
+    # Lookback for OHLCV bars feeding the technical indicators. Negative
+    # or zero values used to load silently and fail downstream with
+    # opaque pandas slicing errors. Floor at 1 (one day of bars is
+    # the absolute minimum for any indicator).
+    lookback_days: int = Field(ge=1)
     schedule: ScheduleConfig
 
 

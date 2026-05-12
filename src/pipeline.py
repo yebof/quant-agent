@@ -1668,7 +1668,16 @@ class TradingPipeline:
             ts = (row.get("timestamp") or "")[:10]
             try:
                 data = json.loads(row.get("full_response") or "{}")
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError) as e:
+                # PM's L5 layer reads RM history to self-calibrate.
+                # Silently dropping a corrupt full_response row makes PM
+                # see fewer verdicts than the DB actually contains and
+                # the operator never knows. Surface it so a recurring
+                # corruption pattern shows up in logs.
+                logger.warning(
+                    "rm_recent_verdicts: JSON parse failed for row %s: %s",
+                    ts or "?", e,
+                )
                 continue
             approved = data.get("approved")
             mods = data.get("modifications") or []
@@ -1709,7 +1718,14 @@ class TradingPipeline:
             ts = (row.get("timestamp") or "")[:10]
             try:
                 data = json.loads(row.get("full_response") or "{}")
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError) as e:
+                # PM's L6 layer reads its own recent decision history to
+                # spot flip-flops. A silent skip on JSON corruption hides
+                # the gap; same fix as L5 / L3d / L3f builders.
+                logger.warning(
+                    "pm_recent_decisions: JSON parse failed for row %s: %s",
+                    ts or "?", e,
+                )
                 continue
             # Phase 2: new schema emits `targets` (target weights + thesis);
             # older logs in the DB carry `decisions` (legacy TradeDecision).
@@ -2244,7 +2260,17 @@ class TradingPipeline:
                 continue
             try:
                 items = _json.loads(raw)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as e:
+                # L3d aggregates 14d of missed themes for PM. A single
+                # corrupt insights row used to vanish silently from PM's
+                # view; surfaces it so a recurring DB corruption pattern
+                # is visible in logs instead of the layer just looking
+                # "empty" some days.
+                logger.warning(
+                    "recent_missed_lessons: JSON parse failed for "
+                    "insights row %s: %s",
+                    row_date or "?", e,
+                )
                 continue
             if not isinstance(items, list):
                 continue
@@ -2727,7 +2753,14 @@ class TradingPipeline:
                 continue
             try:
                 items = _json.loads(raw)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as e:
+                # L3f aggregates 14d of loss-root-cause patterns. Same
+                # silent-drop rationale as L3d above.
+                logger.warning(
+                    "recent_loss_pits: JSON parse failed for insights "
+                    "row %s: %s",
+                    (row.get("date") or "?"), e,
+                )
                 continue
             if not isinstance(items, list):
                 continue

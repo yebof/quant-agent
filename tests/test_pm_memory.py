@@ -483,6 +483,49 @@ def test_vol_adjusted_sizing_caps_qty_on_wide_stops():
     assert min(qty_by_alloc, qty_by_risk_extreme) == 50
 
 
+def test_pm_memory_builders_warn_on_corrupt_json(caplog):
+    """Each of the 4 PM memory builders that parse stored JSON must log
+    a WARN on parse failure, not silently swallow.
+
+    Pre-fix: a single corrupt row in insights / agent_logs vanished
+    from PM's view with no log line, leaving operator unaware that PM
+    saw fewer lessons / verdicts than the DB actually held. The fix
+    surfaces every parse failure so a recurring corruption pattern
+    (e.g. truncated rows from a kill-mid-write) is visible in logs.
+    """
+    import logging
+    from unittest.mock import MagicMock
+    from src.pipeline import TradingPipeline
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = MagicMock()
+
+    corrupt_insights_row = {
+        "date": "2026-05-10",
+        "missed_opportunities_json": "{not valid json",
+        "buy_grades_json": "[also not valid",
+    }
+    corrupt_agent_row = {
+        "timestamp": "2026-05-10T20:30:00",
+        "full_response": "{also bad",
+    }
+    pipeline.db.get_recent_insights.return_value = [corrupt_insights_row]
+    pipeline.db.get_recent_agent_outputs.return_value = [corrupt_agent_row]
+
+    with caplog.at_level(logging.WARNING, logger="src.pipeline"):
+        pipeline._build_recent_missed_lessons(lookback_days=14)
+        pipeline._build_recent_loss_pits(lookback_days=14)
+        pipeline._build_rm_recent_verdicts(limit=5)
+        pipeline._build_pm_recent_decisions(limit=3)
+
+    warns = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    # All 4 builders should have surfaced the parse failure.
+    assert any("recent_missed_lessons" in m for m in warns), warns
+    assert any("recent_loss_pits" in m for m in warns), warns
+    assert any("rm_recent_verdicts" in m for m in warns), warns
+    assert any("pm_recent_decisions" in m for m in warns), warns
+
+
 def test_build_recent_sells_joins_current_prices(tmp_path):
     """_build_recent_sells_for_grading pulls SELL trades and computes pct move."""
     from unittest.mock import MagicMock
