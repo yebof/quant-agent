@@ -164,6 +164,15 @@ Current close: {current_price}""")
         combined_raw: list[str] = []
         combined_msg: list[str] = []
         total_tokens = 0
+        total_input_tokens = 0
+        total_output_tokens = 0
+        # cost_usd is None until at least one chunk produces a known
+        # value; if ANY chunk produces None (unknown model in cost
+        # table), merged stays None — partial sum across same-model
+        # chunks would just understate by the unknown chunk's cost,
+        # so flag the gap.
+        chunk_costs: list[float] = []
+        any_unknown_cost = False
         last_model = self.model
         for i, chunk in enumerate(chunks, 1):
             chunk_analyses, chunk_result = self._analyze_chunk(
@@ -175,13 +184,28 @@ Current close: {current_price}""")
                 combined_raw.append(f"--- chunk {i}/{len(chunks)} ---\n{chunk_result.raw_text}")
                 combined_msg.append(f"--- chunk {i}/{len(chunks)} ---\n{chunk_result.user_message}")
                 total_tokens += chunk_result.tokens_used
+                total_input_tokens += chunk_result.input_tokens
+                total_output_tokens += chunk_result.output_tokens
+                if chunk_result.cost_usd is None:
+                    any_unknown_cost = True
+                else:
+                    chunk_costs.append(chunk_result.cost_usd)
                 last_model = chunk_result.model
+
+        merged_cost: float | None
+        if any_unknown_cost or not chunk_costs:
+            merged_cost = None
+        else:
+            merged_cost = sum(chunk_costs)
 
         merged_result = AgentResult(
             raw_text="\n\n".join(combined_raw),
             tokens_used=total_tokens,
             model=last_model,
             user_message="\n\n".join(combined_msg),
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            cost_usd=merged_cost,
         )
         return merged, merged_result
 
