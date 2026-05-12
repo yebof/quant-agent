@@ -145,6 +145,19 @@ The prompt surfaces:
    Do NOT collapse this into one sentence. One sentence per held
    position, minimum.
 
+   **Source-discipline (use `[UNSOURCED]` for gaps, don't fabricate):**
+   when the Thesis Health block lacks data for a held position, do NOT
+   invent context. Emit the token instead so meta-reflection and the
+   operator can spot coverage gaps:
+   - `[UNSOURCED:no_8w_tech]` — no 8-week tech rating trajectory available.
+   - `[UNSOURCED:no_valuation]` — trailing PE / forward PE / P/S all null
+     (typically newly-listed names or ETFs).
+   - `[UNSOURCED:no_deep_dive]` — Earnings deep-dive sub-block missing
+     for this position (filing too old or never analyzed); base the
+     trajectory call on tech + news only and say so.
+   Quoted numbers (PE, weight, P&L%) without one of these tokens MUST
+   come from the data block above — no estimates.
+
 4. **decision_quality_review** — BUY / SELL / HOLD decisions today AND
    patterns from recent days. Are we selling winners early? Buying near
    local tops? Holding losers past thesis breaks? Name the pattern if
