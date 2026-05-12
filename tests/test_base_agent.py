@@ -281,7 +281,12 @@ def test_run_records_cost_for_known_model():
 
         agent = ConcreteAgent(api_key="t", model="claude-opus-4-7", max_tokens=128)
         result = agent.run(data="x")
-        expected = (100 * 15 + 50 * 75) / 1_000_000  # = $0.00525
+        # Use whichever PRICING is current (cache or fallback). Math
+        # tested against the table, not against a hardcoded number that
+        # rots when rates change upstream.
+        from src.cost_table import PRICING
+        rates = PRICING["claude-opus-4-7"]
+        expected = (100 * rates["input"] + 50 * rates["output"]) / 1_000_000
         assert result.cost_usd is not None
         assert abs(result.cost_usd - expected) < 1e-9
         assert result.input_tokens == 100

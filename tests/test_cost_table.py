@@ -11,17 +11,27 @@ def test_estimate_cost_claude_opus_47_round_trip():
 
 
 def test_estimate_cost_realistic_pm_call():
-    """Typical PM call: ~50k input, ~2k output. Should be a few dollars."""
+    """Typical PM call: ~50k input, ~2k output.
+    Math uses whatever PRICING currently has — values verified
+    against LiteLLM 2026-05-13 for claude-opus-4-7 ($5/$25 per M)."""
     cost = estimate_cost("claude-opus-4-7", 50_000, 2_000)
-    # 50K * $15/M = $0.75 input + 2K * $75/M = $0.15 output = $0.90
-    assert abs(cost - 0.90) < 0.01
+    rates = PRICING["claude-opus-4-7"]
+    expected = (50_000 * rates["input"] + 2_000 * rates["output"]) / 1_000_000
+    assert abs(cost - expected) < 1e-9
+    # Sanity-bound: PM call should land somewhere in $0.10-$1.50 range
+    # whichever pricing tier the user is on. If it's outside, the
+    # PRICING table has wildly wrong rates (or the test is stale).
+    assert 0.10 < cost < 1.50
 
 
 def test_estimate_cost_realistic_tech_call():
-    """Tech analyst with chunked output: ~80k input, ~30k output."""
+    """Tech analyst chunked: ~80k input, ~30k output per chunk."""
     cost = estimate_cost("claude-opus-4-7", 80_000, 30_000)
-    # 80K*$15/M = $1.20 + 30K*$75/M = $2.25 = $3.45
-    assert abs(cost - 3.45) < 0.01
+    rates = PRICING["claude-opus-4-7"]
+    expected = (80_000 * rates["input"] + 30_000 * rates["output"]) / 1_000_000
+    assert abs(cost - expected) < 1e-9
+    # Sanity-bound: tech chunk should land somewhere in $0.50-$5 range.
+    assert 0.50 < cost < 5.00
 
 
 def test_estimate_cost_unknown_model_returns_none():
@@ -136,3 +146,109 @@ def test_extract_openai_usage_normal_path():
         usage=SimpleNamespace(prompt_tokens=5000, completion_tokens=1000),
     )
     assert _extract_openai_usage(response, "test_agent") == (5000, 1000)
+
+
+# === LiteLLM pricing refresh (R7 follow-up: prices must come from upstream) ===
+
+def test_apply_litellm_data_converts_per_token_to_per_million(monkeypatch):
+    """LiteLLM stores cost per single token; our PRICING uses per-million-token
+    units so the math in estimate_cost is readable. Pin the conversion."""
+    from src.cost_table import _apply_litellm_data, PRICING
+
+    # Snapshot original so we can restore after.
+    original = {k: dict(v) for k, v in PRICING.items()}
+    try:
+        # Realistic LiteLLM shape — they store cost per token (not per million).
+        fake_data = {
+            "claude-opus-4-7": {
+                "input_cost_per_token": 5e-6,    # $5 / M
+                "output_cost_per_token": 25e-6,  # $25 / M
+                "max_input_tokens": 200000,      # ignored by us
+            },
+        }
+        n = _apply_litellm_data(fake_data)
+        assert n == 1
+        assert PRICING["claude-opus-4-7"]["input"] == 5.0
+        assert PRICING["claude-opus-4-7"]["output"] == 25.0
+    finally:
+        # Restore so other tests don't see leaked mutations.
+        PRICING.clear()
+        PRICING.update(original)
+
+
+def test_apply_litellm_data_skips_negative_or_non_numeric_rates(monkeypatch):
+    """Defensive: a corrupt LiteLLM entry (negative price, string, missing
+    field) must be skipped — keep the prior PRICING entry intact."""
+    from src.cost_table import _apply_litellm_data, PRICING
+
+    original = {k: dict(v) for k, v in PRICING.items()}
+    try:
+        bad_data = {
+            "claude-opus-4-7": {"input_cost_per_token": -1, "output_cost_per_token": 25e-6},
+            "claude-sonnet-4-6": {"input_cost_per_token": "oops"},
+            "claude-haiku-4-5": {},  # missing both fields
+        }
+        n = _apply_litellm_data(bad_data)
+        assert n == 0
+        # Original values must remain.
+        assert PRICING["claude-opus-4-7"] == original["claude-opus-4-7"]
+        assert PRICING["claude-sonnet-4-6"] == original["claude-sonnet-4-6"]
+        assert PRICING["claude-haiku-4-5"] == original["claude-haiku-4-5"]
+    finally:
+        PRICING.clear()
+        PRICING.update(original)
+
+
+def test_refresh_pricing_falls_back_to_cache_when_network_fails(tmp_path, monkeypatch):
+    """If the LiteLLM fetch raises (DNS / 5xx / firewall), refresh
+    must NOT crash and must fall back to the existing cache file.
+    Trading is observability-only here — pricing fetch failure is
+    non-fatal."""
+    import json as _json
+    from src import cost_table
+
+    # Redirect cache to a temp path with a known-good snapshot.
+    cache = tmp_path / "pricing_cache.json"
+    cache.write_text(_json.dumps({
+        "claude-opus-4-7": {
+            "input_cost_per_token": 7e-6,
+            "output_cost_per_token": 33e-6,
+        },
+    }))
+    monkeypatch.setattr(cost_table, "_CACHE_PATH", cache)
+    monkeypatch.setattr(cost_table, "_CACHE_MAX_AGE_SECONDS", 0)  # always stale
+
+    # Make `requests.get` raise.
+    import requests
+    def _explode(*a, **kw):
+        raise requests.ConnectionError("simulated DNS failure")
+    monkeypatch.setattr("src.cost_table.requests.get" if False else "requests.get", _explode)
+
+    original = {k: dict(v) for k, v in cost_table.PRICING.items()}
+    try:
+        ok = cost_table.refresh_pricing(force=True)
+        # Returns True because cache was successfully loaded as fallback.
+        assert ok is True
+        # PRICING was updated from cache (the unusual 7/33 numbers).
+        assert cost_table.PRICING["claude-opus-4-7"]["input"] == 7.0
+        assert cost_table.PRICING["claude-opus-4-7"]["output"] == 33.0
+    finally:
+        cost_table.PRICING.clear()
+        cost_table.PRICING.update(original)
+
+
+def test_refresh_pricing_returns_false_when_no_cache_and_network_fails(tmp_path, monkeypatch):
+    """No cache + no network = honest False return so the operator
+    knows the fetch didn't update anything. PRICING stays at
+    whatever was loaded at module import (the fallback)."""
+    from src import cost_table
+
+    cache = tmp_path / "pricing_cache.json"  # does NOT exist
+    monkeypatch.setattr(cost_table, "_CACHE_PATH", cache)
+
+    import requests
+    def _explode(*a, **kw):
+        raise requests.ConnectionError("no network")
+    monkeypatch.setattr("requests.get", _explode)
+
+    assert cost_table.refresh_pricing(force=True) is False

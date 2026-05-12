@@ -254,9 +254,13 @@ def test_tech_analyst_chunked_merged_cost_sums_when_model_priced(
     agent = TechAnalystAgent(api_key="test", model="claude-opus-4-7")
     _, merged = agent.analyze_batch(data)
 
-    # Per chunk: 80K * $15/M = $1.20 in + 12K * $75/M = $0.90 out = $2.10
-    # Two chunks → $4.20 total. Tolerate float jitter.
+    # Use current PRICING rates (cache-or-fallback) so the test
+    # doesn't rot when LiteLLM updates upstream prices.
+    from src.cost_table import PRICING
+    rates = PRICING["claude-opus-4-7"]
+    per_chunk = (80_000 * rates["input"] + 12_000 * rates["output"]) / 1_000_000
+    expected = per_chunk * 2  # 2 chunks
     assert merged.cost_usd is not None
-    assert abs(merged.cost_usd - 4.20) < 0.01
+    assert abs(merged.cost_usd - expected) < 0.01
     assert merged.input_tokens == 80_000 * 2
     assert merged.output_tokens == 12_000 * 2
