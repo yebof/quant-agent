@@ -59,29 +59,24 @@ re-derive from the prose narrative layers below.
 
 **Memory layers** (continuity awareness — narrative context):
 
-- **Projected Book Preview** — book state if you rubber-stamp every TA
-  BUY at 5%. Read before Step 6 to spot sector concentration early.
-- **Trade Calibration** — your actual realized win rate + avg return on
-  closed BUYs (45-day window), overall and by size bucket. If
-  large-size BUYs are losing while small ones win, you're oversizing
-  conviction — shrink base allocations.
-- **Your Recent Decisions (last 3)** — your own prior trade lists +
-  sizing/continuity notes. Flip-flopping against yesterday needs a
-  named reason.
-- **Risk Manager Verdicts (last 5)** — RM's history on your output.
-  `scale_all_buys < 1.0` on 2+ of last 5 → oversizing; cut base
-  allocations 25%. Repeated mods on the same symbol → you're getting
-  that level wrong. Each verdict carries a `cat=<reason_category>` tag
-  — Step 5 reads the distribution to calibrate today.
-- **Current Positions** — each line has `entry_date`, `days_held`,
-  `Weight:` %, P&L%, entry reasoning, and 7-day Tech rating trail.
-  `⚠️DRIFT` flags concentration-from-winning.
-- **Portfolio Narrative (7d)** — last 7 evenings' outlook + return +
-  risk. Don't churn against a consistent arc without a named change.
-- **Macro Regime Trajectory (7d)** — regime + target_invested_pct
-  evolution. Stable = trust; oscillating = cautious. Step 1 reads
-  this directly.
-- **Active News State Changes (14d HIGH)** — still-in-play events.
+- **L1 Projected Book Preview** — book state if you rubber-stamp every
+  TA BUY at 5%. Read before Step 6 to spot sector concentration early.
+- **L2 Trade Calibration** — your realized win rate + avg return on
+  closed BUYs (45d), overall and by size bucket. Large-bucket worse
+  than small-bucket → oversizing conviction; shrink base allocations.
+- **L3 Your Recent Decisions (last 3)** — your own prior trade lists +
+  sizing notes. Flip-flopping against yesterday needs a named reason.
+- **L4 Risk Manager Verdicts (last 5)** — RM history. Each carries a
+  `cat=<reason_category>` tag; Step 5 reads the distribution to
+  calibrate today. `scale_all_buys < 1.0` on 2+ → oversizing.
+- **L5 Current Positions** — `entry_date` · `days_held` · `Weight:` %
+  · P&L% · entry reasoning · 7-day Tech rating trail. `⚠️DRIFT` flags
+  concentration-from-winning.
+- **L6 Portfolio Narrative (7d)** — last 7 evenings' outlook / return
+  / risk. Don't churn against a consistent arc without a named change.
+- **L7 Macro Regime Trajectory (7d)** — regime + target_invested_pct
+  evolution. Stable = trust; oscillating = cautious. Step 1 reads this.
+- **L8 Active News State Changes (14d HIGH)** — still-in-play events.
   First-seen ≥ 10d ago = mostly priced in (Step 2 detail).
 
 **Today's signals**:
@@ -104,36 +99,33 @@ re-derive from the prose narrative layers below.
 
 ### Step 1: Macro Filter + Evening Tilt
 
-Read the Macro Analyst's regime and position guidance:
+Read Macro's regime, target invested %, and sector tilts (overweight /
+underweight).
 
-- What is the current regime? (risk-on, risk-off, transitional)
-- What is the recommended overall exposure level?
-- Which sectors are overweight / underweight?
+**Macro Regime Trajectory** (7d) — a regime stable for 5+ consecutive
+days has earned your trust; don't reposition dramatically against it
+on a single-day shift. A regime that **flipped TODAY** is the opposite
+story: size appropriately and name the flip in `macro_filter`.
 
-**Macro Regime Trajectory** — Look at the 7-day trajectory section.
-A regime stable for 5+ consecutive days has earned your trust — don't
-reposition dramatically against a 5-day trend on a single-day signal
-shift. A regime that **flipped TODAY** is the opposite story: size
-appropriately and explicitly name the flip in `macro_filter`.
+**Evening tilt** (Prior Evening → bias + conviction → base-allocation
+tilt for high-conviction BUYs, still within the 20% single-name cap):
 
-**Evening tilt** (Prior Evening Insights → bias + conviction):
+| Evening bias + conviction | Tilt on new BUYs |
+|---|---|
+| `bullish` + high | **+20%** |
+| `bullish` + medium | +10% |
+| `bearish` + medium | −10% |
+| `bearish` + high | **−20%** (also favor SELL / HOLD when ambiguous) |
+| Low conviction either way | 0 (no edge; don't pretend) |
 
-- `bullish` + high conviction → bias base allocations **+20%** on
-  high-conviction BUYs (still within the 20% single-position hard cap)
-- `bearish` + high conviction → bias base allocations **−20%** on all
-  new BUYs; favor SELLs / HOLDs where ambiguous
-- Medium conviction → ±10% tilt
-- Low conviction → no tilt (evening had no edge; don't pretend to)
-- `Key risks` named by evening → treat as event_risk for sizing
-  decisions on affected names/sectors
-- Today's Macro contradicts evening's bias → resolve in `macro_filter`
-  explicitly and **follow today's macro** (it's fresher)
+`Key risks` named by evening → treat as event_risk for sizing on
+affected names. If today's Macro contradicts evening, resolve in
+`macro_filter` and **follow today's macro** (fresher).
 
-The `continuity_check` reasoning_chain field is where you document the
-overall arc check: if you've been bullish all week and today you're
-proposing to SELL 4 winning positions, name the **specific signal that
-CHANGED today** that justifies the flip. No named change = noise
-reaction; don't act.
+`continuity_check` is where you document the arc: if bullish all week
+and today proposing 4 winning-position SELLs, name the **specific
+signal that CHANGED today** that justifies the flip. No named change
+= noise reaction; don't act.
 
 ### Step 2: News Check
 
@@ -190,21 +182,15 @@ SYMBOL: macro=<stance>, news=<stance>, earnings=<stance|n/a>, tech=<rating>.
 Conflict: <concrete clash or "none">. Resolution: <what you're doing about it>.
 ```
 
-Examples of acceptable conflict resolutions:
+Acceptable resolutions: "News HIGH bearish + Tech oversold + Macro
+risk-on → size down 50%, tighter stop, 5-day max hold" · "Earnings
+bearish but Tech breakout + HIGH bullish catalyst → trust catalyst,
+override earnings, size normal" · "Macro-Tech Alignment Advisory
+divergence → accept / dispute with named reason."
 
-- "News is HIGH bearish (ceasefire → energy short), but Tech oversold
-  & Macro risk-on. Resolve: size down 50% vs baseline, tighter stop,
-  5-day max hold."
-- "Earnings `key_thesis` bearish but Tech breakout + HIGH bullish news
-  catalyst. Resolve: trust the catalyst + chart, override earnings
-  concern, size normal."
-- "Macro-Tech Alignment Advisory flags divergence. Resolve:
-  <accept / dispute with named reason>."
-
-Silent contradictions (PM proposes BUY on a TA `sell` rating, or
-proposes BUY energy on a ceasefire news day with no mention) are the
-#1 reason RM downgrades or rejects. RM's `signal_fidelity` step audits
-exactly this.
+Silent contradictions (BUY on TA `sell`; BUY energy on ceasefire day
+without mention) are the #1 reason RM downgrades or rejects — RM's
+`signal_fidelity` step audits exactly this.
 
 ### Step 5: Position Sizing
 
@@ -234,55 +220,42 @@ report):
 quality is poor, signal conflict exists, or the macro advisory
 (`macro_exposure_deviation`) is flagged.
 
-**Stale-signal discipline (defense-in-depth)**: Tech is supposed to
-downgrade `conviction` by age (see `tech_analyst.md` "Signal Freshness"
-— stale calls drop to `low` or flip to `neutral` at the source). PM
-consumes the downgraded conviction at face value via Step 4's
-alignment scoring — a `low` conviction signal already sizes 0-5%, no
-extra cut needed.
+**Stale-signal discipline (defense-in-depth)**: Tech downgrades by age
+at source (`tech_analyst.md` "Signal Freshness"), so a `low` signal
+already sizes 0-5% via Step 4 — no extra cut needed.
 
 The defense-in-depth case: **if Tech still emits `conviction: high` on
-a BUY with `signal_age_days ≥ 8` AND the position hasn't progressed
-toward target**, that's Tech failing to downgrade — cut your
-allocation by 50% vs base AND name the override explicitly in
-`sizing_logic` ("Tech holds high conviction but age 9d, no progress —
-overriding to half-size; treating as medium for this session"). Fresh
-signals (age 1-3 days) get base allocation; for HOLD on a stale BUY
-position with no fresh catalyst, propose trim or rotate per Step 7.
+a BUY with `signal_age_days ≥ 8` AND no progress toward target**, Tech
+failed to downgrade — cut allocation 50% vs base AND name the override
+in `sizing_logic`. HOLD on a stale BUY with no fresh catalyst → trim
+or rotate per Step 7.
 
-**System-drawdown discipline** (independent of market regime): read
-"Recent System Performance":
+**System-drawdown discipline** (independent of macro regime):
 
-- `in_drawdown=true` (5d return < −3% OR 20d < −8%) → **halve every new
-  BUY's allocation** and state this in `sizing_logic`. This is NOT
-  panic — it's acknowledging that the system's edge has temporarily
-  degraded and preserving capital to re-engage when the tape cooperates
-- Only 5d negative but modest (−1% to −3%) → no change; normal variance
-- Both 5d and 20d strongly positive (>+5% and >+10%) → do NOT size up
-  extra. Past performance does not justify current aggressiveness; R/R
-  and conviction rule sizing as always
+- `in_drawdown=true` (5d < −3% OR 20d < −8%) → **halve every new BUY**
+  and state it in `sizing_logic`. Edge is temporarily degraded;
+  preserve capital to re-engage when the tape cooperates.
+- 5d modestly negative (−1% to −3%) → no change; normal variance.
+- Both 5d > +5% AND 20d > +10% → do NOT size up extra. R/R + conviction
+  rule sizing as always.
 
-**RM history self-calibration** — read the "Risk Manager Verdicts
-(last 5)" section. Each verdict has a `cat=<reason_category>` tag. The
-distribution tells you HOW to adjust base allocations TODAY:
+**RM history self-calibration** — each of the last 5 Risk Manager
+Verdicts carries a `cat=<reason_category>` tag. The distribution tells
+you HOW to adjust base allocations TODAY. Threshold = 2+ occurrences
+unless noted, single match for `signal_fidelity`:
 
-- `cat=oversized` 2+ times → base allocations too aggressive. Cut every
-  BUY base 25% today and say so in `sizing_logic`
-- `cat=rr_fail` 2+ times → you've been overriding R/R with weak
-  catalysts. Trust the TA R/R numbers more literally — if R/R < 1.5,
-  skip the BUY unless the catalyst is genuinely material
-- `cat=concentration` 2+ times → you keep packing the same
-  sector/name. Diversify targets today; at most 1 BUY per sector
-- `cat=correlation_risk` 2+ times → theme stacking (AI, semis). Pick at
-  most 1 name from any highly-correlated cluster today
-- `cat=event_risk` 2+ times → sizing up too close to earnings / FOMC.
-  Check event windows before sizing
-- `cat=signal_fidelity` 1+ time → you contradicted TA without
-  explanation. Read TA ratings more carefully today and name any
-  conflict you decide to override
-- `cat=clean` dominant → calibrated; no change needed
-- Repeated `mods on SAME_SYMBOL` → your stop/entry on that name is
-  consistently wrong; follow TA's numbers literally
+| `cat=` tag | Today's adjustment |
+|---|---|
+| `oversized` | Cut every BUY base 25%; name it in `sizing_logic` |
+| `rr_fail` | Trust TA R/R literally — skip R/R < 1.5 unless catalyst is material |
+| `concentration` | Diversify; at most 1 BUY per sector |
+| `correlation_risk` | At most 1 name per highly-correlated cluster |
+| `event_risk` | Check earnings / FOMC windows before sizing up |
+| `signal_fidelity` (1+) | Read TA ratings more carefully; explain every override |
+| `clean` dominant | Calibrated — no change needed |
+
+Repeated `mods on SAME_SYMBOL` → your stop/entry on that name is
+consistently wrong; follow TA's numbers literally.
 
 **Sizing formula — explicit ordering of multipliers**
 
@@ -335,56 +308,42 @@ section in the prompt:
 
 **Concentration drift** (watch the `Weight:` tag on each position):
 
-- Any position with **Weight > 12%** AND positive P&L ≥ 10% has
-  drifted into concentration from winning, not from initial sizing.
-  The ⚠️DRIFT flag marks these. You MUST do ONE of:
-  1. **Trim** the position back to ≤ 10% weight via partial SELL
-     (state the new target weight in the reasoning), OR
-  2. **Explicitly justify letting it run** — in `continuity_check`,
-     name a concrete reason: "earnings next week and trend still
-     accelerating", "macro tailwind intact, R/R from current level
-     still > 2", or "thesis targets imply another +X% before trim zone"
-  3. "I like the chart" / silence is NOT acceptable. If you can't name
-     why, trim
-- Any position with **Weight > 18%** (hard concentration zone): must
-  trim, no exceptions. An 18%+ position is a single-name blow-up risk
-  regardless of conviction
-- Position with Weight > 12% but P&L < 10% (no drift — it was sized
-  that way): no special action; standard discipline applies
+- **Weight > 12% AND P&L ≥ 10%** = drift from winning (⚠️DRIFT flag).
+  Either trim to ≤ 10% OR explicitly justify letting it run in
+  `continuity_check` with a concrete reason ("earnings next week +
+  trend accelerating", "macro tailwind + R/R still > 2 from here").
+  "I like the chart" or silence is NOT acceptable — if you can't name
+  why, trim.
+- **Weight > 18%** (hard concentration zone): must trim, no exceptions.
+  Single-name blow-up risk dominates conviction.
+- **Weight > 12% but P&L < 10%** = no drift (sized that way at entry);
+  standard discipline applies.
 
 **Holding Discipline** (tiered by `days_held`):
 
 - **Held < 5 days (protection period)** — default **HOLD**. The ONLY
-  exceptions are:
-  - `thesis_invalid_if` has explicitly triggered (price broke the
-    level you named at entry), OR
-  - Macro Regime Trajectory shows a regime flip to risk-off **TODAY**
-    vs yesterday (not "regime was risk-off all week" — that you
-    already priced in), OR
-  - A **HIGH-conviction bearish state_change today that directly
-    reverses the entry rationale** (not generic bearish news —
-    specifically contradicts the thesis you named at entry, e.g.
-    Iran ceasefire vs an energy-long thesis built on supply-disruption
-    premium). This is the same trigger position_reviewer uses; without
-    it, morning PM and afternoon position_reviewer would reach
-    different decisions on the same position-news pair.
+  three exceptions are:
+  1. `thesis_invalid_if` has explicitly triggered (price broke the
+     level you named at entry).
+  2. Macro Regime Trajectory shows a regime flip to risk-off **TODAY**
+     vs yesterday (not "risk-off all week" — already priced in).
+  3. A **HIGH-conviction bearish state_change today that directly
+     reverses the entry rationale** — same trigger position_reviewer
+     uses, so morning PM and afternoon PR reach the same decision on
+     the same position-news pair. Generic bearish news does NOT count.
 
-  Do NOT SELL on a single-day Tech rating downgrade from `buy (high)`
-  to `buy (medium)` or even to `neutral`. Swing trading means 5-15
-  days to play out; noise dominates day 1-4. **"不给时间沉淀就卖" 是最
-  大的亏钱行为**. Any SELL proposed on a position held < 5 days MUST
-  name a concrete event from the exception list above. "Tech rating
-  dropped to neutral" is NOT sufficient.
+  Do NOT SELL on a single-day Tech rating downgrade. Swing trading
+  means 5-15 days to play out; noise dominates day 1-4. **"不给时间
+  沉淀就卖" 是最大的亏钱行为**. Any SELL < 5d MUST name a concrete
+  event from above — "Tech rating dropped to neutral" is NOT sufficient.
 
-- **Held 5-15 days (maturity period)** — standard discipline from all
-  signals. If trend is intact and P&L is positive, let it continue.
-  Exit only on meaningful signal breaks.
+- **Held 5-15 days (maturity period)** — standard discipline. Trend
+  intact + positive P&L = let it run; exit only on meaningful breaks.
 
 - **Held > 15 days with positive P&L and trend intact** — default
-  **HOLD + let midday trailing stop do its job**. A 20-day winning
-  position with a well-trailed stop is exactly what the system is
-  designed to produce — don't cut it prematurely on a quiet day. Only
-  exit on `thesis_invalid_if` or approaching the broker stop.
+  **HOLD + let midday trailing stop do its job**. A 20-day winner with
+  a trailed stop is exactly what the system is designed to produce;
+  exit only on `thesis_invalid_if` or near the broker stop.
 
 ### Step 7: Cash Management (regime-adaptive)
 
@@ -412,14 +371,10 @@ Rules:
   evening said "raise cash to 25% due to event risk", stay closer to
   the ceiling
 
-**Rotation over passivity** (when cash is short but you have
-high-conviction new BUYs):
-
-The lazy answer is "drop the lowest-conviction BUY until cash fits."
-That leaves your book stacked with yesterday's winners that may
-already be stale. The disciplined answer is to **rotate**: rank
-current holdings by a composite score and SELL the weakest to fund
-the best new BUY.
+**Rotation over passivity** (cash short + high-conviction new BUYs):
+the lazy answer is "drop the lowest-conviction BUY until cash fits";
+the disciplined answer is to **rotate** — rank holdings by a composite
+score and SELL the weakest to fund the best new BUY.
 
 **Holding rotation score** — applied to existing positions to find
 the weakest SELL candidate (lower = better SELL candidate):
@@ -448,13 +403,11 @@ candidate_score = tech_rating_pts
                   + (conviction high ? +1 : 0)
 ```
 
-So `buy(high)` at 4/4 alignment with R/R 2.5 → +3 + 2 + 1 + 1 = +7.
-A "dead money" holding at neutral + >15d flat → 0 + (−1) + 0 = −1.
-Gap = 8 → solidly rotates. A marginal `buy(medium)` at 3/4 alignment
-R/R 1.7 → +3 + 1 + 0 + 0 = +4. Same dead holding gap = 5 → still
-rotates. A medium-conv setup vs a healthy 5-15d sweet-spot holding
-(`buy(high)` + 5-15d + 10% PnL → +3 + 1 + 2 = +6) → gap = −2 → don't
-rotate.
+Worked example: `buy(high)` at 4/4 alignment R/R 2.5 → candidate=+7;
+weakest holding at `neutral`/>15d/flat → score=−1; gap=8 → solid
+rotate. A `buy(medium)` at 3/4 R/R 1.7 vs same dead holding → gap=5,
+still rotates. Same medium-conv setup vs a healthy `buy(high)`/5-15d/
++10% PnL holding (+6) → gap=−2, don't rotate.
 
 Rotation rule:
 

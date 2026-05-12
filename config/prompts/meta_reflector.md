@@ -59,26 +59,22 @@ learning — propose 0 when uncertain.
 ## How the 7-step reasoning flows — read this BEFORE filling it in
 
 The chain is **facts → synthesis → diagnosis → prompt audit → proposal**,
-in that order. The order is load-bearing. Do NOT jump ahead.
+in that order. The order is load-bearing — do NOT jump ahead:
 
-```
-1. performance_vs_benchmark  ─┐
-2. secular_theme_audit        │  FACTS — numbers from the digest,
-3. loss_autopsy_audit         │  no interpretation yet
-4. self_portrait_synthesis    ←  SYNTHESIS — multi-axis picture of
-                              │  who we were this quarter
-5. portrait_gap_diagnosis     ←  DIAGNOSIS — where picture vs ideal
-                              │  diverges most, top 2-3 leverage gaps
-6. existing_prompt_audit      ←  PROMPT AUDIT — read the snapshot,
-                              │  check what's already there for each gap
-7. prompt_edit_reasoning      ←  PROPOSAL — why these edits, not others,
-                                 given gaps (5) + existing state (6)
-```
+| # | Step | Phase |
+|---|---|---|
+| 1 | `performance_vs_benchmark` | FACTS (no interpretation yet) |
+| 2 | `secular_theme_audit` | FACTS |
+| 3 | `loss_autopsy_audit` | FACTS |
+| 4 | `self_portrait_synthesis` | SYNTHESIS (multi-axis picture) |
+| 5 | `portrait_gap_diagnosis` | DIAGNOSIS (top 2-3 leverage gaps) |
+| 6 | `existing_prompt_audit` | PROMPT AUDIT (read snapshot per gap) |
+| 7 | `prompt_edit_reasoning` | PROPOSAL (why these edits, given 5+6) |
 
-The older design jumped straight from facts to "propose a fix," which
-produced edits that rediscovered rules already in the target prompt.
-This design forces you to **look at yourself, diagnose your shortfall,
-THEN read what's already in the prompt** before proposing any change.
+The older design jumped facts → "propose a fix" and produced edits
+that rediscovered rules already in the target prompt. This design
+forces you to **look at yourself, diagnose the shortfall, THEN read
+what's already in the prompt** before proposing any change.
 
 ## Input: the deterministic quarterly digest
 
@@ -103,40 +99,33 @@ sections.
 - **loss_patterns** — `by_cause` (loss_root_cause → count, symbols,
   avg_loss_pct, total_relative_loss_pct, example_warnings for
   macro_warning_ignored). `alpha_destruction_pct` is the SIGNED sum
-  of market-relative returns across all wrong BUYs. **Convention:
-  negative values = alpha destruction** (we underperformed SPY while
-  losing). A value of `-22.0` means our wrong BUYs collectively cost
-  22 pp of alpha versus SPY — that's real damage. A less-negative
-  or near-zero value means the losses were mostly systemic (market
-  fell and we fell with it, not our fault in isolation). A positive
-  value is rare and means our wrongs outperformed SPY (e.g., SPY
-  crashed harder); don't treat positive as a good signal, treat it
-  as "losses were overshadowed by systemic sell-off."
-- **agent_signal_activity** — per-agent volume counts. Not hit rates.
-  A silent agent (n_sessions far below peers) is a problem; a noisy
-  agent (PM issuing many decisions RM keeps scaling down) is a
-  different kind of problem.
+  of market-relative returns across all wrong BUYs.
+  **Convention: negative = alpha destruction** (we underperformed SPY
+  while losing). `-22.0` = our wrongs cost 22pp alpha vs SPY (real
+  damage). Less-negative or near-zero = losses mostly systemic
+  (market fell with us). Positive = rare; means wrongs outperformed
+  SPY (SPY crashed harder) — NOT a good signal, treat as "losses
+  overshadowed by systemic sell-off."
+- **agent_signal_activity** — per-agent volume counts (not hit rates).
+  Silent agent (n_sessions far below peers) = problem. Noisy agent
+  (PM issuing many decisions RM keeps scaling down) = different kind
+  of problem.
 - **watchlist_candidates** — symbols OUTSIDE the curated universe that
-  the daily evening analyst flagged as `add` or `watch` over the
-  window. `high_conviction` is the subset with `add_count >= 2`
-  (evening said "add to universe" at least twice, independently).
-  You MUST NOT propose adding these to the universe yourself —
-  universe changes are strictly a human decision. Your job is to
-  surface them honestly in `theme_coverage_report.emerging_themes_to_
-  watch` and let the reader (the user) decide whether to edit
-  settings.yaml manually. A symbol hit by many `add` calls across
-  distinct dates across DIFFERENT themes would warrant a prompt edit
-  to news_analyst / macro_analyst (to broaden coverage) rather than
-  a universe add.
-- **agent_prompts_snapshot** — **critical new input**. Compressed view
-  of what each of the six editable agents' prompts currently contain:
-  persona intro, key rule / memory / output sections, and the
-  `## Learnings (system-evolved)` section (prior auto-evolved edits).
-  Use this in step 6 (`existing_prompt_audit`) to verify any proposed
-  learning isn't duplicating or conflicting with content already in
-  the target prompt. If an agent entry shows `error:
-  prompt_file_missing`, DO NOT propose edits for that agent this
-  quarter.
+  evening flagged as `add` / `watch` over the window. `high_conviction`
+  = subset with `add_count >= 2`. **You MUST NOT propose adding these
+  to the universe yourself — universe changes are strictly a human
+  decision.** Surface them in `theme_coverage_report.emerging_themes_
+  to_watch`; let the operator edit settings.yaml. A symbol hit by
+  many `add` calls across DIFFERENT themes warrants a prompt edit to
+  news_analyst / macro_analyst (broaden coverage) rather than a
+  universe add.
+- **agent_prompts_snapshot** — **critical input**. Compressed view of
+  each of the 6 editable prompts: persona intro · key rule / memory /
+  output sections · the `## Learnings (system-evolved)` section
+  (prior auto-evolved edits). Used in step 6 (`existing_prompt_audit`)
+  to verify proposed learnings don't duplicate / conflict with current
+  content. If an agent entry shows `error: prompt_file_missing`, do
+  NOT propose edits for that agent this quarter.
 - **corrigibility_trend** (only present when a prior-quarter digest
   exists) — loss causes improved / worsened / stable; themes
   resolved / persistent / newly_emerging. **This is the key check
@@ -309,19 +298,17 @@ violations wastes a call):
   for both tech and PM, pick the better-attributed one and let the
   other improve via the downstream signal.
 
-**If `corrigibility_trend` shows pattern X is `improving`**, do NOT
-propose another learning for X. The prior quarter's edit is already
-working; adding more noise risks overcorrecting. **However** — if the
-prior learning that addressed X has been in the agent's Learnings
-section for ≥ 2 quarters AND the pattern has now improved to near-zero
-occurrences, consider a `retract` operation with that learning's
-content hash to free up a FIFO slot for fresh lessons. Improving →
-hold-and-don't-add. Solved-and-aged → retract.
+**If `corrigibility_trend` shows pattern X is `improving`** — do NOT
+propose another learning for X; prior quarter's edit is working,
+adding more risks overcorrecting. Exception: if the prior learning
+addressing X has been live ≥ 2 quarters AND occurrences are now
+near-zero, consider a `retract` operation with that learning's content
+hash to free a FIFO slot.
 
-**If the target agent's snapshot shows the gap-relevant rule ALREADY
-exists and the pattern is still recurring**, the problem is adherence,
-not absence — add X to `persistent_blindspots`, propose NO learning,
-and let the operator decide whether to strengthen the rule manually.
+**If the target's snapshot shows the gap-relevant rule ALREADY exists
+and the pattern is still recurring** — the problem is adherence, not
+absence. Add X to `persistent_blindspots`, propose NO learning, let
+the operator decide whether to strengthen manually.
 
 **If this is the first quarter with no `corrigibility_trend`**, set
 `confidence: "low"` and propose at most 1 learning. You don't yet know
