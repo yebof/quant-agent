@@ -150,14 +150,18 @@ class PromptEditor:
         prompts_dir: Path | str,
         evolution_dir: Path | str = "data/evolution",
         auto_commit: bool | None = None,
+        dry_run: bool | None = None,
     ):
         self.config = config
         self.prompts_dir = Path(prompts_dir)
         self.evolution_dir = Path(evolution_dir)
         self.evolution_dir.mkdir(parents=True, exist_ok=True)
-        # Caller may override auto_commit for tests / dry runs.
+        # Caller may override flags for tests / forced-apply scenarios.
         self._auto_commit = (
             auto_commit if auto_commit is not None else config.auto_commit
+        )
+        self._dry_run = (
+            dry_run if dry_run is not None else config.dry_run
         )
         # Pre-build a single regex that catches any prohibited word or phrase
         # as a whole word / case-insensitive. Multi-word phrases ("ignore all",
@@ -196,6 +200,19 @@ class PromptEditor:
                     reason="evolution.enabled=false (observe-only mode)",
                     period=reflection.period,
                 ))
+            self._audit_log(report)
+            return report
+
+        if self._dry_run:
+            # Dry-run mode (default for first 2-3 quarters after meta
+            # auto-trigger was wired): record the proposals to disk for
+            # operator review but do NOT touch any prompt file and do
+            # NOT commit. The proposed_edits.json artifact has enough
+            # detail that a human can either (a) edit the prompts by
+            # hand using it as reference, or (b) flip
+            # evolution.dry_run=false in settings.yaml and re-run
+            # `python main.py --mode meta --force` to apply.
+            self._write_dry_run_proposal(reflection, report)
             self._audit_log(report)
             return report
 
@@ -417,6 +434,87 @@ class PromptEditor:
 
     def _prompt_path_for(self, agent_name: str) -> Path:
         return self.prompts_dir / f"{agent_name}.md"
+
+    # -- dry-run staging ----------------------------------------------------
+
+    def _write_dry_run_proposal(
+        self,
+        reflection: "QuarterlyMetaReflection",
+        report: ApplicationReport,
+    ) -> None:
+        """Write proposed_edits.json to data/evolution/{period}/ when
+        dry_run=True. Each entry includes everything an operator needs
+        to review + manually apply: target agent, agent's current
+        prompt path, proposed learning text, operation (append/retract),
+        retract target hash (when applicable), and the reflector's
+        justification.
+
+        The file is atomic-written so concurrent meta runs don't leave
+        a corrupt JSON. Existing file is overwritten (one quarter, one
+        proposal).
+        """
+        period_dir = self.evolution_dir / reflection.period
+        period_dir.mkdir(parents=True, exist_ok=True)
+        out_path = period_dir / "proposed_edits.json"
+
+        proposals: list[dict] = []
+        for learning in reflection.proposed_learnings:
+            proposals.append({
+                "agent_name": learning.agent_name,
+                "operation": learning.operation,
+                "learning_text": learning.learning_text,
+                "retract_target_hash": getattr(
+                    learning, "retract_target_hash", None,
+                ),
+                "justification": getattr(learning, "justification", ""),
+                "target_prompt_path": str(
+                    self._prompt_path_for(learning.agent_name)
+                ),
+            })
+
+        payload = {
+            "period": reflection.period,
+            "mode": "dry_run",
+            "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+            "proposed_count": len(proposals),
+            "proposals": proposals,
+            "instructions": (
+                "To apply these proposals: (1) flip evolution.dry_run=false "
+                "in config/settings.yaml AND re-run "
+                "`python main.py --mode meta --force`, OR (2) edit the "
+                "target_prompt_path file by hand, appending each "
+                "learning_text to its `## Learnings (system-evolved)` "
+                "section. Option (1) is reversible via `git revert`."
+            ),
+        }
+
+        tmp = out_path.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+            os.replace(str(tmp), str(out_path))
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+
+        # Surface the staged proposal as a "rejected" entry per learning
+        # so the ApplicationReport carries an audit trail explaining
+        # WHY nothing landed. The reason makes it greppable.
+        for learning in reflection.proposed_learnings:
+            report.rejected.append(Rejection(
+                agent_name=learning.agent_name,
+                operation=learning.operation,
+                learning_text=learning.learning_text,
+                reason=(
+                    f"dry_run=True; proposal staged to {out_path} for "
+                    f"operator review (set evolution.dry_run=false to apply)"
+                ),
+                period=reflection.period,
+            ))
+
+        logger.info(
+            "PromptEditor dry-run: staged %d proposal(s) to %s",
+            len(proposals), out_path,
+        )
 
     # -- audit + git --------------------------------------------------------
 

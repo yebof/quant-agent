@@ -728,3 +728,81 @@ def test_format_elapsed_formatting():
     assert "3.7s" in short
     long_msg = format_session_result("morning", r, 247.0)
     assert "4m 7s" in long_msg
+
+
+# ===========================================================================
+# Auto-meta dry-run hint in evening Telegram push (Round 6).
+# Without surfacing this, the operator would miss that the quarterly
+# meta-reflection ran and staged proposals for review.
+# ===========================================================================
+
+def test_format_evening_surfaces_meta_dry_run_hint():
+    """When evening's auto_meta result indicates the dry-run staged N
+    proposals (applied=0, rejected>0 because dry_run wraps each as
+    rejected with the 'dry_run' reason), the message must include a
+    line pointing to proposed_edits.json so the operator can review."""
+    result = {
+        "status": "analyzed", "run_id": "run-e",
+        "analysis": {"risk_rating": "moderate"},
+        "auto_meta": {
+            "status": "reflected",
+            "period": "2026-Q1",
+            "applied": 0,
+            "rejected": 2,
+        },
+    }
+    msg = format_session_result("evening", result, 30.0)
+    assert msg is not None
+    assert "🧪 meta 2026-Q1" in msg
+    assert "2 proposal(s) staged" in msg
+    assert "proposed_edits.json" in msg
+
+
+def test_format_evening_surfaces_meta_live_apply_when_dry_run_off():
+    """When dry_run=False (operator flipped it) the live apply happens.
+    The hint changes shape: 'applied N, rejected M' instead of the
+    staged-dry-run line."""
+    result = {
+        "status": "analyzed", "run_id": "run-e",
+        "analysis": {"risk_rating": "moderate"},
+        "auto_meta": {
+            "status": "reflected",
+            "period": "2026-Q1",
+            "applied": 1,
+            "rejected": 0,
+        },
+    }
+    msg = format_session_result("evening", result, 30.0)
+    assert msg is not None
+    assert "🧪 meta 2026-Q1: applied 1" in msg
+
+
+def test_format_evening_surfaces_meta_error():
+    """If the meta piggyback raised (auto_meta_error status), surface
+    the error so the operator can fix it before the next quarter end
+    (3 months away)."""
+    result = {
+        "status": "analyzed", "run_id": "run-e",
+        "analysis": {"risk_rating": "moderate"},
+        "auto_meta": {
+            "status": "auto_meta_error",
+            "error": "broker unreachable",
+        },
+    }
+    msg = format_session_result("evening", result, 30.0)
+    assert msg is not None
+    assert "🧪 meta" in msg and "ERROR" in msg
+    assert "broker unreachable" in msg
+
+
+def test_format_evening_no_meta_line_on_normal_day():
+    """Non-quarter-end days have auto_meta=None (or missing key).
+    The evening push must NOT have the meta hint line."""
+    result = {
+        "status": "analyzed", "run_id": "run-e",
+        "analysis": {"risk_rating": "moderate"},
+        "auto_meta": None,  # not quarter end
+    }
+    msg = format_session_result("evening", result, 30.0)
+    assert msg is not None
+    assert "🧪 meta" not in msg

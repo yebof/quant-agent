@@ -167,7 +167,26 @@ class EvolutionConfig(BaseModel):
     auto_commit: bool = True
     """After successful prompt edits, `git add` + `git commit` each
     modified prompt file so `git revert <hash>` provides a one-shot
-    rollback for a whole quarter's evolution."""
+    rollback for a whole quarter's evolution. Only meaningful when
+    `dry_run=False`."""
+
+    dry_run: bool = True
+    """Default True for safety. When True, `PromptEditor.apply_reflection`
+    does NOT modify any prompt file — instead it writes the proposed
+    edits to `data/evolution/{period}/proposed_edits.json` for human
+    review. To actually apply a quarter's proposals, flip `dry_run` to
+    False temporarily and re-run `python main.py --mode meta --force`,
+    OR edit the prompt files by hand using the JSON as a reference.
+
+    Reason this defaults True (audit H3 follow-up): meta-reflection
+    auto-fires from evening on quarter-end (added in Round 2). A bad
+    learning landing as an auto-commit is silently degrading — affects
+    every decision until next quarter or until operator notices via git
+    log. The 4 gates (FIFO cap / Jaccard dedup / prohibited-words regex
+    / agent allowlist) catch obvious bad learnings but not subtle
+    polarity-flipped polite proposals. Keep dry_run=True for the first
+    2-3 quarters; once the proposals track operator's expectations,
+    flip to False."""
 
     max_agents_per_cycle: int = 3
     """Hard cap — at most N agents get edited per quarterly run even if

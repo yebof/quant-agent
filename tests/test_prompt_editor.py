@@ -91,6 +91,12 @@ def _mk_editor(tmp_path, **config_overrides):
         enabled=True, auto_commit=False, max_agents_per_cycle=3,
         max_learnings_per_agent=10, max_learning_chars=200,
         min_justification_chars=40, jaccard_dedup_threshold=0.6,
+        # Most existing prompt_editor tests exercise the live-apply
+        # path (file edits + git commit). dry_run defaults True for
+        # production safety (Round 6, audit H3 follow-up); tests that
+        # want to test the dry-run staging path set dry_run=True
+        # explicitly via config_overrides.
+        dry_run=False,
     )
     cfg_kwargs.update(config_overrides)
     cfg = EvolutionConfig(**cfg_kwargs)
@@ -608,11 +614,16 @@ def _build_pipeline_for_editor(tmp_path, evolution_cfg):
 def test_pipeline_runs_editor_when_evolution_enabled(tmp_path):
     """End-to-end with evolution.enabled=True and a real PromptEditor:
     pipeline call actually mutates the target prompt file and reports
-    the applied learning in its return dict."""
+    the applied learning in its return dict.
+
+    Round 6: explicitly sets dry_run=False so this exercises the
+    live-apply path. The new default (dry_run=True) is exercised by
+    test_apply_reflection_dry_run_* above.
+    """
     p, fake_prompts_dir = _build_pipeline_for_editor(
         tmp_path,
         EvolutionConfig(
-            enabled=True, auto_commit=False,
+            enabled=True, auto_commit=False, dry_run=False,
             max_agents_per_cycle=3, max_learnings_per_agent=10,
             max_learning_chars=200, min_justification_chars=40,
         ),
@@ -772,3 +783,153 @@ def test_parse_entries_extracts_period_text_hash_in_order():
     assert entries[0]["period"] == "2025-Q4"
     assert entries[1]["period"] == "2026-Q1"
     assert entries[0]["hash"] == "111111111111"
+
+
+# ===========================================================================
+# Dry-run mode (Round 6 / audit H3 follow-up)
+# ===========================================================================
+#
+# When dry_run=True (the default), apply_reflection MUST NOT touch any
+# prompt file and MUST NOT git commit. Instead it stages the proposed
+# edits to data/evolution/{period}/proposed_edits.json so the operator
+# can review and either (a) flip dry_run=false + re-run, or (b) apply
+# by hand. This is the audit-H3 safety: meta-reflection auto-triggers
+# from evening on quarter-end (Round 2), and the 4 gates don't catch
+# polite-but-reversed learnings.
+
+def test_apply_reflection_dry_run_does_not_touch_prompt_files(tmp_path):
+    """The whole point: dry_run mode never modifies any agent prompt."""
+    editor = _mk_editor(tmp_path, dry_run=True)
+    seed_path = _seed_prompt(
+        editor.prompts_dir, "tech_analyst",
+        "# Tech\n\n## Learnings (system-evolved)\n\n",
+    )
+    original = seed_path.read_text()
+
+    reflection = _mk_reflection("2026-Q1", [_basic_learning()])
+    report = editor.apply_reflection(reflection)
+
+    # File untouched
+    assert seed_path.read_text() == original
+    # Nothing "applied", every proposal staged as rejected with the
+    # dry_run reason
+    assert report.applied == []
+    assert len(report.rejected) == 1
+    assert "dry_run=True" in report.rejected[0].reason
+    assert "proposed_edits.json" in report.rejected[0].reason
+    # git_commit must be None — dry_run never commits
+    assert report.git_commit is None
+
+
+def test_apply_reflection_dry_run_writes_proposed_edits_json(tmp_path):
+    """The staged JSON must contain everything the operator needs to
+    apply by hand — agent name, prompt path, operation, full learning
+    text, retract hash (if any), justification, and instructions."""
+    editor = _mk_editor(tmp_path, dry_run=True)
+    _seed_prompt(
+        editor.prompts_dir, "tech_analyst",
+        "# Tech\n\n## Learnings (system-evolved)\n\n",
+    )
+
+    learning = _basic_learning(text="Trim entries within 2% of 20-day high.")
+    reflection = _mk_reflection("2026-Q1", [learning])
+    editor.apply_reflection(reflection)
+
+    proposed_path = editor.evolution_dir / "2026-Q1" / "proposed_edits.json"
+    assert proposed_path.exists(), "dry-run must write proposed_edits.json"
+
+    import json as _json
+    payload = _json.loads(proposed_path.read_text())
+    assert payload["period"] == "2026-Q1"
+    assert payload["mode"] == "dry_run"
+    assert payload["proposed_count"] == 1
+    assert len(payload["proposals"]) == 1
+    p = payload["proposals"][0]
+    assert p["agent_name"] == "tech_analyst"
+    assert p["operation"] == "append"
+    assert "20-day high" in p["learning_text"]
+    assert "tech_analyst.md" in p["target_prompt_path"]
+    assert p["justification"]  # non-empty
+    assert "evolution.dry_run=false" in payload["instructions"]
+
+
+def test_apply_reflection_dry_run_short_circuits_before_feature_flag(tmp_path):
+    """When evolution.enabled=False, the existing short-circuit fires
+    first — proposals are recorded as rejected with the 'enabled=false'
+    reason, NOT the dry-run reason. dry-run only matters when the
+    feature is on."""
+    editor = _mk_editor(tmp_path, enabled=False, dry_run=True)
+    _seed_prompt(
+        editor.prompts_dir, "tech_analyst",
+        "# Tech\n\n## Learnings (system-evolved)\n\n",
+    )
+
+    reflection = _mk_reflection("2026-Q1", [_basic_learning()])
+    report = editor.apply_reflection(reflection)
+
+    assert report.applied == []
+    assert len(report.rejected) == 1
+    # The 'enabled=false' branch wins; we don't write proposed_edits.json
+    assert "evolution.enabled=false" in report.rejected[0].reason
+    proposed_path = editor.evolution_dir / "2026-Q1" / "proposed_edits.json"
+    assert proposed_path.exists() is False, (
+        "enabled=false short-circuits BEFORE dry-run staging — no file written"
+    )
+
+
+def test_apply_reflection_dry_run_default_when_not_specified(tmp_path):
+    """EvolutionConfig.dry_run defaults to True for safety. If a caller
+    builds an EvolutionConfig without specifying dry_run AND doesn't
+    override it on PromptEditor, the safe default kicks in."""
+    from src.config import EvolutionConfig
+    from src.evolution.prompt_editor import PromptEditor
+
+    cfg = EvolutionConfig(enabled=True, auto_commit=False)
+    # NOT specifying dry_run — the default should be True
+    assert cfg.dry_run is True
+
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    editor = PromptEditor(
+        config=cfg, prompts_dir=prompts_dir,
+        evolution_dir=tmp_path / "evolution",
+    )
+    seed = _seed_prompt(
+        prompts_dir, "tech_analyst",
+        "# Tech\n\n## Learnings (system-evolved)\n\n",
+    )
+    original = seed.read_text()
+
+    reflection = _mk_reflection("2026-Q1", [_basic_learning()])
+    editor.apply_reflection(reflection)
+
+    # File untouched — safe default protected us
+    assert seed.read_text() == original
+
+
+def test_apply_reflection_dry_run_overridable_via_init_kwarg(tmp_path):
+    """The PromptEditor constructor accepts dry_run=False to override
+    the config default. Used by tests + a manual `--mode meta --force`
+    re-run after the operator reviewed proposed_edits.json."""
+    from src.config import EvolutionConfig
+    from src.evolution.prompt_editor import PromptEditor
+
+    cfg = EvolutionConfig(enabled=True, auto_commit=False)  # dry_run=True default
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    editor = PromptEditor(
+        config=cfg, prompts_dir=prompts_dir,
+        evolution_dir=tmp_path / "evolution",
+        dry_run=False,   # explicit override
+    )
+    seed = _seed_prompt(
+        prompts_dir, "tech_analyst",
+        "# Tech\n\n## Learnings (system-evolved)\n\n",
+    )
+
+    reflection = _mk_reflection("2026-Q1", [_basic_learning()])
+    report = editor.apply_reflection(reflection)
+
+    # Override worked: the learning actually landed.
+    assert len(report.applied) == 1
+    assert "20-day" in seed.read_text() or "Flag stretched" in seed.read_text()
