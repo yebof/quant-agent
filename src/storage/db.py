@@ -374,6 +374,52 @@ class Database:
             self.conn.commit()
             return cur.lastrowid
 
+    def confirm_trade_submitted(
+        self, row_id: int, broker_order_id: str | None,
+    ) -> int:
+        """Flip a pending_submit row to submitted after broker accepted.
+
+        Part of the write-ahead-intent pattern for BUY submission (audit
+        F4). The flow is:
+
+            insert_trade(..., fill_status='pending_submit', broker_order_id=NULL)
+            broker.submit_order(...)
+            confirm_trade_submitted(row_id, broker_order_id)  ← this method
+
+        On the crash window between submit_order returning and this call
+        landing, the row stays as pending_submit with broker_order_id
+        unset. Reconcile can detect orphans by (fill_status='pending_submit'
+        AND broker_order_id IS NULL) and decide how to reconcile against
+        the broker's order list.
+        """
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE trades SET broker_order_id = ?, fill_status = 'submitted' "
+                "WHERE id = ?",
+                (broker_order_id, row_id),
+            )
+            self.conn.commit()
+            return cur.rowcount
+
+    def mark_trade_submit_failed(self, row_id: int) -> int:
+        """Flag a pending_submit row as submit_failed.
+
+        Used when broker.submit_order raised (broker may or may not have
+        the order) OR when broker rejected the order (_order_accepted
+        returned False). Distinct from rejected/canceled because those
+        statuses imply the broker accepted then rejected; submit_failed
+        means we don't know what the broker saw. Operator / reconcile
+        sweeps these against the broker's order list by symbol + time.
+        """
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE trades SET fill_status = 'submit_failed' "
+                "WHERE id = ?",
+                (row_id,),
+            )
+            self.conn.commit()
+            return cur.rowcount
+
     def update_trade_fill(
         self, broker_order_id: str, fill_status: str,
         fill_qty: float | None = None, fill_price: float | None = None,

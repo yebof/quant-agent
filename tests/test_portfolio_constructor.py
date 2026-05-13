@@ -374,3 +374,55 @@ def test_resolve_stop_uses_pct_fallback_when_atr_truly_unavailable():
     stop = constructor._resolve_stop(target, fake_analysis, entry_price=100.0)
     # 100 * (1 - 0.05) = 95
     assert stop == 95.0
+
+
+def test_current_weights_applies_gross_multiplier_for_inverse_etfs():
+    """The constructor must agree with RiskRuleEngine.check on what
+    a 20% target means for inverse / leveraged ETFs. Pre-fix the
+    constructor used raw market_value/total_value while engine used
+    gross multiplier — same $10K SQQQ saw 10% in constructor, 30%
+    gross at the engine. That mismatch caused every leveraged-ETF
+    target at the ceiling to hard-block at the engine while the
+    constructor saw no need to trim.
+
+    Now both use gross. PM's target_weight_pct=20 on SQQQ means
+    20% GROSS exposure (≈ 6.67% raw notional)."""
+    from src.portfolio_constructor import PortfolioConstructor
+
+    # 3 positions: SPY (raw=1x), SDS (inverse -2x → gross 2x), SQQQ (inverse -3x → gross 3x).
+    spy = Position(
+        symbol="SPY", qty=100, avg_entry=500.0, current_price=500.0,
+        market_value=50000.0, unrealized_pnl=0.0, sector="Broad",
+    )
+    sds = Position(
+        symbol="SDS", qty=200, avg_entry=50.0, current_price=50.0,
+        market_value=10000.0, unrealized_pnl=0.0, sector="Broad",
+    )
+    sqqq = Position(
+        symbol="SQQQ", qty=100, avg_entry=100.0, current_price=100.0,
+        market_value=10000.0, unrealized_pnl=0.0, sector="Broad",
+    )
+
+    total_value = 200000.0
+    weights = PortfolioConstructor._current_weights(
+        [spy, sds, sqqq], total_value=total_value,
+    )
+
+    # SPY: market_value 50000, gross_mul 1.0 → 50000/200000 * 100 = 25%
+    assert abs(weights["SPY"] - 25.0) < 1e-6
+    # SDS: market_value 10000, gross_mul 2.0 → 10000 * 2 / 200000 * 100 = 10%
+    assert abs(weights["SDS"] - 10.0) < 1e-6
+    # SQQQ: market_value 10000, gross_mul 3.0 → 10000 * 3 / 200000 * 100 = 15%
+    assert abs(weights["SQQQ"] - 15.0) < 1e-6
+
+
+def test_current_weights_zero_or_negative_total_value_returns_empty():
+    """Sanity: NaN / 0 / negative total_value still short-circuits to
+    empty dict. The fix didn't change this guardrail."""
+    from src.portfolio_constructor import PortfolioConstructor
+    pos = Position(
+        symbol="SPY", qty=100, avg_entry=500.0, current_price=500.0,
+        market_value=50000.0, unrealized_pnl=0.0, sector="Broad",
+    )
+    assert PortfolioConstructor._current_weights([pos], total_value=0) == {}
+    assert PortfolioConstructor._current_weights([pos], total_value=-100) == {}

@@ -489,3 +489,92 @@ def test_initialize_sets_busy_timeout_pragma(db):
         f"busy_timeout must be >= 5000ms for cross-process contention "
         f"resilience; got {row[0]}"
     )
+
+
+# ===========================================================================
+# Write-ahead intent for BUY submission — audit F4
+# ===========================================================================
+
+def test_confirm_trade_submitted_updates_pending_row(db):
+    """The write-ahead pattern inserts a pending_submit row BEFORE
+    broker.submit_order; confirm_trade_submitted flips to submitted and
+    attaches the broker_order_id once submit succeeds. This closes the
+    BUY-side phantom-fill window — pre-fix, a crash between
+    submit_order returning and insert_trade landing left broker with
+    an accepted order and DB with no row, and _reconcile_fills had no
+    way to find it (it queries by broker_order_id)."""
+    row_id = db.insert_trade(
+        symbol="NVDA", action="BUY", qty=10, price=150.0,
+        reasoning="write-ahead", run_id="r1",
+        fill_status="pending_submit",
+        broker_order_id=None,
+    )
+    rows = db.conn.execute(
+        "SELECT fill_status, broker_order_id FROM trades WHERE id = ?", (row_id,)
+    ).fetchall()
+    assert rows[0]["fill_status"] == "pending_submit"
+    assert rows[0]["broker_order_id"] is None
+
+    n = db.confirm_trade_submitted(row_id, broker_order_id="alpaca-12345")
+    assert n == 1
+
+    rows = db.conn.execute(
+        "SELECT fill_status, broker_order_id FROM trades WHERE id = ?", (row_id,)
+    ).fetchall()
+    assert rows[0]["fill_status"] == "submitted"
+    assert rows[0]["broker_order_id"] == "alpaca-12345"
+
+
+def test_mark_trade_submit_failed_flags_pending_row(db):
+    """When broker.submit_order raises OR _order_accepted returns False,
+    the pending row gets flagged submit_failed (not 'rejected', which
+    implies the broker accepted then rejected). Operator / reconcile
+    sweeps these against the broker's order list by symbol + time."""
+    row_id = db.insert_trade(
+        symbol="NVDA", action="BUY", qty=10, price=150.0,
+        reasoning="write-ahead", run_id="r1",
+        fill_status="pending_submit",
+        broker_order_id=None,
+    )
+    n = db.mark_trade_submit_failed(row_id)
+    assert n == 1
+
+    rows = db.conn.execute(
+        "SELECT fill_status FROM trades WHERE id = ?", (row_id,)
+    ).fetchall()
+    assert rows[0]["fill_status"] == "submit_failed"
+
+
+def test_pending_submit_row_distinguishable_from_orphan_terminal_states(db):
+    """Reconcile needs to distinguish pending_submit (no broker_order_id
+    yet, may or may not have reached broker) from submitted (has
+    broker_order_id, broker accepted) from terminal states. This pins
+    the four states the reconciler depends on:
+        pending_submit  + broker_order_id IS NULL   → orphan to sweep
+        submit_failed   + broker_order_id IS NULL   → known failed, may need broker check
+        submitted       + broker_order_id IS NOT NULL → reconcile by broker_order_id
+        filled/canceled/rejected/expired            → terminal, no further action
+    """
+    pending = db.insert_trade(
+        "NVDA", "BUY", 10, 150.0, "x", "r1",
+        fill_status="pending_submit", broker_order_id=None,
+    )
+    failed = db.insert_trade(
+        "AAPL", "BUY", 10, 180.0, "x", "r1",
+        fill_status="submit_failed", broker_order_id=None,
+    )
+    submitted = db.insert_trade(
+        "TSLA", "BUY", 10, 200.0, "x", "r1",
+        fill_status="submitted", broker_order_id="alpaca-1",
+    )
+    filled = db.insert_trade(
+        "META", "BUY", 10, 500.0, "x", "r1",
+        fill_status="filled", broker_order_id="alpaca-2",
+    )
+
+    # pending_submit + broker_order_id IS NULL is the orphan signature.
+    orphans = db.conn.execute(
+        "SELECT id FROM trades WHERE fill_status = 'pending_submit' "
+        "AND broker_order_id IS NULL"
+    ).fetchall()
+    assert len(orphans) == 1 and orphans[0]["id"] == pending

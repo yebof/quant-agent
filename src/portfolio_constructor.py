@@ -123,10 +123,30 @@ class PortfolioConstructor:
     def _current_weights(
         positions: list[Position], total_value: float,
     ) -> dict[str, float]:
+        """Current-position weights as gross-leverage percentages.
+
+        Uses the same `_gross_multiplier` convention as
+        `RiskRuleEngine.check` (risk/rules.py:28). For inverse / leveraged
+        ETFs (SH=−1x, SDS=−2x, PSQ=−1x, SQQQ=−3x) the gross multiplier
+        is the unsigned magnitude — a $10K SQQQ position consumes 30%
+        gross notional, not 10% raw, exactly as the risk engine
+        evaluates it.
+
+        Pre-fix this used raw `market_value / total_value`, so a PM
+        target_weight_pct=20 on SQQQ (intended as the 20% single-name
+        cap) computed as 20% raw in the constructor but 60% gross at
+        the engine — the engine then hard-blocked every leveraged-ETF
+        target at the ceiling, while the constructor's delta math saw
+        no trim needed. Now constructor + engine agree on the
+        semantics: target_weight_pct IS gross-leverage percentage.
+        """
         if total_value <= 0:
             return {}
+        # Local import to avoid the cyclic risk -> portfolio_constructor
+        # import chain at module load.
+        from src.risk.rules import _gross_multiplier
         return {
-            p.symbol: (p.market_value / total_value * 100)
+            p.symbol: (p.market_value * _gross_multiplier(p.symbol) / total_value * 100)
             for p in positions
             if p.qty > 0
         }

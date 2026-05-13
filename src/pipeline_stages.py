@@ -973,24 +973,56 @@ class ExecutionStage:
                     )
                     continue
 
-                order = pipeline.broker.submit_order(
-                    symbol=decision.symbol, qty=qty, side="buy",
-                    limit_price=limit_price,
-                    stop_loss_price=decision.stop_loss if decision.stop_loss > 0 else None,
-                    reference_price=market_price,
-                )
-                if not pipeline._order_accepted(order, decision.symbol, "buy"):
-                    continue
-                orders.append(order)
-                available_cash -= estimated_cost
+                # Write-ahead intent: insert a pending row BEFORE calling
+                # the broker. Closes the BUY-side phantom-fill window the
+                # audit surfaced — pre-fix, submit_order could return
+                # successfully and a SIGKILL before db.insert_trade left
+                # the broker with an accepted order and the DB with no
+                # row. _reconcile_fills queries by broker_order_id, so
+                # there was no recovery path for the phantom. With the
+                # pending row pre-inserted, even a crash mid-submit
+                # leaves a fill_status='pending_submit' row the operator
+                # (or a periodic cleanup) can reconcile against the
+                # broker's order list.
                 executed_price = limit_price if limit_price is not None else sizing_price
-                pipeline.db.insert_trade(
+                pending_row_id = pipeline.db.insert_trade(
                     symbol=decision.symbol, action="BUY", qty=qty,
                     price=executed_price, reasoning=decision.reasoning, run_id=run_id,
                     stop_loss=decision.stop_loss, take_profit=decision.take_profit,
-                    broker_order_id=order.get("id"),
-                    fill_status="submitted",
+                    broker_order_id=None,
+                    fill_status="pending_submit",
                 )
+
+                try:
+                    order = pipeline.broker.submit_order(
+                        symbol=decision.symbol, qty=qty, side="buy",
+                        limit_price=limit_price,
+                        stop_loss_price=decision.stop_loss if decision.stop_loss > 0 else None,
+                        reference_price=market_price,
+                    )
+                except Exception:
+                    # Submit raised — broker may or may not have received
+                    # the order. Flag the pending row so reconcile can
+                    # try to match it against broker-side activity by
+                    # symbol + time window. Re-raise so the outer except
+                    # logs the original cause.
+                    pipeline.db.mark_trade_submit_failed(pending_row_id)
+                    raise
+
+                if not pipeline._order_accepted(order, decision.symbol, "buy"):
+                    # Broker explicitly rejected (status != accepted/filled).
+                    # Mark the pending row failed so it doesn't poison
+                    # calibration as a "submitted" trade we never tracked.
+                    pipeline.db.mark_trade_submit_failed(pending_row_id)
+                    continue
+
+                # Submit accepted — finalize the pending row with the
+                # broker's order_id and flip to 'submitted'.
+                pipeline.db.confirm_trade_submitted(
+                    pending_row_id, broker_order_id=order.get("id"),
+                )
+                orders.append(order)
+                available_cash -= estimated_cost
                 order_type = "limit" if limit_price is not None else "market"
                 logger.info(
                     "Executed: buy %d %s @ %s $%.2f",
