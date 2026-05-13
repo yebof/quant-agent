@@ -6,6 +6,7 @@ For existing filings: returns previously saved analysis.
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -120,7 +121,19 @@ Analyze this filing and respond with JSON. Cite specific numbers from the text a
         return validated.model_dump(), result
 
     def _save_analysis(self, path: str, report: EarningsReport, analysis: dict):
-        """Save analysis as markdown + JSON for future reference."""
+        """Save analysis as markdown + JSON. Atomic write: tmp + rename so
+        a SIGKILL mid-write can never leave a half-written file on disk.
+
+        Without atomicity (the pre-2026-05-13 behavior), a kill between
+        `p.write_text` and process exit produces a truncated markdown,
+        which then fails JSON-block re-parse on next session →
+        record_failure() ticks → 3 consecutive ticks abandon the filing
+        permanently. The LLM succeeded but the disk write didn't is the
+        worst kind of silent regression — wasted tokens AND lost thesis
+        context. Same atomic-write discipline as news_store /
+        macro_store / tech_store (those were already protected; earnings
+        was the only outlier).
+        """
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -134,7 +147,16 @@ Analyze this filing and respond with JSON. Cite specific numbers from the text a
         header += f"- Thesis: {impl.get('key_thesis', 'N/A')}\n\n"
         header += f"## Full Analysis\n\n```json\n{json.dumps(analysis, indent=2)}\n```\n"
 
-        p.write_text(header)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        try:
+            tmp.write_text(header)
+            os.replace(tmp, p)
+        except Exception:
+            # Clean up tmp on failure so the next run doesn't see a
+            # stale partial. Re-raise so the caller (manifest update)
+            # doesn't proceed as if the analysis was saved.
+            tmp.unlink(missing_ok=True)
+            raise
         logger.info("Saved analysis for %s %s → %s", report.symbol, report.form_type, path)
 
     def _load_analysis(self, report: EarningsReport) -> dict | None:

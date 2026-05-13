@@ -237,6 +237,62 @@ def test_format_morning_degraded_data_flagged():
     assert "earnings" in msg
 
 
+def test_format_morning_force_delever_triggers_autonomous_intervention_banner():
+    """FORCE_DELEVER is the system's hardest safety net (auto-sells
+    biggest-loser-first when cash < -$1, margin disabled). Without the
+    banner, a force_delever SELL looks identical to a routine SELL on
+    Telegram — the operator misses the most important "system intervened"
+    signal. The banner must appear before the order list."""
+    result = {
+        "status": "executed", "run_id": "run-x",
+        "orders": [
+            {"symbol": "TSLA", "action": "FORCE_DELEVER", "qty": 5, "limit_price": 200.0, "side": "sell"},
+            {"symbol": "NVDA", "action": "BUY", "qty": 10, "limit_price": 250.0, "side": "buy"},
+        ],
+    }
+    msg = format_session_result("morning", result, 65.7)
+    assert msg is not None
+    assert "🚨 AUTONOMOUS INTERVENTION" in msg
+    assert "FORCE_DELEVER" in msg
+    assert "TSLA" in msg
+    # Per-line tag also surfaces on the specific order line
+    assert "🚨FORCE" in msg
+
+
+def test_format_morning_emergency_sell_triggers_autonomous_intervention_banner():
+    """EMERGENCY_SELL fires from intra_check's flash-crash protection.
+    Same intervention signal class as FORCE_DELEVER; same banner."""
+    result = {
+        "status": "executed", "run_id": "run-x",
+        "orders": [
+            {"symbol": "AMZN", "action": "EMERGENCY_SELL", "qty": 3, "limit_price": 145.0, "side": "sell"},
+        ],
+    }
+    msg = format_session_result("morning", result, 30.0)
+    assert msg is not None
+    assert "🚨 AUTONOMOUS INTERVENTION" in msg
+    assert "EMERGENCY_SELL" in msg
+    assert "🚨EMER" in msg
+
+
+def test_format_morning_routine_sells_no_intervention_banner():
+    """Routine SELL/REDUCE actions must NOT trigger the intervention
+    banner — habituation kills the signal."""
+    result = {
+        "status": "executed", "run_id": "run-x",
+        "orders": [
+            {"symbol": "AAPL", "action": "SELL", "qty": 5, "limit_price": 180.0, "side": "sell"},
+            {"symbol": "META", "action": "REDUCE", "qty": 2, "limit_price": 500.0, "side": "sell"},
+        ],
+    }
+    msg = format_session_result("morning", result, 30.0)
+    assert msg is not None
+    assert "🚨 AUTONOMOUS INTERVENTION" not in msg, (
+        "routine SELL/REDUCE must NOT trigger the banner; only "
+        "FORCE_DELEVER / EMERGENCY_SELL count as autonomous intervention"
+    )
+
+
 def test_format_evening_shows_risk_and_outlook():
     analysis = {
         "risk_rating": "moderate",

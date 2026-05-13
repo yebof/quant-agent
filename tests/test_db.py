@@ -471,3 +471,21 @@ def test_prune_methods_reject_keep_days_zero_or_negative(db):
     # Seeded rows must still be there.
     assert len(db.get_trades(symbol="SPY")) == 1
     assert len(db.get_pending_protection_restores()) == 1
+
+
+def test_initialize_sets_busy_timeout_pragma(db):
+    """PRAGMA busy_timeout must be set so concurrent writes don't
+    immediately raise OperationalError. Specifically: 09:30 ET morning
+    + intra_check run as separate Python processes (intra is exempt
+    from the bash session lock per CLAUDE.md). Both contend at the
+    SQLite WAL level; threading.Lock in Database serializes within a
+    process but does nothing across processes. busy_timeout=5000 gives
+    a 5-second wait window for the loser to acquire the lock — covers
+    the observed WAL→checkpoint stall plus headroom.
+    """
+    row = db.conn.execute("PRAGMA busy_timeout").fetchone()
+    # PRAGMA busy_timeout returns the current timeout in ms.
+    assert row[0] >= 5000, (
+        f"busy_timeout must be >= 5000ms for cross-process contention "
+        f"resilience; got {row[0]}"
+    )

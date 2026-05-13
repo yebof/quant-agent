@@ -38,6 +38,21 @@ class Database:
             self.conn.execute("PRAGMA synchronous=NORMAL")
         except sqlite3.DatabaseError:
             pass
+        # busy_timeout — the default is 0 (raise OperationalError instantly
+        # on any lock contention). At 09:30 ET, the morning session and
+        # intra_check fire simultaneously; intra_check is exempt from the
+        # bash-level session lock (CLAUDE.md "Cross-mode session lock" —
+        # intra is the flash-crash circuit breaker and must run every tick).
+        # Both Python processes contend at the SQLite WAL level. The
+        # threading.Lock above serializes within a single process but does
+        # nothing across processes. A 5000ms wait window covers the
+        # observed worst-case WAL→checkpoint stall (~1-2s on a busy day)
+        # plus headroom. Set BEFORE _create_tables so the CREATE statements
+        # also benefit if a concurrent reader is active during first init.
+        try:
+            self.conn.execute("PRAGMA busy_timeout=5000")
+        except sqlite3.DatabaseError:
+            pass
         self._create_tables()
 
     def _create_tables(self):

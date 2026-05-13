@@ -195,7 +195,37 @@ class RiskRuleEngine:
         return violations
 
     def check_daily_loss(self, baseline: float, daily_pnl: float) -> RiskViolation | None:
-        """Standalone daily loss check. `baseline` is the % denominator (e.g. last_equity)."""
+        """Standalone daily loss check. `baseline` is the % denominator (e.g. last_equity).
+
+        NaN handling: any NaN in `baseline` or `daily_pnl` (Alpaca has been
+        observed to return NaN for `portfolio_value` during market-open
+        glitches; that propagates into `last_equity` and `daily_pnl` via
+        `total_value - last_equity`) makes every comparison False, which
+        would SILENTLY DISABLE the circuit breaker on exactly the kind of
+        broken-snapshot day where the breaker is most valuable. So:
+          - NaN baseline → can't compute %, treat as "no signal" + LOG so
+            the operator knows the breaker was bypassed.
+          - NaN daily_pnl → same.
+        Both raise no violation but emit a WARNING; force_delever is the
+        downstream safety net for the actual cash-deficit case.
+        """
+        import math
+        if not math.isfinite(baseline):
+            logger.warning(
+                "check_daily_loss: baseline is non-finite (%s) — circuit "
+                "breaker bypassed for this call. Likely Alpaca returned "
+                "NaN portfolio_value/last_equity; force_delever is the "
+                "downstream safety net.",
+                baseline,
+            )
+            return None
+        if not math.isfinite(daily_pnl):
+            logger.warning(
+                "check_daily_loss: daily_pnl is non-finite (%s) — circuit "
+                "breaker bypassed for this call.",
+                daily_pnl,
+            )
+            return None
         if baseline <= 0:
             return None
         daily_loss_pct = abs(daily_pnl / baseline * 100) if daily_pnl < 0 else 0

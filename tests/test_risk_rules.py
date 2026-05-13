@@ -146,3 +146,55 @@ def test_sell_decision_skips_buy_rules(engine):
     )
     violations = engine.check(decision, positions=[], total_value=10000.0, daily_pnl=0.0)
     assert len(violations) == 0
+
+
+# ===========================================================================
+# NaN-guard tests — check_daily_loss must NOT silently disable on NaN
+# ===========================================================================
+
+def test_check_daily_loss_nan_baseline_does_not_disable_silently(engine, caplog):
+    """Alpaca has been observed to return NaN portfolio_value during
+    market-open glitches; that propagates to last_equity → baseline.
+    Pre-fix: `NaN <= 0` is False → falls through → `abs(NaN/NaN*100)`
+    is NaN → `NaN > limit` is False → no violation → circuit breaker
+    silently disabled on exactly the kind of broken-snapshot day where
+    it's most valuable.
+
+    Fix: NaN baseline returns None (same as the "no signal" path) but
+    LOGS a warning so the operator can see the breaker was bypassed,
+    AND force_delever downstream catches the actual cash deficit.
+    """
+    import logging
+    import math
+    with caplog.at_level(logging.WARNING):
+        v = engine.check_daily_loss(baseline=float("nan"), daily_pnl=-100.0)
+    assert v is None
+    assert any(
+        "non-finite" in r.message and "baseline" in r.message
+        for r in caplog.records
+    ), "non-finite baseline must log a warning so the bypass is visible"
+
+
+def test_check_daily_loss_nan_daily_pnl_does_not_disable_silently(engine, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING):
+        v = engine.check_daily_loss(baseline=10000.0, daily_pnl=float("nan"))
+    assert v is None
+    assert any(
+        "non-finite" in r.message and "daily_pnl" in r.message
+        for r in caplog.records
+    )
+
+
+def test_check_daily_loss_inf_baseline_treated_as_non_finite(engine):
+    """Defense-in-depth: +/- inf is also not a usable baseline."""
+    assert engine.check_daily_loss(baseline=float("inf"), daily_pnl=-100.0) is None
+    assert engine.check_daily_loss(baseline=float("-inf"), daily_pnl=-100.0) is None
+
+
+def test_check_daily_loss_finite_inputs_still_fire_breaker(engine):
+    """Sanity: the NaN guard must not regress the legitimate breach
+    detection. 4% loss with 3% cap → violation."""
+    v = engine.check_daily_loss(baseline=10000.0, daily_pnl=-400.0)
+    assert v is not None
+    assert v.rule == "max_daily_loss_pct"

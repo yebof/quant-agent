@@ -288,3 +288,56 @@ def test_earnings_analyst_rejects_invalid_cached_analysis(agent, report):
     )
 
     assert agent._load_analysis(report) is None
+
+
+# ===========================================================================
+# Atomic write tests — _save_analysis must not leave a half-written .md
+# ===========================================================================
+
+def test_save_analysis_writes_atomically_via_tmp_rename(agent, report, tmp_path):
+    """The save path must use tmp+rename so a SIGKILL mid-write can never
+    leave a half-written markdown that _load_analysis would treat as a
+    corrupt cache → record_failure() → permanent abandonment after 3 ticks.
+
+    Verifies: after _save_analysis completes, the target file exists and
+    contains the expected content. A direct write_text would also pass
+    this test — so we additionally verify the .tmp file is cleaned up.
+    """
+    final_path = tmp_path / "analysis_10-Q_2026-03-15.md"
+    valid = _valid_analysis(report)
+
+    agent._save_analysis(str(final_path), report, valid)
+
+    assert final_path.exists()
+    assert final_path.with_suffix(final_path.suffix + ".tmp").exists() is False, (
+        "tmp file must be renamed away; leftover .tmp suggests non-atomic write"
+    )
+    body = final_path.read_text()
+    assert "# AAPL 10-Q Analysis (2026-03-15)" in body
+    assert "Sentiment: bullish" in body
+    assert "```json" in body
+
+
+def test_save_analysis_cleans_tmp_on_rename_failure(agent, report, tmp_path, monkeypatch):
+    """If os.replace fails (disk full, permissions, racing rmdir), the
+    tmp file must be cleaned up and the exception re-raised — never
+    leave both the tmp file AND no canonical file on disk where the
+    next session's manifest sync would fall into an ambiguous state.
+    """
+    final_path = tmp_path / "analysis_10-Q_2026-03-15.md"
+    valid = _valid_analysis(report)
+
+    real_replace = __import__("os").replace
+
+    def boom(_src, _dst):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr("src.agents.earnings_analyst.os.replace", boom)
+
+    with pytest.raises(OSError, match="simulated disk full"):
+        agent._save_analysis(str(final_path), report, valid)
+
+    assert final_path.exists() is False, "final file must NOT be created on rename failure"
+    assert final_path.with_suffix(final_path.suffix + ".tmp").exists() is False, (
+        "tmp file must be cleaned up on failure; leftover tmp would confuse next run"
+    )
