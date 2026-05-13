@@ -6,6 +6,8 @@ from xml.etree import ElementTree
 
 import feedparser
 
+from src.trading_calendar import et_now
+
 logger = logging.getLogger(__name__)
 
 RSS_FEEDS = {
@@ -41,9 +43,36 @@ class NewsDataProvider:
         self.feeds = feeds or RSS_FEEDS
         self.lookback_hours = lookback_hours
 
-    def fetch_news(self) -> list[NewsItem]:
-        """Fetch recent news from all RSS feeds."""
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=self.lookback_hours)
+    def fetch_news(self, lookback_hours_override: int | None = None) -> list[NewsItem]:
+        """Fetch recent news from all RSS feeds.
+
+        Default lookback is 24h, fine for Tue-Fri morning runs. On Monday
+        morning the previous trading day was Friday, so a 24h window
+        misses ~72h of weekend news (Fed pressers, geopolitical events,
+        earnings pre-announcements all routinely land on weekends). The
+        Monday-aware path: if today is Monday, automatically extend the
+        lookback to cover the gap. The caller can also override via
+        `lookback_hours_override` for hand-tuning / replay scenarios.
+        """
+        if lookback_hours_override is not None:
+            effective_lookback = lookback_hours_override
+        else:
+            today = et_now()
+            # weekday(): Monday=0 .. Sunday=6. Monday morning needs to
+            # cover Fri close → Mon morning ≈ 72h. Tue after a Mon
+            # holiday would also benefit but holiday awareness lives in
+            # broker.is_trading_day; that's overkill here — Monday is
+            # the 95% case.
+            if today.weekday() == 0:  # Monday
+                effective_lookback = max(self.lookback_hours, 72)
+                logger.info(
+                    "fetch_news: Monday detected — extending lookback "
+                    "from %dh to %dh to cover weekend news",
+                    self.lookback_hours, effective_lookback,
+                )
+            else:
+                effective_lookback = self.lookback_hours
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=effective_lookback)
         all_items: list[NewsItem] = []
 
         for source_name, url in self.feeds.items():

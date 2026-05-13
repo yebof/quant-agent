@@ -315,3 +315,62 @@ def test_construct_orders_skips_sell_when_position_market_value_is_nan():
     # The SELL is dropped — no NaN-tainted orders leak to the broker.
     sells = [d for d in decisions if d.action == "SELL"]
     assert sells == []
+
+
+def test_resolve_stop_returns_none_when_atr_too_wide_for_entry(caplog):
+    """High-vol name where 2*ATR >= entry_price would put the ATR stop
+    at or below zero. Pre-fix the `if atr_stop > 0` gate silently fell
+    through to the naive 5% fallback — exactly the scenario the
+    ATR-aware stop was supposed to prevent (a 5% stop on a stock with
+    8% normal-day ATR is one day's noise away from being triggered).
+
+    Now: returns None + WARNING log so the BUY gets rejected upstream
+    rather than silently sized with a guaranteed-trigger stop.
+    """
+    import logging
+    from types import SimpleNamespace
+    constructor = PortfolioConstructor(
+        config=ConstructorConfig(
+            fallback_stop_pct=0.05,
+            default_stop_atr_multiple=2.0,
+        ),
+    )
+    target = TargetPosition(
+        symbol="MICRO", target_weight_pct=3.0,
+        conviction="low", thesis="too volatile",
+    )
+    # ATR 60 on a $100 stock: 2*ATR = 120 > 100, stop would be -20.
+    fake_analysis = SimpleNamespace(stop_loss=None, atr_14=60.0)
+
+    with caplog.at_level(logging.WARNING):
+        stop = constructor._resolve_stop(target, fake_analysis, entry_price=100.0)
+
+    assert stop is None, (
+        "ATR stop below zero must reject rather than fall through to "
+        "5% naive fallback that would be triggered on normal noise"
+    )
+    assert any(
+        "non-positive" in r.message and "Rejecting BUY" in r.message
+        for r in caplog.records
+    ), "rejection must log the reason so the operator can see why the BUY was dropped"
+
+
+def test_resolve_stop_uses_pct_fallback_when_atr_truly_unavailable():
+    """The 5% fallback IS the right answer when there's genuinely no
+    volatility info (e.g. brand-new symbol with <14 bars). Pin this so
+    the previous fix doesn't accidentally over-restrict."""
+    from types import SimpleNamespace
+    constructor = PortfolioConstructor(
+        config=ConstructorConfig(
+            fallback_stop_pct=0.05,
+            default_stop_atr_multiple=2.0,
+        ),
+    )
+    target = TargetPosition(
+        symbol="NEWIPO", target_weight_pct=3.0,
+        conviction="low", thesis="x",
+    )
+    fake_analysis = SimpleNamespace(stop_loss=None, atr_14=None)
+    stop = constructor._resolve_stop(target, fake_analysis, entry_price=100.0)
+    # 100 * (1 - 0.05) = 95
+    assert stop == 95.0

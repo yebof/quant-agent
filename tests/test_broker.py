@@ -1241,3 +1241,108 @@ def test_submit_order_without_reference_price_skips_outlier_check(mock_tc_cls):
     # Even a weird limit price gets through if reference is absent
     result = broker.submit_order(symbol="NVDA", qty=10, side="buy", limit_price=0.01)
     assert result["status"] == "accepted"
+
+
+# ===========================================================================
+# Idempotent _restore_stop_orders — closes the drain re-submission race
+# (audit Round 3 / F6). Drain narrowing at pipeline.py:1039 can't always
+# tell "all failed" from "partial succeeded then function raised", so we
+# defend at the broker level: skip re-submit when the spec already
+# matches an alive open stop.
+# ===========================================================================
+
+def _make_broker_for_restore(mock_tc_cls, alive_stops: list[dict]):
+    """Builds an AlpacaBroker whose _list_open_sell_stop_orders returns
+    objects shaped like Alpaca SDK Order objects with stop_price + qty.
+    _snapshot_stop_order extracts the qty + stop_price + limit_price."""
+    mock_client = MagicMock()
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+
+    # Stub _list_open_sell_stop_orders to return mock order objects.
+    fake_orders = []
+    for spec in alive_stops:
+        order = MagicMock()
+        order.qty = str(spec["qty"])
+        order.stop_price = str(spec["stop_price"])
+        order.limit_price = str(spec.get("limit_price", spec["stop_price"]))
+        order.id = spec.get("id", "fake")
+        fake_orders.append(order)
+    broker._list_open_sell_stop_orders = MagicMock(return_value=fake_orders)
+    broker._submit_stop_limit_order = MagicMock()
+    return broker
+
+
+@patch("src.execution.broker.TradingClient")
+def test_restore_stop_orders_skips_already_alive_specs(mock_tc_cls):
+    """If a spec's (qty, stop_price) already matches a live stop at
+    the broker, _restore_stop_orders must NOT re-submit. This closes
+    the drain re-submission race where a previously-landed stop gets
+    re-submitted and rejected with held_for_orders / duplicate."""
+    alive = [{"qty": 5.0, "stop_price": 145.0}]
+    broker = _make_broker_for_restore(mock_tc_cls, alive_stops=alive)
+
+    specs = [
+        {"qty": 5.0, "stop_price": 145.0, "limit_price": 144.0},  # already alive
+        {"qty": 3.0, "stop_price": 140.0, "limit_price": 139.0},  # genuinely missing
+    ]
+    restored, failed = broker._restore_stop_orders("NVDA", specs, check_idempotency=True)
+
+    # Both count as "restored" from caller's perspective, but only one
+    # was actually submitted to the broker.
+    assert restored == 2, "alive-skipped specs count toward restored total"
+    assert failed == []
+    # Only the missing spec should hit the broker.
+    assert broker._submit_stop_limit_order.call_count == 1
+    args = broker._submit_stop_limit_order.call_args
+    assert args.kwargs["stop_price"] == 140.0
+
+
+@patch("src.execution.broker.TradingClient")
+def test_restore_stop_orders_matches_within_one_cent_tolerance(mock_tc_cls):
+    """_quantize_price rounding can shift the stored stop by a tick. A
+    spec at $145.001 must still match an alive stop at $145.00."""
+    alive = [{"qty": 5.0, "stop_price": 145.00}]
+    broker = _make_broker_for_restore(mock_tc_cls, alive_stops=alive)
+
+    specs = [{"qty": 5.0, "stop_price": 145.005, "limit_price": 144.0}]
+    restored, failed = broker._restore_stop_orders("NVDA", specs, check_idempotency=True)
+
+    assert restored == 1
+    assert broker._submit_stop_limit_order.call_count == 0, (
+        "spec within 1¢ of alive stop must NOT be re-submitted"
+    )
+
+
+@patch("src.execution.broker.TradingClient")
+def test_restore_stop_orders_resubmits_when_qty_differs(mock_tc_cls):
+    """Different qty = different protection coverage. Must NOT be
+    treated as a match even if stop_price is identical (the original
+    spec covered 5 shares; a 3-share alive stop leaves 2 shares
+    uncovered)."""
+    alive = [{"qty": 3.0, "stop_price": 145.0}]  # only partial coverage
+    broker = _make_broker_for_restore(mock_tc_cls, alive_stops=alive)
+
+    specs = [{"qty": 5.0, "stop_price": 145.0, "limit_price": 144.0}]
+    restored, failed = broker._restore_stop_orders("NVDA", specs, check_idempotency=True)
+
+    # Qty mismatch → no match → must submit the 5-share spec.
+    assert broker._submit_stop_limit_order.call_count == 1
+
+
+@patch("src.execution.broker.TradingClient")
+def test_restore_stop_orders_no_alive_stops_uses_legacy_submit_path(mock_tc_cls):
+    """No alive stops at broker → idempotency check is a no-op and all
+    specs go through the submit path. Sanity that the new code doesn't
+    block the basic flow."""
+    broker = _make_broker_for_restore(mock_tc_cls, alive_stops=[])
+
+    specs = [
+        {"qty": 5.0, "stop_price": 145.0, "limit_price": 144.0},
+        {"qty": 3.0, "stop_price": 140.0, "limit_price": 139.0},
+    ]
+    restored, failed = broker._restore_stop_orders("NVDA", specs, check_idempotency=True)
+
+    assert restored == 2
+    assert broker._submit_stop_limit_order.call_count == 2

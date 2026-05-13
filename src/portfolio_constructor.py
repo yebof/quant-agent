@@ -302,6 +302,30 @@ class PortfolioConstructor:
             atr_stop = entry_price - self.cfg.default_stop_atr_multiple * analysis.atr_14
             if atr_stop > 0:
                 return round(atr_stop, 2)
-        # Naive % fallback if ATR also unavailable (e.g. brand-new symbol
-        # with <14 bars of history).
+            # atr_stop <= 0 means 2*ATR >= entry_price — the symbol is
+            # so volatile that the standard ATR-based stop is below
+            # zero. The original code's `if atr_stop > 0` gate then
+            # silently fell through to the naive 5% fallback — exactly
+            # the scenario the ATR-aware stop was meant to prevent
+            # (a 5% stop on an 8%-ATR name is one normal day's noise
+            # away from being triggered). Better: reject the BUY by
+            # returning None so PortfolioConstructor signals upstream
+            # that this position can't be safely sized. Loud, not
+            # silently-degraded.
+            import logging
+            logging.getLogger(__name__).warning(
+                "ATR-based stop for entry=$%.2f with ATR=$%.4f would be "
+                "non-positive (%.4f) — the symbol is too volatile for the "
+                "%.1f×ATR default and no LLM-supplied stop is available. "
+                "Rejecting BUY rather than falling through to naive %.0f%% "
+                "stop that would be triggered on normal noise.",
+                entry_price, analysis.atr_14, atr_stop,
+                self.cfg.default_stop_atr_multiple,
+                self.cfg.fallback_stop_pct * 100,
+            )
+            return None
+        # Naive % fallback ONLY when ATR is genuinely unavailable
+        # (brand-new symbol with <14 bars of history). In that case
+        # we have no volatility information, so the % stop is the
+        # honest best-effort.
         return round(entry_price * (1 - self.cfg.fallback_stop_pct), 2)

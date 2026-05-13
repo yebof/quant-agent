@@ -763,9 +763,11 @@ def test_take_profit_restores_stops_when_sell_rejected(tmp_path):
     assert orders == [], "rejected SELL should not be in orders list"
     # Critical: the cancelled stop must be restored (not re-protected on
     # residual — there's no successful sell, so nothing changed about
-    # the position size, only the stops).
+    # the position size, only the stops). Non-drain path → idempotency
+    # check is OFF (we just cancelled these specs ourselves; checking
+    # would just race against Alpaca's eventual-consistency window).
     pipeline.broker._restore_stop_orders.assert_called_once_with(
-        "NVDA", cancelled,
+        "NVDA", cancelled, check_idempotency=False,
     )
     # And no new residual-stop submission, since the SELL didn't fire.
     pipeline.broker._submit_stop_limit_order.assert_not_called()
@@ -916,8 +918,9 @@ def test_take_profit_restores_originals_when_limit_does_not_fill(tmp_path):
     pipeline._auto_take_profit([winner], run_id="r2")
 
     # Original full-position stops restored — NOT a 67-share residual stop.
+    # Non-drain finalize → check_idempotency=False (recent self-cancel).
     pipeline.broker._restore_stop_orders.assert_called_once_with(
-        "NVDA", cancelled,
+        "NVDA", cancelled, check_idempotency=False,
     )
     # And no residual-shaped stop was submitted.
     pipeline.broker._submit_stop_limit_order.assert_not_called()
@@ -963,8 +966,9 @@ def test_finalize_protection_cancels_lingering_sell_when_status_non_terminal():
     )
     pipeline.broker.wait_for_order_terminal.assert_called_once()
     # Post-cancel fill_qty=0 → restore originals (NOT reprotect residual).
+    # Non-drain finalize → check_idempotency=False.
     pipeline.broker._restore_stop_orders.assert_called_once_with(
-        "NVDA", cancelled,
+        "NVDA", cancelled, check_idempotency=False,
     )
     pipeline._reprotect_residual_after_partial_sell.assert_not_called()
 
@@ -1208,7 +1212,11 @@ def test_intra_check_drains_orphan_restores_at_entry(tmp_path):
 
     # Drain ran during entry → row consumed (broker said terminal).
     assert db.get_pending_protection_restores() == []
-    pipeline.broker._restore_stop_orders.assert_called_once_with("NVDA", cancelled)
+    # Drain replay → check_idempotency=True so the audit's drain-
+    # narrowing race can't re-submit already-alive stops.
+    pipeline.broker._restore_stop_orders.assert_called_once_with(
+        "NVDA", cancelled, check_idempotency=True,
+    )
     db.close()
 
 

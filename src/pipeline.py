@@ -841,8 +841,12 @@ class TradingPipeline:
                         return False, list(cancelled_specs)
                     return True, []
             try:
+                # Drain replays may re-encounter specs that landed in a
+                # prior pass; check_idempotency=from_drain prevents the
+                # re-submit dupes that broke down on held_for_orders
+                # before the audit fix.
                 restored, failed_specs = self.broker._restore_stop_orders(
-                    symbol, cancelled_specs,
+                    symbol, cancelled_specs, check_idempotency=from_drain,
                 )
                 logger.info(
                     "SELL on %s terminated with no fill (status=%s) — "
@@ -1554,11 +1558,17 @@ class TradingPipeline:
             except Exception as e:
                 logger.error("auto_take_profit: submit failed for %s: %s", p.symbol, e)
                 if stop_specs:
-                    self.broker._restore_stop_orders(p.symbol, stop_specs)
+                    # Inline rollback — we just cancelled these moments
+                    # ago; check_idempotency=False (the default behavior).
+                    self.broker._restore_stop_orders(
+                        p.symbol, stop_specs, check_idempotency=False,
+                    )
                 continue
             if not self._order_accepted(order, p.symbol, "sell"):
                 if stop_specs:
-                    self.broker._restore_stop_orders(p.symbol, stop_specs)
+                    self.broker._restore_stop_orders(
+                        p.symbol, stop_specs, check_idempotency=False,
+                    )
                 continue
             # Defer the re-protect / restore decision until we know the
             # actual fill outcome (see _finalize_protection_after_sell).
@@ -3720,7 +3730,7 @@ class TradingPipeline:
                     # protective stops we cancelled so the position isn't
                     # naked while the next intra tick takes another shot.
                     if stop_specs:
-                        self.broker._restore_stop_orders(p.symbol, stop_specs)
+                        self.broker._restore_stop_orders(p.symbol, stop_specs, check_idempotency=False)
                     continue
                 # Emergency sell is always a full exit, but the limit can
                 # still cancel/expire post-acceptance — defer the
@@ -3955,7 +3965,7 @@ class TradingPipeline:
                 )
                 if not self._order_accepted(order, symbol, "sell"):
                     if stop_specs:
-                        self.broker._restore_stop_orders(symbol, stop_specs)
+                        self.broker._restore_stop_orders(symbol, stop_specs, check_idempotency=False)
                     continue
                 # Defer reprotect/restore decision to after wait — see
                 # _finalize_protection_after_sell. Catches the case where
@@ -4099,7 +4109,7 @@ class TradingPipeline:
                     # the position isn't naked while morning/midday tries
                     # other paths to free cash.
                     if stop_specs:
-                        self.broker._restore_stop_orders(p.symbol, stop_specs)
+                        self.broker._restore_stop_orders(p.symbol, stop_specs, check_idempotency=False)
                     continue
                 # Defer reprotect/restore decision to the post-wait loop
                 # below — the existing "block until fills land" wait already
@@ -4978,7 +4988,7 @@ class TradingPipeline:
                     # the position keeps its existing protection until the
                     # next 30-min tick takes another shot.
                     if stop_specs:
-                        self.broker._restore_stop_orders(p.symbol, stop_specs)
+                        self.broker._restore_stop_orders(p.symbol, stop_specs, check_idempotency=False)
                     continue
                 # Always full exit, but the limit can still cancel/expire
                 # post-acceptance — defer the restore-on-no-fill decision

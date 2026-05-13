@@ -851,19 +851,88 @@ class AlpacaBroker:
 
     def _restore_stop_orders(
         self, symbol: str, stop_specs: list[dict],
+        *,
+        check_idempotency: bool = False,
     ) -> tuple[int, list[dict]]:
         """Re-submit a set of cancelled stop specs. Best-effort per-spec —
         a single broker rejection doesn't abort the loop.
 
-        Returns ``(restored_count, failed_specs)``. failed_specs contains
-        the specs that raised on submit. Callers needing to persist a
-        partial-restore recovery intent (P1 codex r9) use failed_specs
-        directly, so the next session retries ONLY the ones that didn't
-        land — not the originals already alive at the broker.
+        ``check_idempotency`` controls whether we first query broker for
+        already-alive stops and skip matching specs:
+
+        - **False (default; in-line rollback path)** — the caller just
+          cancelled these specs moments ago in the same method
+          (cancel_protective_stops or replace_stop_loss partial-cancel
+          rollback). The cancelled stops are not alive anymore at the
+          broker by construction; checking would just slow the rollback
+          and risk false-positives on Alpaca's eventual-consistency
+          window (pending_cancel orders sometimes still appear in
+          get_orders briefly).
+
+        - **True (drain path)** — the caller is replaying a recovery
+          intent persisted from a previous session. Specs that landed
+          successfully in an earlier drain pass are alive at the broker;
+          re-submitting them now would trigger held_for_orders /
+          duplicate-protection rejections. Query open sell-stops first
+          and skip specs whose (qty, stop_price) match a live stop
+          within 1¢ tolerance. This closes the drain re-submission race
+          documented in the design audit — finalize's
+          reprotect-raised / restore-raised paths return the full
+          cancelled_specs list, and drain's length-equality narrowing
+          (pipeline.py:1039) can't distinguish "all failed" from
+          "partial succeeded then raised", so it leaves the row's
+          specs unchanged. Idempotency defends against the resulting
+          re-submit dupes at the broker layer.
+
+        Returns ``(restored_count, failed_specs)``. With idempotency on,
+        ``restored_count`` includes already-alive-skipped specs (from
+        the caller's perspective, coverage is intact either way).
         """
+        existing_alive: list[dict] = []
+        if check_idempotency:
+            try:
+                for order in self._list_open_sell_stop_orders(symbol):
+                    snap = self._snapshot_stop_order(order)
+                    if snap is not None:
+                        existing_alive.append(snap)
+            except Exception as exc:
+                # If we can't see existing stops, fall through to the
+                # non-idempotent behavior — broker's own duplicate
+                # detection is the last line.
+                logger.warning(
+                    "_restore_stop_orders: failed to list existing stops for %s "
+                    "(idempotency check skipped): %s",
+                    symbol, exc,
+                )
+
+        def _spec_matches(spec: dict, alive: dict) -> bool:
+            """Two specs match when qty and stop_price are within rounding."""
+            try:
+                if abs(float(spec.get("qty", 0)) - float(alive.get("qty", 0))) > 1e-6:
+                    return False
+                spec_stop = float(spec.get("stop_price", 0))
+                alive_stop = float(alive.get("stop_price", 0))
+                # 1 cent tolerance covers _quantize_price rounding.
+                return abs(spec_stop - alive_stop) <= 0.01
+            except (TypeError, ValueError):
+                return False
+
         restored = 0
+        skipped_already_alive = 0
         failed_specs: list[dict] = []
         for spec in stop_specs:
+            if existing_alive and any(_spec_matches(spec, alive) for alive in existing_alive):
+                # Already alive at broker (likely landed in a prior
+                # drain pass). Treat as restored from the caller's
+                # perspective; do NOT re-submit.
+                skipped_already_alive += 1
+                restored += 1
+                logger.info(
+                    "_restore_stop_orders: %s @ $%.2f qty=%s already alive "
+                    "at broker — skipping re-submit (idempotent)",
+                    symbol, float(spec.get("stop_price", 0)), spec.get("qty"),
+                )
+                continue
             try:
                 self._submit_stop_limit_order(
                     symbol=symbol,
@@ -879,10 +948,18 @@ class AlpacaBroker:
                 )
                 failed_specs.append(spec)
         if restored:
-            logger.warning(
-                "replace_stop_loss rollback: restored %d/%d prior stop order(s) for %s",
-                restored, len(stop_specs), symbol,
-            )
+            new_submits = restored - skipped_already_alive
+            if skipped_already_alive:
+                logger.warning(
+                    "replace_stop_loss rollback: restored %d/%d prior stop order(s) "
+                    "for %s (%d newly submitted, %d already alive)",
+                    restored, len(stop_specs), symbol, new_submits, skipped_already_alive,
+                )
+            else:
+                logger.warning(
+                    "replace_stop_loss rollback: restored %d/%d prior stop order(s) for %s",
+                    restored, len(stop_specs), symbol,
+                )
         return restored, failed_specs
 
     def replace_stop_loss(
