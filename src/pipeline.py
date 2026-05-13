@@ -5285,6 +5285,8 @@ class TradingPipeline:
         # Evening is the last chance to reconcile today's orders before the
         # next trading day. Sweep everything still marked submitted.
         self._reconcile_fills()
+
+        meta_result = self._maybe_run_quarterly_meta()
         return {
             "status": "analyzed",
             "total_value": total_value,
@@ -5292,7 +5294,43 @@ class TradingPipeline:
             "daily_return_pct": daily_return_pct,
             "analysis": analysis.model_dump() if analysis else None,
             "run_id": run_id,
+            "auto_meta": meta_result,
         }
+
+    def _maybe_run_quarterly_meta(self) -> dict | None:
+        """Evening-time piggyback for the quarterly meta-reflection loop.
+
+        There is no separate systemd timer for `meta`; the autonomous-
+        evolution loop fires by checking the quarter-end gate inside
+        evening. The pre-fix behavior was that `run_quarterly_meta_
+        reflection()` had to be invoked by hand (`python main.py --mode
+        meta`), so the entire 8-week-built loop never ran automatically.
+
+        Wrapped in try/except so a meta failure can never fail the
+        evening report. Evening's artifact is load-bearing for next
+        morning's PM; meta is a once-a-quarter bonus.
+
+        Returns None when not quarter-end, a result dict otherwise.
+        """
+        try:
+            from src.trading_calendar import et_today
+            today = et_today()
+            try:
+                is_last = self.broker.is_last_trading_day_of_quarter(on_date=today)
+            except Exception as e:
+                logger.warning("Evening: meta quarter-end check failed: %s", e)
+                return None
+            if not is_last:
+                return None
+            logger.info(
+                "Evening: today is last trading day of quarter %d-Q%d — "
+                "running auto meta-reflection",
+                today.year, (today.month - 1) // 3 + 1,
+            )
+            return self.run_quarterly_meta_reflection(force=False)
+        except Exception as e:
+            logger.exception("Evening: meta-reflection piggyback failed: %s", e)
+            return {"status": "auto_meta_error", "error": str(e)}
 
     def run_quarterly_meta_reflection(
         self,

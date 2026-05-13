@@ -685,3 +685,74 @@ def test_drop_invalid_meta_lists_handles_non_list_proposed_learnings():
     parsed["proposed_learnings"] = "oops"
     out = MetaReflectorAgent._drop_invalid_meta_lists(parsed)
     assert out["proposed_learnings"] == []
+
+
+# ---------------------------------------------------------------------------
+# Evening-piggyback auto-trigger — Round 2 fix for the H1 finding
+# (meta-reflection had no scheduler; pre-fix, the entire loop never
+# auto-fired)
+# ---------------------------------------------------------------------------
+
+def test_maybe_run_quarterly_meta_skips_on_normal_day(tmp_path):
+    """Mid-quarter evening run — _maybe_run_quarterly_meta returns None
+    so the evening result's `auto_meta` field stays None and
+    run_quarterly_meta_reflection is never invoked. Without this gate
+    the heavy digest+LLM job would fire every evening."""
+    p = _pipeline_for_meta(tmp_path)
+    p.broker.is_last_trading_day_of_quarter.return_value = False
+    # Spy on run_quarterly_meta_reflection so we can prove it wasn't called
+    p.run_quarterly_meta_reflection = MagicMock()
+
+    result = p._maybe_run_quarterly_meta()
+
+    assert result is None
+    p.run_quarterly_meta_reflection.assert_not_called()
+
+
+def test_maybe_run_quarterly_meta_fires_on_quarter_end(tmp_path):
+    """Quarter-end evening must auto-trigger meta-reflection. This is
+    the entire fix for the H1 finding ('meta-reflection has no
+    scheduler') — the only path that auto-fires the autonomous-
+    evolution loop is this evening piggyback."""
+    p = _pipeline_for_meta(tmp_path)
+    p.broker.is_last_trading_day_of_quarter.return_value = True
+    p.run_quarterly_meta_reflection = MagicMock(
+        return_value={"status": "reflected", "period": "2026-Q1"}
+    )
+
+    result = p._maybe_run_quarterly_meta()
+
+    assert result is not None
+    assert result["status"] == "reflected"
+    p.run_quarterly_meta_reflection.assert_called_once_with(force=False)
+
+
+def test_maybe_run_quarterly_meta_swallows_meta_failure(tmp_path):
+    """Meta failure must NEVER fail the evening session. Evening's
+    artifact (insights row + tomorrow_outlook + sell_grades) is
+    load-bearing for next morning's PM; meta is a once-a-quarter
+    bonus. Exception caught + logged + returned as auto_meta_error
+    status so observability survives."""
+    p = _pipeline_for_meta(tmp_path)
+    p.broker.is_last_trading_day_of_quarter.return_value = True
+    p.run_quarterly_meta_reflection = MagicMock(side_effect=RuntimeError("boom"))
+
+    result = p._maybe_run_quarterly_meta()
+
+    assert result is not None
+    assert result["status"] == "auto_meta_error"
+    assert "boom" in result["error"]
+
+
+def test_maybe_run_quarterly_meta_swallows_broker_check_failure(tmp_path):
+    """If the quarter-end probe itself raises (broker API down at
+    20:00 ET), treat as not-quarter-end and return None — evening
+    proceeds normally rather than auto-meta failing."""
+    p = _pipeline_for_meta(tmp_path)
+    p.broker.is_last_trading_day_of_quarter.side_effect = ConnectionError("alpaca down")
+    p.run_quarterly_meta_reflection = MagicMock()
+
+    result = p._maybe_run_quarterly_meta()
+
+    assert result is None
+    p.run_quarterly_meta_reflection.assert_not_called()

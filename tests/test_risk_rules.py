@@ -198,3 +198,57 @@ def test_check_daily_loss_finite_inputs_still_fire_breaker(engine):
     v = engine.check_daily_loss(baseline=10000.0, daily_pnl=-400.0)
     assert v is not None
     assert v.rule == "max_daily_loss_pct"
+
+
+# ===========================================================================
+# Zero / NaN total_value guard — must NOT silently approve BUYs
+# ===========================================================================
+
+def test_check_zero_total_value_emits_blocking_violation(engine):
+    """Alpaca portfolio_value=0 during a market-open glitch must NOT be
+    treated as 'all checks passed'. Pre-fix: early return `[]` had the
+    same shape as the no-violations path → BUYs sailed through with
+    every cap (cash_only, position, sector, daily-loss) bypassed.
+    Now: synthesizes a HARD_BLOCK_RULES violation so the pipeline
+    filter blocks the BUY until the next snapshot reads non-zero.
+    """
+    decision = TradeDecision(
+        action="BUY", symbol="NVDA", allocation_pct=10.0,
+        entry_price=500.0, stop_loss=485.0, take_profit=530.0,
+        reasoning="Test", reasoning_chain={"setup": "x", "rr": "x", "alignment": "x", "risk": "x", "thesis": "x"} if False else "Test",
+    ) if False else TradeDecision(
+        action="BUY", symbol="NVDA", allocation_pct=10.0,
+        entry_price=500.0, stop_loss=485.0, take_profit=530.0, reasoning="Test",
+    )
+    violations = engine.check(decision, positions=[], total_value=0.0, daily_pnl=0.0)
+    assert len(violations) == 1
+    # Must be in HARD_BLOCK_RULES so _filter_hard_risk_decisions blocks
+    from src.pipeline import HARD_BLOCK_RULES
+    assert violations[0].rule in HARD_BLOCK_RULES
+    assert "not a valid equity" in violations[0].message
+
+
+def test_check_nan_total_value_emits_blocking_violation(engine):
+    """NaN total_value (also seen during market-open glitches) must
+    block the BUY same as zero — pre-fix `NaN <= 0` was False, so the
+    early-return guard didn't even fire, and the rest of the check
+    propagated NaN comparisons that all returned False."""
+    decision = TradeDecision(
+        action="BUY", symbol="NVDA", allocation_pct=10.0,
+        entry_price=500.0, stop_loss=485.0, take_profit=530.0, reasoning="Test",
+    )
+    violations = engine.check(decision, positions=[], total_value=float("nan"), daily_pnl=0.0)
+    assert len(violations) == 1
+    from src.pipeline import HARD_BLOCK_RULES
+    assert violations[0].rule in HARD_BLOCK_RULES
+
+
+def test_check_negative_total_value_emits_blocking_violation(engine):
+    """Defense-in-depth: negative equity (extremely unlikely but
+    possible during paper-trading reset) must also block, not bypass."""
+    decision = TradeDecision(
+        action="BUY", symbol="NVDA", allocation_pct=10.0,
+        entry_price=500.0, stop_loss=485.0, take_profit=530.0, reasoning="Test",
+    )
+    violations = engine.check(decision, positions=[], total_value=-100.0, daily_pnl=0.0)
+    assert len(violations) == 1

@@ -58,8 +58,26 @@ class RiskRuleEngine:
               pending_cash_outflow: float = 0.0) -> list[RiskViolation]:
         if decision.action == "SELL":
             return []
-        if total_value <= 0:
-            return []
+        # total_value <= 0 (or NaN) means we can't compute risk percentages.
+        # Pre-fix the early return was `[]` which has the same shape as
+        # "all checks passed" — so an Alpaca portfolio_value=0 blip during
+        # market-open silently approved every BUY, bypassing cash_only /
+        # max_position_pct / max_sector_pct / max_daily_loss_pct. Emit a
+        # synthetic violation in HARD_BLOCK_RULES so the pipeline filter
+        # blocks the BUY instead. The empty list reserved exclusively for
+        # "checked, found no violations" semantics.
+        import math
+        if not math.isfinite(total_value) or total_value <= 0:
+            return [RiskViolation(
+                rule="max_total_position_pct",   # in HARD_BLOCK_RULES
+                message=(
+                    f"total_value={total_value} is not a valid equity figure "
+                    f"(broker glitch or fresh account) — refusing to risk-check "
+                    f"BUY for {decision.symbol}; blocking until next snapshot"
+                ),
+                value=0.0,
+                limit=0.0,
+            )]
 
         # Daily-loss denominator: yesterday-close equity if provided, else current equity.
         # The fallback is only intended for first-day / fresh-account cases where Alpaca
