@@ -784,6 +784,10 @@ class ExecutionStage:
                     "position_qty_before_sell": position_qty,
                     "specs": stop_specs,
                 })
+                # audit F5: notifier banner/inline labels read
+                # order["action"]; broker.submit_order returns none.
+                if isinstance(order, dict):
+                    order.setdefault("action", action_label)
                 orders.append(order)
                 sell_order_ids.append(order["id"])
                 pipeline.db.insert_trade(
@@ -1021,6 +1025,8 @@ class ExecutionStage:
                 pipeline.db.confirm_trade_submitted(
                     pending_row_id, broker_order_id=order.get("id"),
                 )
+                if isinstance(order, dict):
+                    order.setdefault("action", "BUY")  # audit F5
                 orders.append(order)
                 available_cash -= estimated_cost
                 order_type = "limit" if limit_price is not None else "market"

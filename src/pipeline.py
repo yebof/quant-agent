@@ -1461,6 +1461,8 @@ class TradingPipeline:
                 )
             except Exception as e:
                 logger.warning("ex-div: audit log failed for %s: %s", p.symbol, e)
+            if isinstance(order, dict):
+                order.setdefault("action", "TRAIL_STOP")  # audit F5
             orders.append(order)
             logger.info(
                 "Ex-div adjust: %s ex-div %s div $%.4f → stop $%.2f → $%.2f",
@@ -1595,6 +1597,8 @@ class TradingPipeline:
                 )
             except Exception as e:
                 logger.warning("auto_take_profit: audit log failed for %s: %s", p.symbol, e)
+            if isinstance(order, dict):
+                order.setdefault("action", "TAKE_PROFIT")  # audit F5
             orders.append(order)
             logger.info(
                 "Auto take-profit: %s +%.1f%% → sold %s of %s @ limit $%.2f",
@@ -3740,6 +3744,12 @@ class TradingPipeline:
                     "position_qty_before_sell": p.qty,
                     "specs": stop_specs,
                 })
+                # audit F5: tag the order dict with its action so the
+                # notifier's AUTONOMOUS INTERVENTION banner + inline
+                # 🚨EMER label fire (broker.submit_order returns no
+                # 'action' key — the banner was dead in production).
+                if isinstance(order, dict):
+                    order.setdefault("action", "EMERGENCY_SELL")
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,
@@ -3927,6 +3937,8 @@ class TradingPipeline:
                         continue
                     order = self.broker.replace_stop_loss(symbol, new_stop)
                     if order:
+                        if isinstance(order, dict):
+                            order.setdefault("action", "TRAIL_STOP")  # audit F5
                         orders.append(order)
                         self.db.insert_trade(
                             symbol=symbol, action="TRAIL_STOP",
@@ -3975,6 +3987,10 @@ class TradingPipeline:
                     "position_qty_before_sell": position_qty,
                     "specs": stop_specs,
                 })
+                # audit F5: REDUCE/SELL — tag so notifier side/label
+                # detection works on the real pipeline order shape.
+                if isinstance(order, dict):
+                    order.setdefault("action", act)
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=symbol, action=act, qty=qty,
@@ -4131,6 +4147,10 @@ class TradingPipeline:
                     broker_order_id=order.get("id"),
                     fill_status="submitted",
                 )
+                # audit F5: notifier banner / 🚨FORCE label key off
+                # order["action"]; the broker dict has none.
+                if isinstance(order, dict):
+                    order.setdefault("action", "FORCE_DELEVER")
                 orders.append(order)
                 # Conservative estimate: market × 0.99 (matches our limit).
                 projected_proceeds += p.market_value * 0.99
@@ -5000,6 +5020,10 @@ class TradingPipeline:
                     "position_qty_before_sell": p.qty,
                     "specs": stop_specs,
                 })
+                # audit F5: tag action so the notifier banner + 🚨EMER
+                # label fire for intra-session flash-crash liquidation.
+                if isinstance(order, dict):
+                    order.setdefault("action", "EMERGENCY_SELL")
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,

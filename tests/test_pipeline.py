@@ -664,6 +664,58 @@ def test_emergency_liquidate_reconciles_before_dedupe_check(tmp_path):
     db.close()
 
 
+def test_emergency_liquidate_orders_carry_action_for_notifier_banner(tmp_path):
+    """audit F5: the notifier's 🚨 AUTONOMOUS INTERVENTION banner keys off
+    order["action"]. broker.submit_order returns NO 'action' key, so before
+    the fix the banner was dead in production (tests passed only because
+    they hand-crafted action-shaped dicts). Drive the REAL pipeline path
+    with the REAL broker dict shape and assert the banner fires."""
+    from src.storage.db import Database
+    from src.notifier import format_session_result
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = db
+    pipeline.broker = MagicMock()
+    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    # Exactly the shape broker.submit_order returns on success — no "action".
+    pipeline.broker.submit_order.return_value = {
+        "id": "alpaca-1", "status": "accepted", "symbol": "AMZN",
+        "side": "sell", "qty": 51.0, "limit_price": 227.7,
+    }
+    pipeline.broker.get_order_fill_info.return_value = {
+        "status": "filled", "filled_qty": 51.0, "filled_avg_price": 228.0,
+    }
+    pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline._order_accepted = MagicMock(return_value=True)
+    pipeline._full_sell_qty = lambda q: q
+    pipeline._format_qty = lambda q: str(q)
+
+    pos = Position(
+        symbol="AMZN", qty=51.0, avg_entry=240.0, current_price=230.0,
+        market_value=11730.0, unrealized_pnl=-510.0, sector="Consumer Cyclical",
+    )
+    loss_violation = MagicMock(message="Daily loss 4.0% exceeds max 3%")
+
+    orders = pipeline._midday_emergency_liquidate([pos], loss_violation, "run-now")
+
+    assert len(orders) == 1
+    # The enrichment must be on the REAL order dict, not just in insert_trade.
+    assert orders[0].get("action") == "EMERGENCY_SELL", (
+        f"order dict must carry action for the notifier banner; got {orders[0]}"
+    )
+
+    # End-to-end: feed the real pipeline orders into the real notifier.
+    msg = format_session_result(
+        "midday", {"status": "emergency_sold", "orders": orders}, 12.0,
+    )
+    assert "🚨 AUTONOMOUS INTERVENTION" in msg
+    assert "EMERGENCY_SELL" in msg
+    db.close()
+
+
 def test_reprotect_residual_picks_highest_stop_price_among_specs():
     """When multiple stops covered the original position, the re-placed stop
     on the residual qty must use the HIGHEST stop_price from the cancelled
