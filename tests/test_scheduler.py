@@ -108,3 +108,78 @@ def test_scheduler_intra_check_fires_every_30_min_during_market_hours(mock_pipel
         f"intra_check must fire on every 30-min tick within the canonical "
         f"SESSION_WINDOWS window (09:30-16:00 ET inclusive); got {fire_times}"
     )
+
+
+# ---------------------------------------------------------------------------
+# audit F6: --mode live (scheduler) must emit per-session notifications via
+# _run_safe, not just log. Previously a comment claimed parity that didn't
+# exist — legacy/manual live ran silently.
+# ---------------------------------------------------------------------------
+
+@patch("src.scheduler.format_session_result", return_value="MSG")
+@patch("src.scheduler.TradingPipeline")
+def test_run_safe_notifies_on_completed_session(mock_pipeline_cls, mock_fmt):
+    pipeline = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.run_morning.return_value = {"status": "executed"}
+    mock_pipeline_cls.return_value = pipeline
+
+    scheduler = TradingScheduler(MagicMock())
+    scheduler.notifier = MagicMock()
+    scheduler._run_safe(pipeline.run_morning, "morning")
+
+    mock_fmt.assert_called_once()
+    scheduler.notifier.send.assert_called_once_with("MSG")
+
+
+@patch("src.scheduler.format_session_result", return_value="FAILED morning")
+@patch("src.scheduler.TradingPipeline")
+def test_run_safe_notifies_on_raised_session(mock_pipeline_cls, mock_fmt):
+    """A raised session must still push (the operator's only real-time
+    failure signal). The notify hook lives in _run_safe's finally."""
+    pipeline = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.run_morning.side_effect = RuntimeError("broker exploded")
+    mock_pipeline_cls.return_value = pipeline
+
+    scheduler = TradingScheduler(MagicMock())
+    scheduler.notifier = MagicMock()
+    # Must not propagate — _run_safe swallows session exceptions.
+    scheduler._run_safe(pipeline.run_morning, "morning")
+
+    # format_session_result was called with the captured error.
+    assert mock_fmt.call_args.kwargs.get("error") is not None
+    scheduler.notifier.send.assert_called_once_with("FAILED morning")
+
+
+@patch("src.scheduler.format_session_result")
+@patch("src.scheduler.TradingPipeline")
+def test_run_safe_silent_on_non_trading_day(mock_pipeline_cls, mock_fmt):
+    """Non-trading-day skip stays silent — no notification spam (parity
+    with main.py, where the pipeline would return market_holiday)."""
+    pipeline = MagicMock()
+    pipeline.broker.is_trading_day.return_value = False
+    mock_pipeline_cls.return_value = pipeline
+
+    scheduler = TradingScheduler(MagicMock())
+    scheduler.notifier = MagicMock()
+    scheduler._run_safe(pipeline.run_morning, "morning")
+
+    mock_fmt.assert_not_called()
+    scheduler.notifier.send.assert_not_called()
+
+
+@patch("src.scheduler.format_session_result", side_effect=RuntimeError("notifier boom"))
+@patch("src.scheduler.TradingPipeline")
+def test_run_safe_notifier_failure_never_breaks_session(mock_pipeline_cls, mock_fmt):
+    """CLAUDE.md discipline: a missed notification beats a broken
+    session. A notifier blowup inside _run_safe must be swallowed."""
+    pipeline = MagicMock()
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.run_morning.return_value = {"status": "executed"}
+    mock_pipeline_cls.return_value = pipeline
+
+    scheduler = TradingScheduler(MagicMock())
+    scheduler.notifier = MagicMock()
+    # Must not raise despite format_session_result blowing up.
+    scheduler._run_safe(pipeline.run_morning, "morning")

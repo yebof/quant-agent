@@ -1,9 +1,11 @@
 import logging
+import time
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 
 from src.config import AppConfig
+from src.notifier import TelegramNotifier, format_session_result
 from src.pipeline import TradingPipeline
 from src.trading_calendar import ET, SESSION_WINDOWS
 
@@ -14,6 +16,12 @@ class TradingScheduler:
     def __init__(self, config: AppConfig):
         self.config = config
         self.pipeline = TradingPipeline(config)
+        # audit F6: --mode live must notify per-session like
+        # --mode <session> does. main.py wires notifications for the
+        # one-shot modes in its finally block; the blocking scheduler
+        # returns before that, so _run_safe owns notification here.
+        # TelegramNotifier() is a silent no-op without env creds.
+        self.notifier = TelegramNotifier()
         # Schedule times in settings.yaml are interpreted as ET (US equity
         # market local time), matching the morning/midday/evening labels.
         # ET is imported from src.trading_calendar (the project's single
@@ -126,14 +134,37 @@ class TradingScheduler:
         )
 
     def _run_safe(self, func, name: str):
+        start = time.monotonic()
+        result = None
+        error: Exception | None = None
         try:
             if not self.pipeline.broker.is_trading_day():
                 logger.info("[%s] Skipped: market closed for non-trading day", name)
                 return
             result = func()
             logger.info("[%s] Completed: %s", name, result.get("status", "unknown"))
-        except Exception:
+        except Exception as exc:
+            error = exc
             logger.exception("[%s] Failed", name)
+        finally:
+            # Notify only if the session actually ran or raised — a
+            # non-trading-day skip is silent (parity with main.py, where
+            # the pipeline itself returns/notifies). The notification
+            # hook lives in `finally` so a raised session still pushes
+            # FAILED. Notifier failure must NEVER escape _run_safe
+            # (CLAUDE.md: a missed notification beats a broken session).
+            if result is not None or error is not None:
+                try:
+                    elapsed = time.monotonic() - start
+                    message = format_session_result(
+                        name, result, elapsed, error=error,
+                    )
+                    if message:
+                        self.notifier.send(message)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[%s] notifier failed in _run_safe: %s", name, exc,
+                    )
 
     def start(self):
         logger.info("Starting trading scheduler...")

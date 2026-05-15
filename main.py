@@ -103,12 +103,12 @@ def main():
     notifier = TelegramNotifier()
 
     if args.mode == "live":
-        # The blocking scheduler runs forever; the per-session run_*
-        # methods inside still trigger their own notifications via
-        # the same path used by --mode <session> below (the scheduler
-        # uses the same TradingPipeline instance which itself does
-        # not notify — notifications are wired here in main.py at
-        # the entrypoint level so we don't duplicate them).
+        # The blocking scheduler runs forever and never reaches the
+        # finally block below. Per-session Telegram notifications are
+        # therefore emitted by TradingScheduler._run_safe (its own
+        # finally hook + format_session_result), which mirrors the
+        # one-shot path here. audit F6: this used to be only a comment
+        # claiming parity while _run_safe in fact just logged.
         notifier.send("🟢 quant-agent live scheduler starting")
         scheduler = TradingScheduler(config)
         scheduler.setup()
