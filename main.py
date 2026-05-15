@@ -13,6 +13,21 @@ from src.scheduler import TradingScheduler
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+# Result statuses that mean "this session did NOT do its job for a
+# transient/recoverable reason" — a broker-API blip at snapshot time,
+# an earnings fetch failure, an LLM analysis failure. The pipeline
+# returns these as a result dict WITHOUT raising, so without this the
+# process exits 0, the OS-timer wrapper (scripts/run_if_et_window.sh)
+# writes its last-run marker, and the slot is treated as done for the
+# whole day — a 09:30 broker hiccup silently kills the entire morning
+# session. Exiting non-zero makes the wrapper skip the last-run write
+# so the next 30-min tick retries. Terminal "nothing to do" outcomes
+# (no_trades / market_holiday / executed / reviewed / ...) are NOT
+# here — those are successful completions and must exit 0. (audit F2)
+_RETRYABLE_RESULT_STATUSES = frozenset(
+    {"broker_error", "fetch_error", "analysis_error"}
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -147,6 +162,20 @@ def main():
             except Exception as exc:  # noqa: BLE001
                 logger.warning("notifier crashed in finally: %s", exc)
     logger.info("Result: %s", result)
+
+    # audit F2: exit non-zero on a retryable failure so the OS-timer
+    # wrapper does NOT write its last-run marker and the next tick
+    # retries. Placed AFTER the finally block so the Telegram
+    # notification has already been sent — the operator still gets
+    # the FAILED push, the wrapper just doesn't mark the slot done.
+    status = result.get("status") if isinstance(result, dict) else None
+    if status in _RETRYABLE_RESULT_STATUSES:
+        logger.warning(
+            "Session %s ended with retryable status %r — exiting non-zero "
+            "so the OS-timer wrapper retries this slot on the next tick.",
+            args.mode, status,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

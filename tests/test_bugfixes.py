@@ -1215,3 +1215,53 @@ def test_macd_prefilter_normalizes_by_price():
     )
     pct = abs(low_price.macd_hist) / low_price.ma_20
     assert pct >= 0.003  # 0.1, does NOT trigger — correct!
+
+
+# ---------------------------------------------------------------------------
+# audit F2: a retryable failure status must exit non-zero so the OS-timer
+# wrapper does NOT mark the slot done and the next tick retries.
+# ---------------------------------------------------------------------------
+
+def _run_main_with_result(monkeypatch, result_dict):
+    """Invoke main.main() with the pipeline mocked to return result_dict.
+
+    Returns the SystemExit raised (or None if main returned normally).
+    """
+    import main as main_mod
+
+    fake_pipeline = MagicMock()
+    fake_pipeline.run_morning.return_value = result_dict
+
+    monkeypatch.setattr(main_mod, "load_config", lambda _p: MagicMock())
+    monkeypatch.setattr(main_mod, "refresh_pricing", lambda: None)
+    monkeypatch.setattr(main_mod, "TradingPipeline", lambda _c: fake_pipeline)
+    monkeypatch.setattr(main_mod, "TelegramNotifier", lambda: MagicMock())
+    # None means the caller skips the Telegram send path entirely.
+    monkeypatch.setattr(
+        main_mod, "format_session_result", lambda *a, **k: None,
+    )
+    monkeypatch.setattr("sys.argv", ["main.py", "--mode", "morning"])
+
+    try:
+        main_mod.main()
+        return None
+    except SystemExit as exc:
+        return exc
+
+
+def test_main_exits_nonzero_on_retryable_status(monkeypatch):
+    """broker_error / fetch_error / analysis_error → non-zero exit so the
+    wrapper's last-run guard is NOT written and the slot retries."""
+    for status in ("broker_error", "fetch_error", "analysis_error"):
+        exc = _run_main_with_result(monkeypatch, {"status": status})
+        assert exc is not None, f"{status} should raise SystemExit"
+        assert exc.code == 1, f"{status} should exit code 1, got {exc.code}"
+
+
+def test_main_exits_zero_on_terminal_status(monkeypatch):
+    """Terminal 'nothing to do' / success outcomes must exit 0 — otherwise
+    a normal no-trade morning would loop every tick."""
+    for status in ("no_trades", "executed", "market_holiday", "reviewed",
+                    "emergency_sold", "no_data"):
+        exc = _run_main_with_result(monkeypatch, {"status": status})
+        assert exc is None, f"{status} must NOT raise SystemExit (exited {exc})"
