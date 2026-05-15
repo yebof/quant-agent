@@ -110,31 +110,49 @@ def _get_sector(symbol: str) -> str:
     yfinance on every call for an unresolved symbol is a small overhead vs.
     silently disabling a hard risk rule.
     """
+    # _sector_lock guards ONLY the cache dict — never a network call.
+    # audit F3: the old code held _sector_lock for the entire function
+    # including the yfinance fetch, so one stuck symbol froze every
+    # sector lookup process-wide (risk/position sizing all serialize
+    # through _get_sector).
     with _sector_lock:
-        if symbol in _sector_cache:
-            return _sector_cache[symbol]
-        if symbol.upper() in _INDEX_ETFS:
+        cached = _sector_cache.get(symbol)
+    if cached is not None:
+        return cached
+    if symbol.upper() in _INDEX_ETFS:
+        with _sector_lock:
             _sector_cache[symbol] = "Broad"
-            return "Broad"
+        return "Broad"
 
-        def _fetch():
-            try:
-                return yf.Ticker(symbol).info or {}
-            except Exception:
-                return {}
-
+    def _fetch():
         try:
-            with ThreadPoolExecutor(max_workers=1) as ex:
-                info = ex.submit(_fetch).result(timeout=_SECTOR_LOOKUP_TIMEOUT_S)
-        except FuturesTimeout:
-            logger.warning("yfinance sector lookup timed out for %s", symbol)
-            info = {}
+            return yf.Ticker(symbol).info or {}
+        except Exception:
+            return {}
 
-        raw = info.get("sector", "") if isinstance(info, dict) else ""
-        canonical = _canonicalize_sector(raw)
-        if canonical != "Unknown":
+    # yfinance .info has no hard upper bound — a stuck socket can hang
+    # for far longer than _SECTOR_LOOKUP_TIMEOUT_S. audit F3: do NOT use
+    # `with ThreadPoolExecutor(...)`; its __exit__ calls
+    # shutdown(wait=True), which re-blocks on the hung worker after the
+    # .result() timeout fires, making the ceiling illusory.
+    # shutdown(wait=False, cancel_futures=True) returns immediately. A
+    # still-running fetch leaks one worker thread — accepted vs. the
+    # prior behaviour of stalling the whole session.
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        info = ex.submit(_fetch).result(timeout=_SECTOR_LOOKUP_TIMEOUT_S)
+    except FuturesTimeout:
+        logger.warning("yfinance sector lookup timed out for %s", symbol)
+        info = {}
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    raw = info.get("sector", "") if isinstance(info, dict) else ""
+    canonical = _canonicalize_sector(raw)
+    if canonical != "Unknown":
+        with _sector_lock:
             _sector_cache[symbol] = canonical
-        return canonical
+    return canonical
 
 
 class AlpacaBroker:
