@@ -50,6 +50,14 @@ from src.models import (
 
 logger = logging.getLogger(__name__)
 
+# audit F1: a pending_protection_restores row written BEFORE the SELL is
+# submitted carries this as sell_order_id — it means "protective stops
+# were cancelled but the SELL was never confirmed at the broker" (crash
+# in the cancel→submit→record window). The drain pass recognises it and
+# restores coverage from the broker's CURRENT position rather than
+# querying a SELL order that may not exist.
+_WAL_SELL_SENTINEL = "__WAL_PENDING__"
+
 HARD_BLOCK_RULES = {
     "max_daily_loss_pct",
     "max_total_position_pct",
@@ -687,6 +695,43 @@ class TradingPipeline:
         cancelled_specs: list[dict],
         *,
         from_drain: bool = False,
+        wal_row_id: int | None = None,
+    ) -> tuple[bool, list[dict]]:
+        """Thin wrapper over the finalize core (audit F1 WAL lifecycle).
+
+        ``wal_row_id`` is the pending_protection_restores row written
+        BEFORE cancel_protective_stops (write-ahead). The core's bail
+        branches UPDATE that row instead of INSERTing a duplicate; here,
+        once the core confirms coverage is good (ok=True), the
+        write-ahead row is deleted — the recovery intent is discharged.
+        ``from_drain`` rows manage their own lifecycle, so the wrapper
+        never deletes for them. Backward compatible: callers/tests that
+        omit wal_row_id get exactly the pre-F1 behaviour.
+        """
+        ok, retry_specs = self._finalize_protection_after_sell_core(
+            order_id, symbol, position_qty_before_sell, cancelled_specs,
+            from_drain=from_drain, wal_row_id=wal_row_id,
+        )
+        if ok and wal_row_id is not None and not from_drain:
+            try:
+                self.db.delete_pending_protection_restore(wal_row_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "WAL: failed to clear discharged protection-restore "
+                    "row %d for %s: %s (drain will no-op it next session)",
+                    wal_row_id, symbol, exc,
+                )
+        return ok, retry_specs
+
+    def _finalize_protection_after_sell_core(
+        self,
+        order_id: str,
+        symbol: str,
+        position_qty_before_sell: float,
+        cancelled_specs: list[dict],
+        *,
+        from_drain: bool = False,
+        wal_row_id: int | None = None,
     ) -> tuple[bool, list[dict]]:
         """Decide stop coverage based on the actual SELL fill outcome,
         not on submit acceptance.
@@ -765,6 +810,7 @@ class TradingPipeline:
                 if not from_drain:
                     self._persist_orphaned_protection_restore(
                         order_id, symbol, position_qty_before_sell, cancelled_specs,
+                        wal_row_id=wal_row_id,
                     )
                 return False, list(cancelled_specs)
             # Re-read post-cancel — broker may report partial fill that
@@ -793,6 +839,7 @@ class TradingPipeline:
                 if not from_drain:
                     self._persist_orphaned_protection_restore(
                         order_id, symbol, position_qty_before_sell, cancelled_specs,
+                        wal_row_id=wal_row_id,
                     )
                 return False, list(cancelled_specs)
 
@@ -837,6 +884,7 @@ class TradingPipeline:
                         if not from_drain:
                             self._persist_orphaned_protection_restore(
                                 order_id, symbol, current_qty, cancelled_specs,
+                                wal_row_id=wal_row_id,
                             )
                         return False, list(cancelled_specs)
                     return True, []
@@ -862,6 +910,7 @@ class TradingPipeline:
                 if not from_drain:
                     self._persist_orphaned_protection_restore(
                         order_id, symbol, position_qty_before_sell, cancelled_specs,
+                        wal_row_id=wal_row_id,
                     )
                 return False, list(cancelled_specs)
             # PARTIAL restore is incomplete coverage — restoring 1 of 2
@@ -879,6 +928,7 @@ class TradingPipeline:
                 if not from_drain:
                     self._persist_orphaned_protection_restore(
                         order_id, symbol, position_qty_before_sell, failed_specs,
+                        wal_row_id=wal_row_id,
                     )
                 return False, list(failed_specs)
             return True, []
@@ -918,8 +968,135 @@ class TradingPipeline:
             if not from_drain:
                 self._persist_orphaned_protection_restore(
                     order_id, symbol, actual_residual, cancelled_specs,
+                    wal_row_id=wal_row_id,
                 )
             return False, list(cancelled_specs)
+        return True, []
+
+    def _write_ahead_protection_restore(
+        self,
+        symbol: str,
+        position_qty_before_sell: float,
+        specs: list[dict],
+    ) -> int | None:
+        """audit F1: persist the protection-restore intent BEFORE the
+        protective stops are cancelled / the SELL is submitted.
+
+        Every SELL path does cancel_protective_stops() → submit() →
+        wait → finalize. The recovery-intent persist used to live only
+        inside finalize's bail branches, which run AFTER that whole
+        loop. A SIGKILL / reboot / `timeout --kill-after` anywhere in
+        the cancel→finalize window left the broker with no stop and the
+        DB with no recovery row — the position rode naked indefinitely
+        (the in-process try/except in the SELL paths does NOT survive a
+        process kill).
+
+        Writing the row first (sentinel sell_order_id, real specs)
+        collapses the unprotected-and-unrecorded window to the few
+        instructions between cancel_protective_stops() returning and
+        this INSERT committing. The row is flipped to the real order id
+        after the SELL is accepted, and deleted once finalize confirms
+        coverage. Returns the row id (to thread through), or None when
+        there was nothing to protect or the DB write failed (no worse
+        than the pre-F1 behaviour — logged).
+        """
+        if not specs:
+            return None
+        import json as _json
+        try:
+            row_id = self.db.insert_pending_protection_restore(
+                symbol=symbol,
+                sell_order_id=_WAL_SELL_SENTINEL,
+                position_qty_before_sell=position_qty_before_sell,
+                specs_json=_json.dumps(specs),
+            )
+            logger.info(
+                "WAL: wrote protection-restore intent for %s (row %d, "
+                "%d stop(s)) before cancel/submit", symbol, row_id,
+                len(specs),
+            )
+            return row_id
+        except Exception as exc:
+            logger.error(
+                "WAL: failed to write protection-restore intent for %s: "
+                "%s — proceeding without crash-safety for this SELL "
+                "(no worse than pre-F1)", symbol, exc,
+            )
+            return None
+
+    def _restore_after_unconfirmed_sell(
+        self,
+        symbol: str,
+        position_qty_before_sell: float,
+        cancelled_specs: list[dict],
+    ) -> tuple[bool, list[dict]]:
+        """drain handler for a write-ahead row whose SELL was never
+        confirmed (sentinel sell_order_id) — a crash between
+        cancel_protective_stops() and recording the SELL.
+
+        There is no SELL order to query, and the broker may or may not
+        have received/filled a SELL (crash could land before submit, or
+        after submit but before we stored the id). The only trustworthy
+        signal is the broker's CURRENT position. Conservative:
+          - position 0  → SELL filled / position gone → nothing to
+            protect (success).
+          - position unknown → don't guess; leave the row.
+          - position < original spec coverage → collapse to one
+            most-protective stop on the actual shares.
+          - position intact → restore the original specs idempotently
+            (a prior inline reject-restore or partial drain may have
+            already replaced some).
+        Returns (ok, retry_specs) like the finalize core.
+        """
+        if not cancelled_specs:
+            return True, []
+        current = self._current_position_qty_for_finalize(symbol)
+        if current == 0:
+            logger.info(
+                "WAL drain: %s now flat — SELL must have filled / position "
+                "gone; no protection to restore", symbol,
+            )
+            return True, []
+        if current is None:
+            logger.warning(
+                "WAL drain: %s position unknown (broker error) — leaving "
+                "row for next session", symbol,
+            )
+            return False, list(cancelled_specs)
+        total_spec_qty = sum(
+            float(s.get("qty", 0) or 0) for s in cancelled_specs
+        )
+        if current + 1e-6 < total_spec_qty:
+            logger.warning(
+                "WAL drain: %s position=%.4f < original spec qty=%.4f "
+                "(SELL partially filled before crash) — collapsing to a "
+                "single most-protective stop", symbol, current, total_spec_qty,
+            )
+            if not self._reprotect_residual_after_partial_sell(
+                symbol, current, cancelled_specs,
+            ):
+                return False, list(cancelled_specs)
+            return True, []
+        try:
+            restored, failed = self.broker._restore_stop_orders(
+                symbol, cancelled_specs, check_idempotency=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "WAL drain: restore raised for %s: %s — leaving row",
+                symbol, exc,
+            )
+            return False, list(cancelled_specs)
+        if failed:
+            logger.warning(
+                "WAL drain: %s restored %d/%d stop(s) — %d still failing",
+                symbol, restored, len(cancelled_specs), len(failed),
+            )
+            return False, list(failed)
+        logger.info(
+            "WAL drain: %s restored %d original protective stop(s)",
+            symbol, restored,
+        )
         return True, []
 
     def _persist_orphaned_protection_restore(
@@ -928,35 +1105,57 @@ class TradingPipeline:
         symbol: str,
         position_qty_before_sell: float,
         cancelled_specs: list[dict],
+        *,
+        wal_row_id: int | None = None,
     ) -> None:
-        """Write a row to pending_protection_restores so a follow-up
-        session can finish what we couldn't here.
+        """Persist (or update) a protection-restore recovery intent.
 
-        Used by the bail branches of _finalize_protection_after_sell:
-        cancel raised, OR cancel was accepted but didn't converge to
-        terminal in 5s. In both cases the position is sitting with the
+        Used by the bail branches of the finalize core: cancel raised,
+        OR cancel was accepted but didn't converge to terminal in 5s, OR
+        a restore/reprotect failed. The position is sitting with the
         original stops cancelled and a maybe-still-live SELL — neither
-        restoring nor reprotecting is safe right now. Persist the
-        restore intent (specs + sell_order_id) and let the next
-        session's drain pass act once the broker state has settled.
-        Best-effort — DB failure logs but doesn't propagate (the
-        immediate path already had no good option).
+        restoring nor reprotecting is safe right now. Record the intent
+        and let the next session's drain pass act once broker state
+        settles.
+
+        audit F1: when ``wal_row_id`` is set there is already a
+        write-ahead row (inserted BEFORE cancel_protective_stops) — flip
+        it to the real order id + final specs via UPDATE instead of
+        INSERTing a duplicate. Without a wal_row_id (legacy callers /
+        tests) it INSERTs as before. Best-effort — DB failure logs but
+        never propagates (the immediate path already had no good
+        option).
         """
         if not cancelled_specs:
             return
         import json as _json
+        specs_json = _json.dumps(cancelled_specs)
         try:
-            self.db.insert_pending_protection_restore(
-                symbol=symbol,
-                sell_order_id=order_id,
-                position_qty_before_sell=position_qty_before_sell,
-                specs_json=_json.dumps(cancelled_specs),
-            )
-            logger.info(
-                "Persisted orphaned protection-restore for %s (order %s, "
-                "%d cancelled stop(s)) — drain pass will retry next session",
-                symbol, order_id, len(cancelled_specs),
-            )
+            if wal_row_id is not None:
+                self.db.update_pending_protection_restore(
+                    wal_row_id,
+                    sell_order_id=order_id,
+                    position_qty_before_sell=position_qty_before_sell,
+                    specs_json=specs_json,
+                )
+                logger.info(
+                    "WAL: updated protection-restore row %d for %s "
+                    "(order %s, %d cancelled stop(s)) — drain retries next "
+                    "session", wal_row_id, symbol, order_id,
+                    len(cancelled_specs),
+                )
+            else:
+                self.db.insert_pending_protection_restore(
+                    symbol=symbol,
+                    sell_order_id=order_id,
+                    position_qty_before_sell=position_qty_before_sell,
+                    specs_json=specs_json,
+                )
+                logger.info(
+                    "Persisted orphaned protection-restore for %s (order %s, "
+                    "%d cancelled stop(s)) — drain pass will retry next session",
+                    symbol, order_id, len(cancelled_specs),
+                )
         except Exception as exc:
             logger.error(
                 "Failed to persist orphaned protection-restore for %s: %s — "
@@ -990,6 +1189,58 @@ class TradingPipeline:
             row_id = row["id"]
             symbol = row["symbol"]
             order_id = row["sell_order_id"]
+
+            # audit F1: a write-ahead row whose SELL was never confirmed
+            # submitted (crash in the cancel→submit→record window). There
+            # is no SELL order to query — restore coverage from the
+            # broker's CURRENT position instead.
+            if order_id == _WAL_SELL_SENTINEL:
+                try:
+                    wal_specs = _json.loads(row["specs_json"])
+                except Exception as exc:
+                    logger.error(
+                        "drain: WAL row %d has unparseable specs_json (%s) "
+                        "— deleting orphan to unblock the queue", row_id, exc,
+                    )
+                    try:
+                        self.db.delete_pending_protection_restore(row_id)
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    ok, retry = self._restore_after_unconfirmed_sell(
+                        symbol,
+                        float(row["position_qty_before_sell"]),
+                        wal_specs,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "drain: WAL restore raised for %s row %d: %s — "
+                        "leaving for next session", symbol, row_id, exc,
+                    )
+                    continue
+                if ok:
+                    try:
+                        self.db.delete_pending_protection_restore(row_id)
+                    except Exception:
+                        pass
+                    drained += 1
+                    logger.info(
+                        "drain: WAL recovery rebuilt coverage for %s "
+                        "(row %d cleared)", symbol, row_id,
+                    )
+                elif retry and len(retry) < len(wal_specs):
+                    try:
+                        self.db.update_pending_protection_restore_specs(
+                            row_id, _json.dumps(retry),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "drain: failed to narrow WAL row %d: %s",
+                            row_id, exc,
+                        )
+                continue
+
             try:
                 fill_info = self.broker.get_order_fill_info(order_id) or {}
             except Exception as exc:
@@ -1647,6 +1898,11 @@ class TradingPipeline:
                     p.symbol,
                 )
                 continue
+            # audit F1: persist recovery intent BEFORE submit so a crash
+            # in the cancel→finalize window can't leave a naked position.
+            wal_row_id = self._write_ahead_protection_restore(
+                p.symbol, p.qty, stop_specs,
+            )
             try:
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=trim_qty, side="sell",
@@ -1677,6 +1933,7 @@ class TradingPipeline:
                 "order_id": order["id"], "symbol": p.symbol,
                 "position_qty_before_sell": p.qty,
                 "specs": stop_specs,
+                "wal_row_id": wal_row_id,
             })
             try:
                 self.db.insert_trade(
@@ -1715,6 +1972,7 @@ class TradingPipeline:
             self._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
+                wal_row_id=prot.get("wal_row_id"),
             )
         return orders
 
@@ -3820,6 +4078,10 @@ class TradingPipeline:
                         "clear failed; broker would reject the SELL", p.symbol,
                     )
                     continue
+                # audit F1: write-ahead recovery intent before submit.
+                wal_row_id = self._write_ahead_protection_restore(
+                    p.symbol, p.qty, stop_specs,
+                )
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=qty, side="sell",
                     limit_price=emergency_limit,
@@ -3839,6 +4101,7 @@ class TradingPipeline:
                     "order_id": order["id"], "symbol": p.symbol,
                     "position_qty_before_sell": p.qty,
                     "specs": stop_specs,
+                    "wal_row_id": wal_row_id,
                 })
                 # audit F5: tag the order dict with its action so the
                 # notifier's AUTONOMOUS INTERVENTION banner + inline
@@ -3874,6 +4137,7 @@ class TradingPipeline:
             self._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
+                wal_row_id=prot.get("wal_row_id"),
             )
         return orders
 
@@ -4066,6 +4330,10 @@ class TradingPipeline:
                         act, symbol,
                     )
                     continue
+                # audit F1: write-ahead recovery intent before submit.
+                wal_row_id = self._write_ahead_protection_restore(
+                    symbol, position_qty, stop_specs,
+                )
                 order = self.broker.submit_order(
                     symbol=symbol, qty=qty, side="sell",
                     limit_price=sell_limit,
@@ -4082,6 +4350,7 @@ class TradingPipeline:
                     "order_id": order["id"], "symbol": symbol,
                     "position_qty_before_sell": position_qty,
                     "specs": stop_specs,
+                    "wal_row_id": wal_row_id,
                 })
                 # audit F5: REDUCE/SELL — tag so notifier side/label
                 # detection works on the real pipeline order shape.
@@ -4114,6 +4383,7 @@ class TradingPipeline:
             self._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
+                wal_row_id=prot.get("wal_row_id"),
             )
         return orders
 
@@ -4210,6 +4480,10 @@ class TradingPipeline:
                     p.symbol,
                 )
                 continue
+            # audit F1: write-ahead recovery intent before submit.
+            wal_row_id = self._write_ahead_protection_restore(
+                p.symbol, p.qty, stop_specs,
+            )
             try:
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=qty, side="sell",
@@ -4230,6 +4504,7 @@ class TradingPipeline:
                     "order_id": order["id"], "symbol": p.symbol,
                     "position_qty_before_sell": p.qty,
                     "specs": stop_specs,
+                    "wal_row_id": wal_row_id,
                 })
                 self.db.insert_trade(
                     symbol=p.symbol, action="FORCE_DELEVER", qty=qty,
@@ -4273,6 +4548,7 @@ class TradingPipeline:
             self._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
+                wal_row_id=prot.get("wal_row_id"),
             )
 
         # Refresh ctx so downstream stages see post-sell truth.
@@ -5100,6 +5376,10 @@ class TradingPipeline:
                         "clear failed; broker would reject the SELL", p.symbol,
                     )
                     continue
+                # audit F1: write-ahead recovery intent before submit.
+                wal_row_id = self._write_ahead_protection_restore(
+                    p.symbol, p.qty, stop_specs,
+                )
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=qty, side="sell",
                     limit_price=emergency_limit,
@@ -5121,6 +5401,7 @@ class TradingPipeline:
                     "order_id": order["id"], "symbol": p.symbol,
                     "position_qty_before_sell": p.qty,
                     "specs": stop_specs,
+                    "wal_row_id": wal_row_id,
                 })
                 # audit F5: tag action so the notifier banner + 🚨EMER
                 # label fire for intra-session flash-crash liquidation.
@@ -5156,6 +5437,7 @@ class TradingPipeline:
             self._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
+                wal_row_id=prot.get("wal_row_id"),
             )
 
         return {

@@ -765,6 +765,12 @@ class ExecutionStage:
                         action_label, decision.symbol,
                     )
                     continue
+                # audit F1: persist recovery intent BEFORE submit so a
+                # crash (SIGKILL / reboot / timeout --kill-after) in the
+                # cancel→finalize window can't strand a naked position.
+                wal_row_id = pipeline._write_ahead_protection_restore(
+                    decision.symbol, position_qty, stop_specs,
+                )
                 order = pipeline.broker.submit_order(
                     symbol=decision.symbol, qty=qty, side="sell",
                     limit_price=sell_limit,
@@ -783,6 +789,7 @@ class ExecutionStage:
                     "order_id": order["id"], "symbol": decision.symbol,
                     "position_qty_before_sell": position_qty,
                     "specs": stop_specs,
+                    "wal_row_id": wal_row_id,
                 })
                 # audit F5: notifier banner/inline labels read
                 # order["action"]; broker.submit_order returns none.
@@ -808,10 +815,11 @@ class ExecutionStage:
             # — every other SELL path (force_delever / midday_emergency /
             # midday_llm / intra_check / take_profit) wraps the wait in
             # try/except. An uncaught exception here (broker 5xx, DNS
-            # blip mid-poll) propagates past the finalize loop below,
-            # leaving positions with cancelled stops and no recovery
-            # path: pending_protection_restores never gets written
-            # because the persist-on-fail logic lives inside finalize.
+            # blip mid-poll) would propagate past the finalize loop
+            # below. The audit F1 write-ahead row already covers a hard
+            # process kill; this try/except additionally keeps the
+            # in-process finalize path alive so coverage is rebuilt now
+            # rather than waiting for the next session's drain.
             try:
                 status = pipeline.broker.wait_for_order_terminal(order_id)
             except Exception as e:
@@ -834,6 +842,7 @@ class ExecutionStage:
             pipeline._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
+                wal_row_id=prot.get("wal_row_id"),
             )
 
         if sell_decisions:

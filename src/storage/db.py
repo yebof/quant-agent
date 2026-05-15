@@ -567,6 +567,43 @@ class Database:
             self.conn.commit()
             return cur.rowcount or 0
 
+    def update_pending_protection_restore(
+        self, row_id: int, *,
+        sell_order_id: str | None = None,
+        position_qty_before_sell: float | None = None,
+        specs_json: str | None = None,
+    ) -> int:
+        """Partial-update a recovery row (only the provided fields).
+
+        audit F1 write-ahead lifecycle: a row is inserted BEFORE
+        cancel_protective_stops with a sentinel sell_order_id; this flips
+        it to the real broker order id once the SELL is accepted, and
+        finalize-on-bail uses it to UPDATE the existing row (instead of
+        INSERTing a duplicate alongside the write-ahead row).
+        """
+        sets: list[str] = []
+        params: list = []
+        if sell_order_id is not None:
+            sets.append("sell_order_id = ?")
+            params.append(sell_order_id)
+        if position_qty_before_sell is not None:
+            sets.append("position_qty_before_sell = ?")
+            params.append(position_qty_before_sell)
+        if specs_json is not None:
+            sets.append("specs_json = ?")
+            params.append(specs_json)
+        if not sets:
+            return 0
+        params.append(row_id)
+        with self._lock:
+            cur = self.conn.execute(
+                f"UPDATE pending_protection_restores SET {', '.join(sets)} "
+                "WHERE id = ?",
+                tuple(params),
+            )
+            self.conn.commit()
+            return cur.rowcount or 0
+
     def update_pending_protection_restore_specs(
         self, row_id: int, specs_json: str,
     ) -> int:

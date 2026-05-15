@@ -2848,3 +2848,201 @@ def test_filter_hard_risk_decisions_skips_nan_market_value_in_sell_presum(tmp_pa
     # The SELL itself still goes through (not its job to know its proceeds
     # for cash-budget purposes; broker just executes).
     assert any(d.action == "SELL" for d in allowed)
+
+
+# ---------------------------------------------------------------------------
+# audit F1: protection-restore is write-ahead. The recovery row is
+# persisted BEFORE cancel_protective_stops/submit (sentinel order id),
+# flipped to the real id / deleted by finalize, and recovered by the
+# drain pass even after a hard process kill in the cancel→finalize window.
+# ---------------------------------------------------------------------------
+
+def _wal_pipeline(db):
+    from src.pipeline import TradingPipeline
+    p = TradingPipeline.__new__(TradingPipeline)
+    p.db = db
+    p.broker = MagicMock()
+    p._format_qty = lambda q: str(q)
+    return p
+
+
+def test_write_ahead_row_persisted_with_sentinel_then_cleared_on_success(tmp_path):
+    from src.storage.db import Database
+    from src.pipeline import _WAL_SELL_SENTINEL
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipe = _wal_pipeline(db)
+
+    specs = [{"id": "s1", "qty": 10, "stop_price": 90.0, "limit_price": 88.0}]
+    wal_id = pipe._write_ahead_protection_restore("NVDA", 10.0, specs)
+
+    # Row exists BEFORE any submit, keyed by the sentinel.
+    rows = db.get_pending_protection_restores()
+    assert len(rows) == 1
+    assert rows[0]["id"] == wal_id
+    assert rows[0]["sell_order_id"] == _WAL_SELL_SENTINEL
+    assert json.loads(rows[0]["specs_json"]) == specs
+
+    # SELL filled in full → finalize success → WAL row discharged.
+    pipe.broker.get_order_fill_info.return_value = {
+        "status": "filled", "filled_qty": "10", "filled_avg_price": 100.0,
+    }
+    pipe._current_position_qty_for_finalize = lambda s: 0.0
+    ok, _ = pipe._finalize_protection_after_sell(
+        "ord-real", "NVDA", 10.0, specs, wal_row_id=wal_id,
+    )
+    assert ok is True
+    assert db.get_pending_protection_restores() == []
+
+
+def test_write_ahead_no_row_when_nothing_was_protected(tmp_path):
+    from src.storage.db import Database
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipe = _wal_pipeline(db)
+    assert pipe._write_ahead_protection_restore("NVDA", 10.0, []) is None
+    assert db.get_pending_protection_restores() == []
+
+
+def test_finalize_bail_updates_wal_row_not_duplicate(tmp_path):
+    """A finalize bail must UPDATE the existing write-ahead row (flip
+    sentinel→real id) — never INSERT a second row alongside it."""
+    from src.storage.db import Database
+    from src.pipeline import _WAL_SELL_SENTINEL
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipe = _wal_pipeline(db)
+
+    specs = [{"id": "s1", "qty": 5, "stop_price": 90.0, "limit_price": 88.0}]
+    wal_id = pipe._write_ahead_protection_restore("NVDA", 5.0, specs)
+
+    # Lingering non-terminal SELL + cancel raises → first bail branch
+    # persists recovery intent. With wal_row_id set it must UPDATE.
+    pipe.broker.get_order_fill_info.return_value = {"status": "new"}
+    pipe.broker.client.cancel_order_by_id.side_effect = RuntimeError("broker down")
+
+    ok, _ = pipe._finalize_protection_after_sell(
+        "ord-real", "NVDA", 5.0, specs, wal_row_id=wal_id,
+    )
+    assert ok is False
+    rows = db.get_pending_protection_restores()
+    assert len(rows) == 1, "must update the WAL row, not duplicate it"
+    assert rows[0]["id"] == wal_id
+    assert rows[0]["sell_order_id"] == "ord-real"  # sentinel flipped
+    assert rows[0]["sell_order_id"] != _WAL_SELL_SENTINEL
+
+
+def test_drain_sentinel_restores_when_position_intact(tmp_path):
+    """The crash-safety payoff: a sentinel WAL row from a killed session.
+    Drain restores the original stops from the broker's live position."""
+    from src.storage.db import Database
+    from src.pipeline import _WAL_SELL_SENTINEL
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipe = _wal_pipeline(db)
+
+    specs = [{"id": "s1", "qty": 10, "stop_price": 90.0, "limit_price": 88.0}]
+    db.insert_pending_protection_restore(
+        symbol="NVDA", sell_order_id=_WAL_SELL_SENTINEL,
+        position_qty_before_sell=10.0, specs_json=json.dumps(specs),
+    )
+    # SELL never went out → position intact at 10.
+    pipe._current_position_qty_for_finalize = lambda s: 10.0
+    pipe.broker._restore_stop_orders.return_value = (1, [])
+
+    drained = pipe._drain_pending_protection_restores()
+
+    assert drained == 1
+    pipe.broker._restore_stop_orders.assert_called_once()
+    a = pipe.broker._restore_stop_orders.call_args
+    assert a[0][0] == "NVDA" and a[0][1] == specs
+    assert db.get_pending_protection_restores() == []
+
+
+def test_drain_sentinel_noop_when_position_flat(tmp_path):
+    """SELL filled before the crash → broker shows 0 shares → nothing to
+    restore; row cleared, no stop submitted."""
+    from src.storage.db import Database
+    from src.pipeline import _WAL_SELL_SENTINEL
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipe = _wal_pipeline(db)
+    db.insert_pending_protection_restore(
+        symbol="NVDA", sell_order_id=_WAL_SELL_SENTINEL,
+        position_qty_before_sell=10.0,
+        specs_json=json.dumps([{"id": "s1", "qty": 10, "stop_price": 90.0}]),
+    )
+    pipe._current_position_qty_for_finalize = lambda s: 0.0
+
+    drained = pipe._drain_pending_protection_restores()
+
+    assert drained == 1
+    pipe.broker._restore_stop_orders.assert_not_called()
+    assert db.get_pending_protection_restores() == []
+
+
+def test_drain_sentinel_collapses_when_position_reduced(tmp_path):
+    """Partial fill before the crash → position < original coverage →
+    collapse to one most-protective stop on the actual residual."""
+    from src.storage.db import Database
+    from src.pipeline import _WAL_SELL_SENTINEL
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipe = _wal_pipeline(db)
+    specs = [{"id": "s1", "qty": 10, "stop_price": 90.0}]
+    db.insert_pending_protection_restore(
+        symbol="NVDA", sell_order_id=_WAL_SELL_SENTINEL,
+        position_qty_before_sell=10.0, specs_json=json.dumps(specs),
+    )
+    pipe._current_position_qty_for_finalize = lambda s: 4.0
+    pipe._reprotect_residual_after_partial_sell = MagicMock(return_value=True)
+
+    drained = pipe._drain_pending_protection_restores()
+
+    assert drained == 1
+    pipe._reprotect_residual_after_partial_sell.assert_called_once_with(
+        "NVDA", 4.0, specs,
+    )
+    assert db.get_pending_protection_restores() == []
+
+
+def test_midday_emergency_writes_wal_before_submit_survives_submit_crash(tmp_path):
+    """End-to-end of the exact codex gap: cancel succeeds, then the
+    process effectively dies at submit (submit_order raises). The
+    write-ahead row must already be on disk so the next session's drain
+    can rebuild coverage — pre-F1 nothing was persisted here."""
+    from src.storage.db import Database
+    from src.pipeline import _WAL_SELL_SENTINEL
+    from src.models import Position
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipe = _wal_pipeline(db)
+
+    specs = [{"id": "s1", "qty": 51, "stop_price": 200.0, "limit_price": 196.0}]
+    pipe.broker.cancel_protective_stops.return_value = (True, specs)
+    pipe.broker.submit_order.side_effect = RuntimeError("SIGKILL-ish at submit")
+    pipe._full_sell_qty = lambda q: q
+    pipe.db.has_pending_action_for_symbol = lambda *a, **k: False
+
+    pos = Position(
+        symbol="AMZN", qty=51.0, avg_entry=240.0, current_price=230.0,
+        market_value=11730.0, unrealized_pnl=-510.0, sector="Consumer Cyclical",
+    )
+    loss_violation = MagicMock(message="Daily loss 4% exceeds max 3%")
+
+    pipe._midday_emergency_liquidate([pos], loss_violation, "run-x")
+
+    rows = db.get_pending_protection_restores()
+    assert len(rows) == 1, (
+        "write-ahead row must survive a submit-time crash so drain can "
+        "recover — this is the whole point of audit F1"
+    )
+    assert rows[0]["symbol"] == "AMZN"
+    assert rows[0]["sell_order_id"] == _WAL_SELL_SENTINEL
+    assert json.loads(rows[0]["specs_json"]) == specs
