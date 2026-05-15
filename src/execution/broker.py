@@ -625,6 +625,57 @@ class AlpacaBroker:
             logger.warning("Failed to cancel open entry orders: %s", exc)
             return 0
 
+    def list_recent_orders(
+        self, symbol: str, side: str, after,
+    ) -> list[dict]:
+        """All of `symbol`'s orders (any status) on `side` since `after`.
+
+        audit F4: used by the orphan-pending_submit sweep to match a DB
+        write-ahead row to a broker order whose id we lost to a crash
+        between submit_order() and confirm_trade_submitted(). Returns
+        light dicts {id, symbol, side, qty, status}. Best-effort — any
+        API failure returns [] (the caller treats "no candidates" as
+        "submit never landed", which is the safe direction).
+        """
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+
+            want = side.lower()
+            req_side = OrderSide.BUY if want == "buy" else OrderSide.SELL
+            orders = self.client.get_orders(
+                filter=GetOrdersRequest(
+                    status=QueryOrderStatus.ALL, symbols=[symbol],
+                    side=req_side, after=after, nested=False,
+                )
+            )
+            out: list[dict] = []
+            for o in orders or []:
+                o_side = str(getattr(getattr(o, "side", None), "value",
+                                     getattr(o, "side", ""))).lower()
+                if o_side != want:
+                    continue
+                try:
+                    oqty = float(getattr(o, "qty", 0) or 0)
+                except (TypeError, ValueError):
+                    oqty = 0.0
+                oid = str(getattr(o, "id", "") or "")
+                if not oid:
+                    continue
+                out.append({
+                    "id": oid,
+                    "symbol": str(getattr(o, "symbol", "") or ""),
+                    "side": o_side,
+                    "qty": oqty,
+                    "status": str(getattr(getattr(o, "status", None), "value",
+                                          getattr(o, "status", ""))).lower(),
+                })
+            return out
+        except Exception as exc:
+            logger.warning(
+                "list_recent_orders failed for %s %s: %s", side, symbol, exc,
+            )
+            return []
+
     def get_order_fill_info(self, order_id: str) -> dict | None:
         """Return {status, filled_qty, filled_avg_price} for an order, or None.
 

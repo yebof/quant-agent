@@ -457,6 +457,34 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_orphaned_pending_submits(
+        self, min_age_seconds: int = 120,
+    ) -> list[dict]:
+        """BUY write-ahead rows the broker may or may not have received:
+        fill_status 'pending_submit' with broker_order_id still NULL —
+        a crash between submit_order() returning and
+        confirm_trade_submitted() landing.
+
+        audit F4: confirm_trade_submitted's docstring promised reconcile
+        could detect orphans by exactly this predicate, but nothing swept
+        them — a real broker fill could go forever untracked. Age-gated
+        (timestamp older than min_age_seconds) so a same-process in-flight
+        submit — converted to submitted/submit_failed within microseconds
+        — is never misread as an orphan; real orphans are from a prior
+        crashed session and are minutes-to-days old. The cutoff uses
+        SQLite's own clock on both sides (datetime('now', ?)) so there's
+        no host-TZ / format skew.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM trades WHERE fill_status = 'pending_submit' "
+                "AND broker_order_id IS NULL "
+                "AND timestamp < datetime('now', ?) "
+                "ORDER BY timestamp ASC",
+                (f"-{int(min_age_seconds)} seconds",),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def has_pending_action_for_symbol(
         self, symbol: str, action: str, today_only: bool = True,
     ) -> bool:
