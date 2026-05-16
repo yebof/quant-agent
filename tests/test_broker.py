@@ -1346,3 +1346,24 @@ def test_restore_stop_orders_no_alive_stops_uses_legacy_submit_path(mock_tc_cls)
 
     assert restored == 2
     assert broker._submit_stop_limit_order.call_count == 2
+
+
+@patch("src.execution.broker.TradingClient")
+def test_list_recent_orders_returns_none_on_api_failure(mock_tc_cls):
+    """audit F4 review #2: a failed Alpaca query must be distinguishable
+    from 'no such order' so the orphan sweep doesn't mark a real BUY
+    submit_failed. Raise → None; success → list."""
+    from datetime import datetime, timezone
+
+    mock_client = MagicMock()
+    mock_client.get_orders.side_effect = RuntimeError("alpaca 503")
+    mock_tc_cls.return_value = mock_client
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+
+    after = datetime.now(timezone.utc)
+    assert broker.list_recent_orders("NVDA", "buy", after) is None
+
+    # Query succeeds, genuinely no orders → [] (NOT None).
+    mock_client.get_orders.side_effect = None
+    mock_client.get_orders.return_value = []
+    assert broker.list_recent_orders("NVDA", "buy", after) == []

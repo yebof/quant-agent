@@ -432,6 +432,25 @@ def test_orphan_sweep_marks_failed_when_no_broker_order(tmp_path):
     assert r["broker_order_id"] is None
 
 
+def test_orphan_sweep_keeps_row_when_broker_query_failed(tmp_path):
+    """audit F4 review #2: list_recent_orders → None means the broker
+    query FAILED, not 'order absent'. The row must stay pending_submit
+    (retry next session), NOT be marked submit_failed — otherwise a
+    transient Alpaca blip silently drops a possibly-filled BUY."""
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    row_id = _insert_orphan(db, symbol="NVDA", qty=10)
+
+    broker = MagicMock()
+    broker.list_recent_orders.return_value = None  # query FAILED
+    pipeline = _mk_pipeline(db, broker)
+
+    assert pipeline._reconcile_orphan_pending_submits() == 0
+    r = _row(db, row_id)
+    assert r["fill_status"] == "pending_submit"  # untouched — retry later
+    assert r["broker_order_id"] is None
+
+
 def test_orphan_sweep_leaves_ambiguous_for_manual(tmp_path):
     """Two broker orders match symbol+side+qty — adopting either could
     mis-track money. The row must stay untouched + flagged, never guessed."""

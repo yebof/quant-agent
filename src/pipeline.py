@@ -1522,8 +1522,12 @@ class TradingPipeline:
           - exactly ONE broker order matching symbol+side+qty → adopt its
             id (confirm_trade_submitted); _reconcile_fills then resolves
             the fill normally.
-          - ZERO matching broker orders → the submit never landed; mark
-            submit_failed.
+          - broker query FAILED (list_recent_orders → None) → leave the
+            row; retry next session. NEVER mark submit_failed on a
+            transient API failure (review #2): a real / already-filled
+            BUY would be silently dropped.
+          - query OK + ZERO matching orders → the submit never landed;
+            mark submit_failed.
           - AMBIGUOUS (>1 candidate) → do NOT guess. Adopting the wrong
             order would mis-track real money — leave the row pending and
             ERROR-log for manual reconciliation.
@@ -1557,8 +1561,19 @@ class TradingPipeline:
                 candidates = self.broker.list_recent_orders(symbol, "buy", after)
             except Exception as exc:
                 logger.warning(
-                    "orphan-sweep: broker query failed for %s row %d: %s — "
+                    "orphan-sweep: broker query raised for %s row %d: %s — "
                     "leaving for next session", symbol, row_id, exc,
+                )
+                continue
+            if candidates is None:
+                # Query FAILED (not "no such order"). Marking
+                # submit_failed here would discard a possibly-real /
+                # already-filled BUY. Leave the row for next session.
+                logger.warning(
+                    "orphan-sweep: broker order query unavailable for %s "
+                    "row %d — leaving pending_submit for next session "
+                    "(NOT marking submit_failed on a transient failure)",
+                    symbol, row_id,
                 )
                 continue
             matches = [

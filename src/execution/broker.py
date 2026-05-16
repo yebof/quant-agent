@@ -627,15 +627,20 @@ class AlpacaBroker:
 
     def list_recent_orders(
         self, symbol: str, side: str, after,
-    ) -> list[dict]:
+    ) -> list[dict] | None:
         """All of `symbol`'s orders (any status) on `side` since `after`.
 
         audit F4: used by the orphan-pending_submit sweep to match a DB
         write-ahead row to a broker order whose id we lost to a crash
         between submit_order() and confirm_trade_submitted(). Returns
-        light dicts {id, symbol, side, qty, status}. Best-effort — any
-        API failure returns [] (the caller treats "no candidates" as
-        "submit never landed", which is the safe direction).
+        light dicts {id, symbol, side, qty, status}.
+
+        audit F4 (review #2): the return distinguishes "query succeeded,
+        zero orders" ([]) from "query FAILED" (None). The caller must
+        NOT treat a transient Alpaca/API failure as "submit never
+        landed" — doing so would mark a possibly-real / already-filled
+        BUY as submit_failed. None ⇒ leave the row and retry next
+        session; [] ⇒ genuinely no such order.
         """
         try:
             from alpaca.trading.requests import GetOrdersRequest
@@ -672,9 +677,11 @@ class AlpacaBroker:
             return out
         except Exception as exc:
             logger.warning(
-                "list_recent_orders failed for %s %s: %s", side, symbol, exc,
+                "list_recent_orders failed for %s %s: %s — returning None "
+                "so the caller retries rather than misjudging the order "
+                "absent", side, symbol, exc,
             )
-            return []
+            return None
 
     def get_order_fill_info(self, order_id: str) -> dict | None:
         """Return {status, filled_qty, filled_avg_price} for an order, or None.
