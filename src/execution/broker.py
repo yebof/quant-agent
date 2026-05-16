@@ -535,6 +535,81 @@ class AlpacaBroker:
             logger.warning("Failed to cancel open orders: %s", exc)
             return 0
 
+    def snapshot_protective_stops(
+        self, symbol: str,
+    ) -> tuple[bool, list[dict]]:
+        """List + snapshot open SELL stop orders WITHOUT cancelling them.
+
+        audit F1 (review #1): the write-ahead recovery row must be
+        persisted BEFORE any broker mutation. Splitting the read
+        (snapshot) from the write (cancel) lets the pipeline do
+        snapshot → persist WAL → cancel, so a process kill anywhere
+        from the cancel onward is recoverable. Previously the WAL insert
+        ran AFTER cancel_protective_stops had already cancelled the
+        stops at the broker — a kill in that window left a naked
+        position with no recovery intent.
+
+        Returns ``(ok, specs)``. ``ok`` is kept for call-site symmetry
+        with cancel_protective_stops; a pure read can't "fail to clear"
+        so it is always True (a listing API error is swallowed by
+        _list_open_sell_stop_orders and surfaces as no stops, exactly
+        as in the pre-split behaviour).
+        """
+        stops = self._list_open_sell_stop_orders(symbol)
+        if not stops:
+            return True, []
+        specs: list[dict] = []
+        for order in stops:
+            spec = self._snapshot_stop_order(order)
+            if spec:
+                specs.append(spec)
+        return True, specs
+
+    def cancel_snapshotted_stops(
+        self, symbol: str, specs: list[dict],
+    ) -> bool:
+        """Cancel pre-snapshotted protective stops by id.
+
+        Same partial-failure discipline as the original
+        cancel_protective_stops: if any cancel raises, the ones that
+        did cancel are restored and False is returned (the caller won't
+        proceed with the SELL, so leaving coverage shrunk for no gain
+        would be strictly worse). Returns True iff every stop was
+        cancelled (or there were none).
+        """
+        if not specs:
+            return True
+        cancelled: list[dict] = []
+        failed = 0
+        for spec in specs:
+            sid = spec.get("id")
+            if not sid:
+                continue
+            try:
+                self.client.cancel_order_by_id(sid)
+                cancelled.append(spec)
+            except Exception as exc:
+                logger.warning(
+                    "cancel_snapshotted_stops: cancel failed for %s order "
+                    "%s: %s", symbol, sid, exc,
+                )
+                failed += 1
+        if failed > 0:
+            if cancelled:
+                self._restore_stop_orders(symbol, cancelled)
+            logger.warning(
+                "cancel_snapshotted_stops: %d/%d cancel(s) failed for %s "
+                "(rolled back %d that succeeded); SELL won't proceed",
+                failed, len(specs), symbol, len(cancelled),
+            )
+            return False
+        if cancelled:
+            logger.info(
+                "Cancelled %d protective stop(s) for %s",
+                len(cancelled), symbol,
+            )
+        return True
+
     def cancel_protective_stops(self, symbol: str) -> tuple[bool, list[dict]]:
         """Cancel all open SELL stop orders for one symbol so a fresh exit
         order has free shares to work with.
@@ -565,38 +640,23 @@ class AlpacaBroker:
         same rollback discipline as ``replace_stop_loss``. The caller
         won't proceed with the SELL anyway, so leaving partial-cancelled
         state at the broker would just shrink coverage for no gain.
-        """
-        stops = self._list_open_sell_stop_orders(symbol)
-        if not stops:
-            return True, []
 
-        cancelled_specs: list[dict] = []
-        failed = 0
-        for order in stops:
-            spec = self._snapshot_stop_order(order)
-            if not spec:
-                continue
-            try:
-                self.client.cancel_order_by_id(spec["id"])
-                cancelled_specs.append(spec)
-            except Exception as exc:
-                logger.warning(
-                    "cancel_protective_stops: cancel failed for %s order %s: %s",
-                    symbol, spec["id"], exc,
-                )
-                failed += 1
-        if failed > 0:
-            if cancelled_specs:
-                self._restore_stop_orders(symbol, cancelled_specs)
-            logger.warning(
-                "cancel_protective_stops: %d/%d cancel(s) failed for %s "
-                "(rolled back %d that succeeded); downstream SELL won't proceed",
-                failed, len(stops), symbol, len(cancelled_specs),
-            )
+        Now composed from snapshot_protective_stops +
+        cancel_snapshotted_stops (audit F1 review #1). The external
+        contract is unchanged: no stops -> (True, []); all cancelled ->
+        (True, specs); partial failure -> rolled back, (False, []).
+        Direct callers/tests are unaffected; SELL paths use the
+        pipeline's write-ahead orchestrator instead so the recovery row
+        lands before the cancel.
+        """
+        ok, specs = self.snapshot_protective_stops(symbol)
+        if not ok:
             return False, []
-        if cancelled_specs:
-            logger.info("Cancelled %d protective stop(s) for %s", len(cancelled_specs), symbol)
-        return True, cancelled_specs
+        if not specs:
+            return True, []
+        if not self.cancel_snapshotted_stops(symbol, specs):
+            return False, []
+        return True, specs
 
     def cancel_open_entry_orders(self) -> int:
         """Cancel open BUY/entry orders while preserving protective SELL legs."""

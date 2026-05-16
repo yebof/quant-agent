@@ -757,7 +757,13 @@ class ExecutionStage:
                 sell_price = existing[0].current_price
                 sell_limit = round(sell_price * 0.995, 2)
                 position_qty = existing[0].qty
-                ok, stop_specs = pipeline.broker.cancel_protective_stops(decision.symbol)
+                # audit F1 review #1: snapshot -> persist WAL -> cancel,
+                # so the recovery row is durable BEFORE any broker
+                # mutation (a SIGKILL / reboot / timeout --kill-after in
+                # the old cancel→WAL gap left a naked position).
+                ok, stop_specs, wal_row_id = pipeline._cancel_stops_with_write_ahead(
+                    decision.symbol, position_qty,
+                )
                 if not ok:
                     logger.warning(
                         "Skipping %s %s: protective-stop clear failed; "
@@ -765,12 +771,6 @@ class ExecutionStage:
                         action_label, decision.symbol,
                     )
                     continue
-                # audit F1: persist recovery intent BEFORE submit so a
-                # crash (SIGKILL / reboot / timeout --kill-after) in the
-                # cancel→finalize window can't strand a naked position.
-                wal_row_id = pipeline._write_ahead_protection_restore(
-                    decision.symbol, position_qty, stop_specs,
-                )
                 order = pipeline.broker.submit_order(
                     symbol=decision.symbol, qty=qty, side="sell",
                     limit_price=sell_limit,

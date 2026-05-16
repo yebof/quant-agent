@@ -12,6 +12,36 @@ from src.models import (
 )
 
 
+def _mock_stop_seam(broker, *, specs=(), snapshot_ok=True, cancel_ok=True):
+    """Wire a MagicMock broker's split stop-cancel seam (audit F1 #1).
+
+    SELL paths now call broker.snapshot_protective_stops (read) then
+    broker.cancel_snapshotted_stops (mutate) via the pipeline's
+    write-ahead orchestrator, not the old monolithic
+    cancel_protective_stops. This sets all three consistently so a test
+    can keep expressing intent as "stops present + cancel cleanly"
+    (default) or a failure (snapshot_ok / cancel_ok = False).
+    """
+    specs = list(specs)
+    broker.snapshot_protective_stops.return_value = (snapshot_ok, specs)
+    broker.cancel_snapshotted_stops.return_value = cancel_ok
+    cleared = snapshot_ok and cancel_ok
+    broker.cancel_protective_stops.return_value = (
+        cleared, specs if cleared else [],
+    )
+
+
+def _mock_stage_seam(pipeline, *, specs=(), ok=True, wal_row_id=None):
+    """For tests where the WHOLE pipeline is a MagicMock: ExecutionStage
+    (and the other SELL paths) now obtain stops via
+    pipeline._cancel_stops_with_write_ahead (audit F1 #1), so its
+    3-tuple return must be stubbed directly — _mock_stop_seam only wires
+    the broker, which a fully-mocked pipeline never reaches."""
+    pipeline._cancel_stops_with_write_ahead.return_value = (
+        ok, list(specs), wal_row_id,
+    )
+
+
 def _pm_rc() -> ReasoningChain:
     return ReasoningChain(
         macro_filter="x", news_check="x", earnings_check="x",
@@ -632,7 +662,7 @@ def test_emergency_liquidate_reconciles_before_dedupe_check(tmp_path):
     pipeline.broker.get_order_fill_info.return_value = {
         "status": "canceled", "filled_qty": None, "filled_avg_price": None,
     }
-    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    _mock_stop_seam(pipeline.broker)
     pipeline.broker.submit_order.return_value = {
         "id": "alpaca-fresh", "status": "accepted", "symbol": "AMZN",
     }
@@ -679,7 +709,7 @@ def test_emergency_liquidate_orders_carry_action_for_notifier_banner(tmp_path):
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.db = db
     pipeline.broker = MagicMock()
-    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    _mock_stop_seam(pipeline.broker)
     # Exactly the shape broker.submit_order returns on success — no "action".
     pipeline.broker.submit_order.return_value = {
         "id": "alpaca-1", "status": "accepted", "symbol": "AMZN",
@@ -803,7 +833,7 @@ def test_take_profit_restores_stops_when_sell_rejected(tmp_path):
     cancelled = [
         {"id": "stop-old", "qty": 100, "stop_price": 95.0, "limit_price": 92.0},
     ]
-    pipeline.broker.cancel_protective_stops.return_value = (True, cancelled)
+    _mock_stop_seam(pipeline.broker, specs=cancelled)
 
     winner = Position(
         symbol="NVDA", qty=100, avg_entry=100, current_price=135,
@@ -842,7 +872,10 @@ def test_full_sell_skips_residual_reprotect(tmp_path):
         "id": "sell-full", "status": "accepted", "symbol": "JPM",
     }
     pipeline.broker.wait_for_order_terminal.return_value = "filled"
-    pipeline.broker.cancel_protective_stops.return_value = (True, [
+    _mock_stop_seam(pipeline.broker, specs=[
+        {"id": "stop-1", "qty": 10, "stop_price": 280.0, "limit_price": 275.0}
+    ])
+    _mock_stage_seam(pipeline, specs=[
         {"id": "stop-1", "qty": 10, "stop_price": 280.0, "limit_price": 275.0}
     ])
     pipeline._refresh_account_state.return_value = (
@@ -911,7 +944,7 @@ def test_take_profit_reprotects_residual_after_partial_trim_fills(tmp_path):
         {"id": "stop-old-low", "qty": 100, "stop_price": 90.0, "limit_price": 87.0},
         {"id": "stop-old-high", "qty": 100, "stop_price": 95.0, "limit_price": 92.0},
     ]
-    pipeline.broker.cancel_protective_stops.return_value = (True, cancelled)
+    _mock_stop_seam(pipeline.broker, specs=cancelled)
     # Limit fills at exactly the trim qty.
     pipeline.broker.wait_for_order_terminal.return_value = "filled"
     pipeline.broker.get_order_fill_info.return_value = {
@@ -955,7 +988,7 @@ def test_take_profit_restores_originals_when_limit_does_not_fill(tmp_path):
     cancelled = [
         {"id": "stop-old", "qty": 100, "stop_price": 95.0, "limit_price": 92.0},
     ]
-    pipeline.broker.cancel_protective_stops.return_value = (True, cancelled)
+    _mock_stop_seam(pipeline.broker, specs=cancelled)
     # Limit accepted, but later expired with zero fill.
     pipeline.broker.wait_for_order_terminal.return_value = "expired"
     pipeline.broker.get_order_fill_info.return_value = {
@@ -1884,7 +1917,7 @@ def test_take_profit_reprotects_actual_residual_on_partial_fill(tmp_path):
     cancelled = [
         {"id": "stop-old", "qty": 100, "stop_price": 95.0, "limit_price": 92.0},
     ]
-    pipeline.broker.cancel_protective_stops.return_value = (True, cancelled)
+    _mock_stop_seam(pipeline.broker, specs=cancelled)
     pipeline.broker.wait_for_order_terminal.return_value = "canceled"
     pipeline.broker.get_order_fill_info.return_value = {
         "status": "canceled", "filled_qty": "12", "filled_avg_price": "117.5",
@@ -2019,7 +2052,7 @@ def test_emergency_liquidate_skips_position_when_pending_emergency_sell_already_
     pipeline.db.has_pending_action_for_symbol.side_effect = (
         lambda symbol, action: symbol == "AMZN" and action == "EMERGENCY_SELL"
     )
-    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    _mock_stop_seam(pipeline.broker)
     pipeline.broker.submit_order.return_value = {
         "id": "sell-spy-new", "status": "accepted", "symbol": "SPY",
     }
@@ -2069,8 +2102,14 @@ def test_emergency_liquidate_skips_position_when_protective_stop_cancel_fails():
         market_value=11730.0, unrealized_pnl=-510.0, sector="Consumer Cyclical",
     )
 
-    pipeline.broker.cancel_protective_stops.side_effect = (
-        lambda sym: ((sym != "AMZN"), [])
+    # audit F1 #1: split seam. Both symbols HAVE stops (snapshot is a
+    # read, always succeeds); AMZN's cancel is what fails, so AMZN must
+    # be skipped while SPY proceeds.
+    pipeline.broker.snapshot_protective_stops.side_effect = (
+        lambda sym: (True, [{"id": f"stp-{sym}", "qty": 1.0, "stop_price": 1.0}])
+    )
+    pipeline.broker.cancel_snapshotted_stops.side_effect = (
+        lambda sym, specs: sym != "AMZN"
     )
     pipeline.broker.submit_order.return_value = {
         "id": "sell-spy", "status": "accepted", "symbol": "SPY"
@@ -2090,9 +2129,12 @@ def test_emergency_liquidate_skips_position_when_protective_stop_cancel_fails():
 
     assert len(orders) == 1, f"only the cleanly-cleared SPY should sell, got {orders}"
     assert orders[0]["symbol"] == "SPY"
-    assert pipeline.broker.cancel_protective_stops.call_count == 2
-    pipeline.broker.cancel_protective_stops.assert_any_call("SPY")
-    pipeline.broker.cancel_protective_stops.assert_any_call("AMZN")
+    # snapshot is attempted for both; cancel is attempted for both, but
+    # only AMZN's returns False → AMZN skipped before submit.
+    assert pipeline.broker.snapshot_protective_stops.call_count == 2
+    pipeline.broker.snapshot_protective_stops.assert_any_call("SPY")
+    pipeline.broker.snapshot_protective_stops.assert_any_call("AMZN")
+    assert pipeline.broker.cancel_snapshotted_stops.call_count == 2
     # AMZN must NOT have reached the SELL submit — that's the whole point.
     submit_calls = pipeline.broker.submit_order.call_args_list
     assert all(c.kwargs.get("symbol") != "AMZN" for c in submit_calls), (
@@ -2450,7 +2492,7 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
         {"id": "sell-1", "status": "accepted", "symbol": "SPY"},
         {"id": "buy-1", "status": "accepted", "symbol": "QQQ"},
     ]
-    mock_broker.cancel_protective_stops.return_value = (True, [])
+    _mock_stop_seam(mock_broker)
     mock_broker_cls.return_value = mock_broker
 
     mock_maa = MagicMock()
@@ -2515,7 +2557,7 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
 def _mk_midday_pipeline(position: Position) -> TradingPipeline:
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.broker = MagicMock()
-    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    _mock_stop_seam(pipeline.broker)
     pipeline.broker.submit_order.return_value = {
         "id": "ord-1", "status": "accepted", "symbol": position.symbol,
     }
@@ -2699,7 +2741,7 @@ def test_force_delever_persists_exact_action_string_to_trades_table():
     from src.pipeline_context import RunContext
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.broker = MagicMock()
-    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    _mock_stop_seam(pipeline.broker)
     pipeline.broker.submit_order.return_value = {
         "id": "ord-1", "status": "accepted", "symbol": "NVDA",
     }
@@ -2744,7 +2786,7 @@ def test_force_delever_sells_long_before_inverse_etf_hedge():
     from src.pipeline_context import RunContext
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.broker = MagicMock()
-    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    _mock_stop_seam(pipeline.broker)
     pipeline.broker.submit_order.return_value = {
         "id": "ord-1", "status": "accepted",
     }
@@ -3025,7 +3067,7 @@ def test_midday_emergency_writes_wal_before_submit_survives_submit_crash(tmp_pat
     pipe = _wal_pipeline(db)
 
     specs = [{"id": "s1", "qty": 51, "stop_price": 200.0, "limit_price": 196.0}]
-    pipe.broker.cancel_protective_stops.return_value = (True, specs)
+    _mock_stop_seam(pipe.broker, specs=specs)
     pipe.broker.submit_order.side_effect = RuntimeError("SIGKILL-ish at submit")
     pipe._full_sell_qty = lambda q: q
     pipe.db.has_pending_action_for_symbol = lambda *a, **k: False
@@ -3046,3 +3088,99 @@ def test_midday_emergency_writes_wal_before_submit_survives_submit_crash(tmp_pat
     assert rows[0]["symbol"] == "AMZN"
     assert rows[0]["sell_order_id"] == _WAL_SELL_SENTINEL
     assert json.loads(rows[0]["specs_json"]) == specs
+
+
+# ---------------------------------------------------------------------------
+# audit F1 review #1: the WAL row must be durable BEFORE the broker
+# cancels the stops — snapshot (read) -> persist WAL -> cancel (mutate).
+# ---------------------------------------------------------------------------
+
+def _wal_pipe(db):
+    from src.pipeline import TradingPipeline
+    p = TradingPipeline.__new__(TradingPipeline)
+    p.db = db
+    p.broker = MagicMock()
+    p._format_qty = lambda q: str(q)
+    return p
+
+
+def test_cancel_stops_with_write_ahead_persists_before_cancel(tmp_path):
+    """The crux of review #1: when broker.cancel_snapshotted_stops is
+    invoked, the recovery row must ALREADY be committed. Capturing DB
+    state at cancel-time proves the ordering, not just the end state."""
+    from src.storage.db import Database
+    from src.pipeline import _WAL_SELL_SENTINEL
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipe = _wal_pipe(db)
+    specs = [{"id": "s1", "qty": 10, "stop_price": 90.0, "limit_price": 88.0}]
+    pipe.broker.snapshot_protective_stops.return_value = (True, specs)
+
+    seen_at_cancel = {}
+
+    def _cancel(sym, sp):
+        seen_at_cancel["rows"] = db.get_pending_protection_restores()
+        return True
+
+    pipe.broker.cancel_snapshotted_stops.side_effect = _cancel
+
+    ok, out_specs, wal_id = pipe._cancel_stops_with_write_ahead("NVDA", 10.0)
+
+    assert ok is True and out_specs == specs and wal_id is not None
+    # The row existed at the moment cancel was called — true write-ahead.
+    assert len(seen_at_cancel["rows"]) == 1
+    assert seen_at_cancel["rows"][0]["sell_order_id"] == _WAL_SELL_SENTINEL
+    assert seen_at_cancel["rows"][0]["id"] == wal_id
+    # And snapshot happened before cancel (read before mutate).
+    pipe.broker.snapshot_protective_stops.assert_called_once_with("NVDA")
+    pipe.broker.cancel_snapshotted_stops.assert_called_once()
+
+
+def test_cancel_stops_with_write_ahead_no_stops_no_row_no_cancel(tmp_path):
+    """No protective stops → nothing to write-ahead, cancel never called,
+    SELL still proceeds (ok=True, no wal row)."""
+    from src.storage.db import Database
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipe = _wal_pipe(db)
+    pipe.broker.snapshot_protective_stops.return_value = (True, [])
+
+    ok, specs, wal_id = pipe._cancel_stops_with_write_ahead("NVDA", 10.0)
+
+    assert ok is True and specs == [] and wal_id is None
+    pipe.broker.cancel_snapshotted_stops.assert_not_called()
+    assert db.get_pending_protection_restores() == []
+
+
+def test_cancel_stops_with_write_ahead_discharges_row_on_cancel_failure(tmp_path):
+    """Cancel fails (rolled back by the broker) → stops are still live,
+    SELL must be skipped, and the pre-written WAL row is discharged so
+    the next drain doesn't 'restore' stops that never left."""
+    from src.storage.db import Database
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipe = _wal_pipe(db)
+    specs = [{"id": "s1", "qty": 10, "stop_price": 90.0}]
+    pipe.broker.snapshot_protective_stops.return_value = (True, specs)
+    pipe.broker.cancel_snapshotted_stops.return_value = False  # rolled back
+
+    ok, out_specs, wal_id = pipe._cancel_stops_with_write_ahead("NVDA", 10.0)
+
+    assert ok is False and out_specs == [] and wal_id is None
+    # Row must NOT leak — it was discharged on the cancel-rollback.
+    assert db.get_pending_protection_restores() == []
+
+
+def test_cancel_stops_with_write_ahead_skips_on_snapshot_failure(tmp_path):
+    from src.storage.db import Database
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    pipe = _wal_pipe(db)
+    pipe.broker.snapshot_protective_stops.return_value = (False, [])
+
+    ok, specs, wal_id = pipe._cancel_stops_with_write_ahead("NVDA", 10.0)
+
+    assert ok is False and specs == [] and wal_id is None
+    pipe.broker.cancel_snapshotted_stops.assert_not_called()
+    assert db.get_pending_protection_restores() == []

@@ -18,6 +18,28 @@ from src.pipeline_stages import (
 )
 
 
+def _mock_stop_seam(broker, *, specs=(), snapshot_ok=True, cancel_ok=True):
+    """Wire a MagicMock broker's split stop-cancel seam (audit F1 #1):
+    snapshot_protective_stops (read) + cancel_snapshotted_stops (mutate),
+    plus the composed cancel_protective_stops for any direct caller."""
+    specs = list(specs)
+    broker.snapshot_protective_stops.return_value = (snapshot_ok, specs)
+    broker.cancel_snapshotted_stops.return_value = cancel_ok
+    cleared = snapshot_ok and cancel_ok
+    broker.cancel_protective_stops.return_value = (
+        cleared, specs if cleared else [],
+    )
+
+
+def _mock_stage_seam(pipeline, *, specs=(), ok=True, wal_row_id=None):
+    """Full-MagicMock-pipeline tests: ExecutionStage obtains stops via
+    pipeline._cancel_stops_with_write_ahead (audit F1 #1); stub its
+    3-tuple directly (the broker seam is never reached on a mock)."""
+    pipeline._cancel_stops_with_write_ahead.return_value = (
+        ok, list(specs), wal_row_id,
+    )
+
+
 def test_stage_classes_take_pipeline_reference():
     """DecisionStage / RiskStage / ExecutionStage wire a pipeline for helpers."""
     fake_pipeline = MagicMock()
@@ -266,7 +288,8 @@ def test_execution_stage_blocks_buys_when_daily_loss_breached_during_run():
 
     pipeline = MagicMock()
     pipeline.broker.get_latest_price.return_value = 100.0
-    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    _mock_stop_seam(pipeline.broker)
+    _mock_stage_seam(pipeline)
     # SELL submits cleanly first.
     pipeline.broker.submit_order.return_value = {
         "id": "sell-1", "status": "accepted", "symbol": "JPM",
@@ -336,7 +359,7 @@ def test_execution_stage_allows_buys_when_daily_loss_not_breached_after_refresh(
 
     pipeline = MagicMock()
     pipeline.broker.get_latest_price.return_value = 100.0
-    pipeline.broker.cancel_protective_stops.return_value = (True, [])
+    _mock_stop_seam(pipeline.broker)
     pipeline.broker.submit_order.return_value = {
         "id": "buy-1", "status": "accepted", "symbol": "SPY",
     }

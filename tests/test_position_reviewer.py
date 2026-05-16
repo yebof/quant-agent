@@ -677,6 +677,9 @@ def _executor_pipeline_with_position(symbol: str, qty: float, current_price: flo
     on a single position. broker / db are mocked at the call surface."""
     pipeline = TradingPipeline.__new__(TradingPipeline)
     pipeline.broker = MagicMock()
+    # audit F1 #1: SELL paths use the split snapshot/cancel seam.
+    pipeline.broker.snapshot_protective_stops.return_value = (True, [])
+    pipeline.broker.cancel_snapshotted_stops.return_value = True
     pipeline.broker.cancel_protective_stops.return_value = (True, [])
     pipeline.broker.submit_order.return_value = {
         "id": "test-order", "status": "accepted", "symbol": symbol,

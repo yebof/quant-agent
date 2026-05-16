@@ -368,6 +368,69 @@ def test_cancel_protective_stops_cancels_each_stop_and_returns_specs(mock_tc_cls
 
 
 @patch("src.execution.broker.TradingClient")
+def test_snapshot_protective_stops_lists_without_cancelling(mock_tc_cls):
+    """audit F1 review #1: snapshot is a pure READ — it must NOT cancel
+    anything (the pipeline persists the WAL row between snapshot and
+    cancel)."""
+    stop_a = MagicMock(); stop_a.id = "stop-a"
+    stop_a.order_type = "stop"; stop_a.side = "sell"
+    stop_a.qty = "51"; stop_a.stop_price = "248.50"; stop_a.limit_price = "240.00"
+
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [stop_a]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    ok, specs = broker.snapshot_protective_stops("AMZN")
+
+    assert ok is True
+    assert len(specs) == 1 and specs[0]["id"] == "stop-a"
+    assert specs[0]["stop_price"] == 248.50
+    mock_client.cancel_order_by_id.assert_not_called()  # READ only
+
+
+@patch("src.execution.broker.TradingClient")
+def test_cancel_snapshotted_stops_cancels_each_by_id(mock_tc_cls):
+    mock_client = MagicMock()
+    mock_tc_cls.return_value = mock_client
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+
+    specs = [
+        {"id": "stop-a", "qty": 51.0, "stop_price": 248.5, "limit_price": 240.0},
+        {"id": "stop-b", "qty": 51.0, "stop_price": 246.0, "limit_price": 238.0},
+    ]
+    assert broker.cancel_snapshotted_stops("AMZN", specs) is True
+    assert mock_client.cancel_order_by_id.call_count == 2
+    mock_client.cancel_order_by_id.assert_any_call("stop-a")
+    mock_client.cancel_order_by_id.assert_any_call("stop-b")
+
+
+@patch("src.execution.broker.TradingClient")
+def test_cancel_snapshotted_stops_partial_failure_rolls_back(mock_tc_cls):
+    """One cancel raises → the ones that cancelled are restored and
+    False is returned (same discipline as the old monolithic path)."""
+    mock_client = MagicMock()
+
+    def _cancel(oid):
+        if oid == "stop-b":
+            raise RuntimeError("alpaca 500")
+
+    mock_client.cancel_order_by_id.side_effect = _cancel
+    mock_tc_cls.return_value = mock_client
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    broker._restore_stop_orders = MagicMock(return_value=(1, []))
+
+    specs = [
+        {"id": "stop-a", "qty": 51.0, "stop_price": 248.5, "limit_price": 240.0},
+        {"id": "stop-b", "qty": 51.0, "stop_price": 246.0, "limit_price": 238.0},
+    ]
+    assert broker.cancel_snapshotted_stops("AMZN", specs) is False
+    broker._restore_stop_orders.assert_called_once()
+    restored_arg = broker._restore_stop_orders.call_args[0][1]
+    assert [s["id"] for s in restored_arg] == ["stop-a"]  # only the cancelled one
+
+
+@patch("src.execution.broker.TradingClient")
 def test_cancel_protective_stops_partial_failure_rolls_back_and_returns_false(mock_tc_cls):
     """If any cancel raises, restore the ones we already cancelled and
     return (False, []). Submitting through a partially-cleared stop set

@@ -979,26 +979,24 @@ class TradingPipeline:
         position_qty_before_sell: float,
         specs: list[dict],
     ) -> int | None:
-        """audit F1: persist the protection-restore intent BEFORE the
-        protective stops are cancelled / the SELL is submitted.
+        """audit F1: persist the protection-restore intent.
 
-        Every SELL path does cancel_protective_stops() → submit() →
-        wait → finalize. The recovery-intent persist used to live only
-        inside finalize's bail branches, which run AFTER that whole
-        loop. A SIGKILL / reboot / `timeout --kill-after` anywhere in
-        the cancel→finalize window left the broker with no stop and the
-        DB with no recovery row — the position rode naked indefinitely
-        (the in-process try/except in the SELL paths does NOT survive a
+        The recovery-intent persist used to live only inside finalize's
+        bail branches, which run AFTER the whole cancel -> submit ->
+        wait -> finalize loop. A SIGKILL / reboot / `timeout
+        --kill-after` anywhere in that window left the broker with no
+        stop and the DB with no recovery row — the position rode naked
+        indefinitely (the in-process try/except does NOT survive a
         process kill).
 
-        Writing the row first (sentinel sell_order_id, real specs)
-        collapses the unprotected-and-unrecorded window to the few
-        instructions between cancel_protective_stops() returning and
-        this INSERT committing. The row is flipped to the real order id
-        after the SELL is accepted, and deleted once finalize confirms
-        coverage. Returns the row id (to thread through), or None when
-        there was nothing to protect or the DB write failed (no worse
-        than the pre-F1 behaviour — logged).
+        Called by _cancel_stops_with_write_ahead AFTER snapshotting the
+        stops but BEFORE cancelling them (audit F1 review #1), so the
+        sentinel row is durable before any broker mutation — there is no
+        "stops cancelled but nothing recorded" window. The row is
+        flipped to the real order id by finalize's bail and deleted once
+        finalize confirms coverage. Returns the row id (to thread
+        through), or None when there was nothing to protect or the DB
+        write failed (no worse than the pre-F1 behaviour — logged).
         """
         if not specs:
             return None
@@ -1023,6 +1021,54 @@ class TradingPipeline:
                 "(no worse than pre-F1)", symbol, exc,
             )
             return None
+
+    def _cancel_stops_with_write_ahead(
+        self, symbol: str, position_qty_before_sell: float,
+    ) -> tuple[bool, list[dict], int | None]:
+        """Snapshot protective stops -> persist WAL recovery intent ->
+        THEN cancel the stops. audit F1 review #1: true write-ahead.
+
+        The previous F1 fix wrote the WAL row AFTER
+        cancel_protective_stops, which had already cancelled the stops
+        at the broker — a kill inside / just after that call left a
+        naked position with no recovery intent. Ordering snapshot →
+        persist → cancel guarantees the recovery row is durable BEFORE
+        any broker mutation. A kill before the cancel is harmless (stops
+        still live; drain's sentinel path re-reads the position and the
+        idempotent restore is a no-op). A kill during/after the cancel
+        is recoverable from the row.
+
+        Returns ``(ok, specs, wal_row_id)``. ``ok=False`` ⇒ skip the
+        SELL: either the snapshot failed, or the cancel failed and was
+        rolled back (position still protected, SELL would be rejected on
+        held_for_orders anyway). When there were no stops to begin with,
+        returns ``(True, [], None)`` — nothing to protect, SELL proceeds.
+        """
+        ok, specs = self.broker.snapshot_protective_stops(symbol)
+        if not ok:
+            return False, [], None
+        if not specs:
+            return True, [], None
+        wal_row_id = self._write_ahead_protection_restore(
+            symbol, position_qty_before_sell, specs,
+        )
+        if not self.broker.cancel_snapshotted_stops(symbol, specs):
+            # Stops NOT cleared (rolled back by cancel_snapshotted_stops).
+            # The position is still protected and the SELL would be
+            # rejected on held_for_orders — discharge the row we just
+            # pre-wrote so the next drain doesn't redundantly "restore"
+            # stops that never actually left the broker.
+            if wal_row_id is not None:
+                try:
+                    self.db.delete_pending_protection_restore(wal_row_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "WAL: failed to discharge row %d after cancel "
+                        "rollback for %s: %s (drain will idempotently "
+                        "no-op it)", wal_row_id, symbol, exc,
+                    )
+            return False, [], None
+        return True, specs, wal_row_id
 
     def _restore_after_unconfirmed_sell(
         self,
@@ -1906,18 +1952,17 @@ class TradingPipeline:
                 # let the trailing stop handle that decision.
                 continue
             sell_limit = round(p.current_price * 0.995, 2)
-            ok, stop_specs = self.broker.cancel_protective_stops(p.symbol)
+            # audit F1 review #1: snapshot -> persist WAL -> cancel, so
+            # the recovery row is durable BEFORE any broker mutation.
+            ok, stop_specs, wal_row_id = self._cancel_stops_with_write_ahead(
+                p.symbol, p.qty,
+            )
             if not ok:
                 logger.warning(
                     "auto_take_profit: skipping %s — protective-stop clear failed",
                     p.symbol,
                 )
                 continue
-            # audit F1: persist recovery intent BEFORE submit so a crash
-            # in the cancel→finalize window can't leave a naked position.
-            wal_row_id = self._write_ahead_protection_restore(
-                p.symbol, p.qty, stop_specs,
-            )
             try:
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=trim_qty, side="sell",
@@ -4086,17 +4131,16 @@ class TradingPipeline:
                     )
                     continue
                 emergency_limit = round(p.current_price * 0.99, 2)
-                ok, stop_specs = self.broker.cancel_protective_stops(p.symbol)
+                # audit F1 review #1: snapshot -> persist WAL -> cancel.
+                ok, stop_specs, wal_row_id = self._cancel_stops_with_write_ahead(
+                    p.symbol, p.qty,
+                )
                 if not ok:
                     logger.warning(
                         "Midday emergency sell: skipping %s — protective-stop "
                         "clear failed; broker would reject the SELL", p.symbol,
                     )
                     continue
-                # audit F1: write-ahead recovery intent before submit.
-                wal_row_id = self._write_ahead_protection_restore(
-                    p.symbol, p.qty, stop_specs,
-                )
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=qty, side="sell",
                     limit_price=emergency_limit,
@@ -4338,17 +4382,16 @@ class TradingPipeline:
                     continue
                 sell_limit = round(existing[0].current_price * 0.995, 2)
                 position_qty = existing[0].qty
-                ok, stop_specs = self.broker.cancel_protective_stops(symbol)
+                # audit F1 review #1: snapshot -> persist WAL -> cancel.
+                ok, stop_specs, wal_row_id = self._cancel_stops_with_write_ahead(
+                    symbol, position_qty,
+                )
                 if not ok:
                     logger.warning(
                         "Reviewer %s %s skipped: protective-stop clear failed",
                         act, symbol,
                     )
                     continue
-                # audit F1: write-ahead recovery intent before submit.
-                wal_row_id = self._write_ahead_protection_restore(
-                    symbol, position_qty, stop_specs,
-                )
                 order = self.broker.submit_order(
                     symbol=symbol, qty=qty, side="sell",
                     limit_price=sell_limit,
@@ -4488,17 +4531,16 @@ class TradingPipeline:
             if qty is None:
                 continue
             sell_limit = round(p.current_price * 0.99, 2)
-            ok, stop_specs = self.broker.cancel_protective_stops(p.symbol)
+            # audit F1 review #1: snapshot -> persist WAL -> cancel.
+            ok, stop_specs, wal_row_id = self._cancel_stops_with_write_ahead(
+                p.symbol, p.qty,
+            )
             if not ok:
                 logger.warning(
                     "Force-delever: skipping %s — protective-stop clear failed",
                     p.symbol,
                 )
                 continue
-            # audit F1: write-ahead recovery intent before submit.
-            wal_row_id = self._write_ahead_protection_restore(
-                p.symbol, p.qty, stop_specs,
-            )
             try:
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=qty, side="sell",
@@ -5384,17 +5426,16 @@ class TradingPipeline:
                     )
                     continue
                 emergency_limit = round(p.current_price * 0.99, 2)
-                ok, stop_specs = self.broker.cancel_protective_stops(p.symbol)
+                # audit F1 review #1: snapshot -> persist WAL -> cancel.
+                ok, stop_specs, wal_row_id = self._cancel_stops_with_write_ahead(
+                    p.symbol, p.qty,
+                )
                 if not ok:
                     logger.warning(
                         "Intra emergency sell: skipping %s — protective-stop "
                         "clear failed; broker would reject the SELL", p.symbol,
                     )
                     continue
-                # audit F1: write-ahead recovery intent before submit.
-                wal_row_id = self._write_ahead_protection_restore(
-                    p.symbol, p.qty, stop_specs,
-                )
                 order = self.broker.submit_order(
                     symbol=p.symbol, qty=qty, side="sell",
                     limit_price=emergency_limit,
