@@ -223,10 +223,15 @@ def test_order_dump_preserves_every_sdk_field():
     d = mod._order_to_dict(o)
     missing = [name for name in Order.model_fields if name not in d]
     assert not missing, f"export dropped fields the SDK exposed: {missing}"
-    # Enums normalize to their string values; UUIDs to str.
-    assert d["side"] == "buy"
-    assert d["status"] == "filled"
-    assert d["asset_class"] == "us_equity"
+    # Enums must normalize to their string values — alpaca-py enums are
+    # (str, Enum) subclasses, so plain equality with "buy" / "filled"
+    # would pass even if the value were still an enum (the f-string in
+    # the text report would then print 'OrderStatus.FILLED'). Assert
+    # the EXACT type to lock the normalize ordering.
+    assert d["side"] == "buy" and type(d["side"]) is str
+    assert d["status"] == "filled" and type(d["status"]) is str
+    assert d["asset_class"] == "us_equity" and type(d["asset_class"]) is str
+    assert d["order_class"] == "simple" and type(d["order_class"]) is str
     assert isinstance(d["id"], str) and len(d["id"]) == 36  # UUID stringified
     # Decimal-like price strings preserved (no float lossy cast).
     assert d["filled_avg_price"] == "187.42"
