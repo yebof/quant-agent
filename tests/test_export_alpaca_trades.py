@@ -276,7 +276,13 @@ def test_render_daily_pnl_csv_zips_arrays_and_computes_daily_delta():
     """Alpaca returns parallel arrays + a scalar base_value. The renderer
     must zip them into rows AND add daily_pnl = equity[i] − equity[i−1],
     seeding row 0's prev from base_value so the first day's P&L is not
-    silently lost."""
+    silently lost.
+
+    NOTE: Alpaca's profit_loss[i] is DAILY (= equity[i]−equity[i−1]),
+    NOT cumulative-from-base — an earlier version of this renderer
+    misread it as cumulative and showed nonsense for any day past
+    day 0. We now compute cumulative ourselves; this test pins it.
+    """
     import csv
     import io
 
@@ -285,12 +291,15 @@ def test_render_daily_pnl_csv_zips_arrays_and_computes_daily_delta():
     day0 = datetime(2026, 4, 7, 20, 0, tzinfo=timezone.utc)   # close of 4-7
     day1 = datetime(2026, 4, 8, 20, 0, tzinfo=timezone.utc)
     day2 = datetime(2026, 4, 9, 20, 0, tzinfo=timezone.utc)
+    # profit_loss / profit_loss_pct match Alpaca's real (daily) contract,
+    # not the misread cumulative form. They're ignored by the renderer
+    # now but kept here to mirror what the API actually returns.
     history = {
         "timestamp": [int(day0.timestamp()), int(day1.timestamp()),
                        int(day2.timestamp())],
         "equity": [100500.0, 102000.0, 101200.0],
-        "profit_loss": [500.0, 2000.0, 1200.0],
-        "profit_loss_pct": [0.005, 0.02, 0.012],
+        "profit_loss":     [500.0,  1500.0,   -800.0],
+        "profit_loss_pct": [0.005,  0.0149,  -0.00784],
         "base_value": 100000.0,
         "timeframe": "1D",
     }
@@ -305,6 +314,7 @@ def test_render_daily_pnl_csv_zips_arrays_and_computes_daily_delta():
     assert {"equity", "daily_pnl", "daily_return_pct",
             "cumulative_pnl_vs_base"} <= set(header_line)
 
+    # --- daily columns (equity-diff) ---
     # Day 0: daily_pnl seeded from base_value → 100500 − 100000 = 500.
     assert float(rows[0]["equity"]) == 100500.0
     assert float(rows[0]["daily_pnl"]) == pytest.approx(500.0)
@@ -315,8 +325,37 @@ def test_render_daily_pnl_csv_zips_arrays_and_computes_daily_delta():
     assert float(rows[2]["daily_pnl"]) == pytest.approx(-800.0)
     # date_et formatting (ET, YYYY-MM-DD).
     assert rows[0]["date_et"].startswith("2026-04-")
-    # cumulative columns passed through verbatim.
+
+    # --- TRUE cumulative-from-base columns (the bug guard) ---
+    # Day 0: equity − base = 500.   Day 1: 2000.   Day 2: 1200.
+    assert float(rows[0]["cumulative_pnl_vs_base"]) == pytest.approx(500.0)
     assert float(rows[1]["cumulative_pnl_vs_base"]) == pytest.approx(2000.0)
+    assert float(rows[2]["cumulative_pnl_vs_base"]) == pytest.approx(1200.0)
+    assert float(rows[0]["cumulative_return_pct_vs_base"]) == pytest.approx(0.005, abs=1e-6)
+    assert float(rows[1]["cumulative_return_pct_vs_base"]) == pytest.approx(0.02, abs=1e-6)
+    assert float(rows[2]["cumulative_return_pct_vs_base"]) == pytest.approx(0.012, abs=1e-6)
+
+
+def test_render_daily_pnl_csv_cumulative_independent_of_alpaca_profit_loss():
+    """Regression guard for the daily-vs-cumulative confusion: even if
+    Alpaca's profit_loss[] arrays were absent or wildly wrong, the
+    cumulative columns must still compute correctly from equity − base."""
+    import csv
+    import io
+
+    mod = _load_module()
+    day0 = datetime(2026, 4, 7, 20, tzinfo=timezone.utc)
+    day1 = datetime(2026, 4, 8, 20, tzinfo=timezone.utc)
+    history = {
+        "timestamp": [int(day0.timestamp()), int(day1.timestamp())],
+        "equity": [100500.0, 102000.0],
+        # Deliberately omit profit_loss arrays — renderer must not depend on them.
+        "base_value": 100000.0,
+        "timeframe": "1D",
+    }
+    rows = list(csv.DictReader(io.StringIO(mod.render_daily_pnl_csv(history))))
+    assert float(rows[1]["cumulative_pnl_vs_base"]) == pytest.approx(2000.0)
+    assert float(rows[1]["cumulative_return_pct_vs_base"]) == pytest.approx(0.02, abs=1e-6)
 
 
 def test_render_daily_pnl_csv_blank_first_row_when_no_base():
@@ -451,6 +490,61 @@ def test_fetch_all_activities_failure_raises_runtime_error():
     client.get.side_effect = RuntimeError("Alpaca 503")
     with pytest.raises(RuntimeError, match="activities fetch failed"):
         mod.fetch_all_activities(client)
+
+
+def test_fetch_all_activities_orders_fills_before_same_day_dividends():
+    """A DIV record has only `date` ('YYYY-MM-DD'); a FILL has
+    `transaction_time` (ISO with time). Lexical sort would interleave
+    them wrong on a shared calendar day. Canonical-datetime sort places
+    the timed FILL before the date-only DIV (which we treat as
+    end-of-day) on the same date."""
+    mod = _load_module()
+    page = [
+        {"id": "DIV-1", "activity_type": "DIV", "symbol": "AAPL",
+         "date": "2026-05-15", "net_amount": "1.20"},
+        {"id": "FILL-1", "activity_type": "FILL", "symbol": "AAPL",
+         "side": "buy", "qty": "10", "price": "187.42",
+         "transaction_time": "2026-05-15T13:30:02Z"},
+    ]
+    client = MagicMock()
+    client.get.side_effect = [page, []]
+    acts = mod.fetch_all_activities(client, page_size=100)
+    assert [a["id"] for a in acts] == ["FILL-1", "DIV-1"], (
+        "intraday FILL must precede same-day DIV; got "
+        f"{[a['id'] for a in acts]}"
+    )
+
+
+def test_fetch_all_orders_handles_full_page_at_same_timestamp():
+    """When `page_limit` orders all share the same submitted_at (burst
+    of submissions inside one millisecond), the cursor must not skip
+    siblings by stepping back only 1µs. The stalled-cursor branch
+    backs off by 1 second + dedup absorbs the overlap."""
+    mod = _load_module()
+
+    burst_ts = datetime(2026, 4, 19, 13, 30, 0, tzinfo=timezone.utc)
+    later_ts = datetime(2026, 4, 19, 13, 31, 0, tzinfo=timezone.utc)
+
+    def make(oid, ts):
+        return _ord(oid=oid, sym="AAPL", side="buy", qty=1, filled=1,
+                     price=100.0, status="filled", submitted=ts)
+
+    # Page 1 (full, all at burst_ts — orders A,B): full → cursor stalls.
+    page1 = [make("B", burst_ts), make("A", burst_ts)]
+    # Page 2 (full, repeats A,B + reveals C also at burst_ts): dedup
+    # keeps A,B; adds C. Still full → step back further.
+    page2 = [make("B", burst_ts), make("A", burst_ts), make("C", burst_ts)][:2]
+    # After 1-second back-off, Alpaca returns prior orders.
+    page3 = [make("D", later_ts - timedelta(seconds=5))]
+    page4: list = []
+
+    client = MagicMock()
+    client.get_orders.side_effect = [page1, page2, page3, page4]
+
+    orders = mod.fetch_all_orders(client, page_limit=2)
+    ids = {o["id"] for o in orders}
+    # A and B must both survive — no silent loss across the burst.
+    assert {"A", "B"} <= ids, f"burst orders dropped: got {ids}"
 
 
 # ---------------------------------------------------------------------------

@@ -120,6 +120,7 @@ def _normalize_for_json(v):
     This is the SINGLE place that decides "what does a field's value
     look like in the dump" — everything else just reads it.
     """
+    from datetime import date as _date
     from decimal import Decimal
     from enum import Enum
     from uuid import UUID
@@ -141,6 +142,13 @@ def _normalize_for_json(v):
         return str(v)
     if isinstance(v, datetime):
         return v
+    # date BEFORE datetime would be wrong (datetime is a subclass of
+    # date), and AFTER works because isinstance(dt, date) is True for
+    # datetimes too — so the datetime branch above already claimed
+    # them. Plain `date` falls here and renders as ISO 'YYYY-MM-DD',
+    # matching how Alpaca's DIV activities encode their `date` field.
+    if isinstance(v, _date):
+        return v.isoformat()
     if isinstance(v, (str, int, float, bool)):
         return v
     if isinstance(v, dict):
@@ -258,6 +266,14 @@ def fetch_all_orders(
     - 1µs) → repeat until empty / page shorter than limit / cursor falls
     below `since`. Dedup by id covers the boundary tie case (two orders
     sharing the same submitted_at across pages).
+
+    Tie-handling: if a full page returns `page_limit` orders that all
+    share the same submitted_at (rare — burst submissions inside one
+    millisecond), advancing by 1µs would skip the next-id sibling at
+    that same timestamp and silently lose orders. The "stalled cursor"
+    branch below detects this (oldest == previous cursor) and steps
+    back by 1 SECOND, then relies on the id-dedup set to absorb the
+    revisited overlap.
     """
     from alpaca.trading.requests import GetOrdersRequest
     from alpaca.trading.enums import QueryOrderStatus
@@ -265,6 +281,7 @@ def fetch_all_orders(
     seen: set[str] = set()
     out: list[dict] = []
     cursor_until = until
+    prev_oldest: datetime | None = None
 
     while True:
         kwargs = {
@@ -299,9 +316,18 @@ def fetch_all_orders(
         # to advance the cursor.
         if len(page) < page_limit or new_in_page == 0 or oldest_in_page is None:
             break
-        next_until = oldest_in_page - timedelta(microseconds=1)
+        # Stalled cursor: a full page where the oldest timestamp equals
+        # the prior cursor's anchor means more siblings exist at the
+        # same `submitted_at` than fit in one page. A 1µs back-step
+        # would slip past them. Back off by 1s and let dedup handle
+        # the overlap.
+        if prev_oldest is not None and oldest_in_page == prev_oldest:
+            next_until = oldest_in_page - timedelta(seconds=1)
+        else:
+            next_until = oldest_in_page - timedelta(microseconds=1)
         if since is not None and next_until <= since:
             break
+        prev_oldest = oldest_in_page
         cursor_until = next_until
 
     out.sort(key=lambda r: (
@@ -430,17 +456,32 @@ def fetch_all_activities(
             break  # guard against API loop
         page_token = last_id
 
-    # Sort oldest first for export. transaction_time is the canonical
-    # FILL timestamp; non-FILL types may use other keys, so fall back to
-    # `date` then id for stable ordering.
-    def _sort_key(a: dict):
-        for k in ("transaction_time", "date", "id"):
-            v = a.get(k)
-            if v:
-                return (str(v), str(a.get("id") or ""))
-        return ("", str(a.get("id") or ""))
+    # Sort oldest first. transaction_time is the canonical FILL
+    # timestamp (ISO with time); non-FILL types like DIV use a `date`
+    # field (date only, no time). Lexical sort would interleave them
+    # wrong: '2026-05-15' < '2026-05-15T13:00:00Z' compares as 'T' >
+    # '' so the date-only DIV would sort BEFORE same-day FILLs. Parse
+    # to a canonical datetime so a 9:30 FILL precedes a 16:00-stamped
+    # DIV on the same date.
+    def _sort_dt(a: dict) -> datetime:
+        tt = a.get("transaction_time")
+        if tt:
+            try:
+                return datetime.fromisoformat(str(tt).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                pass
+        d = a.get("date")
+        if d:
+            try:
+                # End-of-day so intraday FILLs precede same-date DIV /
+                # CFEE / JNLC records (those are credited at session
+                # close on the trading ledger).
+                return datetime.fromisoformat(str(d) + "T23:59:59+00:00")
+            except (ValueError, TypeError):
+                pass
+        return datetime.min.replace(tzinfo=timezone.utc)
 
-    out.sort(key=_sort_key)
+    out.sort(key=lambda a: (_sort_dt(a), str(a.get("id") or "")))
     return out
 
 
@@ -701,25 +742,29 @@ def render_daily_pnl_csv(history: dict) -> str:
 
     Alpaca returns parallel arrays (timestamp / equity / profit_loss /
     profit_loss_pct) plus a scalar base_value (= equity at the START of
-    the period). We zip them into rows and add a derived `daily_pnl`
-    column (equity[i] − equity[i−1]) so the operator can see per-day
-    deltas, not just cumulative-vs-base.
+    the period). IMPORTANT: Alpaca's profit_loss[i] is the DAILY P&L
+    for that bar (= equity[i] − equity[i−1]), not cumulative-from-base.
+    Earlier versions of this renderer passed those values through as
+    the "cumulative_*" columns, which made them silently wrong (e.g.
+    showing −$18 on the last day when true cumulative was +$5,909). We
+    now compute BOTH the daily and the cumulative columns ourselves
+    from `equity` and `base_value`, so the labels match the math.
 
-    First row's daily_pnl uses base_value as the previous reference
-    point — by definition of base_value, equity[0] − base_value IS the
-    first day's P&L. If base_value is missing the first row's
-    daily_pnl/daily_return_pct stay blank.
+    First row's daily_pnl seeds prev_equity from base_value — by
+    definition equity[0] − base_value IS the first day's P&L. If
+    base_value is missing, the first row's daily_* stay blank; the
+    cumulative_* columns stay blank for the entire run (we won't
+    invent a baseline).
 
-    Empty history -> empty string. Column order is fixed (NOT alphabetical):
-    date first, base_value last — what an operator actually reads.
+    Empty history -> empty string. Column order is fixed (NOT
+    alphabetical): date first, base_value last — what an operator
+    actually reads.
     """
     import csv
     import io
 
     timestamps = history.get("timestamp") or []
     equity_arr = history.get("equity") or []
-    pl_arr = history.get("profit_loss") or []
-    pl_pct_arr = history.get("profit_loss_pct") or []
     if not timestamps:
         return ""
     try:
@@ -742,8 +787,6 @@ def render_daily_pnl_csv(history: dict) -> str:
         date_et = dt_utc.astimezone(ET).strftime("%Y-%m-%d") if dt_utc else ""
 
         eq = _safe_float(equity_arr, i)
-        cum_pnl = _safe_float(pl_arr, i)
-        cum_pct = _safe_float(pl_pct_arr, i)
 
         if eq is not None and prev_equity is not None:
             daily_pnl = eq - prev_equity
@@ -751,6 +794,15 @@ def render_daily_pnl_csv(history: dict) -> str:
         else:
             daily_pnl = None
             daily_pct = None
+
+        # TRUE cumulative-from-base — equity at this bar minus the
+        # account's starting equity at the period boundary.
+        if eq is not None and base_value is not None:
+            cum_pnl = eq - base_value
+            cum_pct = (cum_pnl / base_value) if base_value else None
+        else:
+            cum_pnl = None
+            cum_pct = None
 
         writer.writerow({
             "date_et": date_et,
@@ -917,9 +969,12 @@ def main(argv=None) -> int:
         daily_pnl_history = {}
 
     # 4) Account activities (paginated, full passthrough). Optional.
+    # Skip the fetch when --no-companions is set — the activities.jsonl
+    # would be discarded anyway, and on long-lived accounts this is the
+    # most expensive call in the pipeline.
     activities: list[dict] = []
     activities_warning: str | None = None
-    if not args.skip_activities:
+    if not args.skip_activities and not args.no_companions:
         types = (
             [t.strip().upper() for t in args.activity_types.split(",") if t.strip()]
             if args.activity_types else None
