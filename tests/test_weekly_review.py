@@ -55,14 +55,27 @@ def test_weekly_review_runs_on_fresh_db(tmp_path):
 
 def test_weekly_review_shows_numbers_when_data_present(tmp_path):
     """Populate a DB with one daily_pnl row + one insights row + some
-    trades + agent_logs, assert key numbers surface."""
+    trades + agent_logs, assert key numbers surface.
+
+    Dates are computed relative to today so the fixture stays inside the
+    --days 30 lookback window regardless of when the test runs (matches
+    the sibling test below at line ~163 that uses
+    `datetime.now() - timedelta(days=3)` for the same reason — hardcoded
+    dates here used to drift out of the window once they aged past a
+    month).
+    """
     db_path = tmp_path / "populated.db"
     db = Database(str(db_path))
     db.initialize()
 
+    # Sit comfortably inside the --days 30 window the test passes below.
+    fixture_date = date.today() - timedelta(days=3)
+    fixture_day = fixture_date.isoformat()
+    fixture_day_minus_one = (fixture_date - timedelta(days=1)).isoformat()
+
     # Daily P&L row
     db.insert_daily_pnl(
-        date="2026-04-18",
+        date=fixture_day,
         total_value=105_000.0,
         daily_pnl=500.0,
         daily_return_pct=0.48,
@@ -75,18 +88,18 @@ def test_weekly_review_shows_numbers_when_data_present(tmp_path):
         "tomorrow_bias, tomorrow_conviction, sell_grades_json, buy_grades_json) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            "2026-04-18", "watch FOMC", "be patient", "moderate",
+            fixture_day, "watch FOMC", "be patient", "moderate",
             "bullish", "high",
             json.dumps([
-                {"symbol": "GOOGL", "grade": "premature", "sell_date": "2026-04-18",
+                {"symbol": "GOOGL", "grade": "premature", "sell_date": fixture_day,
                  "sell_price": 320.0, "current_price": 327.0,
                  "pct_move_since_sell": 2.2, "reason": "noise"},
-                {"symbol": "XOM", "grade": "correct", "sell_date": "2026-04-18",
+                {"symbol": "XOM", "grade": "correct", "sell_date": fixture_day,
                  "sell_price": 108.0, "current_price": 106.0,
                  "pct_move_since_sell": -1.8, "reason": "ceasefire"},
             ]),
             json.dumps([
-                {"symbol": "NVDA", "grade": "correct", "buy_date": "2026-04-17",
+                {"symbol": "NVDA", "grade": "correct", "buy_date": fixture_day_minus_one,
                  "buy_price": 196.0, "current_price": 210.0,
                  "pct_move_since_buy": 7.1, "reason": "capex"},
             ]),
