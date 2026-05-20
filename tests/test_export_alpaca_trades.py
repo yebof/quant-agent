@@ -187,6 +187,168 @@ def test_render_jsonl_empty_orders_is_empty_string():
 
 
 # ---------------------------------------------------------------------------
+# orders.csv companion: header row = field names, one row per order.
+# ---------------------------------------------------------------------------
+
+def test_render_orders_csv_header_first_and_alphabetical():
+    """Spreadsheet-friendly export. Header is the alphabetical union of
+    every key seen across rows so a future SDK field surfaces as a new
+    column automatically."""
+    import csv
+    import io
+
+    mod = _load_module()
+    t = datetime(2026, 4, 19, 13, 30, 1, tzinfo=timezone.utc)
+    orders = [
+        mod._order_to_dict(_ord(
+            oid="A", sym="AAPL", side="buy", qty=10, filled=10, price=187.42,
+            status="filled", submitted=t, filled_at=t + timedelta(seconds=2),
+            limit=188.0,
+        )),
+        mod._order_to_dict(_ord(
+            oid="B", sym="NVDA", side="sell", qty=5, filled=0, price=None,
+            status="canceled", submitted=t + timedelta(days=1),
+        )),
+    ]
+
+    blob = mod.render_orders_csv(orders)
+    reader = list(csv.reader(io.StringIO(blob)))
+
+    header = reader[0]
+    # Header is the alphabetical union of keys across both records.
+    assert header == sorted(header), f"header not alphabetical: {header}"
+    expected_keys = set(orders[0].keys()) | set(orders[1].keys())
+    assert set(header) == expected_keys, (
+        f"header missing fields {expected_keys - set(header)} or "
+        f"has extras {set(header) - expected_keys}"
+    )
+
+    # Exactly one row per order.
+    assert len(reader) == 1 + len(orders)
+
+    # Row content lookup by column name.
+    rows_by_id = {}
+    for raw in reader[1:]:
+        rec = dict(zip(header, raw))
+        rows_by_id[rec["id"]] = rec
+    assert rows_by_id["A"]["symbol"] == "AAPL"
+    assert rows_by_id["A"]["side"] == "buy"
+    assert rows_by_id["A"]["status"] == "filled"
+    assert rows_by_id["A"]["filled_avg_price"] == "187.42"
+    # Missing fields render as empty cells (None → "").
+    assert rows_by_id["B"]["filled_avg_price"] == ""
+    # Datetimes survive as UTC ISO 8601.
+    assert rows_by_id["A"]["submitted_at"].endswith("+00:00")
+
+
+def test_render_orders_csv_serializes_legs_as_json_cell():
+    """OTO / bracket orders carry a `legs` list. The CSV cell must keep
+    it intact (JSON-encoded), not flatten it weirdly."""
+    import csv
+    import io
+
+    mod = _load_module()
+    t = datetime(2026, 4, 19, 13, 30, 1, tzinfo=timezone.utc)
+    row = mod._order_to_dict(_ord(
+        oid="parent", sym="AAPL", side="buy", qty=10, filled=10, price=187.42,
+        status="filled", submitted=t,
+    ))
+    row["legs"] = [{"id": "stop-1", "side": "sell", "stop_price": "179.00"}]
+
+    blob = mod.render_orders_csv([row])
+    rec = list(csv.DictReader(io.StringIO(blob)))[0]
+    assert rec["legs"].startswith("[") and rec["legs"].endswith("]")
+    # And it round-trips back to the original Python value.
+    assert json.loads(rec["legs"]) == row["legs"]
+
+
+def test_render_orders_csv_empty_input_is_empty_string():
+    """Nothing to write + no authoritative field list to invent → empty."""
+    mod = _load_module()
+    assert mod.render_orders_csv([]) == ""
+
+
+# ---------------------------------------------------------------------------
+# daily_pnl.csv: per-day equity + daily P&L from /v2/account/portfolio_history.
+# ---------------------------------------------------------------------------
+
+def test_render_daily_pnl_csv_zips_arrays_and_computes_daily_delta():
+    """Alpaca returns parallel arrays + a scalar base_value. The renderer
+    must zip them into rows AND add daily_pnl = equity[i] − equity[i−1],
+    seeding row 0's prev from base_value so the first day's P&L is not
+    silently lost."""
+    import csv
+    import io
+
+    mod = _load_module()
+    # 3 trading days. base_value=100k, equity ramps to 102k, then dips.
+    day0 = datetime(2026, 4, 7, 20, 0, tzinfo=timezone.utc)   # close of 4-7
+    day1 = datetime(2026, 4, 8, 20, 0, tzinfo=timezone.utc)
+    day2 = datetime(2026, 4, 9, 20, 0, tzinfo=timezone.utc)
+    history = {
+        "timestamp": [int(day0.timestamp()), int(day1.timestamp()),
+                       int(day2.timestamp())],
+        "equity": [100500.0, 102000.0, 101200.0],
+        "profit_loss": [500.0, 2000.0, 1200.0],
+        "profit_loss_pct": [0.005, 0.02, 0.012],
+        "base_value": 100000.0,
+        "timeframe": "1D",
+    }
+    blob = mod.render_daily_pnl_csv(history)
+    rows = list(csv.DictReader(io.StringIO(blob)))
+    assert len(rows) == 3
+
+    # Header column order is deterministic + operator-friendly (date first).
+    header_line = blob.splitlines()[0].split(",")
+    assert header_line[0] == "date_et"
+    assert header_line[-1] == "base_value"
+    assert {"equity", "daily_pnl", "daily_return_pct",
+            "cumulative_pnl_vs_base"} <= set(header_line)
+
+    # Day 0: daily_pnl seeded from base_value → 100500 − 100000 = 500.
+    assert float(rows[0]["equity"]) == 100500.0
+    assert float(rows[0]["daily_pnl"]) == pytest.approx(500.0)
+    assert float(rows[0]["daily_return_pct"]) == pytest.approx(0.005, abs=1e-6)
+    # Day 1: 102000 − 100500 = 1500.
+    assert float(rows[1]["daily_pnl"]) == pytest.approx(1500.0)
+    # Day 2: 101200 − 102000 = −800.
+    assert float(rows[2]["daily_pnl"]) == pytest.approx(-800.0)
+    # date_et formatting (ET, YYYY-MM-DD).
+    assert rows[0]["date_et"].startswith("2026-04-")
+    # cumulative columns passed through verbatim.
+    assert float(rows[1]["cumulative_pnl_vs_base"]) == pytest.approx(2000.0)
+
+
+def test_render_daily_pnl_csv_blank_first_row_when_no_base():
+    """No base_value → row 0's daily_pnl must be blank (can't fabricate
+    a previous-day reference)."""
+    import csv
+    import io
+
+    mod = _load_module()
+    history = {
+        "timestamp": [int(datetime(2026, 4, 7, 20, tzinfo=timezone.utc).timestamp()),
+                       int(datetime(2026, 4, 8, 20, tzinfo=timezone.utc).timestamp())],
+        "equity": [100500.0, 102000.0],
+        "profit_loss": [500.0, 2000.0],
+        "profit_loss_pct": [0.005, 0.02],
+        "base_value": None,
+        "timeframe": "1D",
+    }
+    rows = list(csv.DictReader(io.StringIO(mod.render_daily_pnl_csv(history))))
+    assert rows[0]["daily_pnl"] == ""
+    assert rows[0]["daily_return_pct"] == ""
+    # Row 1 onward fills in once a previous equity exists.
+    assert float(rows[1]["daily_pnl"]) == pytest.approx(1500.0)
+
+
+def test_render_daily_pnl_csv_empty_history_is_empty_string():
+    mod = _load_module()
+    assert mod.render_daily_pnl_csv({}) == ""
+    assert mod.render_daily_pnl_csv({"timestamp": []}) == ""
+
+
+# ---------------------------------------------------------------------------
 # Full-fidelity dump: every field the SDK exposes must survive into the
 # canonical dict — the whole point of the rewrite. Build a REAL alpaca-py
 # Order and assert no field is silently dropped on the way to JSONL.
@@ -328,6 +490,16 @@ def test_main_writes_full_companion_set(tmp_path, monkeypatch):
     ]
     monkeypatch.setattr(mod, "fetch_all_activities",
                          lambda *a, **k: fake_activities)
+    fake_history = {
+        "timestamp": [int(t.timestamp()), int((t + timedelta(days=1)).timestamp())],
+        "equity": [100500.0, 102000.0],
+        "profit_loss": [500.0, 2000.0],
+        "profit_loss_pct": [0.005, 0.02],
+        "base_value": 100000.0,
+        "timeframe": "1D",
+    }
+    monkeypatch.setattr(mod, "fetch_portfolio_history_daily",
+                         lambda *a, **k: fake_history)
 
     # Stub out the SDK client construction (we never hit the network).
     monkeypatch.setattr("alpaca.trading.client.TradingClient",
@@ -338,12 +510,16 @@ def test_main_writes_full_companion_set(tmp_path, monkeypatch):
     rc = mod.main(["--output", str(out), "--paper"])
     assert rc == 0
 
-    # All four files exist, side-by-side.
+    # All six files exist, side-by-side.
     expected_orders = tmp_path / "trades.orders.jsonl"
+    expected_orders_csv = tmp_path / "trades.orders.csv"
+    expected_daily_pnl = tmp_path / "trades.daily_pnl.csv"
     expected_acts = tmp_path / "trades.activities.jsonl"
     expected_acct = tmp_path / "trades.account.json"
     assert out.exists()
     assert expected_orders.exists()
+    assert expected_orders_csv.exists()
+    assert expected_daily_pnl.exists()
     assert expected_acts.exists()
     assert expected_acct.exists()
 
@@ -351,11 +527,28 @@ def test_main_writes_full_companion_set(tmp_path, monkeypatch):
     report = out.read_text()
     assert "Companion files" in report
     assert "trades.orders.jsonl" in report
+    assert "trades.orders.csv" in report
+    assert "trades.daily_pnl.csv" in report
     assert "trades.activities.jsonl" in report
+
+    # Daily P&L CSV: header + one row per timestamp; daily_pnl seeded
+    # from base_value so day 0 doesn't lose its P&L.
+    import csv as _csv2
+    pnl_rows = list(_csv2.DictReader(open(expected_daily_pnl)))
+    assert len(pnl_rows) == 2
+    assert float(pnl_rows[0]["daily_pnl"]) == pytest.approx(500.0)
+    assert float(pnl_rows[1]["daily_pnl"]) == pytest.approx(1500.0)
 
     # Orders JSONL is parseable and contains the SDK fields.
     orow = json.loads(expected_orders.read_text().splitlines()[0])
     assert orow["symbol"] == "AAPL"
+    # Orders CSV: header row first, then one row per order.
+    import csv as _csv
+    import io as _io
+    csv_reader = list(_csv.reader(_io.StringIO(expected_orders_csv.read_text())))
+    assert csv_reader[0][0] != "", "first CSV row must be header field names"
+    assert "symbol" in csv_reader[0]
+    assert len(csv_reader) == 1 + 1  # header + one order
     # Activities JSONL keeps the API's raw record shape.
     arow = json.loads(expected_acts.read_text().splitlines()[0])
     assert arow["activity_type"] == "FILL"
@@ -373,6 +566,7 @@ def test_main_no_companions_emits_only_txt(tmp_path, monkeypatch):
                                       "created_at": None})
     monkeypatch.setattr(mod, "fetch_all_orders", lambda *a, **k: [])
     monkeypatch.setattr(mod, "fetch_all_activities", lambda *a, **k: [])
+    monkeypatch.setattr(mod, "fetch_portfolio_history_daily", lambda *a, **k: {})
     monkeypatch.setattr("alpaca.trading.client.TradingClient",
                          lambda *a, **k: MagicMock())
     monkeypatch.setenv("ALPACA_API_KEY", "PKtest")
@@ -382,6 +576,8 @@ def test_main_no_companions_emits_only_txt(tmp_path, monkeypatch):
     assert rc == 0
     assert out.exists()
     assert not (tmp_path / "trades.orders.jsonl").exists()
+    assert not (tmp_path / "trades.orders.csv").exists()
+    assert not (tmp_path / "trades.daily_pnl.csv").exists()
     assert not (tmp_path / "trades.activities.jsonl").exists()
     assert not (tmp_path / "trades.account.json").exists()
 
@@ -402,6 +598,7 @@ def test_main_skip_activities_writes_orders_and_account_only(tmp_path, monkeypat
                                       "created_at": None})
     monkeypatch.setattr(mod, "fetch_all_orders", lambda *a, **k: [])
     monkeypatch.setattr(mod, "fetch_all_activities", _should_not_be_called)
+    monkeypatch.setattr(mod, "fetch_portfolio_history_daily", lambda *a, **k: {})
     monkeypatch.setattr("alpaca.trading.client.TradingClient",
                          lambda *a, **k: MagicMock())
     monkeypatch.setenv("ALPACA_API_KEY", "PKtest")
@@ -411,6 +608,11 @@ def test_main_skip_activities_writes_orders_and_account_only(tmp_path, monkeypat
     assert rc == 0
     assert not sentinel["called"], "fetch_all_activities must not run when skipped"
     assert (tmp_path / "trades.orders.jsonl").exists()
+    # CSV is per-orders, NOT per-activities — must still emit on --skip-activities.
+    assert (tmp_path / "trades.orders.csv").exists()
+    # daily_pnl.csv is per-account history, also unaffected by --skip-activities.
+    # (Empty history → empty file body, but the file is still written.)
+    assert (tmp_path / "trades.daily_pnl.csv").exists()
     assert not (tmp_path / "trades.activities.jsonl").exists()
     assert (tmp_path / "trades.account.json").exists()
     report = out.read_text()

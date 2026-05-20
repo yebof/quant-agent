@@ -9,6 +9,10 @@ Outputs (auto-emitted as a set, alongside --output):
 
     data/alpaca/trades.txt              # human-readable report
     data/alpaca/trades.orders.jsonl     # every order, FULL pydantic dump
+    data/alpaca/trades.orders.csv       # same orders as a CSV table
+                                        # (header row = field names)
+    data/alpaca/trades.daily_pnl.csv    # per-day equity + daily P&L
+                                        # (broker-side portfolio_history)
     data/alpaca/trades.activities.jsonl # account activity log (FILLs +
                                         # by default DIV/JNLC/...; raw)
     data/alpaca/trades.account.json     # full account snapshot
@@ -313,6 +317,48 @@ def fetch_account_dump(client) -> dict:
     return _to_full_dict(acct)
 
 
+def fetch_portfolio_history_daily(
+    client, *, date_start=None,
+) -> dict:
+    """Pull /v2/account/portfolio_history at 1D timeframe.
+
+    Alpaca's portfolio_history endpoint is the broker-side source of
+    truth for "how much did I make today" — it folds realized + open-
+    position mark-to-market into a single daily equity series, which is
+    what an operator actually wants when asking the question.
+
+    `date_start`: ISO date string ('YYYY-MM-DD') or datetime; defaults
+    to None which falls back to `period='5A'` (5 years — covers any
+    realistic agent lifespan). Pass the account's created_at to get
+    the entire history with no truncation.
+
+    Returns the model_dump'd dict (timestamp[], equity[],
+    profit_loss[], profit_loss_pct[], base_value, timeframe). Empty
+    arrays on history-not-available; never raises.
+    """
+    try:
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+        kwargs: dict = {"timeframe": "1D", "extended_hours": False}
+        if date_start is not None:
+            if isinstance(date_start, datetime):
+                kwargs["date_start"] = date_start.date().isoformat()
+            else:
+                kwargs["date_start"] = str(date_start)[:10]
+        else:
+            kwargs["period"] = "5A"
+        req = GetPortfolioHistoryRequest(**kwargs)
+        # alpaca-py 0.43 uses `history_filter=` here, not `filter=` like
+        # get_orders does — keyword name diverges between endpoints.
+        history = client.get_portfolio_history(history_filter=req)
+        return _to_full_dict(history)
+    except Exception as exc:
+        logger_msg = f"portfolio_history fetch failed: {exc}"
+        # Mirror the activities-failure idiom: caller is expected to
+        # detect the empty arrays and downgrade to a header warning.
+        print(f"WARN: {logger_msg}", file=sys.stderr)
+        return {}
+
+
 def fetch_all_activities(
     client,
     *,
@@ -582,6 +628,143 @@ def render_jsonl(rows: list[dict]) -> str:
     ) + ("\n" if rows else "")
 
 
+def _csv_cell(v):
+    """Coerce one normalized value into a CSV-safe string.
+
+    - None             -> "" (csv writes an empty cell)
+    - datetime         -> UTC ISO 8601 (matches the JSONL contract)
+    - list / dict      -> JSON-encoded (legs / nested structures stay
+      lossless in a single cell instead of getting flattened weirdly)
+    - everything else  -> pass through; csv.DictWriter str()s it
+    """
+    if v is None:
+        return ""
+    if isinstance(v, datetime):
+        return v.astimezone(timezone.utc).isoformat()
+    if isinstance(v, (list, dict)):
+        return json.dumps(v, default=_json_default, sort_keys=True)
+    return v
+
+
+def render_orders_csv(rows: list[dict]) -> str:
+    """Orders as a CSV table: header row = field names, one row per
+    order. Header is the alphabetical union of every key seen across
+    rows, so a future SDK addition surfaces as a new column without
+    requiring a code change. Empty input yields an empty string (no
+    header — we don't have an authoritative field list to invent)."""
+    import csv
+    import io
+
+    if not rows:
+        return ""
+    fields = sorted({k for r in rows for k in r.keys()})
+    buf = io.StringIO()
+    writer = csv.DictWriter(
+        buf, fieldnames=fields, lineterminator="\n",
+        extrasaction="ignore",  # never raise on a missing key — pad ""
+    )
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: _csv_cell(r.get(k)) for k in fields})
+    return buf.getvalue()
+
+
+_DAILY_PNL_FIELDS = [
+    "date_et",
+    "timestamp_utc",
+    "equity",
+    "daily_pnl",
+    "daily_return_pct",
+    "cumulative_pnl_vs_base",
+    "cumulative_return_pct_vs_base",
+    "base_value",
+]
+
+
+def render_daily_pnl_csv(history: dict) -> str:
+    """Per-day equity + P&L table from /v2/account/portfolio_history.
+
+    Alpaca returns parallel arrays (timestamp / equity / profit_loss /
+    profit_loss_pct) plus a scalar base_value (= equity at the START of
+    the period). We zip them into rows and add a derived `daily_pnl`
+    column (equity[i] − equity[i−1]) so the operator can see per-day
+    deltas, not just cumulative-vs-base.
+
+    First row's daily_pnl uses base_value as the previous reference
+    point — by definition of base_value, equity[0] − base_value IS the
+    first day's P&L. If base_value is missing the first row's
+    daily_pnl/daily_return_pct stay blank.
+
+    Empty history -> empty string. Column order is fixed (NOT alphabetical):
+    date first, base_value last — what an operator actually reads.
+    """
+    import csv
+    import io
+
+    timestamps = history.get("timestamp") or []
+    equity_arr = history.get("equity") or []
+    pl_arr = history.get("profit_loss") or []
+    pl_pct_arr = history.get("profit_loss_pct") or []
+    if not timestamps:
+        return ""
+    try:
+        base_value = float(history.get("base_value")) if history.get("base_value") not in (None, "") else None
+    except (TypeError, ValueError):
+        base_value = None
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(
+        buf, fieldnames=_DAILY_PNL_FIELDS, lineterminator="\n",
+    )
+    writer.writeheader()
+
+    prev_equity = base_value
+    for i, ts in enumerate(timestamps):
+        try:
+            dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            dt_utc = None
+        date_et = dt_utc.astimezone(ET).strftime("%Y-%m-%d") if dt_utc else ""
+
+        eq = _safe_float(equity_arr, i)
+        cum_pnl = _safe_float(pl_arr, i)
+        cum_pct = _safe_float(pl_pct_arr, i)
+
+        if eq is not None and prev_equity is not None:
+            daily_pnl = eq - prev_equity
+            daily_pct = (daily_pnl / prev_equity) if prev_equity else None
+        else:
+            daily_pnl = None
+            daily_pct = None
+
+        writer.writerow({
+            "date_et": date_et,
+            "timestamp_utc": dt_utc.isoformat() if dt_utc else "",
+            "equity": _csv_cell(eq),
+            "daily_pnl": _csv_cell(daily_pnl),
+            "daily_return_pct": _csv_cell(daily_pct),
+            "cumulative_pnl_vs_base": _csv_cell(cum_pnl),
+            "cumulative_return_pct_vs_base": _csv_cell(cum_pct),
+            "base_value": _csv_cell(base_value),
+        })
+        prev_equity = eq if eq is not None else prev_equity
+
+    return buf.getvalue()
+
+
+def _safe_float(arr, i):
+    try:
+        v = arr[i]
+    except (IndexError, TypeError):
+        return None
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # entrypoint
 # ---------------------------------------------------------------------------
@@ -635,18 +818,22 @@ def _parse_args(argv=None) -> argparse.Namespace:
 
 
 def _companion_paths(output: Path) -> dict[str, Path]:
-    """Derive sibling JSONL/JSON paths from the user's --output.
+    """Derive sibling JSONL / CSV / JSON paths from the user's --output.
 
-    `data/alpaca_trades.txt` →
-      data/alpaca_trades.orders.jsonl
-      data/alpaca_trades.activities.jsonl
-      data/alpaca_trades.account.json
+    `data/alpaca/trades.txt` →
+      data/alpaca/trades.orders.jsonl
+      data/alpaca/trades.orders.csv
+      data/alpaca/trades.activities.jsonl
+      data/alpaca/trades.account.json
+      data/alpaca/trades.daily_pnl.csv
     """
     stem = output.with_suffix("")  # strip .txt
     return {
         "orders": stem.with_suffix(".orders.jsonl"),
+        "orders_csv": stem.with_suffix(".orders.csv"),
         "activities": stem.with_suffix(".activities.jsonl"),
         "account": stem.with_suffix(".account.json"),
+        "daily_pnl_csv": stem.with_suffix(".daily_pnl.csv"),
     }
 
 
@@ -704,7 +891,17 @@ def main(argv=None) -> int:
         fetch_warning = f"orders fetch aborted: {exc} — report may be incomplete"
         orders = []
 
-    # 3) Account activities (paginated, full passthrough). Optional.
+    # 3) Daily P&L (portfolio_history 1D since account inception).
+    try:
+        daily_pnl_history = fetch_portfolio_history_daily(
+            client, date_start=account_full.get("created_at"),
+        )
+    except Exception as exc:
+        # fetch_portfolio_history_daily already swallows; belt-and-braces.
+        print(f"WARN: portfolio_history aborted: {exc}", file=sys.stderr)
+        daily_pnl_history = {}
+
+    # 4) Account activities (paginated, full passthrough). Optional.
     activities: list[dict] = []
     activities_warning: str | None = None
     if not args.skip_activities:
@@ -732,10 +929,12 @@ def main(argv=None) -> int:
     if not args.no_companions:
         companion_note = [
             f"Companion files (canonical, lossless):",
-            f"  orders     -> {companions['orders']}",
-            f"  activities -> {companions['activities']}"
+            f"  orders.jsonl   -> {companions['orders']}",
+            f"  orders.csv     -> {companions['orders_csv']}",
+            f"  daily_pnl.csv  -> {companions['daily_pnl_csv']}",
+            f"  activities     -> {companions['activities']}"
             + (" (skipped via --skip-activities)" if args.skip_activities else ""),
-            f"  account    -> {companions['account']}",
+            f"  account        -> {companions['account']}",
         ]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -757,6 +956,8 @@ def main(argv=None) -> int:
         print(f"Wrote {path}")
 
     _emit(companions["orders"], render_jsonl(orders))
+    _emit(companions["orders_csv"], render_orders_csv(orders))
+    _emit(companions["daily_pnl_csv"], render_daily_pnl_csv(daily_pnl_history))
 
     if args.skip_activities:
         print(f"Skipped {companions['activities']}  (--skip-activities)")
