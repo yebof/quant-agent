@@ -318,7 +318,7 @@ def fetch_account_dump(client) -> dict:
 
 
 def fetch_portfolio_history_daily(
-    client, *, date_start=None,
+    client, *, since=None,
 ) -> dict:
     """Pull /v2/account/portfolio_history at 1D timeframe.
 
@@ -327,35 +327,50 @@ def fetch_portfolio_history_daily(
     position mark-to-market into a single daily equity series, which is
     what an operator actually wants when asking the question.
 
-    `date_start`: ISO date string ('YYYY-MM-DD') or datetime; defaults
-    to None which falls back to `period='5A'` (5 years — covers any
-    realistic agent lifespan). Pass the account's created_at to get
-    the entire history with no truncation.
+    `since`: datetime (or ISO 'YYYY-MM-DD' string) of the first day to
+    include. Pass account.created_at to anchor the series at the
+    account's opening (day 1). When None, falls back to `period='5A'`.
+
+    Three SDK quirks worth flagging:
+      1. The field is named `start` on GetPortfolioHistoryRequest (NOT
+         `date_start` — pydantic silently DROPS unknown kwargs in this
+         version, so a typo here looks fine and the API just returns
+         its default ~30-day window with base_value = equity at the
+         start of THAT window, not the account's opening).
+      2. `client.get_portfolio_history` takes `history_filter=`, not
+         `filter=` like `get_orders` does.
+      3. `start` alone is silently capped at ~30 trading days, leaving
+         a young account looking truncated. Passing `start` AND `end`
+         together (end = now) lifts the cap and returns the full
+         requested window with base_value = equity at the start day.
+         Using `period='5A'` alone also returns long history but
+         walks back ~5 years from today with pre-account-open rows
+         polluting the series — not what we want here.
 
     Returns the model_dump'd dict (timestamp[], equity[],
     profit_loss[], profit_loss_pct[], base_value, timeframe). Empty
-    arrays on history-not-available; never raises.
+    dict on history-not-available; never raises.
     """
     try:
         from alpaca.trading.requests import GetPortfolioHistoryRequest
         kwargs: dict = {"timeframe": "1D", "extended_hours": False}
-        if date_start is not None:
-            if isinstance(date_start, datetime):
-                kwargs["date_start"] = date_start.date().isoformat()
+        if since is not None:
+            if isinstance(since, datetime):
+                start_dt = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
             else:
-                kwargs["date_start"] = str(date_start)[:10]
+                s = str(since)[:10]
+                start_dt = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+            kwargs["start"] = start_dt
+            # Bound the window so Alpaca returns ALL days between
+            # start and now, not just its default ~30-day snap.
+            kwargs["end"] = datetime.now(timezone.utc)
         else:
             kwargs["period"] = "5A"
         req = GetPortfolioHistoryRequest(**kwargs)
-        # alpaca-py 0.43 uses `history_filter=` here, not `filter=` like
-        # get_orders does — keyword name diverges between endpoints.
         history = client.get_portfolio_history(history_filter=req)
         return _to_full_dict(history)
     except Exception as exc:
-        logger_msg = f"portfolio_history fetch failed: {exc}"
-        # Mirror the activities-failure idiom: caller is expected to
-        # detect the empty arrays and downgrade to a header warning.
-        print(f"WARN: {logger_msg}", file=sys.stderr)
+        print(f"WARN: portfolio_history fetch failed: {exc}", file=sys.stderr)
         return {}
 
 
@@ -894,7 +909,7 @@ def main(argv=None) -> int:
     # 3) Daily P&L (portfolio_history 1D since account inception).
     try:
         daily_pnl_history = fetch_portfolio_history_daily(
-            client, date_start=account_full.get("created_at"),
+            client, since=account_full.get("created_at"),
         )
     except Exception as exc:
         # fetch_portfolio_history_daily already swallows; belt-and-braces.
