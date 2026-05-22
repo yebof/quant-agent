@@ -391,11 +391,15 @@ LLM analysis of 10-Q/10-K filings runs **only** in the pre-market `earnings_prep
 
 Morning/midday PM sees a one-line earnings sentiment snippet (~140 chars — `"bullish high — revenue +16%"`); that's enough to gate BUY sizing. **Evening** needs more: when judging `thesis_trajectory` on a held position, "bought expensive" vs "fundamentals actually broke" is the core question. So the evening path calls `src/data/earnings_deep_dive.load_earnings_deep_dive(symbol, manifest)` per held name — it parses the JSON block out of `analysis_*.md`, pulls the full 5-step reasoning_chain (fundamental_quality / growth_trajectory / valuation_context / strategic_risks / management_execution), truncates each step (500c primary, 300c risk+mgmt) to bound token cost, and injects the structured dict into `thesis_health_context[symbol]["earnings_deep_dive"]`. The evening prompt renders a `--- Earnings deep-dive (10-Q 2026-01-30, bullish/high) ---` block so the LLM can reason on actual fundamentals, not a compressed tag. Missed-opportunity symbols still use the 140-char snippet — token budget reason; deep-dive only for the ~10-15 names we actually hold.
 
-## Author
+## Authors
 
 **Yebo Feng** — [@yebof](https://github.com/yebof) · `fengyebo@gmail.com`
 
 Designed and built end-to-end as a personal research project on multi-agent LLM coordination for swing/position trading. The architecture, prompt engineering across all 9 agents, schema-enforced reasoning chains, broker order-lifecycle state machine, and quarterly self-evolution loop are all original work. Implementation was vibe-coded throughout with Claude Code (Anthropic) and Codex (OpenAI) as pair-programmer agents — the system that runs the agents was itself built by agents. Issues and PRs welcome.
+
+**Jingyang Dai** — [@diana-jydai](https://github.com/diana-jydai) · `diana.jydai@gmail.com`
+
+Drives the creative direction and ongoing feature development of the system — from trading ideas and agent behavioral specs to workflow improvements. Also handles day-to-day maintenance, monitoring, and operational upkeep of the live deployment.
 
 If this repository was useful for your own work — academic, professional, or personal — a star is appreciated and a citation/mention is even better.
 
