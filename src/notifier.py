@@ -281,19 +281,40 @@ def _pnl_history_table(lookback: int = 10) -> str | None:
         return None
 
     rows = list(reversed(rows))  # chronological order
-    # Compute cumulative P&L from the slice
     cum = 0.0
+    peak_nav: float | None = None
     table_lines = ["📊 P&L History (last {} days)".format(len(rows))]
-    table_lines.append("Date        Daily P&L (ret%)    Cumul P&L  Equity")
-    table_lines.append("─" * 52)
+    table_lines.append(
+        f"{'Date':<10}  {'Net P&L':>11}  {'Dly Ret':>7}  "
+        f"{'NAV':>11}  {'Cumul P&L':>9}  {'Drawdown':>8}  {'Daily DD':>8}"
+    )
+    table_lines.append("─" * 76)
     for date, total_value, daily_pnl, daily_ret in rows:
         cum += (daily_pnl or 0.0)
-        pnl_str = f"{daily_pnl:+,.0f}" if daily_pnl is not None else "  ?"
-        cum_str = f"{cum:+,.0f}"
-        eq_str = f"{total_value:,.0f}" if total_value is not None else "?"
-        ret_str = f"({daily_ret:+.1f}%)" if daily_ret is not None else ""
+
+        if total_value is not None:
+            if peak_nav is None or total_value > peak_nav:
+                peak_nav = total_value
+
+        pnl_str = f"{daily_pnl:+,.2f}" if daily_pnl is not None else "?"
+        ret_str = f"{daily_ret:+.2f}%" if daily_ret is not None else "?"
+        nav_str = f"${total_value:,.2f}" if total_value is not None else "?"
+        cum_str = f"{cum:+,.2f}"
+
+        if total_value is not None and peak_nav and peak_nav > 0:
+            dd_pct = (total_value - peak_nav) / peak_nav * 100
+            dd_str = f"{dd_pct:.2f}%" if dd_pct < 0 else "0.00%"
+        else:
+            dd_str = "?"
+
+        if daily_ret is not None:
+            daily_dd_str = f"{min(0.0, daily_ret):.2f}%" if daily_ret < 0 else "0.00%"
+        else:
+            daily_dd_str = "?"
+
         table_lines.append(
-            f"{date}  {pnl_str:>9} {ret_str:<8}  {cum_str:>9}  ${eq_str}"
+            f"{date:<10}  {pnl_str:>11}  {ret_str:>7}  "
+            f"{nav_str:>11}  {cum_str:>9}  {dd_str:>8}  {daily_dd_str:>8}"
         )
     return "\n".join(table_lines)
 
