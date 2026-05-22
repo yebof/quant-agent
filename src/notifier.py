@@ -256,6 +256,48 @@ def _append_trade_session_body(lines: list[str], result: dict) -> None:
         lines.append(f"⚠️ degraded: {', '.join(sorted(degraded))}")
 
 
+def _pnl_history_table(lookback: int = 10) -> str | None:
+    """Query daily_pnl table and return a formatted text table.
+
+    Returns None when the table is empty or DB is unreachable.
+    """
+    try:
+        import sqlite3
+        if not _DB_PATH.exists():
+            return None
+        conn = sqlite3.connect(str(_DB_PATH))
+        try:
+            rows = conn.execute(
+                "SELECT date, total_value, daily_pnl, daily_return_pct "
+                "FROM daily_pnl ORDER BY date DESC LIMIT ?",
+                (lookback,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("pnl history lookup failed: %s", exc)
+        return None
+    if not rows:
+        return None
+
+    rows = list(reversed(rows))  # chronological order
+    # Compute cumulative P&L from the slice
+    cum = 0.0
+    table_lines = ["📊 P&L History (last {} days)".format(len(rows))]
+    table_lines.append("Date        Daily P&L (ret%)    Cumul P&L  Equity")
+    table_lines.append("─" * 52)
+    for date, total_value, daily_pnl, daily_ret in rows:
+        cum += (daily_pnl or 0.0)
+        pnl_str = f"{daily_pnl:+,.0f}" if daily_pnl is not None else "  ?"
+        cum_str = f"{cum:+,.0f}"
+        eq_str = f"{total_value:,.0f}" if total_value is not None else "?"
+        ret_str = f"({daily_ret:+.1f}%)" if daily_ret is not None else ""
+        table_lines.append(
+            f"{date}  {pnl_str:>9} {ret_str:<8}  {cum_str:>9}  ${eq_str}"
+        )
+    return "\n".join(table_lines)
+
+
 def _append_evening_body(lines: list[str], result: dict) -> None:
     # Operator escalation banner — prepended before daily P&L when
     # evening flagged elevated/high risk_rating. evening's contract
@@ -297,6 +339,12 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
     # Helper queries the live DB so this works regardless of how the
     # evening result dict is constructed.
     _append_position_snapshot(lines, total_value)
+
+    # Historical P&L table — last 10 trading days
+    pnl_table = _pnl_history_table(lookback=10)
+    if pnl_table:
+        lines.append("")
+        lines.append(pnl_table)
 
     analysis = result.get("analysis")
     risk = _attr_or_key(analysis, "risk_rating")
