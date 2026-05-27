@@ -123,15 +123,30 @@ class RiskRuleEngine:
                 limit=self.config.max_total_position_pct,
             ))
 
-        # 3. Daily loss limit (% of the baseline — prior close equity)
-        daily_loss_pct = abs(daily_pnl / baseline * 100) if daily_pnl < 0 else 0
-        if daily_loss_pct > self.config.max_daily_loss_pct:
-            violations.append(RiskViolation(
-                rule="max_daily_loss_pct",
-                message=f"Daily loss {daily_loss_pct:.1f}% exceeds max {self.config.max_daily_loss_pct}%. Trading paused.",
-                value=daily_loss_pct,
-                limit=self.config.max_daily_loss_pct,
-            ))
+        # 3. Daily loss limit (% of the baseline — prior close equity).
+        # NaN guard mirrors check_daily_loss (line 240): a NaN daily_pnl
+        # (Alpaca portfolio_value glitches propagate into
+        # total_value - last_equity) makes every numeric comparison
+        # False, silently disabling rule 3 inside the per-BUY pipeline
+        # path. Audit 2026-05-27: standalone check_daily_loss + force-
+        # delever already had the guard; this per-BUY backup path did
+        # not — inconsistent defense.
+        if not math.isfinite(daily_pnl):
+            logger.warning(
+                "RiskRuleEngine.check: daily_pnl is non-finite (%s) — "
+                "skipping per-BUY daily-loss rule for %s; standalone "
+                "check_daily_loss + force_delever remain in force",
+                daily_pnl, decision.symbol,
+            )
+        else:
+            daily_loss_pct = abs(daily_pnl / baseline * 100) if daily_pnl < 0 else 0
+            if daily_loss_pct > self.config.max_daily_loss_pct:
+                violations.append(RiskViolation(
+                    rule="max_daily_loss_pct",
+                    message=f"Daily loss {daily_loss_pct:.1f}% exceeds max {self.config.max_daily_loss_pct}%. Trading paused.",
+                    value=daily_loss_pct,
+                    limit=self.config.max_daily_loss_pct,
+                ))
 
         # 4. Stop loss required
         if self.config.require_stop_loss and decision.stop_loss <= 0:

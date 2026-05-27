@@ -341,8 +341,17 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
         # daily_return_pct from pipeline is in % already (e.g. -0.35
         # for a 0.35% loss), but historical rows pre-2026 may have had
         # different scaling — compute fresh for the message either way.
-        if total_value > 0:
-            ret_pct = (daily_pnl / total_value) * 100
+        #
+        # Daily return is P&L over PRIOR-day equity, not current. Using
+        # current understates losses (denominator includes today's draw).
+        # Prior equity = total_value − daily_pnl by definition. CLAUDE.md
+        # mandates broker.last_equity as the canonical baseline; this
+        # arithmetic reconstructs the same number from the result dict
+        # without plumbing last_equity through. Audit 2026-05-27: a -5%
+        # day was displayed as ~-4.76% under the old denominator.
+        prior_equity = total_value - daily_pnl
+        if prior_equity > 0:
+            ret_pct = (daily_pnl / prior_equity) * 100
         else:
             ret_pct = 0.0
         # Format signs as prefix (-$373.46 not $-373.46) — the latter
@@ -515,12 +524,18 @@ def _append_position_snapshot(lines: list[str], total_value: float | None) -> No
         sign = "+" if pnl >= 0 else ""
         return f"   {sym:<6} {sign}${pnl:>+8,.0f}  ({sign}{pct:+.1f}%)"
 
-    winners = [r for r in rows if r[5] > 0][:3]
+    # r[5] is positions.unrealized_pnl. SQLite allows NULL on that
+    # column (broker race / stale snapshot can leave it unset for a
+    # new row), and `None > 0` raises TypeError — which the outer
+    # try/except in format_session_result does NOT catch at the
+    # right granularity, leaving the operator without the evening
+    # snapshot at all. Filter None explicitly. Audit 2026-05-27.
+    winners = [r for r in rows if r[5] is not None and r[5] > 0][:3]
     if winners:
         lines.append("📈 Top winners:")
         for r in winners:
             lines.append(_row_line(r))
-    losers = [r for r in rows if r[5] < 0][-3:][::-1]
+    losers = [r for r in rows if r[5] is not None and r[5] < 0][-3:][::-1]
     if losers:
         lines.append("📉 Underwater:")
         for r in losers:

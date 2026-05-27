@@ -107,6 +107,37 @@ def test_daily_loss_limit(engine):
     assert any(v.rule == "max_daily_loss_pct" for v in violations)
 
 
+def test_check_daily_loss_rule_handles_nan_daily_pnl(engine, caplog):
+    """Per-BUY daily-loss rule mirrors the standalone check_daily_loss
+    NaN guard. A non-finite daily_pnl (Alpaca portfolio_value glitches
+    propagate into total_value - last_equity) used to make
+    `abs(NaN / baseline * 100) > limit` evaluate False, silently
+    disabling rule 3 INSIDE the per-BUY pipeline path while the
+    standalone breaker remained protected. Audit 2026-05-27.
+
+    Contract: NaN does not violate (we don't know the actual loss), and
+    the engine does not crash. force_delever + check_daily_loss handle
+    the disabling-on-NaN class of failure elsewhere."""
+    import logging
+    decision = TradeDecision(
+        action="BUY", symbol="SPY", allocation_pct=10.0,
+        entry_price=500.0, stop_loss=485.0, take_profit=530.0,
+        reasoning="Test",
+    )
+    caplog.set_level(logging.WARNING, logger="src.risk.rules")
+    violations = engine.check(
+        decision, positions=[], total_value=10000.0, daily_pnl=float("nan"),
+    )
+    # rule 3 must NOT spuriously violate on NaN (it's not "we crossed
+    # the loss limit" — it's "we don't know").
+    assert not any(v.rule == "max_daily_loss_pct" for v in violations)
+    # And the bypass must be logged so the operator sees it.
+    assert any(
+        "non-finite" in r.getMessage() and "SPY" in r.getMessage()
+        for r in caplog.records
+    ), "expected a WARNING about non-finite daily_pnl"
+
+
 def test_no_stop_loss(engine):
     decision = TradeDecision(
         action="BUY", symbol="SPY", allocation_pct=10.0,
