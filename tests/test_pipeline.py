@@ -746,6 +746,50 @@ def test_emergency_liquidate_orders_carry_action_for_notifier_banner(tmp_path):
     db.close()
 
 
+def test_reprotect_residual_is_idempotent_against_existing_broker_stop():
+    """Drain replay can re-fire reprotect for a row whose previous attempt
+    already submitted the residual stop but failed to delete the WAL row
+    (DB error / process kill between broker submit and row delete). The
+    second pass must detect the live stop at the broker and skip — or it
+    would double-stack stops on the same residual, doubling the exit on
+    trigger. Audit 2026-05-27 added the idempotency check; this test pins
+    the contract."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+
+    # Broker already has a SELL stop at $90 on this symbol (residual of a
+    # prior reprotect that survived the kill).
+    existing = MagicMock()
+    existing.stop_price = "90.00"
+    pipeline.broker._list_open_sell_stop_orders.return_value = [existing]
+
+    cancelled = [{"id": "s1", "qty": 10, "stop_price": 90.0, "limit_price": 88.0}]
+    ok = pipeline._reprotect_residual_after_partial_sell("NVDA", 10.0, cancelled)
+
+    assert ok is True
+    pipeline.broker._submit_stop_limit_order.assert_not_called()
+
+
+def test_reprotect_residual_submits_when_existing_stop_has_different_price():
+    """Idempotency must NOT swallow a legitimate re-protect at a DIFFERENT
+    price (e.g. trailing stop was raised, original was lower). Only an
+    existing stop at the same best_stop should suppress the submit."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline._format_qty = lambda q: str(q)
+
+    existing = MagicMock()
+    existing.stop_price = "85.00"  # different from best_stop below
+    pipeline.broker._list_open_sell_stop_orders.return_value = [existing]
+
+    cancelled = [{"id": "s1", "qty": 10, "stop_price": 90.0, "limit_price": 88.0}]
+    pipeline._reprotect_residual_after_partial_sell("NVDA", 10.0, cancelled)
+    pipeline.broker._submit_stop_limit_order.assert_called_once_with(
+        symbol="NVDA", qty=10.0, stop_price=90.0,
+    )
+
+
 def test_reprotect_residual_picks_highest_stop_price_among_specs():
     """When multiple stops covered the original position, the re-placed stop
     on the residual qty must use the HIGHEST stop_price from the cancelled

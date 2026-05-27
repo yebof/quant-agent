@@ -491,3 +491,42 @@ def test_orphan_sweep_qty_mismatch_is_not_a_match(tmp_path):
     r = _row(db, row_id)
     assert r["fill_status"] == "submit_failed"
     assert r["broker_order_id"] is None
+
+
+def test_submit_failed_row_is_invisible_to_orphan_sweep(tmp_path):
+    """Regression guard for the BUY-submit-raise / orphan-sweep gap.
+
+    The pre-2026-05-27 BUY path called mark_trade_submit_failed in the
+    `except Exception` branch of submit_order, intending to flag the
+    row "so reconcile can match it against broker activity." But
+    get_orphaned_pending_submits filters strictly on
+    fill_status='pending_submit' — flipping the row to submit_failed
+    HID it from the sweep that was supposed to recover it. The fix is
+    to leave the row pending_submit on submit-exception; this test
+    pins the visibility contract so a future refactor can't quietly
+    re-introduce the hiding."""
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    visible_id = _insert_orphan(db, symbol="AAPL", qty=10)
+    hidden_id = db.insert_trade(
+        symbol="NVDA", action="BUY", qty=10, price=100.0,
+        reasoning="simulating old mark-on-exception behavior",
+        run_id="r-old", broker_order_id=None, fill_status="submit_failed",
+    )
+    # Backdate so it would clear the age gate if it were eligible.
+    db.execute(
+        "UPDATE trades SET timestamp = datetime('now', '-1 hour') WHERE id = ?",
+        (hidden_id,),
+    )
+    db.conn.commit()
+
+    ids = {o["id"] for o in db.get_orphaned_pending_submits()}
+    assert visible_id in ids, (
+        "pending_submit row MUST be visible to the sweep — that's the "
+        "whole recovery path for submit-exception BUYs"
+    )
+    assert hidden_id not in ids, (
+        "submit_failed rows are NOT sweep candidates by design "
+        "(broker explicitly rejected — no orphan to adopt)"
+    )

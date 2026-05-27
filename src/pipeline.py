@@ -1404,6 +1404,39 @@ class TradingPipeline:
         )
         if best_stop <= 0:
             return True
+
+        # Idempotency: drain may replay finalize on a row whose previous
+        # attempt already submitted the residual stop but couldn't
+        # delete the pending_protection_restores row (DB error / process
+        # kill between broker submit and row delete). Without this
+        # check, the next drain pass would add a SECOND stop at the same
+        # price on the same residual qty — doubling exit on trigger.
+        # Audit 2026-05-27: matches the discipline _restore_stop_orders
+        # already enforces via its `check_idempotency` flag for the
+        # restore-originals branch.
+        try:
+            existing = self.broker._list_open_sell_stop_orders(symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Reprotect idempotency check failed for %s: %s — "
+                "proceeding with submit (may duplicate if a stop already "
+                "exists)", symbol, exc,
+            )
+            existing = []
+        for o in existing or []:
+            try:
+                existing_sp = float(getattr(o, "stop_price", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            # Half-penny tolerance covers Alpaca's float<->Decimal round-trip.
+            if existing_sp > 0 and abs(existing_sp - best_stop) < 0.005:
+                logger.info(
+                    "Reprotect skipped for %s — a stop at $%.2f already "
+                    "exists at the broker (idempotent re-run)",
+                    symbol, best_stop,
+                )
+                return True
+
         try:
             self.broker._submit_stop_limit_order(
                 symbol=symbol, qty=residual_qty, stop_price=best_stop,

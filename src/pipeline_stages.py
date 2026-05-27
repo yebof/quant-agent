@@ -1014,18 +1014,25 @@ class ExecutionStage:
                         reference_price=market_price,
                     )
                 except Exception:
-                    # Submit raised — broker may or may not have received
-                    # the order. Flag the pending row so reconcile can
-                    # try to match it against broker-side activity by
-                    # symbol + time window. Re-raise so the outer except
-                    # logs the original cause.
-                    pipeline.db.mark_trade_submit_failed(pending_row_id)
+                    # Submit raised — broker may or may not have the
+                    # order. Leave the row as 'pending_submit' so the
+                    # next session's orphan sweep
+                    # (_reconcile_orphan_pending_submits) can match it
+                    # against broker activity by symbol + qty + time
+                    # window. Audit 2026-05-27: a prior version called
+                    # mark_trade_submit_failed here, but
+                    # get_orphaned_pending_submits filters only
+                    # fill_status='pending_submit' — flipping it to
+                    # submit_failed silently HID the row from the
+                    # recovery path it was supposed to be flagged for.
                     raise
 
                 if not pipeline._order_accepted(order, decision.symbol, "buy"):
                     # Broker explicitly rejected (status != accepted/filled).
                     # Mark the pending row failed so it doesn't poison
                     # calibration as a "submitted" trade we never tracked.
+                    # Distinct from the submit-raised case: here we KNOW
+                    # the broker rejected, so there's no orphan to sweep.
                     pipeline.db.mark_trade_submit_failed(pending_row_id)
                     continue
 

@@ -1412,6 +1412,64 @@ def test_restore_stop_orders_no_alive_stops_uses_legacy_submit_path(mock_tc_cls)
 
 
 @patch("src.execution.broker.TradingClient")
+def test_submit_order_unwraps_orderstatus_enum_value(mock_tc_cls):
+    """alpaca-py OrderStatus is (str, Enum). Plain str(enum) returns
+    'OrderStatus.REJECTED' (the repr), not 'rejected' (the value).
+    _order_accepted's rejection filter lowercases and checks for the
+    *value*, so without the .value unwrap a real broker rejection
+    would slip past as 'accepted'. Regression guard."""
+    from alpaca.trading.enums import OrderStatus
+
+    mock_client = MagicMock()
+    mock_order = MagicMock()
+    mock_order.id = "ord-rej"
+    mock_order.status = OrderStatus.REJECTED  # real enum, not a string fixture
+    mock_order.symbol = "AAPL"
+    mock_client.submit_order.return_value = mock_order
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    order = broker.submit_order(symbol="AAPL", qty=10, side="buy")
+
+    assert order["status"] == "rejected", (
+        f"status must be the enum value 'rejected', not its repr; "
+        f"got {order['status']!r}"
+    )
+
+
+@patch("src.execution.broker.TradingClient")
+def test_close_position_unwraps_orderstatus_enum_value(mock_tc_cls):
+    from alpaca.trading.enums import OrderStatus
+
+    mock_client = MagicMock()
+    mock_order = MagicMock()
+    mock_order.id = "ord-close"
+    mock_order.status = OrderStatus.ACCEPTED
+    mock_client.close_position.return_value = mock_order
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    out = broker.close_position("AAPL")
+    assert out["status"] == "accepted"
+
+
+@patch("src.execution.broker.TradingClient")
+def test_submit_stop_limit_order_unwraps_orderstatus_enum_value(mock_tc_cls):
+    from alpaca.trading.enums import OrderStatus
+
+    mock_client = MagicMock()
+    mock_order = MagicMock()
+    mock_order.id = "ord-stop"
+    mock_order.status = OrderStatus.NEW
+    mock_client.submit_order.return_value = mock_order
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    out = broker._submit_stop_limit_order(symbol="AAPL", qty=5, stop_price=150.0)
+    assert out["status"] == "new"
+
+
+@patch("src.execution.broker.TradingClient")
 def test_list_recent_orders_returns_none_on_api_failure(mock_tc_cls):
     """audit F4 review #2: a failed Alpaca query must be distinguishable
     from 'no such order' so the orphan sweep doesn't mark a real BUY

@@ -896,7 +896,14 @@ class AlpacaBroker:
                      side, qty, symbol, limit_price or "market", bracket_info, order.status)
         return {
             "id": str(order.id),
-            "status": str(order.status),
+            # alpaca-py OrderStatus is `(str, Enum)`. Plain `str(enum)`
+            # returns 'OrderStatus.REJECTED' (the repr), not 'rejected'
+            # (the value). `_order_accepted`'s rejection filter
+            # lowercases and checks for the *value* form, so without
+            # the .value unwrap a real broker rejection would slip past
+            # as "accepted" and proceed through the pipeline (audit
+            # 2026-05-27).
+            "status": str(getattr(order.status, "value", order.status)),
             "symbol": order.symbol,
             # Echo back the parameters so downstream consumers (notifier,
             # audit log, finalize) can render orders without having to
@@ -913,7 +920,9 @@ class AlpacaBroker:
     def close_position(self, symbol: str) -> dict:
         order = self.client.close_position(symbol)
         logger.info("Closed position: %s", symbol)
-        return {"id": str(order.id), "status": str(order.status)}
+        # Unwrap OrderStatus enum value (see submit_order — same reason).
+        return {"id": str(order.id),
+                "status": str(getattr(order.status, "value", order.status))}
 
     def _list_open_sell_stop_orders(self, symbol: str) -> list:
         try:
@@ -983,7 +992,10 @@ class AlpacaBroker:
             limit_price=limit_price_q,
         )
         order = self.client.submit_order(req)
-        return {"id": str(order.id), "status": str(order.status), "symbol": symbol}
+        # Unwrap OrderStatus enum value (see submit_order — same reason).
+        return {"id": str(order.id),
+                "status": str(getattr(order.status, "value", order.status)),
+                "symbol": symbol}
 
     def _restore_stop_orders(
         self, symbol: str, stop_specs: list[dict],
