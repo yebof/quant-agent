@@ -86,6 +86,9 @@ trading:
     - AMD
     - ORCL
     - MU
+    - MRVL   # Marvell Technology (custom AI silicon / DC interconnect)
+    - TSM    # Taiwan Semiconductor (foundry leader, NVDA/AMD/AAPL fab)
+    - CBRS   # Cerebras Systems (AI-chip startup, NVDA competitor in training)
     - NET
     - PATH   # UiPath (RPA / AI automation)
     # Finance
@@ -141,6 +144,7 @@ trading:
     - ZS     # Zscaler
     # Wireless / IoT
     - ONDS   # Ondas
+    - NOK    # Nokia (5G network infrastructure)
     # Communication & Entertainment
     - NFLX
     - DIS
