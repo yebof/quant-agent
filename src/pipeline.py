@@ -5842,6 +5842,12 @@ class TradingPipeline:
                 logger.info("Pruned %d dated news artifact(s)", pruned_n)
         except Exception as e:
             logger.warning("news file-store prune failed: %s", e)
+        try:
+            pruned_e = self.earnings_provider.prune(keep_days=400)
+            if pruned_e:
+                logger.info("Pruned %d old raw earnings filing(s)", pruned_e)
+        except Exception as e:
+            logger.warning("earnings file-store prune failed: %s", e)
 
         logger.info("Evening: value=$%.2f, PnL=$%.2f (%.2f%%), risk=%s",
                      total_value, daily_pnl, daily_return_pct,

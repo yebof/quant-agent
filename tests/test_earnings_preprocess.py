@@ -530,3 +530,29 @@ def test_sec_get_does_not_retry_on_404(tmp_path, monkeypatch):
     with pytest.raises(HTTPError):
         provider._sec_get("https://data.sec.gov/x")
     assert len(call_log) == 1  # no retry on 404
+
+
+def test_earnings_provider_prune_removes_old_raw_html_keeps_analyses(tmp_path, monkeypatch):
+    """prune() deletes old raw filing HTML but never the analysis markdown
+    (what evening's thesis_health reads), and keeps recent HTML."""
+    import src.data.earnings as earnings_mod
+    from datetime import date
+    from src.data.earnings import EarningsDataProvider
+
+    monkeypatch.setattr(earnings_mod, "et_today", lambda: date(2026, 5, 28))
+    prov = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
+    sdir = prov.data_dir / "NVDA"
+    sdir.mkdir(parents=True)
+    old_html = sdir / "10-Q_2024-01-15.html"      # >400d old → prune
+    recent_html = sdir / "10-Q_2026-03-15.html"    # recent → keep
+    old_analysis = sdir / "analysis_10-Q_2024-01-15.md"  # analysis → always keep
+    old_html.write_text("<html>old</html>")
+    recent_html.write_text("<html>recent</html>")
+    old_analysis.write_text("# analysis")
+
+    removed = prov.prune(keep_days=400)
+
+    assert removed == 1
+    assert not old_html.exists()        # old raw HTML pruned
+    assert recent_html.exists()         # recent raw HTML kept
+    assert old_analysis.exists()        # analysis markdown never touched

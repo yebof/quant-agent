@@ -11,9 +11,9 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, timedelta
 
-from src.util.time import et_now
+from src.util.time import et_now, et_today
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
@@ -80,6 +80,48 @@ class EarningsDataProvider:
             tmp = self.manifest_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(self.manifest, indent=2))
             os.replace(str(tmp), str(self.manifest_path))
+
+    def prune(self, keep_days: int = 400) -> int:
+        """Delete raw filing HTML (``{FORM}_{YYYY-MM-DD}.html``) older than
+        keep_days. The file-stores had no prune (design-review finding) — raw
+        10-K/10-Q HTML (often multiple MB each) accreted per symbol per quarter
+        forever.
+
+        Conservative + safe: raw HTML is read ONLY at analysis time; once a
+        filing is analyzed, the cached ``analysis_{FORM}_{date}.md`` is the read
+        target (``_check_symbol`` globs the LATEST analysis per symbol). So this
+        prunes only old raw HTML and leaves ALL analysis markdown untouched
+        (small, and the actual money-relevant read target for evening's
+        thesis_health). keep_days=400 retains ~a year of filings; only stale
+        orphans go. Best-effort. Returns the count removed.
+        """
+        cutoff = et_today() - timedelta(days=keep_days)
+        removed = 0
+        try:
+            symbol_dirs = [d for d in self.data_dir.iterdir() if d.is_dir()]
+        except OSError as exc:
+            logger.warning("earnings prune: cannot list %s: %s", self.data_dir, exc)
+            return 0
+        for sdir in symbol_dirs:
+            for f in sdir.glob("*.html"):
+                # filename: '{FORM}_{YYYY-MM-DD}.html' e.g. '10-Q_2026-03-15.html'
+                datestr = f.stem.rsplit("_", 1)[-1]
+                try:
+                    d = date.fromisoformat(datestr)
+                except (ValueError, TypeError):
+                    continue  # unrecognized name — leave it alone
+                if d < cutoff:
+                    try:
+                        f.unlink()
+                        removed += 1
+                    except OSError as exc:
+                        logger.warning("earnings prune: failed to rm %s: %s", f, exc)
+        if removed:
+            logger.info(
+                "earnings prune: removed %d raw filing HTML older than %s",
+                removed, cutoff,
+            )
+        return removed
 
     def confirm_filing(self, report: "EarningsReport"):
         """Mark a filing as processed in the manifest. Call after analysis file is written."""
