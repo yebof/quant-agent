@@ -143,7 +143,7 @@ class NewsStore:
                       key=lambda x: x.get("first_seen_date", ""),
                       reverse=True)[:limit]
 
-    def prune(self, keep_days: int = 120) -> int:
+    def prune(self, keep_days: int = 1000) -> int:
         """Delete dated daily-report dirs + dated macro_narrative backups older
         than `keep_days` (ET). The live ``macro_narrative.json`` is always kept.
 
@@ -151,7 +151,7 @@ class NewsStore:
         so ``data/news/`` accreted ~250 dated dirs/year forever (design-review
         finding). Nothing reads news artifacts older than ~14 days
         (recent_state_changes walks 14d; the quarterly digest reads the DB, not
-        these files), so 120d is generous headroom.
+        these files), so 1000d is very generous headroom.
 
         Best-effort: a failure on one entry is logged and the sweep continues.
         Returns the count of dated artifacts removed.

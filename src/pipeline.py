@@ -5835,9 +5835,9 @@ class TradingPipeline:
             logger.warning("pending_protection_restores prune failed: %s", e)
         # File-store housekeeping: the news dated dirs + narrative backups grow
         # unbounded (the DB side prunes; the file-stores didn't). Nothing reads
-        # news artifacts older than ~14 days, so 120d is safe headroom.
+        # news artifacts older than ~14 days, so 1000d is very safe headroom.
         try:
-            pruned_n = self.news_store.prune(keep_days=120)
+            pruned_n = self.news_store.prune(keep_days=1000)
             if pruned_n:
                 logger.info("Pruned %d dated news artifact(s)", pruned_n)
         except Exception as e:
