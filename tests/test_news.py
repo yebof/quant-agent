@@ -609,3 +609,32 @@ def test_fetch_news_override_takes_precedence_over_monday_extension(mock_et_now)
         # We can't easily inspect the cutoff value here without restructuring;
         # the behaviour is locked by the existence of the param + the
         # branch ordering in fetch_news.
+
+
+def test_news_store_prune_removes_old_dated_artifacts(tmp_path, monkeypatch):
+    """Dated daily-report dirs + dated macro_narrative backups older than
+    keep_days are removed; recent ones, the live narrative, and non-dated
+    entries are kept."""
+    import src.data.news_store as ns_mod
+    from datetime import date
+    from src.data.news_store import NewsStore
+
+    monkeypatch.setattr(ns_mod, "et_today", lambda: date(2026, 5, 28))
+    store = NewsStore(data_dir=str(tmp_path / "news"))
+    base = store.data_dir
+    (base / "2026-01-01").mkdir(parents=True)                  # >120d → prune
+    (base / "2026-05-20").mkdir(parents=True)                  # recent → keep
+    (base / "macro_narrative_2026-01-01.json").write_text("{}")  # old backup → prune
+    (base / "macro_narrative_2026-05-25.json").write_text("{}")  # recent backup → keep
+    (base / "macro_narrative.json").write_text("{}")           # live → always keep
+    (base / "not_a_date_dir").mkdir()                          # non-dated → keep
+
+    removed = store.prune(keep_days=120)
+
+    assert removed == 2
+    assert not (base / "2026-01-01").exists()
+    assert (base / "2026-05-20").exists()
+    assert not (base / "macro_narrative_2026-01-01.json").exists()
+    assert (base / "macro_narrative_2026-05-25.json").exists()
+    assert (base / "macro_narrative.json").exists()
+    assert (base / "not_a_date_dir").exists()

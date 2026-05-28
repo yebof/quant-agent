@@ -5833,6 +5833,15 @@ class TradingPipeline:
                 logger.info("Pruned %d stale pending_protection_restores rows", pruned_p)
         except Exception as e:
             logger.warning("pending_protection_restores prune failed: %s", e)
+        # File-store housekeeping: the news dated dirs + narrative backups grow
+        # unbounded (the DB side prunes; the file-stores didn't). Nothing reads
+        # news artifacts older than ~14 days, so 120d is safe headroom.
+        try:
+            pruned_n = self.news_store.prune(keep_days=120)
+            if pruned_n:
+                logger.info("Pruned %d dated news artifact(s)", pruned_n)
+        except Exception as e:
+            logger.warning("news file-store prune failed: %s", e)
 
         logger.info("Evening: value=$%.2f, PnL=$%.2f (%.2f%%), risk=%s",
                      total_value, daily_pnl, daily_return_pct,

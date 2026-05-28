@@ -3,11 +3,21 @@
 import json
 import logging
 import os
+import shutil
+from datetime import date, timedelta
 from pathlib import Path
 
 from src.util.time import et_today
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_iso_date(s: str) -> date | None:
+    """Parse a 'YYYY-MM-DD' string to a date, or None if it isn't one."""
+    try:
+        return date.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
 
 
 def _atomic_write(path: Path, data: str):
@@ -132,3 +142,52 @@ class NewsStore:
         return sorted(seen.values(),
                       key=lambda x: x.get("first_seen_date", ""),
                       reverse=True)[:limit]
+
+    def prune(self, keep_days: int = 120) -> int:
+        """Delete dated daily-report dirs + dated macro_narrative backups older
+        than `keep_days` (ET). The live ``macro_narrative.json`` is always kept.
+
+        The SQLite side has tested prune_* methods; the file-stores had none,
+        so ``data/news/`` accreted ~250 dated dirs/year forever (design-review
+        finding). Nothing reads news artifacts older than ~14 days
+        (recent_state_changes walks 14d; the quarterly digest reads the DB, not
+        these files), so 120d is generous headroom.
+
+        Best-effort: a failure on one entry is logged and the sweep continues.
+        Returns the count of dated artifacts removed.
+        """
+        cutoff = et_today() - timedelta(days=keep_days)
+        removed = 0
+        try:
+            entries = list(self.data_dir.iterdir())
+        except OSError as exc:
+            logger.warning("news prune: cannot list %s: %s", self.data_dir, exc)
+            return 0
+        for entry in entries:
+            name = entry.name
+            # Dated daily-report directory: 'YYYY-MM-DD'
+            if entry.is_dir():
+                d = _parse_iso_date(name)
+                if d is not None and d < cutoff:
+                    try:
+                        shutil.rmtree(entry)
+                        removed += 1
+                    except OSError as exc:
+                        logger.warning("news prune: failed to rm dir %s: %s", entry, exc)
+                continue
+            # Dated narrative backup: 'macro_narrative_YYYY-MM-DD.json' (never
+            # the live 'macro_narrative.json').
+            if name.startswith("macro_narrative_") and name.endswith(".json"):
+                d = _parse_iso_date(name[len("macro_narrative_"):-len(".json")])
+                if d is not None and d < cutoff:
+                    try:
+                        entry.unlink()
+                        removed += 1
+                    except OSError as exc:
+                        logger.warning("news prune: failed to rm %s: %s", entry, exc)
+        if removed:
+            logger.info(
+                "news prune: removed %d dated artifact(s) older than %s",
+                removed, cutoff,
+            )
+        return removed
