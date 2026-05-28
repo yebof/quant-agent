@@ -3231,3 +3231,41 @@ def test_cancel_stops_with_write_ahead_skips_on_snapshot_failure(tmp_path):
     assert ok is False and specs == [] and wal_id is None
     pipe.broker.cancel_snapshotted_stops.assert_not_called()
     assert db.get_pending_protection_restores() == []
+
+
+def test_finalize_pending_protections_waits_finalizes_and_logs_on_failure(caplog):
+    """The shared SELL-tail helper waits for terminal, finalizes on actual
+    fill, and logs a warning when coverage couldn't be rebuilt (drain retries
+    next session). This is the behavior the 6 SELL paths used to copy-paste."""
+    import logging
+    pipe = TradingPipeline.__new__(TradingPipeline)
+    pipe.broker = MagicMock()
+    pipe._finalize_protection_after_sell = MagicMock(return_value=(False, [{"id": "s1"}]))
+    pending = [{
+        "order_id": "o1", "symbol": "NVDA", "position_qty_before_sell": 5.0,
+        "specs": [{"id": "s1"}], "wal_row_id": 7,
+    }]
+    with caplog.at_level(logging.WARNING, logger="src.pipeline"):
+        pipe._finalize_pending_protections(pending, context="TestCtx")
+    pipe.broker.wait_for_order_terminal.assert_called_once_with("o1")
+    pipe._finalize_protection_after_sell.assert_called_once_with(
+        "o1", "NVDA", 5.0, [{"id": "s1"}], wal_row_id=7,
+    )
+    assert any(
+        "did not confirm stop coverage" in r.getMessage() and "TestCtx" in r.getMessage()
+        for r in caplog.records
+    ), f"expected a coverage-not-confirmed warning; got {[r.getMessage() for r in caplog.records]}"
+
+
+def test_finalize_pending_protections_skips_wait_when_wait_false():
+    """wait=False (ExecutionStage, which already waited) must not re-wait."""
+    pipe = TradingPipeline.__new__(TradingPipeline)
+    pipe.broker = MagicMock()
+    pipe._finalize_protection_after_sell = MagicMock(return_value=(True, []))
+    pending = [{
+        "order_id": "o2", "symbol": "AAPL", "position_qty_before_sell": 3.0,
+        "specs": [], "wal_row_id": None,
+    }]
+    pipe._finalize_pending_protections(pending, context="X", wait=False)
+    pipe.broker.wait_for_order_terminal.assert_not_called()
+    pipe._finalize_protection_after_sell.assert_called_once()

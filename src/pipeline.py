@@ -707,6 +707,55 @@ class TradingPipeline:
                     return None
         return 0.0
 
+    def _finalize_pending_protections(
+        self,
+        pending_protections: list[dict],
+        *,
+        context: str,
+        wait: bool = True,
+    ) -> None:
+        """Tail half of the SELL discipline: drain a batch of stashed
+        protection-restore intents after a round of SELLs.
+
+        For each stashed ``{order_id, symbol, position_qty_before_sell, specs,
+        wal_row_id}``: (optionally) block until the SELL reaches terminal,
+        finalize stop coverage on the ACTUAL fill (reprotect residual / restore
+        originals / no-op on full exit), and log when coverage couldn't be
+        rebuilt (the WAL row drives a retry next session).
+
+        Previously copy-pasted near-verbatim at 6 call sites — that duplication
+        is exactly how a step once went missing (ExecutionStage lacked the wait
+        try/except until an audit caught it). Centralizing makes the discipline
+        one tested path.
+
+        ``wait=False`` for callers (ExecutionStage) that already waited for
+        terminal in an earlier loop — the orders are terminal, so re-waiting
+        would be a redundant no-op; skipping it preserves their prior behavior.
+        ``context`` is the human-readable log prefix (e.g. 'FORCE DE-LEVER').
+        """
+        for prot in pending_protections:
+            if wait:
+                try:
+                    self.broker.wait_for_order_terminal(prot["order_id"])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "%s: wait failed for %s order %s: %s — finalize will "
+                        "use whatever fill_info reads now",
+                        context, prot["symbol"], prot["order_id"], exc,
+                    )
+            ok, _retry_specs = self._finalize_protection_after_sell(
+                prot["order_id"], prot["symbol"],
+                prot["position_qty_before_sell"], prot["specs"],
+                wal_row_id=prot.get("wal_row_id"),
+            )
+            if not ok:
+                logger.warning(
+                    "%s: finalize for %s (order %s) did not confirm stop "
+                    "coverage — recovery intent persisted; drain rebuilds "
+                    "next session",
+                    context, prot["symbol"], prot["order_id"],
+                )
+
     def _finalize_protection_after_sell(
         self,
         order_id: str,
@@ -2073,27 +2122,9 @@ class TradingPipeline:
             )
         # Wait for each accepted sell to terminate, then reprotect on
         # actual residual or restore originals if the sell didn't fill.
-        for prot in pending_protections:
-            try:
-                self.broker.wait_for_order_terminal(prot["order_id"])
-            except Exception as exc:
-                logger.warning(
-                    "auto_take_profit: wait failed for %s order %s: %s — "
-                    "finalize will use whatever fill_info reads now",
-                    prot["symbol"], prot["order_id"], exc,
-                )
-            ok, _retry_specs = self._finalize_protection_after_sell(
-                prot["order_id"], prot["symbol"],
-                prot["position_qty_before_sell"], prot["specs"],
-                wal_row_id=prot.get("wal_row_id"),
-            )
-            if not ok:
-                logger.warning(
-                    "auto_take_profit: finalize for %s (order %s) did not "
-                    "confirm stop coverage — recovery intent persisted; "
-                    "drain rebuilds next session",
-                    prot["symbol"], prot["order_id"],
-                )
+        self._finalize_pending_protections(
+            pending_protections, context="auto_take_profit",
+        )
         return orders
 
     def _wait_for_midday_auto_tp_orders(self, auto_tp_orders: list[dict]) -> set[str]:
@@ -4245,26 +4276,9 @@ class TradingPipeline:
                 logger.error("Emergency sell failed for %s: %s", p.symbol, e)
         # Wait + finalize: if any limit didn't fill, restore the original
         # stops so the position doesn't ride the rest of the session naked.
-        for prot in pending_protections:
-            try:
-                self.broker.wait_for_order_terminal(prot["order_id"])
-            except Exception as exc:
-                logger.warning(
-                    "Midday emergency: wait failed for %s order %s: %s",
-                    prot["symbol"], prot["order_id"], exc,
-                )
-            ok, _retry_specs = self._finalize_protection_after_sell(
-                prot["order_id"], prot["symbol"],
-                prot["position_qty_before_sell"], prot["specs"],
-                wal_row_id=prot.get("wal_row_id"),
-            )
-            if not ok:
-                logger.warning(
-                    "Midday emergency: finalize for %s (order %s) did not "
-                    "confirm stop coverage — recovery intent persisted; "
-                    "drain rebuilds next session",
-                    prot["symbol"], prot["order_id"],
-                )
+        self._finalize_pending_protections(
+            pending_protections, context="Midday emergency",
+        )
         return orders
 
     def _symbols_already_trimmed_today(self) -> set[str]:
@@ -4497,26 +4511,9 @@ class TradingPipeline:
                 )
             except Exception as e:
                 logger.error("Midday order failed for %s: %s", symbol, e)
-        for prot in pending_protections:
-            try:
-                self.broker.wait_for_order_terminal(prot["order_id"])
-            except Exception as exc:
-                logger.warning(
-                    "Midday reviewer: wait failed for %s order %s: %s",
-                    prot["symbol"], prot["order_id"], exc,
-                )
-            ok, _retry_specs = self._finalize_protection_after_sell(
-                prot["order_id"], prot["symbol"],
-                prot["position_qty_before_sell"], prot["specs"],
-                wal_row_id=prot.get("wal_row_id"),
-            )
-            if not ok:
-                logger.warning(
-                    "Midday reviewer: finalize for %s (order %s) did not "
-                    "confirm stop coverage — recovery intent persisted; "
-                    "drain rebuilds next session",
-                    prot["symbol"], prot["order_id"],
-                )
+        self._finalize_pending_protections(
+            pending_protections, context="Midday reviewer",
+        )
         return orders
 
     def _force_delever(self, ctx: RunContext) -> list[dict]:
@@ -4668,26 +4665,9 @@ class TradingPipeline:
         # Block the session until fills land so the post-refresh cash is real.
         # Then finalize protection — if any limit didn't fill, restore the
         # original stop coverage so the position isn't left naked.
-        for prot in pending_protections:
-            try:
-                self.broker.wait_for_order_terminal(prot["order_id"])
-            except Exception as e:
-                logger.warning(
-                    "FORCE DE-LEVER: wait failed for %s order %s: %s",
-                    prot["symbol"], prot["order_id"], e,
-                )
-            ok, _retry_specs = self._finalize_protection_after_sell(
-                prot["order_id"], prot["symbol"],
-                prot["position_qty_before_sell"], prot["specs"],
-                wal_row_id=prot.get("wal_row_id"),
-            )
-            if not ok:
-                logger.warning(
-                    "FORCE DE-LEVER: finalize for %s (order %s) did not "
-                    "confirm stop coverage — recovery intent persisted; "
-                    "drain rebuilds next session",
-                    prot["symbol"], prot["order_id"],
-                )
+        self._finalize_pending_protections(
+            pending_protections, context="FORCE DE-LEVER",
+        )
 
         # Refresh ctx so downstream stages see post-sell truth.
         try:
@@ -5563,26 +5543,9 @@ class TradingPipeline:
                 logger.error("Intra emergency sell failed for %s: %s", p.symbol, e)
 
         # Wait + finalize: restore originals on any no-fill terminal.
-        for prot in pending_protections:
-            try:
-                self.broker.wait_for_order_terminal(prot["order_id"])
-            except Exception as exc:
-                logger.warning(
-                    "Intra emergency: wait failed for %s order %s: %s",
-                    prot["symbol"], prot["order_id"], exc,
-                )
-            ok, _retry_specs = self._finalize_protection_after_sell(
-                prot["order_id"], prot["symbol"],
-                prot["position_qty_before_sell"], prot["specs"],
-                wal_row_id=prot.get("wal_row_id"),
-            )
-            if not ok:
-                logger.warning(
-                    "Intra emergency: finalize for %s (order %s) did not "
-                    "confirm stop coverage — recovery intent persisted; "
-                    "drain rebuilds next session",
-                    prot["symbol"], prot["order_id"],
-                )
+        self._finalize_pending_protections(
+            pending_protections, context="Intra emergency",
+        )
 
         return {
             "status": "emergency_sold",

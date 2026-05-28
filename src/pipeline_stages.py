@@ -844,24 +844,12 @@ class ExecutionStage:
         # Now that wait_for_order_terminal has returned for every sell,
         # the broker's fill_info is final. Reprotect on actual residual
         # (filled successfully) or restore originals (no-fill terminal).
-        for prot in pending_protections:
-            ok, _retry_specs = pipeline._finalize_protection_after_sell(
-                prot["order_id"], prot["symbol"],
-                prot["position_qty_before_sell"], prot["specs"],
-                wal_row_id=prot.get("wal_row_id"),
-            )
-            if not ok:
-                # finalize has already persisted the orphaned-restore intent
-                # to pending_protection_restores (next session's drain rebuilds
-                # coverage). Surface it now so the operator has a real-time
-                # signal that the morning SELL left protection unconfirmed —
-                # matches the drain path's visibility (pipeline.py drain loop).
-                logger.warning(
-                    "ExecutionStage: finalize for %s (order %s) did not "
-                    "confirm stop coverage — recovery intent persisted; "
-                    "drain will rebuild next session",
-                    prot["symbol"], prot["order_id"],
-                )
+        # wait=False: the sell_order_ids loop above already blocked until each
+        # order reached terminal (it also gates the buy phase), so the orders
+        # are terminal here — re-waiting would be a redundant no-op.
+        pipeline._finalize_pending_protections(
+            pending_protections, context="ExecutionStage", wait=False,
+        )
 
         if sell_decisions:
             account, positions, price_map = pipeline._refresh_account_state()

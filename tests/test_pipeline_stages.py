@@ -354,15 +354,12 @@ def test_execution_stage_blocks_buys_when_daily_loss_breached_during_run():
     )
 
 
-def test_execution_stage_logs_when_finalize_cannot_confirm_coverage(caplog):
-    """When _finalize_protection_after_sell returns (ok=False, ...) — its
-    restore/reprotect failed and it persisted the recovery intent — the
-    morning ExecutionStage must surface a warning so the operator has a
-    real-time signal that protection wasn't rebuilt (matches the drain
-    path's visibility). Pre-fix the return value was ignored entirely, so
-    a naked-until-next-session position left no log trail at the point of
-    failure."""
-    import logging
+def test_execution_stage_delegates_to_finalize_pending_protections(caplog):
+    """ExecutionStage must route its post-sell protection finalize through the
+    single shared `_finalize_pending_protections` helper (wait=False, since it
+    already waited for terminal in the buy-gating loop). The wait/finalize/
+    log-on-failure behavior is owned + tested in that helper; here we pin that
+    the morning SELL path actually delegates to it with the stashed intent."""
     from src.models import PortfolioDecision, Position, TradeDecision
     from src.pipeline_context import RunContext
 
@@ -371,8 +368,6 @@ def test_execution_stage_logs_when_finalize_cannot_confirm_coverage(caplog):
     pipeline.broker.get_latest_price.return_value = 320.0
     _mock_stop_seam(pipeline.broker, specs=specs)
     _mock_stage_seam(pipeline, specs=specs)
-    # finalize couldn't rebuild coverage (e.g. reprotect raised) → (False, specs).
-    pipeline._finalize_protection_after_sell.return_value = (False, list(specs))
     pipeline.broker.submit_order.return_value = {
         "id": "sell-9", "status": "accepted", "symbol": "JPM",
     }
@@ -410,14 +405,14 @@ def test_execution_stage_logs_when_finalize_cannot_confirm_coverage(caplog):
     ctx.symbols_bars = {}
 
     stage = ExecutionStage(pipeline=pipeline)
-    with caplog.at_level(logging.WARNING, logger="src.pipeline_stages"):
-        stage.run(ctx)
+    stage.run(ctx)
 
-    assert pipeline._finalize_protection_after_sell.called
-    assert any(
-        "did not" in r.getMessage() and "coverage" in r.getMessage()
-        for r in caplog.records
-    ), f"expected a finalize-failure warning; got {[r.getMessage() for r in caplog.records]}"
+    pipeline._finalize_pending_protections.assert_called_once()
+    _, kwargs = pipeline._finalize_pending_protections.call_args
+    assert kwargs.get("context") == "ExecutionStage"
+    assert kwargs.get("wait") is False
+    pending = pipeline._finalize_pending_protections.call_args.args[0]
+    assert len(pending) == 1 and pending[0]["symbol"] == "JPM"
 
 
 def test_execution_stage_allows_buys_when_daily_loss_not_breached_after_refresh():
