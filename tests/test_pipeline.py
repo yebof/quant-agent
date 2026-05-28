@@ -2399,7 +2399,9 @@ def test_pipeline_midday_blocks_llm_sells_while_auto_take_profit_pending():
         symbol="SPY", qty=10.0, avg_entry=500.0, current_price=505.0,
         market_value=5050.0, unrealized_pnl=50.0, sector="ETF",
     )
-    pipeline.broker.get_positions.side_effect = [[position], [position]]
+    # First entry feeds the session-entry broker-truth coverage reconciler;
+    # the remaining entries feed the session's own position reads.
+    pipeline.broker.get_positions.side_effect = [[position], [position], [position]]
     pipeline.broker.wait_for_order_terminal.return_value = "accepted"
     pipeline.macro = MagicMock()
     pipeline.macro.get_macro_summary.return_value = {}
@@ -2543,7 +2545,8 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
         {"cash": 3500.0, "portfolio_value": 10000.0, "last_equity": 10000.0},
     ]
     mock_broker.get_positions.side_effect = [
-        [spy_position], [spy_position], [spy_position], [],
+        # First entry feeds the session-entry broker-truth coverage reconciler.
+        [spy_position], [spy_position], [spy_position], [spy_position], [],
     ]
     mock_broker.wait_for_order_terminal.return_value = "filled"
     mock_broker.submit_order.side_effect = [
@@ -3348,3 +3351,48 @@ def test_submit_protected_sell_restores_stops_on_submit_throw():
     pipe.broker._restore_stop_orders.assert_called_once_with(
         "NVDA", [{"id": "s1", "qty": 10}], check_idempotency=False,
     )
+
+
+def test_reconcile_stop_coverage_flags_undercovered_long():
+    """A held long with less open protective-stop qty than held qty is a gap."""
+    from types import SimpleNamespace
+    pipe = TradingPipeline.__new__(TradingPipeline)
+    pipe.broker = MagicMock()
+    pipe.db = MagicMock()
+    pipe.db.get_pending_protection_restores.return_value = []
+    pipe.broker.get_positions.return_value = [
+        SimpleNamespace(symbol="NVDA", qty=10.0),
+        SimpleNamespace(symbol="AAPL", qty=5.0),
+    ]
+
+    def _snap(sym):
+        if sym == "NVDA":
+            return (True, [{"id": "s1", "qty": 4.0}])   # only 4 of 10 covered
+        return (True, [{"id": "s2", "qty": 5.0}])        # fully covered
+    pipe.broker.snapshot_protective_stops.side_effect = _snap
+
+    gaps = pipe._reconcile_stop_coverage()
+    assert len(gaps) == 1
+    assert gaps[0]["symbol"] == "NVDA"
+    assert gaps[0]["held_qty"] == 10.0 and gaps[0]["covered_qty"] == 4.0
+
+
+def test_reconcile_stop_coverage_skips_shorts_pending_and_covered():
+    """Shorts/inverse (qty<=0), symbols the drain owns (pending row), and
+    fully-covered longs all produce no gap — and we don't even snapshot the
+    skipped ones."""
+    from types import SimpleNamespace
+    pipe = TradingPipeline.__new__(TradingPipeline)
+    pipe.broker = MagicMock()
+    pipe.db = MagicMock()
+    pipe.db.get_pending_protection_restores.return_value = [{"symbol": "TSLA"}]
+    pipe.broker.get_positions.return_value = [
+        SimpleNamespace(symbol="SQQQ", qty=-3.0),   # short/inverse → skip
+        SimpleNamespace(symbol="TSLA", qty=8.0),    # drain owns it → skip
+        SimpleNamespace(symbol="MSFT", qty=2.0),    # fully covered
+    ]
+    pipe.broker.snapshot_protective_stops.return_value = (True, [{"id": "s", "qty": 2.0}])
+
+    gaps = pipe._reconcile_stop_coverage()
+    assert gaps == []
+    pipe.broker.snapshot_protective_stops.assert_called_once_with("MSFT")

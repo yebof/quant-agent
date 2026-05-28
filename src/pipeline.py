@@ -707,6 +707,83 @@ class TradingPipeline:
                     return None
         return 0.0
 
+    def _reconcile_stop_coverage(self) -> list[dict]:
+        """Broker-truth stop-coverage audit, independent of the WAL queue.
+
+        At session entry, enumerate held LONG positions and compare each one's
+        held qty against the qty actually covered by open protective SELL-stops
+        at the broker. Flag (log + return) any long whose covered qty is
+        materially below its held qty.
+
+        Why this exists (design review's strongest finding): the whole
+        naked-protection guarantee otherwise rests on some code path having
+        successfully persisted a WAL recovery row. A position that goes naked
+        WITHOUT a row — a best-effort persist that silently failed, a manual
+        broker action, a future SELL path that skips a step — is never
+        re-detected, because the WAL is a log of INTENDED operations, not an
+        audit of ACTUAL broker coverage. This reconciler closes that gap by
+        reading broker truth directly.
+
+        Read-only and best-effort: it lists positions + open stops and logs
+        gaps; it does NOT auto-submit a replacement stop (the original
+        protective level is unknown for a position with no live stop, and
+        picking one is a policy decision). Symbols already queued for WAL
+        recovery are skipped — the drain owns them. Returns the list of
+        under-covered ``{symbol, held_qty, covered_qty}`` for the caller to
+        surface to the operator.
+        """
+        try:
+            positions = self.broker.get_positions()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("coverage reconcile: get_positions failed: %s", exc)
+            return []
+        if not isinstance(positions, list):
+            return []
+        try:
+            pending_syms = {
+                r.get("symbol") for r in self.db.get_pending_protection_restores()
+            }
+        except Exception:  # noqa: BLE001
+            pending_syms = set()
+
+        gaps: list[dict] = []
+        longs_checked = 0
+        for p in positions:
+            symbol = getattr(p, "symbol", None)
+            try:
+                qty = float(getattr(p, "qty", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            # Longs only — a SELL-stop can't protect a short, and inverse-ETF
+            # hedges have their own handling. Skip symbols the drain already owns.
+            if not symbol or qty <= 0 or symbol in pending_syms:
+                continue
+            longs_checked += 1
+            try:
+                _ok, specs = self.broker.snapshot_protective_stops(symbol)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "coverage reconcile: snapshot failed for %s: %s", symbol, exc,
+                )
+                continue
+            covered = sum(float(s.get("qty", 0) or 0) for s in (specs or []))
+            if covered + 1e-6 < qty:
+                gaps.append({
+                    "symbol": symbol, "held_qty": qty, "covered_qty": covered,
+                })
+                logger.warning(
+                    "STOP-COVERAGE GAP: %s held=%.4f but only %.4f covered by "
+                    "open protective stops — (partially) unprotected with no WAL "
+                    "recovery row. Manual review / re-protect needed.",
+                    symbol, qty, covered,
+                )
+        if longs_checked and not gaps:
+            logger.info(
+                "Stop-coverage reconcile: all %d long position(s) adequately "
+                "stop-covered", longs_checked,
+            )
+        return gaps
+
     def _submit_protected_sell(
         self,
         *,
@@ -4686,6 +4763,9 @@ class TradingPipeline:
             # audit F4: resolve BUY write-ahead orphans from a prior
             # crashed session before this run touches positions/cash.
             self._reconcile_orphan_pending_submits()
+            # 0b. Broker-truth coverage audit (independent of the WAL): catch
+            # any long that's gone naked WITHOUT leaving a recovery row.
+            coverage_gaps = self._reconcile_stop_coverage()
 
             # 0. Cancel stale entry orders from previous sessions, but preserve live protective exits.
             self.broker.cancel_open_entry_orders()
@@ -4791,12 +4871,14 @@ class TradingPipeline:
                 return {
                     "status": "no_trades", "orders": [], "run_id": run_id,
                     "data_status": dict(ctx.data_status),
+                    "stop_coverage_gaps": coverage_gaps,
                 }
             if not portfolio_decision.decisions:
                 logger.info("Portfolio manager + Constructor: no trades suggested")
                 return {
                     "status": "no_trades", "orders": [], "run_id": run_id,
                     "data_status": dict(ctx.data_status),
+                    "stop_coverage_gaps": coverage_gaps,
                 }
 
             # Phase 4 #1: risk stage — hard filter + earnings cap + RM review + mods.
@@ -4813,6 +4895,7 @@ class TradingPipeline:
             return {
                 "status": "executed", "orders": orders, "run_id": run_id,
                 "data_status": dict(ctx.data_status),
+                "stop_coverage_gaps": coverage_gaps,
             }
         finally:
             # Phase 3: ask broker which of today's submitted orders actually filled.
@@ -5022,6 +5105,8 @@ class TradingPipeline:
         # next-morning's drain — codex r8 #2.
         self._drain_pending_protection_restores()
         self._reconcile_orphan_pending_submits()  # audit F4
+        # Broker-truth coverage audit (independent of the WAL).
+        coverage_gaps = self._reconcile_stop_coverage()
 
         # 1. Sync positions (snapshot into ctx)
         account = self.broker.get_account()
@@ -5235,6 +5320,7 @@ class TradingPipeline:
             "review": review.model_dump() if review else None,
             "orders": orders,
             "run_id": run_id,
+            "stop_coverage_gaps": coverage_gaps,
         }
 
     def run_earnings_preprocess(self) -> dict:
@@ -5513,6 +5599,9 @@ class TradingPipeline:
         # a naked position overnight. Codex r8 #2.
         self._drain_pending_protection_restores()
         self._reconcile_orphan_pending_submits()  # audit F4
+        # Broker-truth coverage audit — last check before carrying positions
+        # overnight (independent of the WAL).
+        coverage_gaps = self._reconcile_stop_coverage()
 
         # 1. Record daily PnL — use Alpaca's last_equity (previous trading-day close)
         # as the baseline. This correctly handles weekends/holidays (Alpaca updates
@@ -5776,6 +5865,7 @@ class TradingPipeline:
             "max_daily_loss_pct": getattr(
                 getattr(self.config, "risk", None), "max_daily_loss_pct", None,
             ),
+            "stop_coverage_gaps": coverage_gaps,
         }
 
     def _expected_sessions_missing_today(self) -> list[str]:

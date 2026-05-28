@@ -954,3 +954,23 @@ def test_format_evening_suggested_actions_precede_history_table():
     assert "Reduce NVDA exposure" in msg
     # Appears before the Tomorrow block (which sits after the history table).
     assert msg.index("⚡ Suggested actions:") < msg.index("🔮 Tomorrow")
+
+
+def test_format_morning_renders_stop_coverage_gap_banner():
+    result = {
+        "status": "executed", "run_id": "r", "orders": [],
+        "stop_coverage_gaps": [{"symbol": "NVDA", "held_qty": 10.0, "covered_qty": 4.0}],
+    }
+    msg = format_session_result("morning", result, 5.0)
+    assert "🔴 STOP-COVERAGE GAP" in msg
+    assert "NVDA" in msg
+
+
+def test_format_evening_renders_stop_coverage_gap_banner():
+    result = {
+        "status": "analyzed", "run_id": "r", "daily_pnl": 10.0, "total_value": 100_000.0,
+        "stop_coverage_gaps": [{"symbol": "AAPL", "held_qty": 5.0, "covered_qty": 0.0}],
+    }
+    msg = format_session_result("evening", result, 5.0)
+    assert "🔴 STOP-COVERAGE GAP" in msg
+    assert "AAPL" in msg

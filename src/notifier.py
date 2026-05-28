@@ -198,7 +198,31 @@ def format_session_result(
     return "\n".join(lines)
 
 
+def _append_coverage_gap_banner(lines: list[str], result: dict) -> None:
+    """Render the broker-truth stop-coverage gap banner (🔴) when the session-
+    entry reconciler found held longs with less open protective-stop coverage
+    than held qty — a (partially) naked position the WAL queue didn't know
+    about. This is operator-actionable: a stop needs manual re-protection."""
+    gaps = result.get("stop_coverage_gaps")
+    if not isinstance(gaps, list) or not gaps:
+        return
+    parts = []
+    for g in gaps[:6]:
+        if not isinstance(g, dict):
+            continue
+        parts.append(
+            f"{g.get('symbol', '?')}"
+            f"({_fmt_qty(g.get('covered_qty', 0) or 0)}/{_fmt_qty(g.get('held_qty', 0) or 0)})"
+        )
+    lines.append(
+        f"🔴 STOP-COVERAGE GAP: {len(gaps)} long(s) under-protected "
+        f"(covered/held): {', '.join(parts)}"
+    )
+
+
 def _append_trade_session_body(lines: list[str], result: dict) -> None:
+    # System-health first: a naked long is more urgent than the order list.
+    _append_coverage_gap_banner(lines, result)
     orders = result.get("orders") or []
 
     # FORCE_DELEVER / EMERGENCY_SELL banner — these actions mean the
@@ -395,6 +419,9 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
         soft = [m for m in missing if m != "morning"]
         if soft:
             lines.append(f"⚠️ no activity logged today for: {', '.join(soft)}")
+
+    # (0b) Broker-truth stop-coverage gap (last check before overnight).
+    _append_coverage_gap_banner(lines, result)
 
     # (1) LLM-graded escalation — evening's contract maps thesis_trajectory=
     # broken / macro_warning_ignored loss patterns to risk_rating >= elevated.
