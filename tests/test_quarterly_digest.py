@@ -552,3 +552,63 @@ def test_build_quarterly_digest_populates_all_core_sections():
     assert digest["period"] == "2026-Q1"
     # No corrigibility when prev_digest=None
     assert "corrigibility_trend" not in digest
+
+
+def test_insight_aggregators_exclude_out_of_window_rows():
+    """Regression: the insights-derived aggregators (missed_themes /
+    loss_patterns / watchlist_candidates) must filter by the
+    [period_start, period_end] CALENDAR window, like period_performance /
+    agent_signal_activity — not by a row-count slice that pulls in ~36
+    extra calendar days. A row dated AFTER period_end belongs to the next
+    quarter and must not leak into this digest."""
+    db = MagicMock()
+    db.get_daily_pnl.return_value = []
+    db.get_recent_agent_outputs.return_value = []
+    db.compute_trade_calibration.return_value = {"n": 0}
+    db.get_recent_insights.return_value = [
+        # OUT of window — dated after period_end (2026-03-31). Newest first.
+        {"date": "2026-04-15",
+         "missed_opportunities_json": json.dumps([
+             {"symbol": "OUT", "miss_category": "theme_blindspot",
+              "theme_if_any": "next-quarter-theme",
+              "universe_addition_recommendation": "add",
+              "universe_addition_reason": "should be excluded", "lesson": "x"},
+         ]),
+         "buy_grades_json": json.dumps([
+             {"grade": "wrong", "loss_root_cause": "fomo", "symbol": "OUT"},
+         ])},
+        # IN window — mid-March, inside [2025-12-31, 2026-03-31].
+        {"date": "2026-03-15",
+         "missed_opportunities_json": json.dumps([
+             {"symbol": "INW", "miss_category": "theme_blindspot",
+              "theme_if_any": "this-quarter-theme",
+              "universe_addition_recommendation": "add",
+              "universe_addition_reason": "should be counted", "lesson": "x"},
+         ]),
+         "buy_grades_json": json.dumps([
+             {"grade": "wrong", "loss_root_cause": "greed_top_chasing",
+              "symbol": "INW"},
+         ])},
+    ]
+
+    digest = build_quarterly_digest(
+        db, market=None, period_end=date(2026, 3, 31), lookback_days=90,
+    )
+
+    # missed_themes: only the in-window theme/category.
+    mt = digest["missed_themes"]
+    assert "this-quarter-theme" in mt["by_theme"]
+    assert "next-quarter-theme" not in mt["by_theme"]
+    assert mt["total_real_misses"] == 1
+
+    # loss_patterns: only the in-window wrong-BUY cause.
+    lp = digest["loss_patterns"]
+    assert "greed_top_chasing" in lp["by_cause"]
+    assert "fomo" not in lp["by_cause"]
+    assert lp["total_wrong_buys"] == 1
+
+    # watchlist_candidates: only the in-window symbol.
+    wlc = digest["watchlist_candidates"]
+    syms = {c["symbol"] for c in wlc["candidates"]}
+    assert "INW" in syms
+    assert "OUT" not in syms

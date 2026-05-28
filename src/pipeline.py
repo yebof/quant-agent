@@ -465,8 +465,28 @@ class TradingPipeline:
                         d.symbol, held.market_value,
                     )
                     continue
-                frac = 1.0 if d.allocation_pct >= 100 else d.allocation_pct / 100.0
-                sell_proceeds += held.market_value * frac
+                # Mirror ExecutionStage's exact share rounding so the cash
+                # budget credits the proceeds the SELL will *actually* realize.
+                # ExecutionStage (pipeline_stages.py) rounds a partial alloc to
+                # whole shares for integer-qty positions via
+                # `max(1.0, int(qty*frac))`, then promotes to a full sell when
+                # the rounded qty meets/exceeds the position. The naive
+                # `market_value * (alloc/100)` diverges from that both ways:
+                #   - under-credits (e.g. 40% of a 1-share lot rounds UP to a
+                #     full sell → 100% proceeds) → false-blocks a legit BUY;
+                #   - over-credits (e.g. 99% of a 10-share lot rounds DOWN to 9
+                #     shares = 90% proceeds) → phantom cash a BUY could borrow.
+                # Crediting `eff_qty / held.qty` closes both gaps.
+                if d.allocation_pct >= 100:
+                    proceeds_frac = 1.0
+                else:
+                    eff_qty = held.qty * (d.allocation_pct / 100.0)
+                    if float(held.qty).is_integer():
+                        eff_qty = max(1.0, float(int(eff_qty)))
+                    if eff_qty >= held.qty:
+                        eff_qty = held.qty  # rounds up to a full exit
+                    proceeds_frac = eff_qty / held.qty if held.qty > 0 else 0.0
+                sell_proceeds += held.market_value * proceeds_frac
         effective_cash = None if cash is None else cash + sell_proceeds
 
         for decision in decisions:
@@ -2062,11 +2082,18 @@ class TradingPipeline:
                     "finalize will use whatever fill_info reads now",
                     prot["symbol"], prot["order_id"], exc,
                 )
-            self._finalize_protection_after_sell(
+            ok, _retry_specs = self._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
                 wal_row_id=prot.get("wal_row_id"),
             )
+            if not ok:
+                logger.warning(
+                    "auto_take_profit: finalize for %s (order %s) did not "
+                    "confirm stop coverage — recovery intent persisted; "
+                    "drain rebuilds next session",
+                    prot["symbol"], prot["order_id"],
+                )
         return orders
 
     def _wait_for_midday_auto_tp_orders(self, auto_tp_orders: list[dict]) -> set[str]:
@@ -4226,11 +4253,18 @@ class TradingPipeline:
                     "Midday emergency: wait failed for %s order %s: %s",
                     prot["symbol"], prot["order_id"], exc,
                 )
-            self._finalize_protection_after_sell(
+            ok, _retry_specs = self._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
                 wal_row_id=prot.get("wal_row_id"),
             )
+            if not ok:
+                logger.warning(
+                    "Midday emergency: finalize for %s (order %s) did not "
+                    "confirm stop coverage — recovery intent persisted; "
+                    "drain rebuilds next session",
+                    prot["symbol"], prot["order_id"],
+                )
         return orders
 
     def _symbols_already_trimmed_today(self) -> set[str]:
@@ -4471,11 +4505,18 @@ class TradingPipeline:
                     "Midday reviewer: wait failed for %s order %s: %s",
                     prot["symbol"], prot["order_id"], exc,
                 )
-            self._finalize_protection_after_sell(
+            ok, _retry_specs = self._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
                 wal_row_id=prot.get("wal_row_id"),
             )
+            if not ok:
+                logger.warning(
+                    "Midday reviewer: finalize for %s (order %s) did not "
+                    "confirm stop coverage — recovery intent persisted; "
+                    "drain rebuilds next session",
+                    prot["symbol"], prot["order_id"],
+                )
         return orders
 
     def _force_delever(self, ctx: RunContext) -> list[dict]:
@@ -4635,11 +4676,18 @@ class TradingPipeline:
                     "FORCE DE-LEVER: wait failed for %s order %s: %s",
                     prot["symbol"], prot["order_id"], e,
                 )
-            self._finalize_protection_after_sell(
+            ok, _retry_specs = self._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
                 wal_row_id=prot.get("wal_row_id"),
             )
+            if not ok:
+                logger.warning(
+                    "FORCE DE-LEVER: finalize for %s (order %s) did not "
+                    "confirm stop coverage — recovery intent persisted; "
+                    "drain rebuilds next session",
+                    prot["symbol"], prot["order_id"],
+                )
 
         # Refresh ctx so downstream stages see post-sell truth.
         try:
@@ -5523,11 +5571,18 @@ class TradingPipeline:
                     "Intra emergency: wait failed for %s order %s: %s",
                     prot["symbol"], prot["order_id"], exc,
                 )
-            self._finalize_protection_after_sell(
+            ok, _retry_specs = self._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
                 wal_row_id=prot.get("wal_row_id"),
             )
+            if not ok:
+                logger.warning(
+                    "Intra emergency: finalize for %s (order %s) did not "
+                    "confirm stop coverage — recovery intent persisted; "
+                    "drain rebuilds next session",
+                    prot["symbol"], prot["order_id"],
+                )
 
         return {
             "status": "emergency_sold",

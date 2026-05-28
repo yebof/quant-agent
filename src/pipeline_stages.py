@@ -778,7 +778,13 @@ class ExecutionStage:
                 )
                 if not pipeline._order_accepted(order, decision.symbol, "sell"):
                     if stop_specs:
-                        pipeline.broker._restore_stop_orders(decision.symbol, stop_specs)
+                        # Inline rollback: the stops were cancelled moments ago
+                        # and cannot still be alive at the broker, so re-submit
+                        # without the idempotency pre-check (matches every other
+                        # inline-rollback SELL path in pipeline.py).
+                        pipeline.broker._restore_stop_orders(
+                            decision.symbol, stop_specs, check_idempotency=False,
+                        )
                     continue
                 # Defer reprotect/restore decision until the existing
                 # post-sell wait below resolves the actual fill_qty —
@@ -839,11 +845,23 @@ class ExecutionStage:
         # the broker's fill_info is final. Reprotect on actual residual
         # (filled successfully) or restore originals (no-fill terminal).
         for prot in pending_protections:
-            pipeline._finalize_protection_after_sell(
+            ok, _retry_specs = pipeline._finalize_protection_after_sell(
                 prot["order_id"], prot["symbol"],
                 prot["position_qty_before_sell"], prot["specs"],
                 wal_row_id=prot.get("wal_row_id"),
             )
+            if not ok:
+                # finalize has already persisted the orphaned-restore intent
+                # to pending_protection_restores (next session's drain rebuilds
+                # coverage). Surface it now so the operator has a real-time
+                # signal that the morning SELL left protection unconfirmed —
+                # matches the drain path's visibility (pipeline.py drain loop).
+                logger.warning(
+                    "ExecutionStage: finalize for %s (order %s) did not "
+                    "confirm stop coverage — recovery intent persisted; "
+                    "drain will rebuild next session",
+                    prot["symbol"], prot["order_id"],
+                )
 
         if sell_decisions:
             account, positions, price_map = pipeline._refresh_account_state()

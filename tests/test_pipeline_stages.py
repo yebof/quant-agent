@@ -38,6 +38,9 @@ def _mock_stage_seam(pipeline, *, specs=(), ok=True, wal_row_id=None):
     pipeline._cancel_stops_with_write_ahead.return_value = (
         ok, list(specs), wal_row_id,
     )
+    # Callers unpack finalize's (ok, retry_specs) contract; default to
+    # "coverage confirmed" so the full-MagicMock pipeline yields a tuple.
+    pipeline._finalize_protection_after_sell.return_value = (True, [])
 
 
 def test_stage_classes_take_pipeline_reference():
@@ -349,6 +352,72 @@ def test_execution_stage_blocks_buys_when_daily_loss_breached_during_run():
     pipeline.risk_engine.check_daily_loss.assert_called_with(
         100_000.0, 96_500.0 - 100_000.0,
     )
+
+
+def test_execution_stage_logs_when_finalize_cannot_confirm_coverage(caplog):
+    """When _finalize_protection_after_sell returns (ok=False, ...) — its
+    restore/reprotect failed and it persisted the recovery intent — the
+    morning ExecutionStage must surface a warning so the operator has a
+    real-time signal that protection wasn't rebuilt (matches the drain
+    path's visibility). Pre-fix the return value was ignored entirely, so
+    a naked-until-next-session position left no log trail at the point of
+    failure."""
+    import logging
+    from src.models import PortfolioDecision, Position, TradeDecision
+    from src.pipeline_context import RunContext
+
+    specs = [{"id": "stop-1", "qty": 10, "stop_price": 280.0, "limit_price": 275.0}]
+    pipeline = MagicMock()
+    pipeline.broker.get_latest_price.return_value = 320.0
+    _mock_stop_seam(pipeline.broker, specs=specs)
+    _mock_stage_seam(pipeline, specs=specs)
+    # finalize couldn't rebuild coverage (e.g. reprotect raised) → (False, specs).
+    pipeline._finalize_protection_after_sell.return_value = (False, list(specs))
+    pipeline.broker.submit_order.return_value = {
+        "id": "sell-9", "status": "accepted", "symbol": "JPM",
+    }
+    pipeline.broker.wait_for_order_terminal.return_value = "filled"
+    pipeline._refresh_account_state.return_value = (
+        {"cash": 60_000.0, "portfolio_value": 100_000.0}, [], {},
+    )
+    pipeline.risk_engine.check_daily_loss.return_value = None
+    pipeline._order_accepted.return_value = True
+    pipeline._format_qty = lambda q: str(q)
+    pipeline._full_sell_qty = lambda q: q
+    pipeline.db = MagicMock()
+
+    ctx = RunContext.start("morning")
+    ctx.cash = 30_000.0
+    ctx.total_value = 100_000.0
+    ctx.last_equity = 100_000.0
+    ctx.positions = [
+        Position(
+            symbol="JPM", qty=10.0, avg_entry=300.0, current_price=320.0,
+            market_value=3_200.0, unrealized_pnl=200.0, sector="Financial",
+        ),
+    ]
+    ctx.portfolio_decision = PortfolioDecision(
+        reasoning_chain=_pm_rc(),
+        decisions=[
+            TradeDecision(
+                action="SELL", symbol="JPM", allocation_pct=100,
+                entry_price=300.0, stop_loss=280.0, take_profit=350.0,
+                reasoning="exit",
+            ),
+        ],
+        portfolio_view="test",
+    )
+    ctx.symbols_bars = {}
+
+    stage = ExecutionStage(pipeline=pipeline)
+    with caplog.at_level(logging.WARNING, logger="src.pipeline_stages"):
+        stage.run(ctx)
+
+    assert pipeline._finalize_protection_after_sell.called
+    assert any(
+        "did not" in r.getMessage() and "coverage" in r.getMessage()
+        for r in caplog.records
+    ), f"expected a finalize-failure warning; got {[r.getMessage() for r in caplog.records]}"
 
 
 def test_execution_stage_allows_buys_when_daily_loss_not_breached_after_refresh():

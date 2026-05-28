@@ -578,3 +578,27 @@ def test_pending_submit_row_distinguishable_from_orphan_terminal_states(db):
         "AND broker_order_id IS NULL"
     ).fetchall()
     assert len(orphans) == 1 and orphans[0]["id"] == pending
+
+
+def test_get_recent_agent_outputs_unparseable_before_date_skips_filter(db, caplog):
+    """An unparseable before_date must NOT fall back to a timezone-naive
+    `date(timestamp) < before_date` comparison (UTC-date vs ET-key — the
+    documented bug). It skips the date filter and returns the most-recent
+    rows instead. All production callers pass session_date_key() so this is
+    defensive, but the old wrong comparison could silently drop every row."""
+    import logging
+    for i in range(2):
+        db.insert_agent_log(
+            agent_name="portfolio_manager", run_id=f"r{i}",
+            input_summary="in", output_summary="out",
+            full_response="{}", model="x", tokens_used=1,
+        )
+    # "0000-99-99": fromisoformat rejects it (→ fallback). A naive
+    # `date(timestamp) < '0000-99-99'` is False for any real timestamp, so
+    # the buggy fallback dropped ALL rows. Correct behavior keeps them.
+    with caplog.at_level(logging.WARNING, logger="src.storage.db"):
+        rows = db.get_recent_agent_outputs(
+            "portfolio_manager", limit=5, before_date="0000-99-99",
+        )
+    assert len(rows) == 2, "unparseable before_date must not drop rows via a wrong filter"
+    assert any("skipping the date filter" in r.getMessage() for r in caplog.records)

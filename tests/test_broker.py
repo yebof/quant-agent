@@ -1412,7 +1412,7 @@ def test_restore_stop_orders_no_alive_stops_uses_legacy_submit_path(mock_tc_cls)
 
 
 @patch("src.execution.broker.TradingClient")
-def test_submit_order_unwraps_orderstatus_enum_value(mock_tc_cls):
+def test_submit_order_unwraps_orderstatus_enum_value(mock_tc_cls, caplog):
     """alpaca-py OrderStatus is (str, Enum). Plain str(enum) returns
     'OrderStatus.REJECTED' (the repr), not 'rejected' (the value).
     _order_accepted's rejection filter lowercases and checks for the
@@ -1428,13 +1428,25 @@ def test_submit_order_unwraps_orderstatus_enum_value(mock_tc_cls):
     mock_client.submit_order.return_value = mock_order
     mock_tc_cls.return_value = mock_client
 
+    import logging
     broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
-    order = broker.submit_order(symbol="AAPL", qty=10, side="buy")
+    with caplog.at_level(logging.INFO, logger="src.execution.broker"):
+        order = broker.submit_order(symbol="AAPL", qty=10, side="buy")
 
     assert order["status"] == "rejected", (
         f"status must be the enum value 'rejected', not its repr; "
         f"got {order['status']!r}"
     )
+    # The "Order submitted" info log must ALSO unwrap the enum value —
+    # str(OrderStatus.REJECTED) would otherwise pollute logs with the
+    # 'OrderStatus.REJECTED' repr (audit re-scan).
+    submit_lines = [
+        r.getMessage() for r in caplog.records
+        if "Order submitted" in r.getMessage()
+    ]
+    assert submit_lines, "expected an 'Order submitted' log line"
+    assert "OrderStatus." not in submit_lines[0], submit_lines[0]
+    assert "rejected" in submit_lines[0]
 
 
 @patch("src.execution.broker.TradingClient")

@@ -893,7 +893,8 @@ class AlpacaBroker:
             if use_stop else ""
         )
         logger.info("Order submitted: %s %s %s @ %s%s — status: %s",
-                     side, qty, symbol, limit_price or "market", bracket_info, order.status)
+                     side, qty, symbol, limit_price or "market", bracket_info,
+                     str(getattr(order.status, "value", order.status)))
         return {
             "id": str(order.id),
             # alpaca-py OrderStatus is `(str, Enum)`. Plain `str(enum)`

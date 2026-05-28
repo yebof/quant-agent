@@ -40,6 +40,9 @@ def _mock_stage_seam(pipeline, *, specs=(), ok=True, wal_row_id=None):
     pipeline._cancel_stops_with_write_ahead.return_value = (
         ok, list(specs), wal_row_id,
     )
+    # Callers unpack finalize's (ok, retry_specs) contract; default to
+    # "coverage confirmed" so the full-MagicMock pipeline yields a tuple.
+    pipeline._finalize_protection_after_sell.return_value = (True, [])
 
 
 def _pm_rc() -> ReasoningChain:

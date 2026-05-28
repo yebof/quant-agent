@@ -126,6 +126,7 @@ class Database:
                 sell_decisions_assessment TEXT DEFAULT '',
                 sell_grades_json TEXT DEFAULT '[]',
                 buy_grades_json TEXT DEFAULT '[]',
+                missed_opportunities_json TEXT DEFAULT '[]',
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -1085,13 +1086,21 @@ class Database:
                 conditions.append("timestamp < ?")
                 params.append(utc_cutoff)
             except (ValueError, TypeError) as exc:
+                # before_date couldn't be parsed as an ISO date, so we
+                # cannot convert it to the ET→UTC cutoff the main path uses.
+                # The old fallback (`date(timestamp) < before_date`) compared
+                # a UTC calendar date against an ET key — the exact bug this
+                # docstring warns about — and could silently drop/keep the
+                # wrong rows. All production callers pass session_date_key()
+                # (always valid ISO), so this branch is unreachable in
+                # practice; degrade by skipping the date filter entirely
+                # rather than applying a known-wrong comparison.
                 logger.warning(
                     "get_recent_agent_outputs: unparseable before_date=%r (%s); "
-                    "falling back to date-string comparison",
+                    "skipping the date filter (returning most-recent rows "
+                    "unfiltered) to avoid a UTC-vs-ET mismatch",
                     before_date, exc,
                 )
-                conditions.append("date(timestamp) < ?")
-                params.append(before_date)
         where = "WHERE " + " AND ".join(conditions)
         with self._lock:
             rows = self.conn.execute(

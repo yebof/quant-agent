@@ -1263,8 +1263,11 @@ def test_quarterly_digest_includes_watchlist_candidates():
 
     db = _MM()
     db.get_daily_pnl.return_value = []
+    # Dates must fall inside the quarter being analyzed ([period_start,
+    # period_end]); period_end=2026-03-31, lookback=90 → window starts
+    # 2025-12-31, so these sit in mid-March.
     db.get_recent_insights.return_value = [
-        {"date": "2026-04-18",
+        {"date": "2026-03-18",
          "missed_opportunities_json": _json.dumps([
              {"symbol": "VST", "miss_category": "theme_blindspot",
               "theme_if_any": "nuclear/power",
@@ -1272,7 +1275,7 @@ def test_quarterly_digest_includes_watchlist_candidates():
               "universe_addition_reason": "$180M · 2.1x · distributed",
               "lesson": "x"},
          ])},
-        {"date": "2026-04-17",
+        {"date": "2026-03-17",
          "missed_opportunities_json": _json.dumps([
              {"symbol": "VST", "miss_category": "theme_blindspot",
               "theme_if_any": "nuclear/power",
@@ -1307,7 +1310,7 @@ def test_quarterly_digest_watchlist_high_conviction_threshold():
     db = _MM()
     db.get_daily_pnl.return_value = []
     db.get_recent_insights.return_value = [
-        {"date": "2026-04-18",
+        {"date": "2026-03-18",  # in-window for the Q1 (period_end 2026-03-31) digest
          "missed_opportunities_json": _json.dumps([
              {"symbol": "LONE", "miss_category": "theme_blindspot",
               "theme_if_any": "ai-capex",

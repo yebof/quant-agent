@@ -134,6 +134,83 @@ def test_filter_anticipates_same_session_sell_proceeds():
     assert "SPY" in symbols
 
 
+def _generous_config() -> RiskConfig:
+    """Caps high enough that only cash_only can bind — isolates the
+    SELL-proceeds pre-sum math from position/sector/total limits."""
+    return RiskConfig(
+        max_position_pct=100.0,
+        max_total_position_pct=1000.0,
+        max_daily_loss_pct=100.0,
+        max_sector_pct=100.0,
+        require_stop_loss=True,
+        allow_margin=False,
+    )
+
+
+def test_presum_partial_sell_does_not_overcredit_proceeds():
+    """A partial SELL whose shares round DOWN realizes LESS than the raw
+    allocation fraction. ExecutionStage sells alloc=99% of a 10-share lot
+    as int(9.9)=9 shares = 90% of value, not 99%. The cash-only pre-sum
+    must credit the 90% it will actually realize, else a BUY sized against
+    the phantom extra 9% would draw margin at execution time."""
+    pipeline = _pipeline_with_engine(_generous_config())
+    pipeline.config.trading.universe = ["BRK", "NVDA"]
+    held = Position(
+        symbol="BRK", qty=10, avg_entry=50_000, current_price=6_000,
+        market_value=60_000, unrealized_pnl=0, sector="Financial Services",
+    )
+    sell = TradeDecision(
+        action="SELL", symbol="BRK", allocation_pct=99.0,  # 9.9 → 9 shares = $54k
+        entry_price=0, stop_loss=0, take_profit=0, reasoning="trim",
+    )
+    buy = TradeDecision(
+        action="BUY", symbol="NVDA", allocation_pct=58.0,  # $58k
+        entry_price=100.0, stop_loss=95.0, take_profit=110.0, reasoning="rotate",
+    )
+    # cash $2k + actual proceeds $54k = $56k < $58k BUY → must block.
+    # The pre-fix code credited 99% ($59.4k) → $61.4k effective → wrongly allowed.
+    allowed, _, blocked = pipeline._filter_hard_risk_decisions(
+        [sell, buy], positions=[held], total_value=100_000.0,
+        daily_pnl=0, baseline=100_000.0, cash=2_000.0,
+    )
+    symbols = {d.symbol for d in allowed}
+    assert "NVDA" not in symbols, (
+        "BUY must block — it exceeds cash + the 90% the rounded SELL realizes"
+    )
+    assert any("NVDA" in msg and "cash" in msg.lower() for msg in blocked)
+
+
+def test_presum_partial_sell_rounding_up_to_full_credits_full_proceeds():
+    """The opposite rounding edge: alloc=40% of a 1-share lot rounds UP to
+    a full exit (int(0.4)=0 → max(1,0)=1 share = 100%). The pre-sum must
+    credit the full proceeds so a legit rotation BUY isn't false-blocked."""
+    pipeline = _pipeline_with_engine(_generous_config())
+    pipeline.config.trading.universe = ["BRK", "NVDA"]
+    held = Position(
+        symbol="BRK", qty=1, avg_entry=50_000, current_price=60_000,
+        market_value=60_000, unrealized_pnl=10_000, sector="Financial Services",
+    )
+    sell = TradeDecision(
+        action="SELL", symbol="BRK", allocation_pct=40.0,  # rounds up to full exit
+        entry_price=0, stop_loss=0, take_profit=0, reasoning="exit",
+    )
+    buy = TradeDecision(
+        action="BUY", symbol="NVDA", allocation_pct=58.0,  # $58k
+        entry_price=100.0, stop_loss=95.0, take_profit=110.0, reasoning="rotate",
+    )
+    # cash $2k + full proceeds $60k = $62k > $58k → must allow. The pre-fix
+    # code credited only 40% ($24k) → $26k effective → wrongly blocked.
+    allowed, _, blocked = pipeline._filter_hard_risk_decisions(
+        [sell, buy], positions=[held], total_value=100_000.0,
+        daily_pnl=0, baseline=100_000.0, cash=2_000.0,
+    )
+    symbols = {d.symbol for d in allowed}
+    assert "NVDA" in symbols, (
+        f"BUY should pass — the partial SELL rounds up to a full exit "
+        f"realizing 100% proceeds; blocked={blocked}"
+    )
+
+
 def test_pm_prompt_surfaces_delever_mandate_when_cash_negative():
     """When margin is disabled and cash is already negative, PM sees a clear
     mandate to SELL before any BUY. The engine will hard-block BUYs anyway,

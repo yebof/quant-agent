@@ -408,18 +408,21 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
         # without plumbing last_equity through. Audit 2026-05-27: a -5%
         # day was displayed as ~-4.76% under the old denominator.
         prior_equity = total_value - daily_pnl
-        if prior_equity > 0:
-            ret_pct = (daily_pnl / prior_equity) * 100
-        else:
-            ret_pct = 0.0
         # Format signs as prefix (-$373.46 not $-373.46) — the latter
         # reads as "dollar minus 373" which is awkward.
         if daily_pnl >= 0:
             pnl_str = f"+${daily_pnl:,.2f}"
-            ret_str = f"+{ret_pct:.2f}%"
         else:
             pnl_str = f"-${abs(daily_pnl):,.2f}"
-            ret_str = f"{ret_pct:.2f}%"  # already has leading minus
+        if prior_equity > 0:
+            ret_pct = (daily_pnl / prior_equity) * 100
+            # ret already carries its own leading minus when negative.
+            ret_str = f"+{ret_pct:.2f}%" if daily_pnl >= 0 else f"{ret_pct:.2f}%"
+        else:
+            # prior_equity <= 0 → return % is mathematically undefined.
+            # Rendering "0.00%" would read as a real flat day; surface the
+            # undefined state instead so the operator isn't misled.
+            ret_str = "n/a"
         lines.append(f"💰 Daily P&L: {pnl_str} ({ret_str})")
         lines.append(f"   Equity: ${total_value:,.2f}")
 

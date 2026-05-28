@@ -339,6 +339,25 @@ def test_format_evening_shows_daily_pnl_when_present():
     assert "$107,278.55" in msg
 
 
+def test_format_evening_return_pct_na_when_prior_equity_nonpositive():
+    """When prior-day equity (total_value − daily_pnl) is ≤ 0 the return %
+    is mathematically undefined. Render 'n/a', not a misleading '0.00%'
+    that reads as a real flat day. The P&L dollar figure is still shown."""
+    result = {
+        "status": "analyzed",
+        "run_id": "run-zero",
+        # prior_equity = total_value - daily_pnl = -1000 - (-500) = -500 ≤ 0
+        "daily_pnl": -500.0,
+        "total_value": -1000.0,
+        "daily_return_pct": 0.0,
+    }
+    msg = format_session_result("evening", result, 10.0)
+    assert msg is not None
+    # Assert on the Daily P&L line specifically (the P&L history table,
+    # if a DB is present, legitimately contains "0.00%" elsewhere).
+    assert "💰 Daily P&L: -$500.00 (n/a)" in msg, msg
+
+
 def test_format_evening_shows_negative_daily_pnl():
     result = {
         "status": "analyzed", "run_id": "run-e",

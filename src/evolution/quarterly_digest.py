@@ -127,13 +127,17 @@ def build_quarterly_digest(
         db, market, period_start, period_end,
     )
     digest["calibration_by_size"] = _calibration_by_size(db, lookback_days)
-    digest["missed_themes"] = _missed_themes_aggregated(db, lookback_days)
-    digest["loss_patterns"] = _loss_patterns_aggregated(db, lookback_days)
+    digest["missed_themes"] = _missed_themes_aggregated(
+        db, period_start, period_end,
+    )
+    digest["loss_patterns"] = _loss_patterns_aggregated(
+        db, period_start, period_end,
+    )
     digest["agent_signal_activity"] = _agent_signal_activity(
         db, period_start, period_end,
     )
     digest["watchlist_candidates"] = _watchlist_candidates_aggregated(
-        db, lookback_days,
+        db, period_start, period_end,
     )
     digest["agent_prompts_snapshot"] = _build_agent_prompts_snapshot(
         prompts_dir=prompts_dir,
@@ -327,7 +331,48 @@ def _calibration_by_size(db: "Database", lookback_days: int) -> dict:
 _ESCAPE_HATCH_MISS_CATEGORIES = {"noise_rally", "risk_disciplined"}
 
 
-def _missed_themes_aggregated(db: "Database", lookback_days: int) -> dict:
+def _insights_in_window(
+    db: "Database", period_start: date, period_end: date,
+) -> list[dict]:
+    """Fetch insights rows whose ET trading-day `date` falls in
+    [period_start, period_end] (inclusive both ends).
+
+    The insights-derived aggregators (missed_themes / loss_patterns /
+    watchlist_candidates) previously sliced `rows[:lookback_days]` — a
+    ROW COUNT, which selects ~90 *trading* days (~126 calendar days) and
+    so scanned a wider window than the date-range sections
+    (_period_performance / _agent_signal_activity, which filter the same
+    [period_start, period_end] calendar window). That misalignment fed
+    the meta-reflector inconsistent windows across digest sections. This
+    helper makes every section share one calendar-day window.
+
+    Fetches generously (insights is one row per trading day) then filters
+    by date string — ISO dates sort lexicographically, so plain string
+    comparison is correct. Assumes the digest is built at/near
+    `period_end` (the just-ended quarter), which all callers do.
+    """
+    # 500 trading days ≈ 2y — comfortably covers a 90-day window even if a
+    # few newer post-period insights exist. Matches the limit_hint used by
+    # the agent-signal counters elsewhere in this module.
+    try:
+        rows = db.get_recent_insights(limit=500)
+    except Exception as exc:
+        logger.warning("insights window fetch failed: %s", exc)
+        return []
+    start_str = period_start.isoformat()
+    end_str = period_end.isoformat()
+    in_window = []
+    for row in rows:
+        row_date = row.get("date") or ""
+        if not row_date or row_date < start_str or row_date > end_str:
+            continue
+        in_window.append(row)
+    return in_window
+
+
+def _missed_themes_aggregated(
+    db: "Database", period_start: date, period_end: date,
+) -> dict:
     """Aggregate daily `missed_opportunities` into per-theme / per-category
     counts over the quarter.
 
@@ -340,16 +385,12 @@ def _missed_themes_aggregated(db: "Database", lookback_days: int) -> dict:
     by_category but NOT to by_theme — they aren't real misses, flagging
     them as recurring would mislead the LLM.
     """
-    try:
-        rows = db.get_recent_insights(limit=lookback_days + 10)
-    except Exception as exc:
-        logger.warning("missed_themes: insights fetch failed: %s", exc)
-        rows = []
+    rows = _insights_in_window(db, period_start, period_end)
 
     by_theme: dict[str, dict] = {}
     by_category: Counter = Counter()
 
-    for row in rows[:lookback_days]:
+    for row in rows:
         raw = row.get("missed_opportunities_json")
         if not raw:
             continue
@@ -416,7 +457,9 @@ def _missed_themes_aggregated(db: "Database", lookback_days: int) -> dict:
 # Section: loss_patterns (aggregated over quarter's wrong-BUY grades)
 # ---------------------------------------------------------------------------
 
-def _loss_patterns_aggregated(db: "Database", lookback_days: int) -> dict:
+def _loss_patterns_aggregated(
+    db: "Database", period_start: date, period_end: date,
+) -> dict:
     """Aggregate `buy_grades` with grade='wrong' by `loss_root_cause`.
 
     Output shape:
@@ -447,18 +490,14 @@ def _loss_patterns_aggregated(db: "Database", lookback_days: int) -> dict:
                                                 # not "20% alpha destruction".
       }
     """
-    try:
-        rows = db.get_recent_insights(limit=lookback_days + 10)
-    except Exception as exc:
-        logger.warning("loss_patterns: insights fetch failed: %s", exc)
-        rows = []
+    rows = _insights_in_window(db, period_start, period_end)
 
     by_cause: dict[str, dict] = {}
     total_wrong = 0
     alpha_destruction_sum = 0.0
     alpha_destruction_n = 0
 
-    for row in rows[:lookback_days]:
+    for row in rows:
         raw = row.get("buy_grades_json")
         if not raw:
             continue
@@ -535,7 +574,7 @@ def _loss_patterns_aggregated(db: "Database", lookback_days: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def _watchlist_candidates_aggregated(
-    db: "Database", lookback_days: int,
+    db: "Database", period_start: date, period_end: date,
 ) -> dict:
     """Symbols the evening analyst has repeatedly flagged as `add` / `watch`
     over the quarter — candidates for universe expansion, surfaced for
@@ -545,7 +584,7 @@ def _watchlist_candidates_aggregated(
 
     Output:
       {
-        "window_days": int,                # lookback_days actually scanned
+        "window_days": int,                # calendar-day span scanned
         "candidates": [                    # sorted (add desc, watch desc)
           {"symbol", "add_count", "watch_count", "total_flags",
            "dates", "themes", "latest_reason", "latest_miss_category"},
@@ -560,21 +599,11 @@ def _watchlist_candidates_aggregated(
     rest are watching, not deciding. Threshold is intentionally strict —
     the user's universe is deliberately curated.
     """
-    try:
-        rows = db.get_recent_insights(limit=lookback_days + 10)
-    except Exception as exc:
-        logger.warning(
-            "watchlist_candidates: insights fetch failed: %s", exc,
-        )
-        return {
-            "window_days": lookback_days,
-            "candidates": [],
-            "high_conviction": [],
-            "total_candidates": 0,
-        }
+    window_days = (period_end - period_start).days
+    rows = _insights_in_window(db, period_start, period_end)
 
     by_symbol: dict[str, dict] = {}
-    for row in rows[:lookback_days]:
+    for row in rows:
         row_date = row.get("date") or ""
         raw = row.get("missed_opportunities_json")
         if not raw:
@@ -635,7 +664,7 @@ def _watchlist_candidates_aggregated(
     high_conviction = [c["symbol"] for c in candidates if c["add_count"] >= 2]
 
     return {
-        "window_days": lookback_days,
+        "window_days": window_days,
         "candidates": candidates,
         "high_conviction": high_conviction,
         "total_candidates": len(candidates),
