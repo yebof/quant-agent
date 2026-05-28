@@ -81,7 +81,7 @@ class EarningsDataProvider:
             tmp.write_text(json.dumps(self.manifest, indent=2))
             os.replace(str(tmp), str(self.manifest_path))
 
-    def prune(self, keep_days: int = 400) -> int:
+    def prune(self, keep_days: int = 1000) -> int:
         """Delete raw filing HTML (``{FORM}_{YYYY-MM-DD}.html``) older than
         keep_days. The file-stores had no prune (design-review finding) — raw
         10-K/10-Q HTML (often multiple MB each) accreted per symbol per quarter
@@ -92,8 +92,8 @@ class EarningsDataProvider:
         target (``_check_symbol`` globs the LATEST analysis per symbol). So this
         prunes only old raw HTML and leaves ALL analysis markdown untouched
         (small, and the actual money-relevant read target for evening's
-        thesis_health). keep_days=400 retains ~a year of filings; only stale
-        orphans go. Best-effort. Returns the count removed.
+        thesis_health). keep_days=1000 retains ~2.7 years of filings; only
+        stale orphans go. Best-effort. Returns the count removed.
         """
         cutoff = et_today() - timedelta(days=keep_days)
         removed = 0

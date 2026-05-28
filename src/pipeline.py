@@ -5843,7 +5843,7 @@ class TradingPipeline:
         except Exception as e:
             logger.warning("news file-store prune failed: %s", e)
         try:
-            pruned_e = self.earnings_provider.prune(keep_days=400)
+            pruned_e = self.earnings_provider.prune(keep_days=1000)
             if pruned_e:
                 logger.info("Pruned %d old raw earnings filing(s)", pruned_e)
         except Exception as e:
