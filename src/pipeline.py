@@ -707,6 +707,85 @@ class TradingPipeline:
                     return None
         return 0.0
 
+    def _submit_protected_sell(
+        self,
+        *,
+        symbol: str,
+        qty: float,
+        limit_price: float,
+        reference_price: float,
+        position_qty_before_sell: float,
+        label: str,
+    ) -> tuple[dict, dict] | None:
+        """Head half of the SELL discipline: clear protective stops
+        (write-ahead) → submit the SELL → guarantee stops are restored if the
+        order never reaches the broker.
+
+        Returns ``(order, pending_protection)`` on broker acceptance, or
+        ``None`` when the symbol must be skipped — stop-clear failed, the
+        submit raised, or the broker rejected. In every skip case the
+        protective stops are already restored (or were never cancelled), so
+        the caller just ``continue``s with no naked-position window.
+
+        The caller owns qty/price selection, ``insert_trade``, the orders list,
+        and any accounting (projected_proceeds, sell_order_ids); this owns the
+        cancel → submit → accept → restore-on-failure invariant so no SELL path
+        can silently skip a step (CLAUDE.md's longest convention). ``label`` is
+        both the order's action tag and the log context (e.g. 'EMERGENCY_SELL',
+        'FORCE_DELEVER', 'SELL').
+
+        ``position_qty_before_sell`` is the FULL held qty (drives the WAL +
+        finalize residual math); ``qty`` is the order quantity (may be a
+        partial / reduce / trim).
+        """
+        # audit F1 review #1: snapshot → persist WAL → cancel, so the recovery
+        # row is durable BEFORE any broker mutation.
+        ok, stop_specs, wal_row_id = self._cancel_stops_with_write_ahead(
+            symbol, position_qty_before_sell,
+        )
+        if not ok:
+            logger.warning(
+                "%s: skipping %s — protective-stop clear failed (broker would "
+                "reject the SELL on held_for_orders)", label, symbol,
+            )
+            return None
+        try:
+            order = self.broker.submit_order(
+                symbol=symbol, qty=qty, side="sell",
+                limit_price=limit_price, reference_price=reference_price,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Submit raised → the position is intact but its stops are
+            # cancelled. Restore them in-session rather than waiting for the
+            # next drain (this used to vary by site — only auto_take_profit
+            # restored; the others rode naked until drain).
+            logger.error("%s: submit failed for %s: %s", label, symbol, exc)
+            if stop_specs:
+                self.broker._restore_stop_orders(
+                    symbol, stop_specs, check_idempotency=False,
+                )
+            return None
+        if not self._order_accepted(order, symbol, "sell"):
+            # Broker rejected — restore the stops we just cancelled.
+            if stop_specs:
+                self.broker._restore_stop_orders(
+                    symbol, stop_specs, check_idempotency=False,
+                )
+            return None
+        # audit F5: tag the order dict so the notifier's intervention banner +
+        # inline action labels fire (broker.submit_order returns no 'action').
+        if isinstance(order, dict):
+            order.setdefault("action", label)
+        # Defer the reprotect/restore decision to finalize (after the wait) —
+        # an accepted limit can still cancel/expire without filling, in which
+        # case the FULL original protection is what the position needs.
+        prot = {
+            "order_id": order["id"], "symbol": symbol,
+            "position_qty_before_sell": position_qty_before_sell,
+            "specs": stop_specs, "wal_row_id": wal_row_id,
+        }
+        return order, prot
+
     def _finalize_pending_protections(
         self,
         pending_protections: list[dict],
@@ -2056,47 +2135,15 @@ class TradingPipeline:
             sell_limit = round(p.current_price * 0.995, 2)
             # audit F1 review #1: snapshot -> persist WAL -> cancel, so
             # the recovery row is durable BEFORE any broker mutation.
-            ok, stop_specs, wal_row_id = self._cancel_stops_with_write_ahead(
-                p.symbol, p.qty,
+            sale = self._submit_protected_sell(
+                symbol=p.symbol, qty=trim_qty, limit_price=sell_limit,
+                reference_price=p.current_price, position_qty_before_sell=p.qty,
+                label="TAKE_PROFIT",
             )
-            if not ok:
-                logger.warning(
-                    "auto_take_profit: skipping %s — protective-stop clear failed",
-                    p.symbol,
-                )
+            if sale is None:
                 continue
-            try:
-                order = self.broker.submit_order(
-                    symbol=p.symbol, qty=trim_qty, side="sell",
-                    limit_price=sell_limit,
-                    reference_price=p.current_price,
-                )
-            except Exception as e:
-                logger.error("auto_take_profit: submit failed for %s: %s", p.symbol, e)
-                if stop_specs:
-                    # Inline rollback — we just cancelled these moments
-                    # ago; check_idempotency=False (the default behavior).
-                    self.broker._restore_stop_orders(
-                        p.symbol, stop_specs, check_idempotency=False,
-                    )
-                continue
-            if not self._order_accepted(order, p.symbol, "sell"):
-                if stop_specs:
-                    self.broker._restore_stop_orders(
-                        p.symbol, stop_specs, check_idempotency=False,
-                    )
-                continue
-            # Defer the re-protect / restore decision until we know the
-            # actual fill outcome (see _finalize_protection_after_sell).
-            # An accepted limit can still cancel/expire later in the
-            # session, in which case the original full protection — not
-            # a residual-shaped stop — is what the position needs.
-            pending_protections.append({
-                "order_id": order["id"], "symbol": p.symbol,
-                "position_qty_before_sell": p.qty,
-                "specs": stop_specs,
-                "wal_row_id": wal_row_id,
-            })
+            order, prot = sale
+            pending_protections.append(prot)
             try:
                 self.db.insert_trade(
                     symbol=p.symbol, action="TAKE_PROFIT", qty=trim_qty,
@@ -2112,8 +2159,6 @@ class TradingPipeline:
                 )
             except Exception as e:
                 logger.warning("auto_take_profit: audit log failed for %s: %s", p.symbol, e)
-            if isinstance(order, dict):
-                order.setdefault("action", "TAKE_PROFIT")  # audit F5
             orders.append(order)
             logger.info(
                 "Auto take-profit: %s +%.1f%% → sold %s of %s @ limit $%.2f",
@@ -4223,42 +4268,15 @@ class TradingPipeline:
                     continue
                 emergency_limit = round(p.current_price * 0.99, 2)
                 # audit F1 review #1: snapshot -> persist WAL -> cancel.
-                ok, stop_specs, wal_row_id = self._cancel_stops_with_write_ahead(
-                    p.symbol, p.qty,
+                sale = self._submit_protected_sell(
+                    symbol=p.symbol, qty=qty, limit_price=emergency_limit,
+                    reference_price=p.current_price, position_qty_before_sell=p.qty,
+                    label="EMERGENCY_SELL",
                 )
-                if not ok:
-                    logger.warning(
-                        "Midday emergency sell: skipping %s — protective-stop "
-                        "clear failed; broker would reject the SELL", p.symbol,
-                    )
+                if sale is None:
                     continue
-                order = self.broker.submit_order(
-                    symbol=p.symbol, qty=qty, side="sell",
-                    limit_price=emergency_limit,
-                    reference_price=p.current_price,
-                )
-                if not self._order_accepted(order, p.symbol, "sell"):
-                    # Emergency sell didn't reach the broker — restore the
-                    # protective stops we cancelled so the position isn't
-                    # naked while the next intra tick takes another shot.
-                    if stop_specs:
-                        self.broker._restore_stop_orders(p.symbol, stop_specs, check_idempotency=False)
-                    continue
-                # Emergency sell is always a full exit, but the limit can
-                # still cancel/expire post-acceptance — defer the
-                # restore-on-no-fill decision to after wait below.
-                pending_protections.append({
-                    "order_id": order["id"], "symbol": p.symbol,
-                    "position_qty_before_sell": p.qty,
-                    "specs": stop_specs,
-                    "wal_row_id": wal_row_id,
-                })
-                # audit F5: tag the order dict with its action so the
-                # notifier's AUTONOMOUS INTERVENTION banner + inline
-                # 🚨EMER label fire (broker.submit_order returns no
-                # 'action' key — the banner was dead in production).
-                if isinstance(order, dict):
-                    order.setdefault("action", "EMERGENCY_SELL")
+                order, prot = sale
+                pending_protections.append(prot)
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,
@@ -4464,37 +4482,15 @@ class TradingPipeline:
                 sell_limit = round(existing[0].current_price * 0.995, 2)
                 position_qty = existing[0].qty
                 # audit F1 review #1: snapshot -> persist WAL -> cancel.
-                ok, stop_specs, wal_row_id = self._cancel_stops_with_write_ahead(
-                    symbol, position_qty,
-                )
-                if not ok:
-                    logger.warning(
-                        "Reviewer %s %s skipped: protective-stop clear failed",
-                        act, symbol,
-                    )
-                    continue
-                order = self.broker.submit_order(
-                    symbol=symbol, qty=qty, side="sell",
-                    limit_price=sell_limit,
+                sale = self._submit_protected_sell(
+                    symbol=symbol, qty=qty, limit_price=sell_limit,
                     reference_price=existing[0].current_price,
+                    position_qty_before_sell=position_qty, label=act,
                 )
-                if not self._order_accepted(order, symbol, "sell"):
-                    if stop_specs:
-                        self.broker._restore_stop_orders(symbol, stop_specs, check_idempotency=False)
+                if sale is None:
                     continue
-                # Defer reprotect/restore decision to after wait — see
-                # _finalize_protection_after_sell. Catches the case where
-                # an accepted limit later cancels/expires without filling.
-                pending_protections.append({
-                    "order_id": order["id"], "symbol": symbol,
-                    "position_qty_before_sell": position_qty,
-                    "specs": stop_specs,
-                    "wal_row_id": wal_row_id,
-                })
-                # audit F5: REDUCE/SELL — tag so notifier side/label
-                # detection works on the real pipeline order shape.
-                if isinstance(order, dict):
-                    order.setdefault("action", act)
+                order, prot = sale
+                pending_protections.append(prot)
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=symbol, action=act, qty=qty,
@@ -4602,38 +4598,16 @@ class TradingPipeline:
             if qty is None:
                 continue
             sell_limit = round(p.current_price * 0.99, 2)
-            # audit F1 review #1: snapshot -> persist WAL -> cancel.
-            ok, stop_specs, wal_row_id = self._cancel_stops_with_write_ahead(
-                p.symbol, p.qty,
+            sale = self._submit_protected_sell(
+                symbol=p.symbol, qty=qty, limit_price=sell_limit,
+                reference_price=p.current_price, position_qty_before_sell=p.qty,
+                label="FORCE_DELEVER",
             )
-            if not ok:
-                logger.warning(
-                    "Force-delever: skipping %s — protective-stop clear failed",
-                    p.symbol,
-                )
+            if sale is None:
                 continue
+            order, prot = sale
+            pending_protections.append(prot)
             try:
-                order = self.broker.submit_order(
-                    symbol=p.symbol, qty=qty, side="sell",
-                    limit_price=sell_limit,
-                    reference_price=p.current_price,
-                )
-                if not self._order_accepted(order, p.symbol, "sell"):
-                    # FORCE_DELEVER didn't reach broker — restore stops so
-                    # the position isn't naked while morning/midday tries
-                    # other paths to free cash.
-                    if stop_specs:
-                        self.broker._restore_stop_orders(p.symbol, stop_specs, check_idempotency=False)
-                    continue
-                # Defer reprotect/restore decision to the post-wait loop
-                # below — the existing "block until fills land" wait already
-                # gives us terminal status; we just need to act on it.
-                pending_protections.append({
-                    "order_id": order["id"], "symbol": p.symbol,
-                    "position_qty_before_sell": p.qty,
-                    "specs": stop_specs,
-                    "wal_row_id": wal_row_id,
-                })
                 self.db.insert_trade(
                     symbol=p.symbol, action="FORCE_DELEVER", qty=qty,
                     price=p.current_price,
@@ -4646,10 +4620,6 @@ class TradingPipeline:
                     broker_order_id=order.get("id"),
                     fill_status="submitted",
                 )
-                # audit F5: notifier banner / 🚨FORCE label key off
-                # order["action"]; the broker dict has none.
-                if isinstance(order, dict):
-                    order.setdefault("action", "FORCE_DELEVER")
                 orders.append(order)
                 # Conservative estimate: market × 0.99 (matches our limit).
                 projected_proceeds += p.market_value * 0.99
@@ -5488,42 +5458,15 @@ class TradingPipeline:
                     continue
                 emergency_limit = round(p.current_price * 0.99, 2)
                 # audit F1 review #1: snapshot -> persist WAL -> cancel.
-                ok, stop_specs, wal_row_id = self._cancel_stops_with_write_ahead(
-                    p.symbol, p.qty,
+                sale = self._submit_protected_sell(
+                    symbol=p.symbol, qty=qty, limit_price=emergency_limit,
+                    reference_price=p.current_price, position_qty_before_sell=p.qty,
+                    label="EMERGENCY_SELL",
                 )
-                if not ok:
-                    logger.warning(
-                        "Intra emergency sell: skipping %s — protective-stop "
-                        "clear failed; broker would reject the SELL", p.symbol,
-                    )
+                if sale is None:
                     continue
-                order = self.broker.submit_order(
-                    symbol=p.symbol, qty=qty, side="sell",
-                    limit_price=emergency_limit,
-                    reference_price=p.current_price,
-                )
-                if not self._order_accepted(order, p.symbol, "sell"):
-                    # Intra emergency didn't reach broker — restore stops so
-                    # the position keeps its existing protection until the
-                    # next 30-min tick takes another shot.
-                    if stop_specs:
-                        self.broker._restore_stop_orders(p.symbol, stop_specs, check_idempotency=False)
-                    continue
-                # Always full exit, but the limit can still cancel/expire
-                # post-acceptance — defer the restore-on-no-fill decision
-                # to after wait below. Critical for intra: a flash crash
-                # likely blows past our -1% limit fast and leaves it
-                # unfilled, exactly when stop coverage matters most.
-                pending_protections.append({
-                    "order_id": order["id"], "symbol": p.symbol,
-                    "position_qty_before_sell": p.qty,
-                    "specs": stop_specs,
-                    "wal_row_id": wal_row_id,
-                })
-                # audit F5: tag action so the notifier banner + 🚨EMER
-                # label fire for intra-session flash-crash liquidation.
-                if isinstance(order, dict):
-                    order.setdefault("action", "EMERGENCY_SELL")
+                order, prot = sale
+                pending_protections.append(prot)
                 orders.append(order)
                 self.db.insert_trade(
                     symbol=p.symbol, action="EMERGENCY_SELL", qty=qty,

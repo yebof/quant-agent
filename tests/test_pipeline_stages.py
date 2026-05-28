@@ -41,6 +41,17 @@ def _mock_stage_seam(pipeline, *, specs=(), ok=True, wal_row_id=None):
     # Callers unpack finalize's (ok, retry_specs) contract; default to
     # "coverage confirmed" so the full-MagicMock pipeline yields a tuple.
     pipeline._finalize_protection_after_sell.return_value = (True, [])
+    # Bind the REAL protected-sell helpers onto the mock so the extracted
+    # cancel→submit→accept→restore + wait→finalize discipline actually runs
+    # against the mocked broker/seams (real integration, not a no-op mock).
+    import types as _types
+    from src.pipeline import TradingPipeline as _TP
+    pipeline._submit_protected_sell = _types.MethodType(
+        _TP._submit_protected_sell, pipeline,
+    )
+    pipeline._finalize_pending_protections = _types.MethodType(
+        _TP._finalize_pending_protections, pipeline,
+    )
 
 
 def test_stage_classes_take_pipeline_reference():
@@ -354,12 +365,13 @@ def test_execution_stage_blocks_buys_when_daily_loss_breached_during_run():
     )
 
 
-def test_execution_stage_delegates_to_finalize_pending_protections(caplog):
-    """ExecutionStage must route its post-sell protection finalize through the
-    single shared `_finalize_pending_protections` helper (wait=False, since it
-    already waited for terminal in the buy-gating loop). The wait/finalize/
-    log-on-failure behavior is owned + tested in that helper; here we pin that
-    the morning SELL path actually delegates to it with the stashed intent."""
+def test_execution_stage_logs_when_finalize_cannot_confirm_coverage(caplog):
+    """Morning SELL path: when finalize can't rebuild coverage (returns
+    ok=False, having persisted the recovery intent), the shared helper logs a
+    warning so the operator sees protection wasn't confirmed in-session (drain
+    rebuilds it next session). With the real protected-sell helpers bound, the
+    SELL submits + finalizes against the mocked broker end-to-end."""
+    import logging
     from src.models import PortfolioDecision, Position, TradeDecision
     from src.pipeline_context import RunContext
 
@@ -368,6 +380,8 @@ def test_execution_stage_delegates_to_finalize_pending_protections(caplog):
     pipeline.broker.get_latest_price.return_value = 320.0
     _mock_stop_seam(pipeline.broker, specs=specs)
     _mock_stage_seam(pipeline, specs=specs)
+    # finalize couldn't rebuild coverage → (False, specs).
+    pipeline._finalize_protection_after_sell.return_value = (False, list(specs))
     pipeline.broker.submit_order.return_value = {
         "id": "sell-9", "status": "accepted", "symbol": "JPM",
     }
@@ -405,14 +419,19 @@ def test_execution_stage_delegates_to_finalize_pending_protections(caplog):
     ctx.symbols_bars = {}
 
     stage = ExecutionStage(pipeline=pipeline)
-    stage.run(ctx)
+    # The warning is emitted by _finalize_pending_protections, which lives on
+    # TradingPipeline (src.pipeline) now that the loop is extracted.
+    with caplog.at_level(logging.WARNING, logger="src.pipeline"):
+        stage.run(ctx)
 
-    pipeline._finalize_pending_protections.assert_called_once()
-    _, kwargs = pipeline._finalize_pending_protections.call_args
-    assert kwargs.get("context") == "ExecutionStage"
-    assert kwargs.get("wait") is False
-    pending = pipeline._finalize_pending_protections.call_args.args[0]
-    assert len(pending) == 1 and pending[0]["symbol"] == "JPM"
+    # The SELL submitted through the real protected-sell helper...
+    pipeline.broker.submit_order.assert_called_once()
+    assert pipeline.broker.submit_order.call_args.kwargs["side"] == "sell"
+    # ...and the finalize-failure warning surfaced.
+    assert any(
+        "did not confirm stop coverage" in r.getMessage() and "ExecutionStage" in r.getMessage()
+        for r in caplog.records
+    ), f"expected a finalize-failure warning; got {[r.getMessage() for r in caplog.records]}"
 
 
 def test_execution_stage_allows_buys_when_daily_loss_not_breached_after_refresh():

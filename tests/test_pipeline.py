@@ -43,6 +43,17 @@ def _mock_stage_seam(pipeline, *, specs=(), ok=True, wal_row_id=None):
     # Callers unpack finalize's (ok, retry_specs) contract; default to
     # "coverage confirmed" so the full-MagicMock pipeline yields a tuple.
     pipeline._finalize_protection_after_sell.return_value = (True, [])
+    # Bind the REAL protected-sell helpers onto the mock so the extracted
+    # cancel→submit→accept→restore + wait→finalize discipline actually runs
+    # against the mocked broker/seams (real integration, not a no-op mock).
+    import types as _types
+    from src.pipeline import TradingPipeline as _TP
+    pipeline._submit_protected_sell = _types.MethodType(
+        _TP._submit_protected_sell, pipeline,
+    )
+    pipeline._finalize_pending_protections = _types.MethodType(
+        _TP._finalize_pending_protections, pipeline,
+    )
 
 
 def _pm_rc() -> ReasoningChain:
@@ -3269,3 +3280,71 @@ def test_finalize_pending_protections_skips_wait_when_wait_false():
     pipe._finalize_pending_protections(pending, context="X", wait=False)
     pipe.broker.wait_for_order_terminal.assert_not_called()
     pipe._finalize_protection_after_sell.assert_called_once()
+
+
+def _protected_sell_pipe(*, accepted=True, submit_raises=False, clear_ok=True):
+    """A __new__'d pipeline wired just enough to exercise _submit_protected_sell."""
+    pipe = TradingPipeline.__new__(TradingPipeline)
+    pipe.broker = MagicMock()
+    pipe.db = MagicMock()
+    pipe._cancel_stops_with_write_ahead = MagicMock(
+        return_value=(clear_ok, [{"id": "s1", "qty": 10}], 99),
+    )
+    pipe._order_accepted = MagicMock(return_value=accepted)
+    if submit_raises:
+        pipe.broker.submit_order.side_effect = RuntimeError("broker down")
+    else:
+        pipe.broker.submit_order.return_value = {"id": "ord-1", "status": "accepted", "symbol": "NVDA"}
+    return pipe
+
+
+def test_submit_protected_sell_accept_returns_order_and_prot():
+    pipe = _protected_sell_pipe(accepted=True)
+    out = pipe._submit_protected_sell(
+        symbol="NVDA", qty=5, limit_price=99.0, reference_price=100.0,
+        position_qty_before_sell=10.0, label="SELL",
+    )
+    assert out is not None
+    order, prot = out
+    assert order["action"] == "SELL"                      # helper tags the action
+    assert prot["order_id"] == "ord-1" and prot["symbol"] == "NVDA"
+    assert prot["position_qty_before_sell"] == 10.0
+    assert prot["specs"] == [{"id": "s1", "qty": 10}] and prot["wal_row_id"] == 99
+    pipe.broker._restore_stop_orders.assert_not_called()   # no restore on success
+
+
+def test_submit_protected_sell_skips_and_does_not_submit_when_clear_fails():
+    pipe = _protected_sell_pipe(clear_ok=False)
+    out = pipe._submit_protected_sell(
+        symbol="NVDA", qty=5, limit_price=99.0, reference_price=100.0,
+        position_qty_before_sell=10.0, label="SELL",
+    )
+    assert out is None
+    pipe.broker.submit_order.assert_not_called()           # never submit if stops aren't cleared
+
+
+def test_submit_protected_sell_restores_stops_on_reject():
+    pipe = _protected_sell_pipe(accepted=False)
+    out = pipe._submit_protected_sell(
+        symbol="NVDA", qty=5, limit_price=99.0, reference_price=100.0,
+        position_qty_before_sell=10.0, label="EMERGENCY_SELL",
+    )
+    assert out is None
+    pipe.broker._restore_stop_orders.assert_called_once_with(
+        "NVDA", [{"id": "s1", "qty": 10}], check_idempotency=False,
+    )
+
+
+def test_submit_protected_sell_restores_stops_on_submit_throw():
+    """Unified behavior: a submit that raises leaves the position intact with
+    stops cancelled — restore them in-session (previously only auto_take_profit
+    did; the other paths rode naked until next drain)."""
+    pipe = _protected_sell_pipe(submit_raises=True)
+    out = pipe._submit_protected_sell(
+        symbol="NVDA", qty=5, limit_price=99.0, reference_price=100.0,
+        position_qty_before_sell=10.0, label="FORCE_DELEVER",
+    )
+    assert out is None
+    pipe.broker._restore_stop_orders.assert_called_once_with(
+        "NVDA", [{"id": "s1", "qty": 10}], check_idempotency=False,
+    )

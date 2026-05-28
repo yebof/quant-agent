@@ -757,50 +757,19 @@ class ExecutionStage:
                 sell_price = existing[0].current_price
                 sell_limit = round(sell_price * 0.995, 2)
                 position_qty = existing[0].qty
-                # audit F1 review #1: snapshot -> persist WAL -> cancel,
-                # so the recovery row is durable BEFORE any broker
-                # mutation (a SIGKILL / reboot / timeout --kill-after in
-                # the old cancel→WAL gap left a naked position).
-                ok, stop_specs, wal_row_id = pipeline._cancel_stops_with_write_ahead(
-                    decision.symbol, position_qty,
-                )
-                if not ok:
-                    logger.warning(
-                        "Skipping %s %s: protective-stop clear failed; "
-                        "Alpaca would reject on held_for_orders",
-                        action_label, decision.symbol,
-                    )
-                    continue
-                order = pipeline.broker.submit_order(
-                    symbol=decision.symbol, qty=qty, side="sell",
-                    limit_price=sell_limit,
+                # Single protected-sell discipline (cancel-WAL → submit →
+                # accept → restore-on-failure) lives in one helper so this path
+                # can't skip a step; defer reprotect/restore to the post-sell
+                # wait below, which resolves the actual fill_qty.
+                sale = pipeline._submit_protected_sell(
+                    symbol=decision.symbol, qty=qty, limit_price=sell_limit,
                     reference_price=existing[0].current_price,
+                    position_qty_before_sell=position_qty, label=action_label,
                 )
-                if not pipeline._order_accepted(order, decision.symbol, "sell"):
-                    if stop_specs:
-                        # Inline rollback: the stops were cancelled moments ago
-                        # and cannot still be alive at the broker, so re-submit
-                        # without the idempotency pre-check (matches every other
-                        # inline-rollback SELL path in pipeline.py).
-                        pipeline.broker._restore_stop_orders(
-                            decision.symbol, stop_specs, check_idempotency=False,
-                        )
+                if sale is None:
                     continue
-                # Defer reprotect/restore decision until the existing
-                # post-sell wait below resolves the actual fill_qty —
-                # see _finalize_protection_after_sell. Stash specs +
-                # pre-sell qty here so we can act on truth, not on
-                # submit-acceptance optimism.
-                pending_protections.append({
-                    "order_id": order["id"], "symbol": decision.symbol,
-                    "position_qty_before_sell": position_qty,
-                    "specs": stop_specs,
-                    "wal_row_id": wal_row_id,
-                })
-                # audit F5: notifier banner/inline labels read
-                # order["action"]; broker.submit_order returns none.
-                if isinstance(order, dict):
-                    order.setdefault("action", action_label)
+                order, prot = sale
+                pending_protections.append(prot)
                 orders.append(order)
                 sell_order_ids.append(order["id"])
                 pipeline.db.insert_trade(
