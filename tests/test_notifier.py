@@ -895,3 +895,62 @@ def test_format_evening_no_meta_line_on_normal_day():
     msg = format_session_result("evening", result, 30.0)
     assert msg is not None
     assert "🧪 meta" not in msg
+
+
+# === deterministic escalation + dead-man's banner + action ordering ===
+
+def test_format_evening_deterministic_loss_escalation_independent_of_llm():
+    """A loss within 80% of the daily-loss circuit-breaker raises a 🚨 even
+    when the LLM under-rated the day (risk_rating=moderate). The deterministic
+    layer must not depend on the model grading its own day correctly."""
+    result = {
+        "status": "analyzed", "run_id": "r",
+        "daily_pnl": -4500.0, "total_value": 95_500.0,   # prior_eq=100k → 4.5% loss
+        "max_daily_loss_pct": 5.0,                        # 0.8*5 = 4.0% threshold
+        "analysis": {"risk_rating": "moderate"},          # LLM did NOT escalate
+    }
+    msg = format_session_result("evening", result, 10.0)
+    assert "DETERMINISTIC ALERT" in msg
+    assert "OPERATOR ATTENTION" not in msg  # LLM banner correctly stays quiet
+
+
+def test_format_evening_no_deterministic_alert_when_loss_modest():
+    result = {
+        "status": "analyzed", "run_id": "r",
+        "daily_pnl": -500.0, "total_value": 99_500.0,     # 0.5% loss
+        "max_daily_loss_pct": 5.0,
+        "analysis": {"risk_rating": "low"},
+    }
+    msg = format_session_result("evening", result, 10.0)
+    assert "DETERMINISTIC ALERT" not in msg
+
+
+def test_format_evening_missing_morning_session_is_red():
+    result = {
+        "status": "analyzed", "run_id": "r",
+        "daily_pnl": 0.0, "total_value": 100_000.0,
+        "missing_sessions": ["morning", "midday"],
+        "analysis": {"risk_rating": "low"},
+    }
+    msg = format_session_result("evening", result, 10.0)
+    assert "🔴 SESSION DID NOT RUN TODAY: morning" in msg
+    assert "midday" in msg  # soft warning for the non-morning miss
+
+
+def test_format_evening_suggested_actions_precede_history_table():
+    """Suggested actions must appear ABOVE the long P&L history table so the
+    tail-clip truncation can't eat them on high-risk days."""
+    result = {
+        "status": "analyzed", "run_id": "r",
+        "daily_pnl": -100.0, "total_value": 100_000.0,
+        "analysis": {
+            "risk_rating": "high",
+            "suggested_actions": ["Reduce NVDA exposure", "Raise cash to 30%"],
+            "tomorrow_outlook": "cautious",
+        },
+    }
+    msg = format_session_result("evening", result, 10.0)
+    assert "⚡ Suggested actions:" in msg
+    assert "Reduce NVDA exposure" in msg
+    # Appears before the Tomorrow block (which sits after the history table).
+    assert msg.index("⚡ Suggested actions:") < msg.index("🔮 Tomorrow")

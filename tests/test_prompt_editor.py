@@ -933,3 +933,27 @@ def test_apply_reflection_dry_run_overridable_via_init_kwarg(tmp_path):
     # Override worked: the learning actually landed.
     assert len(report.applied) == 1
     assert "20-day" in seed.read_text() or "Flag stretched" in seed.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Effective-mode logging (audit re-scan: the enabled×dry_run posture must be
+# stated loudly so docs/config drift can't hide whether prompts get rewritten)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("enabled,dry_run,marker", [
+    (False, True, "OFF"),
+    (True, True, "STAGE-ONLY"),
+    (True, False, "LIVE-APPLY"),
+])
+def test_apply_reflection_logs_effective_mode(tmp_path, caplog, enabled, dry_run, marker):
+    import logging
+    editor = _mk_editor(tmp_path, enabled=enabled, dry_run=dry_run)
+    if enabled and not dry_run:
+        _seed_prompt(editor.prompts_dir, "tech_analyst", "# tech\n")
+    reflection = _mk_reflection("2026-Q2", [_basic_learning()])
+    with caplog.at_level(logging.WARNING, logger="src.evolution.prompt_editor"):
+        editor.apply_reflection(reflection)
+    mode_lines = [r.getMessage() for r in caplog.records
+                  if "effective mode" in r.getMessage().lower()]
+    assert mode_lines, "PromptEditor must log its effective mode at every run"
+    assert marker in mode_lines[0], f"expected {marker} in {mode_lines[0]!r}"

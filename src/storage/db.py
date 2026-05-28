@@ -55,6 +55,42 @@ class Database:
             pass
         self._create_tables()
 
+    def _locked_write(self, do, *, label: str = "write"):
+        """Run a write closure under the process lock with bounded retry on
+        cross-process SQLite lock contention.
+
+        busy_timeout (5s) only covers the lock-WAIT; a WAL checkpoint stall
+        longer than that surfaces as `OperationalError: database is locked`
+        AFTER the wait expires. The bare execute path would then either raise
+        (trade / recovery-queue inserts) or silently lose the row
+        (agent_logs). intra_check is explicitly exempt from the cross-mode
+        session lock (CLAUDE.md), so it WILL write concurrently with a long
+        morning — the in-process threading.Lock serializes only within THIS
+        process; this retry is what protects the write across processes.
+
+        ~1.55s of extra backoff on top of the 5s busy_timeout; if still
+        locked after that, re-raise (a stuck DB is a real problem worth
+        surfacing, not silently dropping).
+        """
+        import time as _time
+        last_exc: sqlite3.OperationalError | None = None
+        for attempt in range(5):
+            try:
+                with self._lock:
+                    return do()
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if "locked" not in msg and "busy" not in msg:
+                    raise
+                last_exc = exc
+                logger.warning(
+                    "DB %s contended (attempt %d/5): %s — retrying",
+                    label, attempt + 1, exc,
+                )
+                _time.sleep(0.05 * (2 ** attempt))  # 0.05,0.1,0.2,0.4,0.8s
+        logger.error("DB %s still locked after retries — giving up: %s", label, last_exc)
+        raise last_exc
+
     def _create_tables(self):
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS trades (
@@ -364,7 +400,7 @@ class Database:
                            Legacy BUY/SELL rows still count as executed for back-compat;
                            synthetic HOLD rows are explicitly excluded from executed_only.
         """
-        with self._lock:
+        def _do():
             cur = self.conn.execute(
                 "INSERT INTO trades (symbol, action, qty, price, reasoning, run_id, "
                 "stop_loss, take_profit, broker_order_id, fill_status) "
@@ -374,6 +410,7 @@ class Database:
             )
             self.conn.commit()
             return cur.lastrowid
+        return self._locked_write(_do, label="insert_trade")
 
     def confirm_trade_submitted(
         self, row_id: int, broker_order_id: str | None,
@@ -538,7 +575,7 @@ class Database:
         for terminal status, and if now terminal, the persisted specs
         drive a fresh finalize attempt.
         """
-        with self._lock:
+        def _do():
             cur = self.conn.execute(
                 "INSERT INTO pending_protection_restores "
                 "(symbol, sell_order_id, position_qty_before_sell, specs_json, run_id) "
@@ -547,6 +584,7 @@ class Database:
             )
             self.conn.commit()
             return cur.lastrowid or 0
+        return self._locked_write(_do, label="insert_pending_protection_restore")
 
     def get_pending_protection_restores(self) -> list[dict]:
         """All currently-pending protection-restore rows, oldest first."""
@@ -560,13 +598,14 @@ class Database:
 
     def delete_pending_protection_restore(self, row_id: int) -> int:
         """Remove a row by its primary key (after successful drain)."""
-        with self._lock:
+        def _do():
             cur = self.conn.execute(
                 "DELETE FROM pending_protection_restores WHERE id = ?",
                 (row_id,),
             )
             self.conn.commit()
             return cur.rowcount or 0
+        return self._locked_write(_do, label="delete_pending_protection_restore")
 
     def update_pending_protection_restore(
         self, row_id: int, *,
@@ -754,7 +793,7 @@ class Database:
                          input_tokens: int | None = None,
                          output_tokens: int | None = None,
                          cost_usd: float | None = None):
-        with self._lock:
+        def _do():
             self.conn.execute(
                 """INSERT INTO agent_logs (agent_name, run_id, input_summary, input_message,
                    output_summary, full_response, model, tokens_used,
@@ -765,6 +804,32 @@ class Database:
                  input_tokens, output_tokens, cost_usd),
             )
             self.conn.commit()
+        self._locked_write(_do, label="insert_agent_log")
+
+    def session_prefixes_logged_on(self, trading_day: date | None = None) -> set[str]:
+        """Set of session run_id PREFIXES that produced agent_logs on the given
+        ET trading day (default today).
+
+        run_id is formatted '{prefix}-{8hex}' where prefix is 'run' for the
+        morning session and the session name otherwise (midday / close /
+        evening / intra_check / earnings_preprocess / meta — see
+        RunContext.start). A session that ran its LLM work leaves >=1 row; a
+        session that silently never fired leaves none. Used by the evening
+        dead-man's-switch check to detect a missing session — the one failure
+        mode push-on-completion observability structurally cannot see.
+        """
+        start_utc, end_utc = self._et_day_utc_bounds(trading_day)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT run_id FROM agent_logs "
+                "WHERE timestamp >= ? AND timestamp < ?",
+                (start_utc, end_utc),
+            ).fetchall()
+        prefixes: set[str] = set()
+        for r in rows:
+            rid = r[0] or ""
+            prefixes.add(rid.rsplit("-", 1)[0] if "-" in rid else rid)
+        return prefixes
 
     def sum_session_cost(self, run_id: str) -> tuple[float | None, int]:
         """Total cost + per-call count for a session's run_id.

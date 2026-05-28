@@ -5850,6 +5850,12 @@ class TradingPipeline:
         self._reconcile_fills()
 
         meta_result = self._maybe_run_quarterly_meta()
+        missing_sessions = self._expected_sessions_missing_today()
+        if missing_sessions:
+            logger.warning(
+                "Dead-man's check: expected session(s) left no agent_logs "
+                "today: %s", ", ".join(missing_sessions),
+            )
         return {
             "status": "analyzed",
             "total_value": total_value,
@@ -5858,7 +5864,35 @@ class TradingPipeline:
             "analysis": analysis.model_dump() if analysis else None,
             "run_id": run_id,
             "auto_meta": meta_result,
+            # Observability: surface a silently-missing session + the loss cap
+            # so the notifier can raise deterministic escalation (not just LLM).
+            "missing_sessions": missing_sessions,
+            "max_daily_loss_pct": getattr(
+                getattr(self.config, "risk", None), "max_daily_loss_pct", None,
+            ),
         }
+
+    def _expected_sessions_missing_today(self) -> list[str]:
+        """Best-effort internal dead-man's check: on a trading day, which of
+        the market-day sessions that should have run by evening left NO
+        agent_logs rows? Catches a session that silently never fired — the one
+        failure mode push-on-completion observability structurally cannot see
+        (a disabled timer, a stuck lock, ET-window math wrong on a half-day).
+
+        Run from evening, which is already gated on `_is_trading_day`, so this
+        never false-fires on a holiday. Does NOT cover total host death or
+        evening itself not firing — that needs an EXTERNAL dead-man's switch
+        (e.g. a healthchecks.io ping the wrapper hits on success). Best-effort:
+        any failure returns [] so it can never break the evening push.
+        """
+        try:
+            present = self.db.session_prefixes_logged_on()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("missing-session check: agent_logs read failed: %s", exc)
+            return []
+        # run_id prefix -> display name; morning's prefix is 'run'.
+        expected = {"run": "morning", "midday": "midday", "close": "close"}
+        return [name for prefix, name in expected.items() if prefix not in present]
 
     def _maybe_run_quarterly_meta(self) -> dict | None:
         """Evening-time piggyback for the quarterly meta-reflection loop.

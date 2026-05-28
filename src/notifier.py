@@ -378,17 +378,49 @@ def _pnl_history_table(lookback: int = 10) -> str | None:
 
 
 def _append_evening_body(lines: list[str], result: dict) -> None:
-    # Operator escalation banner — prepended before daily P&L when
-    # evening flagged elevated/high risk_rating. evening's contract
-    # (config/prompts/evening_analyst.md) maps thesis_trajectory=broken
-    # holdings and macro_warning_ignored loss patterns to risk_rating
-    # >= elevated; this is the operator's only push-time hint that the
-    # autonomous loop has surfaced something needing human eyes.
-    # Banner goes in BEFORE Daily P&L so it's the first thing read.
+    # === Escalation banners (first thing read, before Daily P&L) ===
     analysis = result.get("analysis")
+
+    # (0) Dead-man's check: a market-day session that left zero agent_logs
+    # today silently never ran (disabled timer, stuck lock, half-day window
+    # math). morning missing is unambiguous → 🔴; midday/close can be
+    # legitimately skipped on some early-close days → softer ⚠️.
+    missing = result.get("missing_sessions")
+    if isinstance(missing, list) and missing:
+        if "morning" in missing:
+            lines.append(
+                "🔴 SESSION DID NOT RUN TODAY: morning — no agent activity "
+                "logged; check the timer/scheduler"
+            )
+        soft = [m for m in missing if m != "morning"]
+        if soft:
+            lines.append(f"⚠️ no activity logged today for: {', '.join(soft)}")
+
+    # (1) LLM-graded escalation — evening's contract maps thesis_trajectory=
+    # broken / macro_warning_ignored loss patterns to risk_rating >= elevated.
     risk_for_banner = _attr_or_key(analysis, "risk_rating")
     if isinstance(risk_for_banner, str) and risk_for_banner.lower() in ("elevated", "high"):
         lines.append(f"🚨 OPERATOR ATTENTION — risk_rating={risk_for_banner}")
+
+    # (2) DETERMINISTIC escalation — does NOT depend on the LLM correctly
+    # grading its own day (under-rating is exactly the failure you most want
+    # caught). If today's loss is within 80% of the hard daily-loss circuit-
+    # breaker limit, raise the banner regardless of risk_rating. Mirrors the
+    # trading path's two-layer (hard rule OR LLM) philosophy — the observability
+    # path should escalate on facts too, not just on model judgment.
+    dl_pnl = result.get("daily_pnl")
+    dl_tv = result.get("total_value")
+    dl_limit = result.get("max_daily_loss_pct")
+    if (isinstance(dl_pnl, (int, float)) and isinstance(dl_tv, (int, float))
+            and isinstance(dl_limit, (int, float)) and dl_limit > 0 and dl_pnl < 0):
+        prior_eq = dl_tv - dl_pnl
+        if prior_eq > 0:
+            loss_pct = abs(dl_pnl / prior_eq * 100)
+            if loss_pct >= 0.8 * dl_limit:
+                lines.append(
+                    f"🚨 DETERMINISTIC ALERT — daily loss {loss_pct:.2f}% is "
+                    f"≥80% of the {dl_limit:.0f}% circuit-breaker limit"
+                )
 
     # Daily P&L summary — the headline of the evening push. Operator
     # wants to know "did I make money today" without grepping logs.
@@ -426,6 +458,21 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
         lines.append(f"💰 Daily P&L: {pnl_str} ({ret_str})")
         lines.append(f"   Equity: ${total_value:,.2f}")
 
+    # Suggested actions — surfaced HIGH in the message (right after the
+    # headline P&L, before the ~1000-char history table) so the tail-clip
+    # truncation in send() can never eat them. On exactly the high-risk days
+    # where these are populated the message is longest, and these are the
+    # lines most worth reading. Only shown when risk_rating is elevated/high.
+    risk_for_actions = _attr_or_key(analysis, "risk_rating")
+    if isinstance(risk_for_actions, str) and risk_for_actions.lower() in ("elevated", "high"):
+        actions = _attr_or_key(analysis, "suggested_actions") or []
+        if isinstance(actions, list) and actions:
+            lines.append("⚡ Suggested actions:")
+            for act in actions[:5]:
+                if not isinstance(act, str):
+                    continue
+                lines.append(f"   • {act[:200]}")
+
     # Position snapshot: total invested + cash + top winners/losers.
     # Helper queries the live DB so this works regardless of how the
     # evening result dict is constructed.
@@ -453,22 +500,6 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
     outlook = _attr_or_key(analysis, "tomorrow_outlook") or ""
     if outlook:
         lines.append(f"   {outlook[:280]}")
-
-    # When risk_rating is elevated/high, surface the specific
-    # `suggested_actions` evening proposed so the operator can act
-    # without opening the DB. Cap at 5 entries + 200 chars each so a
-    # verbose LLM doesn't blow past Telegram's 4096-char limit; the
-    # MAX_MESSAGE_CHARS truncation would clip the elapsed-line tail
-    # otherwise.
-    risk_for_actions = _attr_or_key(analysis, "risk_rating")
-    if isinstance(risk_for_actions, str) and risk_for_actions.lower() in ("elevated", "high"):
-        actions = _attr_or_key(analysis, "suggested_actions") or []
-        if isinstance(actions, list) and actions:
-            lines.append("⚡ Suggested actions:")
-            for act in actions[:5]:
-                if not isinstance(act, str):
-                    continue
-                lines.append(f"   • {act[:200]}")
 
     # Auto-meta piggyback (Round 2 enabled this; Round 6 adds the
     # dry-run staging hint). When today is the last trading day of a

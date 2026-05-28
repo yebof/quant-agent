@@ -369,3 +369,85 @@ def test_run_with_anthropic_caching_sums_input_correctly():
         # Token COUNT must include all three input fields.
         assert result.input_tokens == 1000 + 500 + 3000
         assert result.output_tokens == 200
+
+
+# === retry classification / truncation / prompt-cache (audit re-scan) ===
+
+class _FakeStatusError(Exception):
+    """Mimics an SDK APIStatusError carrying an HTTP status_code."""
+    def __init__(self, status_code, msg="boom"):
+        super().__init__(msg)
+        self.status_code = status_code
+
+
+def test_agent_fast_fails_non_retryable_4xx(mock_anthropic, monkeypatch):
+    """A 401/400-class error is not transient — retrying burns the budget
+    and masks 'your key is dead'. It must fail on the FIRST attempt."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def auth_fail(*a, **k):
+        calls["n"] += 1
+        raise _FakeStatusError(401, "invalid x-api-key")
+
+    mock_anthropic.messages.create.side_effect = auth_fail
+    agent = ConcreteAgent(api_key="bad", model="claude-sonnet-4-6-20250514", max_tokens=64)
+    with pytest.raises(_FakeStatusError):
+        agent.run(data="test")
+    assert calls["n"] == 1, f"non-retryable error must not retry; got {calls['n']} attempts"
+
+
+def test_agent_retries_429_and_5xx(mock_anthropic, monkeypatch):
+    """429 (rate limit) and 5xx are transient and must still be retried."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    calls = {"n": 0}
+    good = MagicMock()
+    good.content = [MagicMock(text='{"result": "ok"}')]
+    good.usage.input_tokens = 1
+    good.usage.output_tokens = 1
+    good.stop_reason = "end_turn"
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _FakeStatusError(429, "rate limited")
+        if calls["n"] == 2:
+            raise _FakeStatusError(503, "upstream")
+        return good
+
+    mock_anthropic.messages.create.side_effect = flaky
+    agent = ConcreteAgent(api_key="k", model="claude-sonnet-4-6-20250514", max_tokens=64)
+    result = agent.run(data="test")
+    assert calls["n"] == 3
+    assert result.raw_text == '{"result": "ok"}'
+
+
+def test_agent_flags_truncated_response(mock_anthropic):
+    """stop_reason='max_tokens' marks the result truncated so a cut-off
+    decision isn't mistaken for a deliberate 'no signal'."""
+    mock_anthropic.messages.create.return_value.stop_reason = "max_tokens"
+    agent = ConcreteAgent(api_key="k", model="claude-sonnet-4-6-20250514", max_tokens=8)
+    result = agent.run(data="test")
+    assert result.truncated is True
+    assert result.finish_reason == "max_tokens"
+
+
+def test_agent_normal_response_not_flagged_truncated(mock_anthropic):
+    mock_anthropic.messages.create.return_value.stop_reason = "end_turn"
+    agent = ConcreteAgent(api_key="k", model="claude-sonnet-4-6-20250514", max_tokens=1024)
+    result = agent.run(data="test")
+    assert result.truncated is False
+    assert result.finish_reason == "end_turn"
+
+
+def test_anthropic_system_prompt_carries_cache_control(mock_anthropic):
+    """The static system prompt is sent as an ephemeral cache breakpoint so
+    Anthropic reuses the prefix across calls."""
+    mock_anthropic.messages.create.return_value.stop_reason = "end_turn"
+    agent = ConcreteAgent(api_key="k", model="claude-sonnet-4-6-20250514", max_tokens=64)
+    agent.run(data="test")
+    _, kwargs = mock_anthropic.messages.create.call_args
+    system = kwargs["system"]
+    assert isinstance(system, list) and system, "system must be a content-block list"
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
+    assert system[0]["text"] == "You are a test agent."

@@ -602,3 +602,78 @@ def test_get_recent_agent_outputs_unparseable_before_date_skips_filter(db, caplo
         )
     assert len(rows) == 2, "unparseable before_date must not drop rows via a wrong filter"
     assert any("skipping the date filter" in r.getMessage() for r in caplog.records)
+
+
+class _ConnProxy:
+    """Wraps a real sqlite3 connection so a test can inject failures on
+    .execute (the C method itself can't be monkeypatched)."""
+    def __init__(self, real, on_execute):
+        self._real = real
+        self._on_execute = on_execute
+
+    def execute(self, sql, *a, **k):
+        return self._on_execute(self._real, sql, *a, **k)
+
+    def commit(self):
+        return self._real.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_locked_write_retries_then_succeeds(db, monkeypatch):
+    """A transient 'database is locked' (cross-process WAL contention that
+    outlasts busy_timeout) must be retried, not lost. insert_agent_log used
+    to silently drop the row on OperationalError."""
+    import sqlite3 as _sql
+    calls = {"n": 0}
+
+    def flaky(real, sql, *a, **k):
+        if sql.strip().upper().startswith("INSERT INTO AGENT_LOGS"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _sql.OperationalError("database is locked")
+        return real.execute(sql, *a, **k)
+
+    monkeypatch.setattr(db, "conn", _ConnProxy(db.conn, flaky))
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    db.insert_agent_log(
+        agent_name="portfolio_manager", run_id="rlock",
+        input_summary="i", output_summary="o", full_response="{}",
+        model="x", tokens_used=1,
+    )
+    # The row landed despite the first attempt hitting a lock.
+    rows = db.get_recent_agent_outputs("portfolio_manager", limit=5)
+    assert len(rows) == 1
+    assert calls["n"] == 2, f"expected one retry after the lock; got {calls['n']} attempts"
+
+
+def test_locked_write_reraises_non_lock_operational_error(db, monkeypatch):
+    """A non-lock OperationalError (e.g. a real SQL/schema fault) must NOT be
+    swallowed by the lock-retry path — it should propagate immediately."""
+    import sqlite3 as _sql
+
+    def boom(real, sql, *a, **k):
+        if sql.strip().upper().startswith("INSERT INTO TRADES"):
+            raise _sql.OperationalError("no such column: bogus")
+        return real.execute(sql, *a, **k)
+
+    monkeypatch.setattr(db, "conn", _ConnProxy(db.conn, boom))
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    with pytest.raises(_sql.OperationalError, match="no such column"):
+        db.insert_trade(
+            symbol="NVDA", action="BUY", qty=1, price=1.0,
+            reasoning="x", run_id="r",
+        )
+
+
+def test_session_prefixes_logged_on_extracts_run_id_prefixes(db):
+    """The dead-man's check maps agent_logs run_id prefixes to sessions:
+    'run-...'=morning, 'midday-...', 'close-...', etc."""
+    db.insert_agent_log("tech_analyst", "run-aaaa1111", "i", "o", "{}", "m", 1)
+    db.insert_agent_log("position_reviewer", "midday-bbbb2222", "i", "o", "{}", "m", 1)
+    prefixes = db.session_prefixes_logged_on()
+    assert "run" in prefixes      # morning ran
+    assert "midday" in prefixes   # midday ran
+    assert "close" not in prefixes  # close did NOT run today

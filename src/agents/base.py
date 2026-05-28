@@ -91,6 +91,44 @@ def _is_openai_model(model: str) -> bool:
     return any(model.startswith(p) for p in _OPENAI_PREFIXES)
 
 
+# Exception class names that are always transient regardless of any status
+# code (connection resets, DNS blackouts, read timeouts, provider 5xx /
+# rate-limit). Matched by name so we don't have to import both SDKs.
+_RETRYABLE_EXC_NAMES = frozenset({
+    "APIConnectionError", "APITimeoutError", "APIConnectionTimeoutError",
+    "InternalServerError", "RateLimitError", "APIError",
+    "Timeout", "ConnectionError", "ConnectTimeout", "ReadTimeout",
+})
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Decide whether an LLM-call exception is worth retrying.
+
+    The old loop retried EVERY exception identically, so a non-transient
+    failure — a 401 (dead key), a 400 (bad request), a 429-vs-quota-
+    exhausted, a context-length-exceeded — burned the full ~140s backoff
+    budget per agent for something that can never succeed, and with 4-5
+    agents/session could push the run toward the 1200s outer kill. It also
+    blurred the distinction the operator most needs: 'network blipped' vs
+    'your key is dead' (exactly the 2026-05-11 quota-exhaustion case).
+
+    Retry on: transient connection/timeout classes, HTTP 429, and 5xx.
+    Fast-fail on: any other 4xx (auth / bad-request / not-found / context
+    length). Unknown exceptions with no status code retry conservatively
+    (preserves the prior catch-all behavior for genuinely unexpected
+    local/network errors).
+    """
+    if type(exc).__name__ in _RETRYABLE_EXC_NAMES:
+        return True
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status == 429 or status >= 500
+    # No status code and not a recognized transient class. Could be a local
+    # network hiccup — retry rather than fail a session on something we
+    # haven't classified.
+    return True
+
+
 @dataclass
 class AgentResult:
     raw_text: str
@@ -106,6 +144,14 @@ class AgentResult:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float | None = None
+    # Provider stop/finish reason + a derived flag. `truncated` is True when
+    # the model hit the token ceiling mid-output (Anthropic stop_reason
+    # 'max_tokens' / OpenAI finish_reason 'length'). This is distinct from a
+    # clean "no signal" answer: a PM decision cut off at max_tokens parses to
+    # None and looks identical to "chose not to trade" — callers/notifier can
+    # now tell a swallowed truncation from a real silence.
+    finish_reason: str | None = None
+    truncated: bool = False
 
     # Top-level keys we recognize as "this looks like a real agent output."
     # When the LLM prose includes an extra JSON fragment (self-correction,
@@ -220,14 +266,24 @@ class BaseAgent(ABC):
         logger.info("Agent %s input:\n%s", self.name, user_message)
 
         max_retries = _max_retries()
+        finish_reason: str | None = None
         for attempt in range(max_retries):
             try:
                 if self._use_openai:
-                    raw_text, input_tokens, output_tokens = self._call_openai(user_message)
+                    raw_text, input_tokens, output_tokens, finish_reason = self._call_openai(user_message)
                 else:
-                    raw_text, input_tokens, output_tokens = self._call_anthropic(user_message)
+                    raw_text, input_tokens, output_tokens, finish_reason = self._call_anthropic(user_message)
                 break
             except Exception as e:
+                # Non-retryable (auth / bad-request / 4xx / context-length):
+                # fail fast — sleeping won't help and it burns the budget +
+                # masks the real cause from the operator.
+                if not _is_retryable(e):
+                    logger.warning(
+                        "Agent %s attempt %d hit a non-retryable error: %s. "
+                        "Failing fast (no retry).", self.name, attempt + 1, e,
+                    )
+                    raise
                 # Last attempt: re-raise immediately — sleeping then giving
                 # up wastes the final backoff on nothing.
                 if attempt == max_retries - 1:
@@ -239,6 +295,20 @@ class BaseAgent(ABC):
                                self.name, attempt + 1, e, wait)
                 import time
                 time.sleep(wait)
+
+        # Truncation detection: a max_tokens / length cutoff means the output
+        # is incomplete, NOT a deliberate "no action". Flag + log loudly so a
+        # truncated decision isn't silently collapsed into "no trades".
+        truncated = isinstance(finish_reason, str) and finish_reason.lower() in (
+            "max_tokens", "length",
+        )
+        if truncated:
+            logger.warning(
+                "Agent %s response was TRUNCATED (finish_reason=%s) — output is "
+                "incomplete, likely hit max_tokens=%d. Treat downstream None as "
+                "'cut off', not 'no signal'.",
+                self.name, finish_reason, self.max_tokens,
+            )
 
         tokens = input_tokens + output_tokens
         # Cost computation — uses src.cost_table.PRICING. Returns None
@@ -272,22 +342,38 @@ class BaseAgent(ABC):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost_usd=cost,
+            finish_reason=finish_reason,
+            truncated=truncated,
         )
 
-    def _call_anthropic(self, user_message: str) -> tuple[str, int, int]:
+    def _call_anthropic(self, user_message: str) -> tuple[str, int, int, str | None]:
+        # System prompt is static per agent and re-sent on every call (and
+        # for tech_analyst, once per 25-symbol chunk). Mark it as an ephemeral
+        # cache breakpoint so Anthropic reuses the prefix across calls within
+        # the 5-min TTL: cheaper (cache reads are ~0.1x input rate) and lower
+        # latency, which also relieves the timeout pressure that drives the
+        # tech_analyst 300s ceiling. No-op for prompts under the cache
+        # minimum, so it's safe to apply unconditionally.
         response = self.client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            system=self.system_prompt,
+            system=[{
+                "type": "text",
+                "text": self.system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }],
             messages=[{"role": "user", "content": user_message}],
         )
         in_tok, out_tok = _extract_anthropic_usage(response, self.name)
+        finish_reason = getattr(response, "stop_reason", None)
+        if not isinstance(finish_reason, str):
+            finish_reason = None
         if not response.content or not hasattr(response.content[0], "text"):
-            logger.warning("Anthropic returned empty content (stop_reason=%s)", response.stop_reason)
-            return ("", in_tok, out_tok)
-        return (response.content[0].text, in_tok, out_tok)
+            logger.warning("Anthropic returned empty content (stop_reason=%s)", finish_reason)
+            return ("", in_tok, out_tok, finish_reason)
+        return (response.content[0].text, in_tok, out_tok, finish_reason)
 
-    def _call_openai(self, user_message: str) -> tuple[str, int, int]:
+    def _call_openai(self, user_message: str) -> tuple[str, int, int, str | None]:
         response = self.client.chat.completions.create(
             model=self.model,
             max_completion_tokens=self.max_tokens,
@@ -296,12 +382,16 @@ class BaseAgent(ABC):
                 {"role": "user", "content": user_message},
             ],
         )
-        content = response.choices[0].message.content or ""
+        choice = response.choices[0]
+        content = choice.message.content or ""
         if not content:
-            refusal = getattr(response.choices[0].message, "refusal", None)
+            refusal = getattr(choice.message, "refusal", None)
             logger.warning("OpenAI returned empty content (refusal=%s)", refusal)
         in_tok, out_tok = _extract_openai_usage(response, self.name)
-        return (content, in_tok, out_tok)
+        finish_reason = getattr(choice, "finish_reason", None)
+        if not isinstance(finish_reason, str):
+            finish_reason = None
+        return (content, in_tok, out_tok, finish_reason)
 
 
 # === Provider-specific usage extraction ===

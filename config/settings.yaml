@@ -189,14 +189,25 @@ storage:
 evolution:
   # Quarterly meta-reflection can auto-append "Learnings" bullets to the six
   # non-discipline prompts (tech / news / macro / earnings / portfolio_manager
-  # / evening_analyst). When enabled, PromptEditor applies reflection.json
-  # proposals at end-of-quarter; risk_manager + position_reviewer are
-  # protected (MetaReflectionAgentName schema literal rejects them). Four
-  # belts still enforce: FIFO cap per agent, Jaccard dedup against existing
-  # Learnings, prohibited-word regex, and git auto-commit (revert <hash>
-  # rolls back a whole quarter). Flip back to false any time — already-
-  # applied learnings stay put; use the retract path to remove specifics.
+  # / evening_analyst); risk_manager + position_reviewer are protected
+  # (MetaReflectionAgentName schema literal rejects them). Four belts enforce:
+  # FIFO cap per agent, Jaccard dedup against existing Learnings, prohibited-
+  # word regex, and git auto-commit (revert <hash> rolls back a whole quarter).
+  #
+  # EFFECTIVE MODE = enabled × dry_run (PromptEditor logs it loudly each run):
+  #   enabled:false              -> OFF (observe only, nothing staged)
+  #   enabled:true  dry_run:true -> STAGE-ONLY (proposals -> proposed_edits.json
+  #                                 for human review; NO prompt files touched)
+  #   enabled:true  dry_run:false-> LIVE-APPLY (writes prompt files + git commit)
+  #
+  # Current posture is STAGE-ONLY: the loop is a quarterly self-audit aid, not
+  # an autonomous prompt-rewriter. The mechanical guardrails are all syntactic
+  # (they can't tell a correct learning from a confidently-wrong one), so live
+  # auto-apply is left OFF until a track record of staged proposals justifies
+  # it — review proposed_edits.json by hand and apply with --mode meta --force
+  # after flipping dry_run to false for that run.
   enabled: true
+  dry_run: true            # explicit (was relying on the schema default)
   auto_commit: true
   max_agents_per_cycle: 3
   max_learnings_per_agent: 10

@@ -190,6 +190,25 @@ class PromptEditor:
         """
         report = ApplicationReport(period=reflection.period)
 
+        # Loudly log the EFFECTIVE mode so the operator never has to infer it
+        # from two interacting flags (enabled + dry_run). The docs historically
+        # implied live-apply while the settings defaulted dry_run=true, i.e.
+        # the deployment was actually STAGE-ONLY — surface the real posture at
+        # every run so that drift can't hide.
+        if not self.config.enabled:
+            effective_mode = "OFF — evolution.enabled=false (observe only, nothing staged)"
+        elif self._dry_run:
+            effective_mode = (
+                "STAGE-ONLY — dry_run=true: proposals written to "
+                "proposed_edits.json for human review, NO prompt files modified"
+            )
+        else:
+            effective_mode = (
+                "LIVE-APPLY — dry_run=false: proposals will be written into "
+                "prompt files + git-committed"
+            )
+        logger.warning("PromptEditor effective mode: %s", effective_mode)
+
         if not self.config.enabled:
             # Feature-flag off — record the intent but don't touch any file.
             for learning in reflection.proposed_learnings:
