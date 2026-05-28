@@ -256,6 +256,56 @@ def _append_trade_session_body(lines: list[str], result: dict) -> None:
         lines.append(f"⚠️ degraded: {', '.join(sorted(degraded))}")
 
 
+def _spy_daily_returns(dates: list[str]) -> dict[str, float | None]:
+    """Return SPY close-to-close daily return (%) keyed by date string.
+
+    Fetches enough history to cover one extra bar before the earliest date
+    so the first row has a prior close to diff against. Returns an empty
+    dict on any failure so the caller can degrade gracefully.
+    """
+    if not dates:
+        return {}
+    try:
+        from datetime import datetime, timedelta as _td
+        from src.trading_calendar import et_today as _et_today
+        import yfinance as _yf
+        import pandas as _pd
+
+        earliest = min(dates)
+        # Extra buffer: fetch 20 calendar days before earliest to guarantee
+        # at least one prior trading-day close even across holiday gaps.
+        start = (datetime.strptime(earliest, "%Y-%m-%d") - _td(days=20)).date()
+        end = _et_today() + _td(days=1)  # yfinance end is exclusive; +1 to include today
+
+        def _dl():
+            return _yf.download("SPY", start=str(start), end=str(end), progress=False)
+
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FT
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            df = ex.submit(_dl).result(timeout=15)
+
+        if df is None or df.empty:
+            return {}
+        if isinstance(df.columns, _pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        closes = df["Close"].dropna()
+        date_strs = [str(d.date()) for d in closes.index]
+        close_vals = list(closes.values)
+
+        # Build close-to-close return for each date.
+        spy_map: dict[str, float | None] = {}
+        for i, ds in enumerate(date_strs):
+            if i == 0:
+                spy_map[ds] = None  # no prior bar
+            else:
+                prev = close_vals[i - 1]
+                spy_map[ds] = (close_vals[i] - prev) / prev * 100 if prev else None
+        return spy_map
+    except Exception as exc:
+        logger.warning("SPY daily return fetch failed: %s", exc)
+        return {}
+
+
 def _pnl_history_table(lookback: int = 10) -> str | None:
     """Query daily_pnl table and return a formatted text table.
 
@@ -281,40 +331,48 @@ def _pnl_history_table(lookback: int = 10) -> str | None:
         return None
 
     rows = list(reversed(rows))  # chronological order
+    dates = [r[0] for r in rows]
+    spy_returns = _spy_daily_returns(dates)
+
     cum = 0.0
     peak_nav: float | None = None
+
+    # Reconstruct NAV from the first row's last_equity (= Alpaca's official close
+    # for the day before the first displayed row) plus cumulative daily_pnl.
+    # This aligns NAV with the same 4pm-close basis used by SPY and other
+    # benchmark comparisons, so NAV[today] - NAV[yesterday] == daily_pnl[today].
+    first_tv, first_pnl = rows[0][1], rows[0][2]
+    running_nav = (first_tv - (first_pnl or 0.0)) if first_tv is not None else 0.0
+
     table_lines = ["📊 P&L History (last {} days)".format(len(rows))]
     table_lines.append(
-        f"{'Date':<10}  {'Net P&L':>11}  {'Dly Ret':>7}  "
-        f"{'NAV':>11}  {'Cumul P&L':>9}  {'Drawdown':>8}  {'Daily DD':>8}"
+        f"{'Date':<10}  {'Net P&L':>11}  {'Dly Ret':>7}  {'SPY':>7}  "
+        f"{'NAV':>11}  {'Cumul P&L':>9}  {'Drawdown':>8}"
     )
     table_lines.append("─" * 76)
     for date, total_value, daily_pnl, daily_ret in rows:
         cum += (daily_pnl or 0.0)
+        running_nav += (daily_pnl or 0.0)
 
-        if total_value is not None:
-            if peak_nav is None or total_value > peak_nav:
-                peak_nav = total_value
+        if peak_nav is None or running_nav > peak_nav:
+            peak_nav = running_nav
 
         pnl_str = f"{daily_pnl:+,.2f}" if daily_pnl is not None else "?"
         ret_str = f"{daily_ret:+.2f}%" if daily_ret is not None else "?"
-        nav_str = f"${total_value:,.2f}" if total_value is not None else "?"
+        spy_ret = spy_returns.get(date)
+        spy_str = f"{spy_ret:+.2f}%" if spy_ret is not None else "  n/a"
+        nav_str = f"${running_nav:,.2f}"
         cum_str = f"{cum:+,.2f}"
 
-        if total_value is not None and peak_nav and peak_nav > 0:
-            dd_pct = (total_value - peak_nav) / peak_nav * 100
+        if peak_nav and peak_nav > 0:
+            dd_pct = (running_nav - peak_nav) / peak_nav * 100
             dd_str = f"{dd_pct:.2f}%" if dd_pct < 0 else "0.00%"
         else:
             dd_str = "?"
 
-        if daily_ret is not None:
-            daily_dd_str = f"{min(0.0, daily_ret):.2f}%" if daily_ret < 0 else "0.00%"
-        else:
-            daily_dd_str = "?"
-
         table_lines.append(
-            f"{date:<10}  {pnl_str:>11}  {ret_str:>7}  "
-            f"{nav_str:>11}  {cum_str:>9}  {dd_str:>8}  {daily_dd_str:>8}"
+            f"{date:<10}  {pnl_str:>11}  {ret_str:>7}  {spy_str:>7}  "
+            f"{nav_str:>11}  {cum_str:>9}  {dd_str:>8}"
         )
     return "\n".join(table_lines)
 
