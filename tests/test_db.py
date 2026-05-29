@@ -688,3 +688,15 @@ def test_daily_pnl_equity_close_roundtrips(db):
     db.insert_daily_pnl("2026-05-29", 100_000.0, 0.0, 0.0)
     rows = db.get_daily_pnl(limit=1)
     assert rows[0]["equity_close"] is None
+
+
+def test_daily_pnl_reinsert_preserves_equity_close_when_none(db):
+    """[D] A same-day re-run whose 4pm fetch failed (equity_close=None) must NOT
+    wipe the value captured by the first run; a real new value still overwrites."""
+    db.insert_daily_pnl("2026-05-28", 100_400.0, -600.0, -0.59, equity_close=100_500.0)
+    db.insert_daily_pnl("2026-05-28", 100_450.0, -550.0, -0.55, equity_close=None)
+    row = db.get_daily_pnl(limit=1)[0]
+    assert row["equity_close"] == 100_500.0   # preserved
+    assert row["daily_pnl"] == -550.0         # other columns still updated
+    db.insert_daily_pnl("2026-05-28", 100_450.0, -550.0, -0.55, equity_close=100_600.0)
+    assert db.get_daily_pnl(limit=1)[0]["equity_close"] == 100_600.0  # real value overwrites

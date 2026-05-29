@@ -342,7 +342,7 @@ def _pnl_history_table(lookback: int = 10) -> str | None:
         conn = sqlite3.connect(str(_DB_PATH))
         try:
             rows = conn.execute(
-                "SELECT date, total_value, daily_pnl, daily_return_pct "
+                "SELECT date, total_value, daily_pnl, daily_return_pct, equity_close "
                 "FROM daily_pnl ORDER BY date DESC LIMIT ?",
                 (lookback,),
             ).fetchall()
@@ -361,10 +361,12 @@ def _pnl_history_table(lookback: int = 10) -> str | None:
     cum = 0.0
     peak_nav: float | None = None
 
-    # Reconstruct NAV from the first row's last_equity (= Alpaca's official close
-    # for the day before the first displayed row) plus cumulative daily_pnl.
-    # This aligns NAV with the same 4pm-close basis used by SPY and other
-    # benchmark comparisons, so NAV[today] - NAV[yesterday] == daily_pnl[today].
+    # Anchor NAV on the official 4pm close (equity_close) whenever it's stored;
+    # legacy rows that predate that column step by the real-time daily_pnl
+    # instead. The seed is the first row's prior-day close
+    # (total_value - daily_pnl == last_equity). Net P&L per row is the NAV
+    # increment, so a row that HAS equity_close shows the SAME 4pm-to-4pm figure
+    # as the headline — no headline/table contradiction within one message.
     first_tv, first_pnl = rows[0][1], rows[0][2]
     running_nav = (first_tv - (first_pnl or 0.0)) if first_tv is not None else 0.0
 
@@ -374,15 +376,27 @@ def _pnl_history_table(lookback: int = 10) -> str | None:
         f"{'NAV':>11}  {'Cumul P&L':>9}  {'Drawdown':>8}"
     )
     table_lines.append("─" * 76)
-    for date, total_value, daily_pnl, daily_ret in rows:
-        cum += (daily_pnl or 0.0)
-        running_nav += (daily_pnl or 0.0)
+    for date, total_value, daily_pnl, daily_ret, equity_close in rows:
+        prev_nav = running_nav
+        if equity_close is not None:
+            running_nav = equity_close          # true 4pm close
+        else:
+            running_nav += (daily_pnl or 0.0)   # legacy: step by real-time P&L
+        row_pnl = running_nav - prev_nav        # NAV increment = the day's P&L
+        cum += row_pnl
 
         if peak_nav is None or running_nav > peak_nav:
             peak_nav = running_nav
 
-        pnl_str = f"{daily_pnl:+,.2f}" if daily_pnl is not None else "?"
-        ret_str = f"{daily_ret:+.2f}%" if daily_ret is not None else "?"
+        pnl_str = f"{row_pnl:+,.2f}"
+        # Return computed from the same NAV increment so it matches Net P&L; for
+        # legacy rows (row_pnl == daily_pnl) fall back to the stored figure.
+        if prev_nav and prev_nav > 0:
+            ret_str = f"{(row_pnl / prev_nav * 100):+.2f}%"
+        elif daily_ret is not None:
+            ret_str = f"{daily_ret:+.2f}%"
+        else:
+            ret_str = "?"
         spy_ret = spy_returns.get(date)
         spy_str = f"{spy_ret:+.2f}%" if spy_ret is not None else "  n/a"
         nav_str = f"${running_nav:,.2f}"
@@ -435,19 +449,32 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
     # breaker limit, raise the banner regardless of risk_rating. Mirrors the
     # trading path's two-layer (hard rule OR LLM) philosophy — the observability
     # path should escalate on facts too, not just on model judgment.
-    dl_pnl = result.get("daily_pnl")
-    dl_tv = result.get("total_value")
+    # Use the SAME basis the headline shows: prefer the 4pm close-to-close P&L
+    # (esc_pnl=pnl_4pm, baseline=prior official close = equity_close - pnl_4pm)
+    # so the alert evaluates the number the operator actually sees. Fall back to
+    # the real-time diff when the 4pm figures aren't available. Without this, a
+    # day that recovered after-hours could hide a material 4pm loss from the
+    # alert (or vice-versa).
+    esc_pnl = result.get("pnl_4pm")
+    esc_close = result.get("equity_close")
+    if esc_pnl is not None and isinstance(esc_close, (int, float)):
+        esc_base = esc_close - esc_pnl
+    else:
+        esc_pnl = result.get("daily_pnl")
+        esc_tv = result.get("total_value")
+        esc_base = (esc_tv - esc_pnl) if (
+            isinstance(esc_pnl, (int, float)) and isinstance(esc_tv, (int, float))
+        ) else None
     dl_limit = result.get("max_daily_loss_pct")
-    if (isinstance(dl_pnl, (int, float)) and isinstance(dl_tv, (int, float))
-            and isinstance(dl_limit, (int, float)) and dl_limit > 0 and dl_pnl < 0):
-        prior_eq = dl_tv - dl_pnl
-        if prior_eq > 0:
-            loss_pct = abs(dl_pnl / prior_eq * 100)
-            if loss_pct >= 0.8 * dl_limit:
-                lines.append(
-                    f"🚨 DETERMINISTIC ALERT — daily loss {loss_pct:.2f}% is "
-                    f"≥80% of the {dl_limit:.0f}% circuit-breaker limit"
-                )
+    if (isinstance(esc_pnl, (int, float)) and isinstance(esc_base, (int, float))
+            and isinstance(dl_limit, (int, float)) and dl_limit > 0
+            and esc_pnl < 0 and esc_base > 0):
+        loss_pct = abs(esc_pnl / esc_base * 100)
+        if loss_pct >= 0.8 * dl_limit:
+            lines.append(
+                f"🚨 DETERMINISTIC ALERT — daily loss {loss_pct:.2f}% is "
+                f"≥80% of the {dl_limit:.0f}% circuit-breaker limit"
+            )
 
     # Daily P&L summary — the headline of the evening push. Operator wants to
     # know "did I make money today" without grepping logs.
@@ -466,7 +493,7 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
     def _fmt_pnl(v: float) -> str:
         return f"+${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
 
-    if pnl_4pm is not None and equity_close:
+    if pnl_4pm is not None and equity_close is not None:
         # baseline = prior official close = equity_close - pnl_4pm.
         baseline = equity_close - pnl_4pm
         if baseline > 0:

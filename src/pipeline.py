@@ -5789,7 +5789,10 @@ class TradingPipeline:
             if closes and closes[-1][0] == today_str:
                 equity_close = closes[-1][1]
                 prev_close = closes[-2][1] if len(closes) >= 2 else None
-                if prev_close:
+                # Guard > 0: a negative prior close (corrupted data / underwater
+                # account) would flip the sign of the return %; leave pnl_4pm
+                # None so the headline falls back to the real-time path.
+                if prev_close and prev_close > 0:
                     pnl_4pm = equity_close - prev_close
                     pnl_4pm_pct = pnl_4pm / prev_close * 100
             elif closes:

@@ -366,10 +366,19 @@ class Database:
         with self._lock:
             try:
                 self.conn.execute("BEGIN")
+                # Upsert that PRESERVES a previously-stored equity_close when
+                # this write carries None — a documented same-day evening re-run
+                # whose portfolio_history fetch failed must not wipe the 4pm
+                # close captured by the first run. COALESCE keeps the old value.
                 self.conn.execute(
-                    "INSERT OR REPLACE INTO daily_pnl "
+                    "INSERT INTO daily_pnl "
                     "(date, total_value, daily_pnl, daily_return_pct, equity_close) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(date) DO UPDATE SET "
+                    "total_value=excluded.total_value, "
+                    "daily_pnl=excluded.daily_pnl, "
+                    "daily_return_pct=excluded.daily_return_pct, "
+                    "equity_close=COALESCE(excluded.equity_close, daily_pnl.equity_close)",
                     (date, total_value, daily_pnl, daily_return_pct, equity_close),
                 )
                 self.conn.execute(
@@ -948,10 +957,18 @@ class Database:
     def insert_daily_pnl(self, date: str, total_value: float, daily_pnl: float,
                          daily_return_pct: float, equity_close: float | None = None):
         with self._lock:
+            # COALESCE preserves a previously-stored equity_close when this
+            # write carries None (e.g. an LLM-failed evening re-run on a day the
+            # first run already captured the 4pm close).
             self.conn.execute(
-                """INSERT OR REPLACE INTO daily_pnl
+                """INSERT INTO daily_pnl
                    (date, total_value, daily_pnl, daily_return_pct, equity_close)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(date) DO UPDATE SET
+                     total_value=excluded.total_value,
+                     daily_pnl=excluded.daily_pnl,
+                     daily_return_pct=excluded.daily_return_pct,
+                     equity_close=COALESCE(excluded.equity_close, daily_pnl.equity_close)""",
                 (date, total_value, daily_pnl, daily_return_pct, equity_close),
             )
             self.conn.commit()
