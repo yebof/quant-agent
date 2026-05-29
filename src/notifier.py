@@ -474,9 +474,11 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
     # last_equity[today] - last_equity[yesterday] (pure 4pm-to-4pm).
     # Falls back to the broker real-time diff for legacy result dicts
     # that predate last_equity being plumbed through.
-    display_equity = last_equity if last_equity else total_value
-    pnl_display = _4pm_daily_pnl(last_equity) if last_equity else daily_pnl
-    if pnl_display is not None and display_equity:
+display_equity = last_equity if last_equity is not None else total_value
+pnl_display = _4pm_daily_pnl(last_equity) if last_equity is not None else daily_pnl
+if pnl_display is None:
+    pnl_display = daily_pnl
+if pnl_display is not None and display_equity is not None:
         baseline = display_equity - pnl_display
         ret_pct = (pnl_display / baseline * 100) if baseline > 0 else 0.0
         if pnl_display >= 0:
