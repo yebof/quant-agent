@@ -5774,6 +5774,33 @@ class TradingPipeline:
             cost_usd=ev_result.cost_usd,
         )
 
+        # True close-to-close ("4pm-to-4pm") P&L. account.last_equity is the
+        # PRIOR day's close (stale at the 20:00 ET evening run), and
+        # total_value here is the 8pm after-hours value — neither gives today's
+        # official 4pm close. Alpaca portfolio_history (extended_hours=False)
+        # does: its latest 1D point is today's regular-session close. We report
+        # the clean close-to-close P&L when available and store today's close
+        # for the audit trail; on any gap we fall back to the real-time diff.
+        equity_close = None
+        pnl_4pm = None
+        pnl_4pm_pct = None
+        try:
+            closes = self.broker.get_recent_daily_closes(lookback_days=10)
+            if closes and closes[-1][0] == today_str:
+                equity_close = closes[-1][1]
+                prev_close = closes[-2][1] if len(closes) >= 2 else None
+                if prev_close:
+                    pnl_4pm = equity_close - prev_close
+                    pnl_4pm_pct = pnl_4pm / prev_close * 100
+            elif closes:
+                logger.info(
+                    "4pm snapshot: portfolio_history latest date %s != today %s "
+                    "(API lag?) — evening uses the real-time P&L fallback",
+                    closes[-1][0], today_str,
+                )
+        except Exception as e:
+            logger.warning("4pm snapshot fetch failed: %s — using real-time P&L", e)
+
         # Save daily_pnl + insights atomically (Phase 4 #5). If the LLM
         # failed (analysis is None), still record the P&L number so the
         # audit trail is complete — just with empty insights fields.
@@ -5782,6 +5809,7 @@ class TradingPipeline:
                 date=today_str,
                 total_value=total_value, daily_pnl=daily_pnl,
                 daily_return_pct=daily_return_pct,
+                equity_close=equity_close,
                 tomorrow_outlook=analysis.tomorrow_outlook,
                 lessons=analysis.lessons,
                 suggested_actions=analysis.suggested_actions,
@@ -5806,6 +5834,7 @@ class TradingPipeline:
                 total_value=total_value,
                 daily_pnl=daily_pnl,
                 daily_return_pct=daily_return_pct,
+                equity_close=equity_close,
             )
 
         # Housekeeping: drop agent_logs older than 2 years (full_response bloats the DB
@@ -5881,6 +5910,11 @@ class TradingPipeline:
                 getattr(self.config, "risk", None), "max_daily_loss_pct", None,
             ),
             "stop_coverage_gaps": coverage_gaps,
+            # True 4pm-to-4pm headline P&L (None → notifier falls back to the
+            # real-time total_value/daily_pnl figures).
+            "equity_close": equity_close,
+            "pnl_4pm": pnl_4pm,
+            "pnl_4pm_pct": pnl_4pm_pct,
         }
 
     def _expected_sessions_missing_today(self) -> list[str]:

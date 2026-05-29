@@ -185,6 +185,48 @@ class AlpacaBroker:
             "last_equity": last_equity,
         }
 
+    def get_recent_daily_closes(self, lookback_days: int = 10) -> list[tuple[str, float]]:
+        """Official regular-session daily CLOSE equity for recent trading days.
+
+        Source: Alpaca portfolio_history at 1D timeframe with
+        ``extended_hours=False`` — the broker-side source of truth for
+        end-of-regular-session equity. Crucially, unlike ``account.last_equity``
+        (which is the PRIOR trading day's close, and so is one day stale at the
+        20:00 ET evening run), the LAST point here is TODAY's 4pm close. That
+        lets the evening report show a true close-to-close ("4pm-to-4pm") P&L
+        instead of a close-to-8pm-after-hours broker diff.
+
+        Returns ``[(et_date_str, close_equity), ...]`` oldest-first, or ``[]``
+        on any failure (caller falls back to the real-time P&L). Best-effort —
+        never raises. ET-date mapping mirrors scripts/export_alpaca_trades.py.
+        """
+        from datetime import datetime, timedelta, timezone
+        from src.util.time import ET
+        try:
+            from alpaca.trading.requests import GetPortfolioHistoryRequest
+            now = datetime.now(timezone.utc)
+            req = GetPortfolioHistoryRequest(
+                timeframe="1D", extended_hours=False,
+                start=now - timedelta(days=lookback_days * 2 + 10), end=now,
+            )
+            history = self.client.get_portfolio_history(history_filter=req)
+        except Exception as exc:
+            logger.warning("get_recent_daily_closes: portfolio_history failed: %s", exc)
+            return []
+        timestamps = getattr(history, "timestamp", None) or []
+        equities = getattr(history, "equity", None) or []
+        out: list[tuple[str, float]] = []
+        for i, ts in enumerate(timestamps):
+            if i >= len(equities) or equities[i] is None:
+                continue
+            try:
+                d = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(ET).strftime("%Y-%m-%d")
+                eq = float(equities[i])
+            except (TypeError, ValueError, OSError):
+                continue
+            out.append((d, eq))
+        return out
+
     def get_positions(self) -> list[Position]:
         raw_positions = self.client.get_all_positions()
         positions = []

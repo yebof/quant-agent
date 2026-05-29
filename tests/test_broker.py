@@ -1500,3 +1500,33 @@ def test_list_recent_orders_returns_none_on_api_failure(mock_tc_cls):
     mock_client.get_orders.side_effect = None
     mock_client.get_orders.return_value = []
     assert broker.list_recent_orders("NVDA", "buy", after) == []
+
+
+@patch("src.execution.broker.TradingClient")
+def test_get_recent_daily_closes_maps_et_dates_and_equity(mock_tc_cls):
+    """portfolio_history (1D, extended_hours=False) → [(ET-date, close_equity)].
+    20:00 UTC = 16:00 EDT, so each bar maps to that ET trading date; equity[i]
+    is that day's official regular-session close."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    ts1 = int(datetime(2026, 5, 27, 20, 0, tzinfo=timezone.utc).timestamp())
+    ts2 = int(datetime(2026, 5, 28, 20, 0, tzinfo=timezone.utc).timestamp())
+    mock_client = MagicMock()
+    mock_client.get_portfolio_history.return_value = SimpleNamespace(
+        timestamp=[ts1, ts2], equity=[101000.0, 100500.0],
+    )
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
+    closes = broker.get_recent_daily_closes(lookback_days=5)
+    assert closes == [("2026-05-27", 101000.0), ("2026-05-28", 100500.0)]
+
+
+@patch("src.execution.broker.TradingClient")
+def test_get_recent_daily_closes_swallows_errors(mock_tc_cls):
+    mock_client = MagicMock()
+    mock_client.get_portfolio_history.side_effect = RuntimeError("api down")
+    mock_tc_cls.return_value = mock_client
+    broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
+    assert broker.get_recent_daily_closes() == []   # best-effort, never raises

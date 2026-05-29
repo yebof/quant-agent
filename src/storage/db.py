@@ -147,6 +147,7 @@ class Database:
                 total_value REAL NOT NULL,
                 daily_pnl REAL NOT NULL,
                 daily_return_pct REAL NOT NULL,
+                equity_close REAL,
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -216,6 +217,10 @@ class Database:
                 _log.error("Schema migration failed for %s.%s: %s", table, column, e)
 
         _ensure_column("agent_logs", "input_message", "input_message TEXT DEFAULT ''")
+        # Today's official regular-session (4pm) close equity, captured from
+        # Alpaca portfolio_history — enables true close-to-close evening P&L
+        # instead of the close-to-8pm-AH broker diff. NULL for legacy rows.
+        _ensure_column("daily_pnl", "equity_close", "equity_close REAL")
         _ensure_column("trades", "stop_loss", "stop_loss REAL DEFAULT 0")
         _ensure_column("trades", "take_profit", "take_profit REAL DEFAULT 0")
         _ensure_column("insights", "tomorrow_bias", "tomorrow_bias TEXT DEFAULT 'neutral'")
@@ -303,6 +308,7 @@ class Database:
         total_value: float,
         daily_pnl: float,
         daily_return_pct: float,
+        equity_close: float | None = None,
         tomorrow_outlook: str,
         lessons: str,
         suggested_actions,
@@ -362,9 +368,9 @@ class Database:
                 self.conn.execute("BEGIN")
                 self.conn.execute(
                     "INSERT OR REPLACE INTO daily_pnl "
-                    "(date, total_value, daily_pnl, daily_return_pct) "
-                    "VALUES (?, ?, ?, ?)",
-                    (date, total_value, daily_pnl, daily_return_pct),
+                    "(date, total_value, daily_pnl, daily_return_pct, equity_close) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (date, total_value, daily_pnl, daily_return_pct, equity_close),
                 )
                 self.conn.execute(
                     "INSERT OR REPLACE INTO insights "
@@ -940,12 +946,13 @@ class Database:
             return cursor.rowcount or 0
 
     def insert_daily_pnl(self, date: str, total_value: float, daily_pnl: float,
-                         daily_return_pct: float):
+                         daily_return_pct: float, equity_close: float | None = None):
         with self._lock:
             self.conn.execute(
-                """INSERT OR REPLACE INTO daily_pnl (date, total_value, daily_pnl, daily_return_pct)
-                   VALUES (?, ?, ?, ?)""",
-                (date, total_value, daily_pnl, daily_return_pct),
+                """INSERT OR REPLACE INTO daily_pnl
+                   (date, total_value, daily_pnl, daily_return_pct, equity_close)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (date, total_value, daily_pnl, daily_return_pct, equity_close),
             )
             self.conn.commit()
 

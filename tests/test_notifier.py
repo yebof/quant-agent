@@ -974,3 +974,36 @@ def test_format_evening_renders_stop_coverage_gap_banner():
     msg = format_session_result("evening", result, 5.0)
     assert "🔴 STOP-COVERAGE GAP" in msg
     assert "AAPL" in msg
+
+
+def test_format_evening_uses_true_4pm_pnl_not_offset_day():
+    """The 4pm-to-4pm headline uses pnl_4pm/equity_close (today's OFFICIAL
+    close, computed by the pipeline) directly. Regression against the off-by-
+    one that differenced account.last_equity and showed the PRIOR day's P&L:
+    here the real-time figures say +$1,200 (incl. after-hours) but today
+    actually closed DOWN $500 — the headline must show -$500, not +$1,200."""
+    result = {
+        "status": "analyzed", "run_id": "r",
+        "daily_pnl": 1200.0, "total_value": 101_200.0,   # real-time (incl AH) — ignored
+        "pnl_4pm": -500.0, "equity_close": 100_500.0,     # today's true close-to-close
+        "analysis": {"risk_rating": "low"},
+    }
+    msg = format_session_result("evening", result, 10.0)
+    assert "💰 Daily P&L: -$500.00" in msg
+    assert "4pm close" in msg
+    assert "$100,500.00" in msg
+    assert "+$1,200" not in msg                 # must not leak the real-time figure
+    assert "(-0.50%)" in msg                    # -500 / (100500+500) = -0.495% → -0.50%
+
+
+def test_format_evening_falls_back_to_realtime_when_no_4pm():
+    """No pnl_4pm/equity_close (API gap / legacy) → real-time fallback, no
+    '4pm close' tag."""
+    result = {
+        "status": "analyzed", "run_id": "r",
+        "daily_pnl": 1234.56, "total_value": 107_278.55,
+        "analysis": {"risk_rating": "low"},
+    }
+    msg = format_session_result("evening", result, 10.0)
+    assert "💰 Daily P&L: +$1,234.56" in msg
+    assert "4pm close" not in msg
