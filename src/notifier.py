@@ -449,40 +449,45 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
                     f"≥80% of the {dl_limit:.0f}% circuit-breaker limit"
                 )
 
-    # Daily P&L summary — the headline of the evening push. Operator
-    # wants to know "did I make money today" without grepping logs.
+    # Daily P&L summary — the headline of the evening push. Operator wants to
+    # know "did I make money today" without grepping logs.
+    #
+    # Prefer the TRUE close-to-close ("4pm-to-4pm") P&L the pipeline computed
+    # from Alpaca portfolio_history (pnl_4pm / equity_close = today's official
+    # regular-session close). That's clean of after-hours drift AND free of the
+    # off-by-one trap of differencing account.last_equity (which is the PRIOR
+    # day's close). Fall back to the real-time prior-close→now diff when the
+    # 4pm figures aren't available (API gap / legacy result dicts).
     daily_pnl = result.get("daily_pnl")
     total_value = result.get("total_value")
-    daily_ret = result.get("daily_return_pct")
-    if daily_pnl is not None and total_value is not None:
-        # daily_return_pct from pipeline is in % already (e.g. -0.35
-        # for a 0.35% loss), but historical rows pre-2026 may have had
-        # different scaling — compute fresh for the message either way.
-        #
-        # Daily return is P&L over PRIOR-day equity, not current. Using
-        # current understates losses (denominator includes today's draw).
-        # Prior equity = total_value − daily_pnl by definition. CLAUDE.md
-        # mandates broker.last_equity as the canonical baseline; this
-        # arithmetic reconstructs the same number from the result dict
-        # without plumbing last_equity through. Audit 2026-05-27: a -5%
-        # day was displayed as ~-4.76% under the old denominator.
-        prior_equity = total_value - daily_pnl
-        # Format signs as prefix (-$373.46 not $-373.46) — the latter
-        # reads as "dollar minus 373" which is awkward.
-        if daily_pnl >= 0:
-            pnl_str = f"+${daily_pnl:,.2f}"
+    pnl_4pm = result.get("pnl_4pm")
+    equity_close = result.get("equity_close")
+
+    def _fmt_pnl(v: float) -> str:
+        return f"+${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
+
+    if pnl_4pm is not None and equity_close:
+        # baseline = prior official close = equity_close - pnl_4pm.
+        baseline = equity_close - pnl_4pm
+        if baseline > 0:
+            r = pnl_4pm / baseline * 100
+            ret_str = f"+{r:.2f}%" if pnl_4pm >= 0 else f"{r:.2f}%"
         else:
-            pnl_str = f"-${abs(daily_pnl):,.2f}"
+            ret_str = "n/a"
+        lines.append(f"💰 Daily P&L: {_fmt_pnl(pnl_4pm)} ({ret_str})  ·  4pm close")
+        lines.append(f"   Equity: ${equity_close:,.2f}")
+    elif daily_pnl is not None and total_value is not None:
+        # Fallback: real-time diff (prior close → 8pm, includes after-hours).
+        # Return is P&L over PRIOR-day equity (= total_value − daily_pnl); using
+        # current equity would understate losses (denominator includes the draw).
+        prior_equity = total_value - daily_pnl
         if prior_equity > 0:
             ret_pct = (daily_pnl / prior_equity) * 100
-            # ret already carries its own leading minus when negative.
             ret_str = f"+{ret_pct:.2f}%" if daily_pnl >= 0 else f"{ret_pct:.2f}%"
         else:
-            # prior_equity <= 0 → return % is mathematically undefined.
-            # Rendering "0.00%" would read as a real flat day; surface the
-            # undefined state instead so the operator isn't misled.
+            # prior_equity <= 0 → return % undefined; "0.00%" would mislead.
             ret_str = "n/a"
-        lines.append(f"💰 Daily P&L: {pnl_str} ({ret_str})")
+        lines.append(f"💰 Daily P&L: {_fmt_pnl(daily_pnl)} ({ret_str})")
         lines.append(f"   Equity: ${total_value:,.2f}")
 
     # Suggested actions — surfaced HIGH in the message (right after the

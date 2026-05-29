@@ -677,3 +677,14 @@ def test_session_prefixes_logged_on_extracts_run_id_prefixes(db):
     assert "run" in prefixes      # morning ran
     assert "midday" in prefixes   # midday ran
     assert "close" not in prefixes  # close did NOT run today
+
+
+def test_daily_pnl_equity_close_roundtrips(db):
+    """equity_close (today's official 4pm close) persists + reads back."""
+    db.insert_daily_pnl("2026-05-28", 100_400.0, -600.0, -0.59, equity_close=100_500.0)
+    rows = db.get_daily_pnl(limit=1)
+    assert rows[0]["equity_close"] == 100_500.0
+    # legacy path (no equity_close) stores NULL, not a crash
+    db.insert_daily_pnl("2026-05-29", 100_000.0, 0.0, 0.0)
+    rows = db.get_daily_pnl(limit=1)
+    assert rows[0]["equity_close"] is None
