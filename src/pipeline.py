@@ -5732,6 +5732,7 @@ class TradingPipeline:
                 date=today_str,
                 total_value=total_value, daily_pnl=daily_pnl,
                 daily_return_pct=daily_return_pct,
+                last_equity=last_equity,
                 tomorrow_outlook=analysis.tomorrow_outlook,
                 lessons=analysis.lessons,
                 suggested_actions=analysis.suggested_actions,
@@ -5756,6 +5757,7 @@ class TradingPipeline:
                 total_value=total_value,
                 daily_pnl=daily_pnl,
                 daily_return_pct=daily_return_pct,
+                last_equity=last_equity,
             )
 
         # Housekeeping: drop agent_logs older than 2 years (full_response bloats the DB
@@ -5800,6 +5802,7 @@ class TradingPipeline:
             "total_value": total_value,
             "daily_pnl": daily_pnl,
             "daily_return_pct": daily_return_pct,
+            "last_equity": last_equity,
             "analysis": analysis.model_dump() if analysis else None,
             "run_id": run_id,
             "auto_meta": meta_result,

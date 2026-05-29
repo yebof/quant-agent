@@ -8,7 +8,9 @@ These tests cover:
   - per-mode noise policy: which result statuses are silent
   - error path (exception surfaces with type + message)
 """
+from datetime import datetime
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 import requests
@@ -223,6 +225,21 @@ def test_format_morning_no_trades_shows_zero_orders():
     assert "⚪ morning" in msg
     assert "orders: 0" in msg
     assert "elapsed: 1m 5s" in msg
+
+
+def test_format_timestamp_uses_telegram_timezone(monkeypatch):
+    """Time label should follow TELEGRAM_TIMEZONE so notifier lines up
+    with the operator's Alpaca dashboard timezone."""
+    monkeypatch.setenv("TELEGRAM_TIMEZONE", "America/Chicago")
+    fixed_et = datetime(2026, 5, 29, 9, 0, tzinfo=ZoneInfo("America/New_York"))
+    with patch("src.trading_calendar.et_now", return_value=fixed_et):
+        msg = format_session_result(
+            "morning",
+            {"status": "no_trades", "run_id": "run-tz", "orders": []},
+            1.0,
+        )
+    assert msg is not None
+    assert "(2026-05-29 08:00 CDT)" in msg
 
 
 def test_format_morning_degraded_data_flagged():

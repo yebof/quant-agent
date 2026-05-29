@@ -16,10 +16,12 @@ Per-mode noise policy (see `format_session_result`):
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 import os
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -32,6 +34,7 @@ logger = logging.getLogger(__name__)
 # and position snapshot because `Path("data/...")` resolved relative to
 # the caller's CWD.
 _DB_PATH = Path(__file__).resolve().parent.parent / "data" / "quant_agent.db"
+_DEFAULT_NOTIFY_TZ = "America/Chicago"
 
 
 class TelegramNotifier:
@@ -123,9 +126,7 @@ def format_session_result(
     earnings_preprocess nothing_new, meta skipped). Caller treats
     None as "do nothing".
     """
-    from src.trading_calendar import et_now
-
-    timestamp = et_now().strftime("%Y-%m-%d %H:%M ET")
+    timestamp = _notification_timestamp(result)
     elapsed_str = _fmt_elapsed(elapsed_seconds)
 
     if error is not None:
@@ -196,6 +197,46 @@ def format_session_result(
 
     lines.append(f"elapsed: {elapsed_str}")
     return "\n".join(lines)
+
+
+def _notification_timestamp(result: dict | None) -> str:
+    """Format notifier timestamp in operator-preferred timezone.
+
+    `TELEGRAM_TIMEZONE` (IANA tz name) controls rendering timezone.
+    Defaults to America/Chicago to match Alpaca dashboard workflows.
+    """
+    from src.trading_calendar import et_now
+
+    tz_name = (os.getenv("TELEGRAM_TIMEZONE", _DEFAULT_NOTIFY_TZ) or "").strip()
+    if not tz_name:
+        tz_name = _DEFAULT_NOTIFY_TZ
+    try:
+        target_tz = ZoneInfo(tz_name)
+    except Exception:
+        logger.warning(
+            "Invalid TELEGRAM_TIMEZONE=%r; fallback to %s",
+            tz_name,
+            _DEFAULT_NOTIFY_TZ,
+        )
+        target_tz = ZoneInfo(_DEFAULT_NOTIFY_TZ)
+
+    # Optional as-of timestamp lets callers pin message time to the
+    # underlying account snapshot instant instead of formatter runtime.
+    dt = None
+    asof = result.get("account_asof_utc") if isinstance(result, dict) else None
+    if isinstance(asof, str) and asof.strip():
+        try:
+            parsed = datetime.fromisoformat(asof.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            dt = parsed.astimezone(target_tz)
+        except ValueError:
+            logger.warning("Invalid account_asof_utc=%r in notifier result", asof)
+
+    if dt is None:
+        dt = et_now().astimezone(target_tz)
+    tz_abbr = dt.tzname() or tz_name
+    return dt.strftime("%Y-%m-%d %H:%M") + f" {tz_abbr}"
 
 
 def _append_trade_session_body(lines: list[str], result: dict) -> None:
@@ -306,6 +347,33 @@ def _spy_daily_returns(dates: list[str]) -> dict[str, float | None]:
         return {}
 
 
+def _4pm_daily_pnl(last_equity: float) -> float | None:
+    """4pm-to-4pm P&L: last_equity[today] minus last_equity[prev trading day].
+
+    Returns None when the DB is unavailable or there is no prior row.
+    Assumes today's daily_pnl row is already written before this is called.
+    """
+    try:
+        import sqlite3
+        if not _DB_PATH.exists():
+            return None
+        conn = sqlite3.connect(str(_DB_PATH))
+        try:
+            row = conn.execute(
+                "SELECT last_equity FROM daily_pnl "
+                "WHERE last_equity IS NOT NULL "
+                "ORDER BY date DESC LIMIT 1 OFFSET 1"
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("4pm daily pnl lookup failed: %s", exc)
+        return None
+    if row is None or row[0] is None:
+        return None
+    return last_equity - float(row[0])
+
+
 def _pnl_history_table(lookback: int = 10) -> str | None:
     """Query daily_pnl table and return a formatted text table.
 
@@ -318,7 +386,7 @@ def _pnl_history_table(lookback: int = 10) -> str | None:
         conn = sqlite3.connect(str(_DB_PATH))
         try:
             rows = conn.execute(
-                "SELECT date, total_value, daily_pnl, daily_return_pct "
+                "SELECT date, total_value, daily_pnl, daily_return_pct, last_equity "
                 "FROM daily_pnl ORDER BY date DESC LIMIT ?",
                 (lookback,),
             ).fetchall()
@@ -337,35 +405,40 @@ def _pnl_history_table(lookback: int = 10) -> str | None:
     cum = 0.0
     peak_nav: float | None = None
 
-    # Reconstruct NAV from the first row's last_equity (= Alpaca's official close
-    # for the day before the first displayed row) plus cumulative daily_pnl.
-    # This aligns NAV with the same 4pm-close basis used by SPY and other
-    # benchmark comparisons, so NAV[today] - NAV[yesterday] == daily_pnl[today].
-    first_tv, first_pnl = rows[0][1], rows[0][2]
-    running_nav = (first_tv - (first_pnl or 0.0)) if first_tv is not None else 0.0
-
     table_lines = ["📊 P&L History (last {} days)".format(len(rows))]
     table_lines.append(
         f"{'Date':<10}  {'Net P&L':>11}  {'Dly Ret':>7}  {'SPY':>7}  "
         f"{'NAV':>11}  {'Cumul P&L':>9}  {'Drawdown':>8}"
     )
     table_lines.append("─" * 76)
-    for date, total_value, daily_pnl, daily_ret in rows:
-        cum += (daily_pnl or 0.0)
-        running_nav += (daily_pnl or 0.0)
+    for i, (date, total_value, daily_pnl, daily_ret, last_equity) in enumerate(rows):
+        nav = last_equity if last_equity is not None else total_value
 
-        if peak_nav is None or running_nav > peak_nav:
-            peak_nav = running_nav
+        # 4pm-to-4pm P&L: this row's last_equity minus the previous row's.
+        # First row has no predecessor → undefined, show "?".
+        if i > 0:
+            prev_le = rows[i - 1][4]
+            pnl_4pm = (last_equity - prev_le) if (last_equity is not None and prev_le is not None) else daily_pnl
+        else:
+            pnl_4pm = None
 
-        pnl_str = f"{daily_pnl:+,.2f}" if daily_pnl is not None else "?"
-        ret_str = f"{daily_ret:+.2f}%" if daily_ret is not None else "?"
+        prev_le_for_ret = rows[i - 1][4] if i > 0 else None
+        ret_4pm = (pnl_4pm / prev_le_for_ret * 100) if (pnl_4pm is not None and prev_le_for_ret) else (daily_ret if i > 0 else None)
+
+        cum += (pnl_4pm or 0.0)
+
+        if peak_nav is None or nav > peak_nav:
+            peak_nav = nav
+
+        pnl_str = f"{pnl_4pm:+,.2f}" if pnl_4pm is not None else "?"
+        ret_str = f"{ret_4pm:+.2f}%" if ret_4pm is not None else "?"
         spy_ret = spy_returns.get(date)
         spy_str = f"{spy_ret:+.2f}%" if spy_ret is not None else "  n/a"
-        nav_str = f"${running_nav:,.2f}"
+        nav_str = f"${nav:,.2f}"
         cum_str = f"{cum:+,.2f}"
 
         if peak_nav and peak_nav > 0:
-            dd_pct = (running_nav - peak_nav) / peak_nav * 100
+            dd_pct = (nav - peak_nav) / peak_nav * 100
             dd_str = f"{dd_pct:.2f}%" if dd_pct < 0 else "0.00%"
         else:
             dd_str = "?"
@@ -394,39 +467,31 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
     # wants to know "did I make money today" without grepping logs.
     daily_pnl = result.get("daily_pnl")
     total_value = result.get("total_value")
-    daily_ret = result.get("daily_return_pct")
-    if daily_pnl is not None and total_value is not None:
-        # daily_return_pct from pipeline is in % already (e.g. -0.35
-        # for a 0.35% loss), but historical rows pre-2026 may have had
-        # different scaling — compute fresh for the message either way.
-        #
-        # Daily return is P&L over PRIOR-day equity, not current. Using
-        # current understates losses (denominator includes today's draw).
-        # Prior equity = total_value − daily_pnl by definition. CLAUDE.md
-        # mandates broker.last_equity as the canonical baseline; this
-        # arithmetic reconstructs the same number from the result dict
-        # without plumbing last_equity through. Audit 2026-05-27: a -5%
-        # day was displayed as ~-4.76% under the old denominator.
-        prior_equity = total_value - daily_pnl
-        if prior_equity > 0:
-            ret_pct = (daily_pnl / prior_equity) * 100
-        else:
-            ret_pct = 0.0
-        # Format signs as prefix (-$373.46 not $-373.46) — the latter
-        # reads as "dollar minus 373" which is awkward.
-        if daily_pnl >= 0:
-            pnl_str = f"+${daily_pnl:,.2f}"
+    last_equity = result.get("last_equity")
+
+    # Report the 4pm official snapshot regardless of when evening runs.
+    # display_equity = last_equity (Alpaca 4pm close); pnl_display =
+    # last_equity[today] - last_equity[yesterday] (pure 4pm-to-4pm).
+    # Falls back to the broker real-time diff for legacy result dicts
+    # that predate last_equity being plumbed through.
+    display_equity = last_equity if last_equity else total_value
+    pnl_display = _4pm_daily_pnl(last_equity) if last_equity else daily_pnl
+    if pnl_display is not None and display_equity:
+        baseline = display_equity - pnl_display
+        ret_pct = (pnl_display / baseline * 100) if baseline > 0 else 0.0
+        if pnl_display >= 0:
+            pnl_str = f"+${pnl_display:,.2f}"
             ret_str = f"+{ret_pct:.2f}%"
         else:
-            pnl_str = f"-${abs(daily_pnl):,.2f}"
-            ret_str = f"{ret_pct:.2f}%"  # already has leading minus
+            pnl_str = f"-${abs(pnl_display):,.2f}"
+            ret_str = f"{ret_pct:.2f}%"
         lines.append(f"💰 Daily P&L: {pnl_str} ({ret_str})")
-        lines.append(f"   Equity: ${total_value:,.2f}")
+        lines.append(f"   Equity: ${display_equity:,.2f}")
 
     # Position snapshot: total invested + cash + top winners/losers.
     # Helper queries the live DB so this works regardless of how the
     # evening result dict is constructed.
-    _append_position_snapshot(lines, total_value)
+    _append_position_snapshot(lines, display_equity)
 
     # Historical P&L table — last 10 trading days
     pnl_table = _pnl_history_table(lookback=10)
@@ -579,8 +644,9 @@ def _append_position_snapshot(lines: list[str], total_value: float | None) -> No
     def _row_line(r: tuple) -> str:
         sym, qty, avg, curr, mv, pnl = r
         pct = ((curr / avg - 1) * 100) if avg else 0
-        sign = "+" if pnl >= 0 else ""
-        return f"   {sym:<6} {sign}${pnl:>+8,.0f}  ({sign}{pct:+.1f}%)"
+        pnl_str = f"+${pnl:,.0f}" if pnl >= 0 else f"-${abs(pnl):,.0f}"
+        pct_str = f"+{pct:.1f}%" if pct >= 0 else f"{pct:.1f}%"
+        return f"   {sym:<6} {pnl_str:>10}  ({pct_str})"
 
     # r[5] is positions.unrealized_pnl. SQLite allows NULL on that
     # column (broker race / stale snapshot can leave it unset for a

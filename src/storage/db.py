@@ -111,6 +111,7 @@ class Database:
                 total_value REAL NOT NULL,
                 daily_pnl REAL NOT NULL,
                 daily_return_pct REAL NOT NULL,
+                last_equity REAL,
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -217,6 +218,10 @@ class Database:
         _ensure_column("agent_logs", "input_tokens", "input_tokens INTEGER")
         _ensure_column("agent_logs", "output_tokens", "output_tokens INTEGER")
         _ensure_column("agent_logs", "cost_usd", "cost_usd REAL")
+        # 2026-05-29: store Alpaca's last_equity (4pm official close baseline)
+        # alongside total_value so P&L history table can show accurate NAV
+        # without drifting due to after-hours price movements in total_value.
+        _ensure_column("daily_pnl", "last_equity", "last_equity REAL")
         # codex r7 P1 #3: pending_protection_restores table for older DBs
         # that pre-date the orphaned-stop-restore queue. Idempotent.
         try:
@@ -266,6 +271,7 @@ class Database:
         total_value: float,
         daily_pnl: float,
         daily_return_pct: float,
+        last_equity: float | None = None,
         tomorrow_outlook: str,
         lessons: str,
         suggested_actions,
@@ -325,9 +331,9 @@ class Database:
                 self.conn.execute("BEGIN")
                 self.conn.execute(
                     "INSERT OR REPLACE INTO daily_pnl "
-                    "(date, total_value, daily_pnl, daily_return_pct) "
-                    "VALUES (?, ?, ?, ?)",
-                    (date, total_value, daily_pnl, daily_return_pct),
+                    "(date, total_value, daily_pnl, daily_return_pct, last_equity) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (date, total_value, daily_pnl, daily_return_pct, last_equity),
                 )
                 self.conn.execute(
                     "INSERT OR REPLACE INTO insights "
@@ -874,12 +880,13 @@ class Database:
             return cursor.rowcount or 0
 
     def insert_daily_pnl(self, date: str, total_value: float, daily_pnl: float,
-                         daily_return_pct: float):
+                         daily_return_pct: float, last_equity: float | None = None):
         with self._lock:
             self.conn.execute(
-                """INSERT OR REPLACE INTO daily_pnl (date, total_value, daily_pnl, daily_return_pct)
-                   VALUES (?, ?, ?, ?)""",
-                (date, total_value, daily_pnl, daily_return_pct),
+                """INSERT OR REPLACE INTO daily_pnl
+                   (date, total_value, daily_pnl, daily_return_pct, last_equity)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (date, total_value, daily_pnl, daily_return_pct, last_equity),
             )
             self.conn.commit()
 
