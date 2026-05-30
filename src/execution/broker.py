@@ -227,6 +227,41 @@ class AlpacaBroker:
             out.append((d, eq))
         return out
 
+    def get_full_portfolio_history(self) -> list[tuple[str, float]]:
+        """All available 1D equity history from Alpaca portfolio_history.
+
+        Returns [(et_date_str, equity), ...] oldest-first, skipping zero
+        rows (pre-funding). Best-effort — never raises.
+        """
+        from datetime import datetime, timedelta, timezone
+        from src.util.time import ET
+        try:
+            from alpaca.trading.requests import GetPortfolioHistoryRequest
+            now = datetime.now(timezone.utc)
+            req = GetPortfolioHistoryRequest(
+                timeframe="1D", extended_hours=False,
+                start=now - timedelta(days=365 * 5), end=now,
+            )
+            history = self.client.get_portfolio_history(history_filter=req)
+        except Exception as exc:
+            logger.warning("get_full_portfolio_history failed: %s", exc)
+            return []
+        timestamps = getattr(history, "timestamp", None) or []
+        equities = getattr(history, "equity", None) or []
+        out: list[tuple[str, float]] = []
+        for i, ts in enumerate(timestamps):
+            if i >= len(equities) or equities[i] is None:
+                continue
+            try:
+                d = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(ET).strftime("%Y-%m-%d")
+                eq = float(equities[i])
+            except (TypeError, ValueError, OSError):
+                continue
+            if eq == 0.0:
+                continue  # skip pre-funding rows
+            out.append((d, eq))
+        return out
+
     def get_positions(self) -> list[Position]:
         raw_positions = self.client.get_all_positions()
         positions = []
