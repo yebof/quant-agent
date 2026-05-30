@@ -844,12 +844,13 @@ def _fmt_elapsed(seconds: float) -> str:
 def build_weekly_csv(closes: list[tuple[str, float]]) -> bytes:
     """Build a P&L history CSV from portfolio_history closes.
 
-    Columns: Date, NAV, Daily P&L, Daily Return %, SPY Close, SPY Return %
+    Columns: Date, NAV, Daily P&L, Daily Return %, Drawdown %, SPY Close,
+    SPY Return %
 
     SPY data is fetched via yfinance for the same date range. On any
     yfinance failure the SPY columns are left blank.
     """
-    import io, csv
+    import io, csv, math
     from datetime import datetime, timedelta
 
     if not closes:
@@ -868,8 +869,14 @@ def build_weekly_csv(closes: list[tuple[str, float]]) -> bytes:
         if not df.empty:
             if hasattr(df.columns, "get_level_values"):
                 df.columns = df.columns.get_level_values(0)
-            for dt_idx, row in df["Close"].items():
-                spy_closes[str(dt_idx.date())] = float(row)
+            # dropna()+isfinite: a NaN close (data gap / halt) is truthy as a
+            # float, so it would slip past the `spy_close and prev_spy` guard,
+            # render as "+nan" in the CSV, AND poison prev_spy for every later
+            # row. Keep only valid finite closes out of the dict entirely.
+            for dt_idx, row in df["Close"].dropna().items():
+                val = float(row)
+                if math.isfinite(val):
+                    spy_closes[str(dt_idx.date())] = val
     except Exception as exc:
         logger.warning("build_weekly_csv: SPY fetch failed: %s", exc)
 
@@ -886,7 +893,10 @@ def build_weekly_csv(closes: list[tuple[str, float]]) -> bytes:
         peak_nav = max(peak_nav, nav) if peak_nav is not None else nav
         drawdown = (nav - peak_nav) / peak_nav * 100 if peak_nav else 0.0
         spy_close = spy_closes.get(date)
-        spy_ret = ((spy_close - prev_spy) / prev_spy * 100) if (spy_close and prev_spy) else ""
+        if spy_close is not None and math.isfinite(spy_close) and prev_spy:
+            spy_ret = (spy_close - prev_spy) / prev_spy * 100
+        else:
+            spy_ret = ""
         writer.writerow([
             date,
             f"{nav:.2f}",
