@@ -103,6 +103,23 @@ class TelegramNotifier:
             logger.warning("Telegram notify failed: %s", exc)
             return False
 
+    def send_document(self, csv_bytes: bytes, filename: str, caption: str = "") -> bool:
+        """Send a file (e.g. CSV) via Telegram sendDocument. Best-effort."""
+        if not self.enabled:
+            return False
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{self.token}/sendDocument",
+                data={"chat_id": self.chat_id, "caption": caption},
+                files={"document": (filename, csv_bytes, "text/csv")},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning("Telegram send_document failed: %s", exc)
+            return False
+
 
 # === Session result formatting ===
 # Built as a free function (not a TelegramNotifier method) so it's
@@ -193,6 +210,10 @@ def format_session_result(
         _append_intra_check_body(lines, result)
     elif mode == "meta":
         _append_meta_body(lines, result)
+    elif mode == "weekly":
+        rows = result.get("rows", "?")
+        filename = result.get("filename", "")
+        lines.append(f"📊 {rows} rows → {filename}")
 
     lines.append(f"elapsed: {elapsed_str}")
     return "\n".join(lines)
@@ -818,6 +839,77 @@ def _fmt_elapsed(seconds: float) -> str:
     minutes = int(seconds // 60)
     secs = int(seconds % 60)
     return f"{minutes}m {secs}s"
+
+
+def build_weekly_csv(closes: list[tuple[str, float]]) -> bytes:
+    """Build a P&L history CSV from portfolio_history closes.
+
+    Columns: Date, NAV, Daily P&L, Daily Return %, Drawdown %, SPY Close,
+    SPY Return %
+
+    SPY data is fetched via yfinance for the same date range. On any
+    yfinance failure the SPY columns are left blank.
+    """
+    import io, csv, math
+    from datetime import datetime, timedelta
+
+    if not closes:
+        return b""
+
+    # Fetch SPY closes for the same date range.
+    spy_closes: dict[str, float] = {}
+    try:
+        import yfinance as yf
+        import pandas as pd
+        earliest = closes[0][0]
+        start = (datetime.strptime(earliest, "%Y-%m-%d") - timedelta(days=5)).strftime("%Y-%m-%d")
+        end_dt = datetime.strptime(closes[-1][0], "%Y-%m-%d") + timedelta(days=2)
+        end = end_dt.strftime("%Y-%m-%d")
+        df = yf.download("SPY", start=start, end=end, progress=False, auto_adjust=True)
+        if not df.empty:
+            if hasattr(df.columns, "get_level_values"):
+                df.columns = df.columns.get_level_values(0)
+            # dropna()+isfinite: a NaN close (data gap / halt) is truthy as a
+            # float, so it would slip past the `spy_close and prev_spy` guard,
+            # render as "+nan" in the CSV, AND poison prev_spy for every later
+            # row. Keep only valid finite closes out of the dict entirely.
+            for dt_idx, row in df["Close"].dropna().items():
+                val = float(row)
+                if math.isfinite(val):
+                    spy_closes[str(dt_idx.date())] = val
+    except Exception as exc:
+        logger.warning("build_weekly_csv: SPY fetch failed: %s", exc)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Date", "NAV", "Daily P&L", "Daily Return %", "Drawdown %", "SPY Close", "SPY Return %"])
+
+    prev_nav: float | None = None
+    prev_spy: float | None = None
+    peak_nav: float | None = None
+    for date, nav in closes:
+        daily_pnl = nav - prev_nav if prev_nav is not None else 0.0
+        daily_ret = (daily_pnl / prev_nav * 100) if prev_nav else 0.0
+        peak_nav = max(peak_nav, nav) if peak_nav is not None else nav
+        drawdown = (nav - peak_nav) / peak_nav * 100 if peak_nav else 0.0
+        spy_close = spy_closes.get(date)
+        if spy_close is not None and math.isfinite(spy_close) and prev_spy:
+            spy_ret = (spy_close - prev_spy) / prev_spy * 100
+        else:
+            spy_ret = ""
+        writer.writerow([
+            date,
+            f"{nav:.2f}",
+            f"{daily_pnl:+.2f}",
+            f"{daily_ret:+.4f}",
+            f"{drawdown:+.4f}",
+            f"{spy_close:.2f}" if spy_close else "",
+            f"{spy_ret:+.4f}" if spy_ret != "" else "",
+        ])
+        prev_nav = nav
+        prev_spy = spy_close if spy_close else prev_spy
+
+    return buf.getvalue().encode("utf-8")
 
 
 def _attr_or_key(obj: Any, name: str) -> Any:

@@ -50,7 +50,7 @@ def main():
         "--mode",
         choices=[
             "live", "once", "morning", "midday", "close", "evening",
-            "intra_check", "earnings_preprocess", "meta",
+            "intra_check", "earnings_preprocess", "meta", "weekly",
         ],
         default="once", help="Run mode",
     )
@@ -134,6 +134,8 @@ def main():
             result = pipeline.run_earnings_preprocess()
         elif args.mode == "meta":
             result = pipeline.run_quarterly_meta_reflection(force=args.force)
+        elif args.mode == "weekly":
+            result = pipeline.run_weekly()
     except BaseException as exc:
         # Catch broadly (incl. SystemExit / KeyboardInterrupt) so a
         # wrapper-kill or ctrl-C still gets a notification — but
