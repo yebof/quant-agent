@@ -436,3 +436,17 @@ storage:
     f.write_text(no_key_yaml)
     cfg = load_config(f)
     assert cfg.risk.allow_margin is False
+
+
+def test_llm_config_defaults_are_current_claude_model():
+    """Stale claude-*-4-6 defaults are gone — if settings.yaml omits a model,
+    agents fall back to a current, priced Claude model, not a 4-6."""
+    from src.config import LLMConfig
+    from src.cost_table import estimate_cost
+    defaults = {
+        f: LLMConfig.model_fields[f].default
+        for f in LLMConfig.model_fields if f.endswith("_model")
+    }
+    assert set(defaults.values()) == {"claude-opus-4-7"}, defaults
+    # and the default is actually priced (cost won't show $?.??)
+    assert estimate_cost("claude-opus-4-7", 1000, 1000) is not None

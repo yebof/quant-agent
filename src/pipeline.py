@@ -238,16 +238,19 @@ class TradingPipeline:
             api_key=_key_for(config.llm.tech_analyst_model),
             model=config.llm.tech_analyst_model,
             max_tokens=config.llm.get_max_tokens("tech_analyst"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.portfolio_manager = PortfolioManagerAgent(
             api_key=_key_for(config.llm.portfolio_manager_model),
             model=config.llm.portfolio_manager_model,
             max_tokens=config.llm.get_max_tokens("portfolio_manager"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.risk_manager = RiskManagerAgent(
             api_key=_key_for(config.llm.risk_manager_model),
             model=config.llm.risk_manager_model,
             max_tokens=config.llm.get_max_tokens("risk_manager"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.risk_engine = RiskRuleEngine(RiskConfig(
             max_position_pct=config.risk.max_position_pct,
@@ -267,21 +270,25 @@ class TradingPipeline:
             api_key=_key_for(config.llm.position_reviewer_model),
             model=config.llm.position_reviewer_model,
             max_tokens=config.llm.get_max_tokens("position_reviewer"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.evening_analyst = EveningAnalystAgent(
             api_key=_key_for(config.llm.evening_analyst_model),
             model=config.llm.evening_analyst_model,
             max_tokens=config.llm.get_max_tokens("evening_analyst"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.news_analyst = NewsAnalystAgent(
             api_key=_key_for(config.llm.news_analyst_model),
             model=config.llm.news_analyst_model,
             max_tokens=config.llm.get_max_tokens("news_analyst"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.macro_analyst = MacroAnalystAgent(
             api_key=_key_for(config.llm.macro_analyst_model),
             model=config.llm.macro_analyst_model,
             max_tokens=config.llm.get_max_tokens("macro_analyst"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.news_provider = NewsDataProvider()
         self.news_store = NewsStore()
@@ -291,11 +298,13 @@ class TradingPipeline:
             api_key=_key_for(config.llm.earnings_analyst_model),
             model=config.llm.earnings_analyst_model,
             max_tokens=config.llm.get_max_tokens("earnings_analyst"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.meta_reflector = MetaReflectorAgent(
             api_key=_key_for(config.llm.meta_reflector_model),
             model=config.llm.meta_reflector_model,
             max_tokens=config.llm.get_max_tokens("meta_reflector"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.earnings_provider = EarningsDataProvider()
         self.broker = AlpacaBroker(

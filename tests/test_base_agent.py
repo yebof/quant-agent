@@ -451,3 +451,81 @@ def test_anthropic_system_prompt_carries_cache_control(mock_anthropic):
     assert isinstance(system, list) and system, "system must be a content-block list"
     assert system[0]["cache_control"] == {"type": "ephemeral"}
     assert system[0]["text"] == "You are a test agent."
+
+
+# === cross-provider failover (OpenAI primary -> Anthropic fallback) ===
+
+def _good_anthropic_response(text='{"result": "ok"}'):
+    r = MagicMock()
+    r.content = [MagicMock(text=text)]
+    r.usage.input_tokens = 10
+    r.usage.output_tokens = 5
+    r.stop_reason = "end_turn"
+    return r
+
+
+def test_failover_openai_exhausted_then_anthropic_succeeds(monkeypatch):
+    """OpenAI primary fails all retries → ONE Anthropic call with the fallback
+    model succeeds → result carries the fallback model (so cost is priced right)."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+    oai = MagicMock()
+    oai.chat.completions.create.side_effect = ConnectionError("openai down")
+    anth = MagicMock()
+    anth.messages.create.return_value = _good_anthropic_response()
+    with patch("openai.OpenAI", return_value=oai), patch("anthropic.Anthropic", return_value=anth):
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64, fallback_api_key="fk")
+        result = agent.run(data="x")
+    assert result.raw_text == '{"result": "ok"}'
+    assert result.model == "claude-opus-4-7"      # actual model used → correct pricing
+    anth.messages.create.assert_called_once()       # single-shot failover (no retry)
+
+
+def test_no_failover_when_fallback_key_empty(monkeypatch):
+    """No fallback key → the original OpenAI error propagates; no Anthropic call."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+    oai = MagicMock()
+    oai.chat.completions.create.side_effect = ConnectionError("down")
+    with patch("openai.OpenAI", return_value=oai), patch("anthropic.Anthropic") as A:
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)  # no fallback_api_key
+        with pytest.raises(ConnectionError):
+            agent.run(data="x")
+        A.assert_not_called()
+
+
+def test_no_failover_when_primary_is_claude(monkeypatch):
+    """A Claude primary's fallback would hit the same provider → no failover
+    (and construction with a fallback key must NOT raise)."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+    anth = MagicMock()
+    anth.messages.create.side_effect = ConnectionError("anthropic down")
+    with patch("anthropic.Anthropic", return_value=anth):
+        agent = ConcreteAgent(api_key="k", model="claude-opus-4-7", max_tokens=64, fallback_api_key="fk")
+        with pytest.raises(ConnectionError):
+            agent.run(data="x")
+    assert anth.messages.create.call_count == 2     # 2 primary retries, no extra failover call
+
+
+def test_failover_both_fail_reraises_original_openai_error(monkeypatch):
+    """OpenAI AND Anthropic both fail → the ORIGINAL OpenAI error surfaces (so
+    the operator sees the root cause), not the secondary Anthropic error."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+
+    class OpenAIDown(ConnectionError):
+        pass
+
+    class AnthropicDown(Exception):
+        pass
+
+    oai = MagicMock()
+    oai.chat.completions.create.side_effect = OpenAIDown("openai")
+    anth = MagicMock()
+    anth.messages.create.side_effect = AnthropicDown("anthropic")
+    with patch("openai.OpenAI", return_value=oai), patch("anthropic.Anthropic", return_value=anth):
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64, fallback_api_key="fk")
+        with pytest.raises(OpenAIDown):
+            agent.run(data="x")
+    anth.messages.create.assert_called_once()

@@ -31,18 +31,18 @@ class AlpacaConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    tech_analyst_model: str = "claude-sonnet-4-6"
-    news_analyst_model: str = "claude-sonnet-4-6"
-    macro_analyst_model: str = "claude-sonnet-4-6"
-    earnings_analyst_model: str = "claude-opus-4-6"
-    portfolio_manager_model: str = "claude-opus-4-6"
-    risk_manager_model: str = "claude-opus-4-6"
-    position_reviewer_model: str = "claude-opus-4-6"
-    evening_analyst_model: str = "claude-opus-4-6"
+    tech_analyst_model: str = "claude-opus-4-7"
+    news_analyst_model: str = "claude-opus-4-7"
+    macro_analyst_model: str = "claude-opus-4-7"
+    earnings_analyst_model: str = "claude-opus-4-7"
+    portfolio_manager_model: str = "claude-opus-4-7"
+    risk_manager_model: str = "claude-opus-4-7"
+    position_reviewer_model: str = "claude-opus-4-7"
+    evening_analyst_model: str = "claude-opus-4-7"
     # Quarterly meta-reflector — strategic self-audit agent. Opus by default
     # because the input (deterministic digest) is dense and the output must
     # cite numbers precisely; a weaker model tends to vibe-reason.
-    meta_reflector_model: str = "claude-opus-4-6"
+    meta_reflector_model: str = "claude-opus-4-7"
     # Global fallback — used by any agent without an explicit override below.
     max_tokens: int
     # Per-agent overrides. Each agent emits a different output shape; the PM
