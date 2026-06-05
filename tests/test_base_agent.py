@@ -529,3 +529,168 @@ def test_failover_both_fail_reraises_original_openai_error(monkeypatch):
         with pytest.raises(OpenAIDown):
             agent.run(data="x")
     anth.messages.create.assert_called_once()
+
+
+# === DeepSeek provider (OpenAI-compatible API, distinct routing) ===
+
+def _deepseek_oai_mock(content='{"result": "ok"}', finish_reason="stop", reasoning=None):
+    """Build a mock OpenAI client whose chat.completions.create returns a
+    DeepSeek-shaped (OpenAI-shaped) response."""
+    oai = MagicMock()
+    resp = MagicMock()
+    msg = MagicMock()
+    msg.content = content
+    if reasoning is not None:
+        msg.reasoning_content = reasoning
+    choice = MagicMock()
+    choice.message = msg
+    choice.finish_reason = finish_reason
+    resp.choices = [choice]
+    resp.usage.prompt_tokens = 100
+    resp.usage.completion_tokens = 50
+    oai.chat.completions.create.return_value = resp
+    return oai
+
+
+def test_deepseek_routes_to_openai_sdk_with_base_url():
+    """A deepseek-* model uses the OpenAI SDK pointed at the DeepSeek base_url,
+    NOT Anthropic; _use_deepseek True and _use_openai False."""
+    from src.agents.base import _DEEPSEEK_BASE_URL
+    with patch("openai.OpenAI") as oai_cls, patch("anthropic.Anthropic") as anth_cls:
+        oai_cls.return_value = _deepseek_oai_mock()
+        agent = ConcreteAgent(api_key="dk", model="deepseek-v4-flash", max_tokens=4096)
+        assert agent._use_deepseek is True
+        assert agent._use_openai is False
+        anth_cls.assert_not_called()
+        _, kwargs = oai_cls.call_args
+        assert kwargs.get("base_url") == _DEEPSEEK_BASE_URL == "https://api.deepseek.com"
+        assert kwargs.get("api_key") == "dk"
+
+
+def test_deepseek_sends_max_tokens_not_max_completion_tokens():
+    """THE load-bearing fact: DeepSeek honors `max_tokens`, ignores
+    `max_completion_tokens`. The OpenAI path must keep sending
+    `max_completion_tokens`; the DeepSeek path must send `max_tokens`."""
+    with patch("openai.OpenAI") as oai_cls:
+        client = _deepseek_oai_mock()
+        oai_cls.return_value = client
+        agent = ConcreteAgent(api_key="dk", model="deepseek-v4-flash", max_tokens=4096)
+        agent.run(data="x")
+        _, call_kwargs = client.chat.completions.create.call_args
+        assert "max_tokens" in call_kwargs
+        assert "max_completion_tokens" not in call_kwargs
+
+    # mirror: the OpenAI path still uses max_completion_tokens
+    with patch("openai.OpenAI") as oai_cls:
+        client = _deepseek_oai_mock()
+        oai_cls.return_value = client
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=4096)
+        agent.run(data="x")
+        _, call_kwargs = client.chat.completions.create.call_args
+        assert "max_completion_tokens" in call_kwargs
+        assert "max_tokens" not in call_kwargs
+
+
+def test_deepseek_clamps_max_tokens_to_model_ceiling():
+    """max_tokens is clamped to the per-model ceiling (DeepSeek rejects, does
+    not clamp, an over-ceiling value). v4-flash (384000) passes 128000 through;
+    an unknown deepseek-* id clamps to the conservative 8192 default."""
+    from src.agents.base import _DEEPSEEK_DEFAULT_CEILING
+    # under ceiling → unchanged
+    with patch("openai.OpenAI") as oai_cls:
+        client = _deepseek_oai_mock()
+        oai_cls.return_value = client
+        ConcreteAgent(api_key="dk", model="deepseek-v4-flash", max_tokens=128000).run(data="x")
+        _, kw = client.chat.completions.create.call_args
+        assert kw["max_tokens"] == 128000
+    # unknown deepseek id → clamped to conservative default
+    with patch("openai.OpenAI") as oai_cls:
+        client = _deepseek_oai_mock()
+        oai_cls.return_value = client
+        ConcreteAgent(api_key="dk", model="deepseek-zzz-unknown", max_tokens=128000).run(data="x")
+        _, kw = client.chat.completions.create.call_args
+        assert kw["max_tokens"] == _DEEPSEEK_DEFAULT_CEILING == 8192
+
+
+def test_deepseek_parses_content_and_records_model():
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = _deepseek_oai_mock(content='{"result": "ok"}')
+        agent = ConcreteAgent(api_key="dk", model="deepseek-v4-flash", max_tokens=4096)
+        result = agent.run(data="x")
+        assert result.parse_json() == {"result": "ok"}
+        assert result.model == "deepseek-v4-flash"
+        assert result.input_tokens == 100 and result.output_tokens == 50
+
+
+def test_deepseek_empty_content_with_reasoning_returns_empty():
+    """A reasoner truncated mid-thought returns empty content + reasoning_content.
+    We parse only content → empty string (downstream None distinguishable via the
+    truncated flag), and must not crash on the non-standard field."""
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = _deepseek_oai_mock(content="", finish_reason="length", reasoning="thinking...")
+        agent = ConcreteAgent(api_key="dk", model="deepseek-reasoner", max_tokens=4096)
+        result = agent.run(data="x")
+        assert result.raw_text == ""
+        assert result.truncated is True  # finish_reason=length
+
+
+def test_is_deepseek_model_prefix_routing():
+    from src.agents.base import _is_deepseek_model, _is_openai_model
+    assert _is_deepseek_model("deepseek-v4-flash") is True
+    assert _is_deepseek_model("deepseek-chat") is True
+    assert _is_openai_model("deepseek-v4-flash") is False   # must NOT be OpenAI
+    assert _is_deepseek_model("gpt-5.5") is False
+    assert _is_deepseek_model("claude-opus-4-7") is False
+
+
+def test_insufficient_system_resource_flags_truncated():
+    """DeepSeek's resource-interruption finish_reason (200 with a cut-off body)
+    is flagged truncated, like a token-limit cutoff."""
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = _deepseek_oai_mock(content='{"x":1}', finish_reason="insufficient_system_resource")
+        agent = ConcreteAgent(api_key="dk", model="deepseek-v4-flash", max_tokens=4096)
+        assert agent.run(data="x").truncated is True
+
+
+def test_is_retryable_402_insufficient_balance_fast_fails():
+    """DeepSeek 402 'Insufficient Balance' must NOT retry (dead-money, like a
+    dead key) so the failover takes over; 429/503 stay retryable."""
+    from src.agents.base import _is_retryable
+
+    class Err(Exception):
+        def __init__(self, status):
+            self.status_code = status
+    assert _is_retryable(Err(402)) is False
+    assert _is_retryable(Err(429)) is True
+    assert _is_retryable(Err(503)) is True
+    assert _is_retryable(Err(400)) is False
+    assert _is_retryable(Err(401)) is False
+
+
+def test_deepseek_primary_fails_over_to_anthropic(monkeypatch):
+    """DeepSeek primary exhausted → ONE Anthropic failover call; result carries
+    the fallback model so cost is priced right."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+    ds = MagicMock()
+    ds.chat.completions.create.side_effect = ConnectionError("deepseek down")
+    anth = MagicMock()
+    anth.messages.create.return_value = _good_anthropic_response()
+    with patch("openai.OpenAI", return_value=ds), patch("anthropic.Anthropic", return_value=anth):
+        agent = ConcreteAgent(api_key="dk", model="deepseek-v4-flash", max_tokens=64, fallback_api_key="fk")
+        result = agent.run(data="x")
+    assert result.raw_text == '{"result": "ok"}'
+    assert result.model == "claude-opus-4-7"
+    anth.messages.create.assert_called_once()
+
+
+def test_deepseek_primary_no_failover_without_key(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+    ds = MagicMock()
+    ds.chat.completions.create.side_effect = ConnectionError("down")
+    with patch("openai.OpenAI", return_value=ds), patch("anthropic.Anthropic") as A:
+        agent = ConcreteAgent(api_key="dk", model="deepseek-v4-flash", max_tokens=64)  # no fallback key
+        with pytest.raises(ConnectionError):
+            agent.run(data="x")
+        A.assert_not_called()

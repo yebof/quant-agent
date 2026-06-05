@@ -5,6 +5,9 @@ input/output token counts returned by each provider, and by
 `src/notifier.py` to surface session-level cost in Telegram pushes.
 
 **Pricing source priority** (highest first):
+  0. `_PRICING_PINNED` — verified-official rates for models where LiteLLM is
+     KNOWN-STALE (currently DeepSeek). Structurally immune to cache refresh
+     (`_apply_litellm_data` only iterates `_PRICING_FALLBACK` keys).
   1. `data/pricing_cache.json` — fetched from LiteLLM upstream JSON.
      Refreshed automatically every 24h via `refresh_pricing()` (also
      callable on-demand via `scripts/refresh_pricing.py`).
@@ -76,10 +79,32 @@ _PRICING_FALLBACK: dict[str, dict[str, float]] = {
     "o4-mini":             {"input":  1.10, "output":  4.40},
 }
 
+# === Pinned overrides — verified-official rates that must BEAT LiteLLM ===
+# Normally the LiteLLM cache (priority 1) wins over the hardcoded baseline. For
+# these models LiteLLM is KNOWN-STALE and wrong, so we pin the official rate
+# here instead. `_apply_litellm_data` only iterates `_PRICING_FALLBACK` keys, so
+# anything in this dict is structurally immune to being overwritten by a cache
+# load/refresh — and these are merged into PRICING at import below.
+#
+# DeepSeek (OpenAI-compatible): rates from the OFFICIAL /pricing page
+# (api-docs.deepseek.com, 2026-06-05), cache-MISS input. LiteLLM's deepseek-chat/
+# deepseek-reasoner rows ($0.28 in / $0.42 out) are a stale pre-V4 snapshot — if
+# they won, output cost would be overstated ~50%. The names deepseek-chat /
+# deepseek-reasoner are deprecated 2026-07-24 and now alias deepseek-v4-flash.
+# NOTE: this flat table has no cache-tier column, so it can't represent
+# DeepSeek's large context-cache discount (cache-hit input = $0.0028/M) → these
+# rows OVER-estimate on cache-heavy runs. Conservative on purpose.
+_PRICING_PINNED: dict[str, dict[str, float]] = {
+    "deepseek-v4-flash":   {"input": 0.14,  "output": 0.28},
+    "deepseek-v4-pro":     {"input": 0.435, "output": 0.87},
+    "deepseek-chat":       {"input": 0.14,  "output": 0.28},   # legacy alias -> v4-flash
+    "deepseek-reasoner":   {"input": 0.14,  "output": 0.28},   # legacy alias -> v4-flash
+}
+
 # Active PRICING — populated below from cache or fallback at module
 # import time. Mutated in-place by refresh_pricing() so callers
 # that imported the name `PRICING` see the latest values.
-PRICING: dict[str, dict[str, float]] = dict(_PRICING_FALLBACK)
+PRICING: dict[str, dict[str, float]] = {**_PRICING_FALLBACK, **_PRICING_PINNED}
 
 
 def _rates_from_entry(entry: object) -> dict[str, float] | None:

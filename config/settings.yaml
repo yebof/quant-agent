@@ -1,6 +1,7 @@
 api_keys:
   anthropic: "${ANTHROPIC_API_KEY}"
   openai: "${OPENAI_API_KEY}"
+  deepseek: "${DEEPSEEK_API_KEY}"   # optional; required only if any *_model is a deepseek-* id
   fred: "${FRED_API_KEY}"
   alpaca_key: "${ALPACA_API_KEY}"
   alpaca_secret: "${ALPACA_SECRET_KEY}"

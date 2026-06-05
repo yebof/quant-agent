@@ -229,7 +229,9 @@ class TradingPipeline:
 
         def _key_for(model: str) -> str:
             """Return the right API key based on model name."""
-            from src.agents.base import _is_openai_model
+            from src.agents.base import _is_deepseek_model, _is_openai_model
+            if _is_deepseek_model(model):
+                return config.api_keys.deepseek
             if _is_openai_model(model):
                 return config.api_keys.openai
             return config.api_keys.anthropic

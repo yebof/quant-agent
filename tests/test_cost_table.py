@@ -521,3 +521,30 @@ def test_rates_from_entry_validation():
     assert _rates_from_entry({"input_cost_per_token": 5e-6}) is None  # missing output
     assert _rates_from_entry(None) is None
     assert _rates_from_entry("garbage") is None
+
+
+def test_deepseek_models_priced_from_official_rates():
+    """DeepSeek rows use the OFFICIAL /pricing rates ($0.14/$0.28), pinned so the
+    STALE LiteLLM snapshot ($0.28/$0.42, which IS in the cache for deepseek-chat/
+    -reasoner) can't clobber them on a refresh."""
+    assert abs(estimate_cost("deepseek-v4-flash", 1_000_000, 1_000_000) - (0.14 + 0.28)) < 1e-9
+    # legacy aliases priced same as v4-flash (they route to it) — pinned, NOT the
+    # LiteLLM $0.28 input that would win without the pin.
+    assert abs(estimate_cost("deepseek-chat", 1_000_000, 0) - 0.14) < 1e-9
+    assert abs(estimate_cost("deepseek-reasoner", 1_000_000, 0) - 0.14) < 1e-9
+    # pro tier is more expensive
+    assert abs(estimate_cost("deepseek-v4-pro", 0, 1_000_000) - 0.87) < 1e-9
+
+
+def test_deepseek_pinned_survives_cache_refresh(tmp_path, monkeypatch, _restore_pricing):
+    """A cache refresh carrying LiteLLM's stale deepseek-chat ($0.28/$0.42) must
+    NOT overwrite the pinned official rate."""
+    from src import cost_table
+    cache = tmp_path / "pricing_cache.json"
+    monkeypatch.setattr(cost_table, "_CACHE_PATH", cache)
+    monkeypatch.setattr(
+        cost_table, "_fetch_litellm_dataset",
+        lambda: {"deepseek-chat": {"input_cost_per_token": 0.28e-6, "output_cost_per_token": 0.42e-6}},
+    )
+    cost_table.refresh_pricing(force=True)
+    assert cost_table.PRICING["deepseek-chat"] == {"input": 0.14, "output": 0.28}  # pin held
