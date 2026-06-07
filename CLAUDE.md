@@ -31,7 +31,7 @@ python main.py --mode morning|midday|evening|live   # 手动跑
 | news_analyst | ❌ 无 | 故意；结构化输出 `state_changes` + `stock_news` 本身就是它的思维结构 |
 | macro_analyst | 6 | vol / yield curve / monetary / inflation+labor+credit / cross-signal / sector |
 | earnings_analyst | 5 | 嵌在 `investment_implications.reasoning_chain` |
-| portfolio_manager | 7 | 8 层 memory (L1-L8) 喂进来 |
+| portfolio_manager | 7 (+pre-mortem) | 8 层 memory (L1-L8) 喂进来。**Step 4 加独立性折算**（4/4 对齐若是同一 beta 因子数 4 遍 → 降一档 size，防牛市 oversize 平庸多头）。**Step 8 `premortem_check` 红队步**（最大仓位的反方论据 + falsifier + 同涨 cluster 自检；schema 里 optional-default 兼容旧日志，prompt 里强制，2026-06-07 加） |
 | risk_manager | 6 | rr_audit / signal_fidelity / correlation / event_risk / sizing / overall |
 | position_reviewer | 6 | midday + close 共用；`session_type` 切换 disposition |
 | meta_reflector | 7 | **facts→synthesis→diagnosis→prompt-audit→proposal** 顺序：performance / theme / loss (事实) → **self_portrait_synthesis**（5 维自画像：conviction_calibration / theme_breadth / loss_discipline / execution_style / agent_balance）→ **portrait_gap_diagnosis**（top 2-3 leverage gap + 归因到 agent）→ **existing_prompt_audit**（读 `agent_prompts_snapshot`——每个 target agent 的 persona + 关键 section + `## Learnings (system-evolved)`——检查 gap 对应的规则是否已存在 / 已失效 / 有冲突）→ prompt_edit_reasoning。**"先看自己是谁、再看哪里差、再看现有 prompt 有没有、最后才提修改"**——防止 LLM 凭记忆重复已有规则或和现有 invariant 冲突 |

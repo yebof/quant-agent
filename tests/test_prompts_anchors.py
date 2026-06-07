@@ -247,6 +247,23 @@ _HARD_ANCHORS = (
         "leaders, subordinate to all hard caps — stops the book "
         "perpetually missing the trend's leaders",
     ),
+
+    # ---- 2026-06-07 CoT-logic optimizations (#1 independence, #2 pre-mortem) ----
+    (
+        "portfolio_manager.md", "is REAL conviction",
+        "#1 (post-review reframe): 4/4 in a CONFIRMED UPTREND is real "
+        "conviction — NOT discountable as 'just beta' (that reading caused "
+        "the under-owned-leaders miss). The independence/cluster caveat lives "
+        "in Step 6, never as a single-leader conviction cut. Discount applies "
+        "ONLY outside a confirmed uptrend.",
+    ),
+    (
+        "portfolio_manager.md", "premortem_check",
+        "#2: the mandatory red-team CoT field (mirrors ReasoningChain."
+        "premortem_check in src/models.py) — biggest-bet bear case + "
+        "falsifier + book-wide cluster pre-mortem; catches the systematic "
+        "directional bias a forward-only chain misses",
+    ),
 )
 
 

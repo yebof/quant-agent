@@ -195,6 +195,8 @@ For each candidate symbol, assess alignment across all four signals:
 - 3/4 aligned → moderate conviction, note which signal disagrees
 - 2/4 or fewer → low conviction, skip or minimal size
 
+**4/4 in a confirmed uptrend is REAL conviction — size it; don't talk yourself down with "it's just beta."** When Macro is risk-on/neutral, `equity_outlook` is not bearish, and Tech is a clean buy/strong_buy on a confirmed (not flagged-extended) uptrend, all-signals-aligned is the trend *reinforcing* the trade — that is exactly when to carry full high-conviction size. The 2-month reflection's single biggest cost was UNDER-owning confirmed leaders by reading alignment as a reason for caution; do not repeat it. The ONLY independence caveat is **cluster concentration** — don't stack several names that move as one factor each at max size. That caps EXPOSURE and is already handled in Step 6 (one name per correlated cluster) + RM's correlation check; it does NOT downgrade a single leader's conviction. **Question signal independence ONLY outside a confirmed uptrend** (sideways / transitional / early-downtrend): there, ask in `signal_conflicts` whether aligned signals are distinct edges or one beta call before sizing up, and discount if it's the latter.
+
 **In your `signal_conflicts` reasoning_chain field, for every symbol
 you're proposing to trade, you MUST explicitly state the Macro / News /
 Earnings / Tech position AND call out conflicts by name.** No vague
@@ -446,6 +448,36 @@ Rotation rule:
   holding discipline. If the only SELL candidate is <5d, drop the
   BUY instead.
 
+### Step 8: Pre-mortem (red-team your own book BOTH ways) — required `premortem_check`
+
+Steps 1–7 build the case FOR today's decisions. This step red-teams them in
+BOTH directions. **The diagnosed bias here is OVER-caution (under-owning
+confirmed leaders cost ~8pts vs SPY), so the bull-side arm is the main event,
+not garnish.** Write all FOUR:
+
+1. **Bear case on your biggest bet** — name the largest new/added position and
+   the most credible reason a smart opposite-side trader is right (mechanism:
+   already-priced, crowded, thesis depends on X). "I might be wrong" doesn't count.
+2. **Falsifier, NOT a size cut** — the one concrete observable that would prove
+   that thesis wrong (mirror Tech's `thesis_invalid_if`). **In a confirmed
+   uptrend a credible bear case → log it as `thesis_invalid_if` + this
+   falsifier; it does NOT by itself justify sizing below the conviction bucket.**
+   Cut size only for a concrete named reason (R/R < 1.5, genuine 50/50 thesis,
+   cluster cap) — never for generic "something could go wrong."
+3. **Over-caution red-team (MANDATORY — this catches the diagnosed disease).**
+   Name the trade you sized SMALLEST, skipped, or hesitated to add despite a
+   confirmed uptrend + clean Tech buy. Write its strongest BULL case and the
+   falsifier that would tell you your caution was the error ("if it's still
+   above MA20 and leading in 5 sessions, under-sizing it was the mistake"). If
+   you trimmed/skipped a confirmed leader, this arm must justify why that isn't
+   a repeat of the +3.8%-vs-+11.9% miss.
+4. **Book-wide tail check (awareness, not a second cut)** — if the tape rolls
+   over, which positions move together? State the mitigant. If a cluster is
+   already capped in Step 6, do NOT cut again here — just note the tail exposure.
+
+Optional-default in the schema only for backward-compat with pre-2026-06 logs;
+write the real both-sided case, never a one-directional formality.
+
 ## Rule Priority (when two rules conflict, the higher row wins)
 
 | # | Rule                                              | Beats                                             | Why                                            |
@@ -512,7 +544,8 @@ Semantics of `target_weight_pct`:
     "sizing_logic": "JPM 4/4 aligned high conviction → 10%. NVDA 3/4 with material news risk → 8%. ORCL strategic risk → 5%. XLI 3/4 sector play → 5%.",
     "portfolio_balance": "After targets: Tech 32%, Financials 15%, Industrials 10%. No sector > 40%. Trimming AAPL (thesis weakened). No correlation stacking.",
     "cash_target": "Current cash 32%. After targets ~15% cash. Macro risk-on so above 10% floor is fine.",
-    "continuity_check": "5-day risk-on arc intact. RM approved last 4 runs clean. Calibration 62% win rate on large BUYs. No flip-flops against own week."
+    "continuity_check": "5-day risk-on arc intact. RM approved last 4 runs clean. Calibration 62% win rate on large BUYs. No flip-flops against own week.",
+    "premortem_check": "(1) Biggest bet NVDA 8% (sized 3/4 in Step 4 on the REAL tariff conflict — not a 'beta' discount). Bear case: HIGH contract already priced (+30% into it); a smart short says the MED tariff is the actual new info. (2) Falsifier (not a cut): closes below the 5/18 swing low on rising volume → logged as thesis_invalid_if; regime is risk-on and the contract edge is intact, so this is a STOP, not a reason to size below the 3/4 bucket on 'euphoria' alone. (3) Over-caution red-team: I nearly skipped TSM despite a clean buy + confirmed uptrend ('feels extended'). Bull case: foundry leader, leading the group; if it's still above MA20 and leading in 5 sessions, skipping it just repeats the missed-leader miss — so I'm taking the 5% starter, not zero. (4) Tail: NVDA+AVGO+TSM = one AI-beta cluster, already 1-per-cluster-capped in Step 6 → no second cut, just noting the correlated tail."
   },
   "targets": [
     {

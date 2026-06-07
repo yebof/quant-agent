@@ -1322,3 +1322,40 @@ def test_outlook_calibration_trend_none_when_no_forward_window():
     assert calib["n"] == 1
     assert calib["samples"][0]["trend_matched"] is None
     assert calib["bullish_trend_hit_rate_pct"] is None  # no resolved window
+
+
+# === 2026-06-07 CoT optimization #2: PM pre-mortem reasoning field ===
+
+def test_pm_reasoning_chain_premortem_optional_default_and_accepts_value():
+    """premortem_check follows the continuity_check pattern: optional-default
+    (zero blast radius on existing logs/tests that omit it) but the prompt
+    makes it mandatory. Adding it must NOT break a ReasoningChain built with
+    only the 7 required fields."""
+    from src.models import ReasoningChain
+    rc = ReasoningChain(
+        macro_filter="x", news_check="x", earnings_check="x",
+        signal_conflicts="x", sizing_logic="x", portfolio_balance="x",
+        cash_target="x",
+    )
+    assert rc.premortem_check == ""  # backward-compatible default
+    rc2 = ReasoningChain(
+        macro_filter="x", news_check="x", earnings_check="x",
+        signal_conflicts="x", sizing_logic="x", portfolio_balance="x",
+        cash_target="x", premortem_check="bear case: crowded beta; falsifier: MA50 break",
+    )
+    assert "falsifier" in rc2.premortem_check
+
+
+def test_pm_prompt_example_reasoning_chain_parses_with_premortem():
+    """The reasoning_chain example in portfolio_manager.md must stay parseable
+    into the model (incl. the new premortem_check) — pins prompt↔schema sync."""
+    import json, re
+    from pathlib import Path
+    from src.models import ReasoningChain
+    pm_path = Path(__file__).resolve().parent.parent / "config" / "prompts" / "portfolio_manager.md"
+    text = pm_path.read_text()
+    # pull the first reasoning_chain object out of the fenced JSON example
+    m = re.search(r'"reasoning_chain":\s*(\{.*?\n  \})', text, re.DOTALL)
+    assert m, "PM prompt no longer has a reasoning_chain JSON example"
+    rc = ReasoningChain(**json.loads(m.group(1)))
+    assert rc.premortem_check  # the example populates it (non-empty)
