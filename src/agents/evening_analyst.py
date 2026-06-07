@@ -284,12 +284,19 @@ def _fmt_outlook_calibration(calib: dict) -> str:
     def _pct(v):
         return f"{v:.0f}%" if isinstance(v, (int, float)) else "n/a"
     header = (
-        f"Overall hit rate: {_pct(calib.get('overall_hit_rate_pct'))} over {n} sessions. "
+        f"NEXT-DAY hit rate (NOISE — not a directional verdict): "
+        f"{_pct(calib.get('overall_hit_rate_pct'))} over {n} sessions. "
         f"By bias — bullish: {_pct(calib.get('bullish_hit_rate_pct'))}, "
         f"neutral: {_pct(calib.get('neutral_hit_rate_pct'))}, "
         f"bearish: {_pct(calib.get('bearish_hit_rate_pct'))}. "
         f"By conviction — high: {_pct(calib.get('high_conviction_hit_rate_pct'))}, "
-        f"low: {_pct(calib.get('low_conviction_hit_rate_pct'))}."
+        f"low: {_pct(calib.get('low_conviction_hit_rate_pct'))}.\n"
+        f"5-SESSION TREND hit rate (the real directional scorecard) — "
+        f"overall: {_pct(calib.get('overall_trend_hit_rate_pct'))}, "
+        f"bullish: {_pct(calib.get('bullish_trend_hit_rate_pct'))}, "
+        f"bearish: {_pct(calib.get('bearish_trend_hit_rate_pct'))}. "
+        f"A low next-day but decent 5-session trend rate = direction is right, "
+        f"daily timing is noise — keep participating, don't default neutral."
     )
     tail_rows = samples[:6]
     row_lines = []

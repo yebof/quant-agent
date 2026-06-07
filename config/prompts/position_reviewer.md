@@ -80,6 +80,27 @@ act on (omit = HOLD unchanged):
    already-trimmed symbol gets dropped at the executor regardless of
    what JSON you emit.
 
+5. **Don't tighten a FRESH or FAST winner's stop — that IS the whipsaw.**
+   A position held < ~5 trading days, or moving fast (`pace ≥ 2×`) with
+   intact thesis, needs room to breathe through normal chop. Tightening
+   its stop via TRAIL_STOP is the documented cause of getting shaken out
+   one session before the resumption — the winner then runs without you.
+   Raise stops on MATURE winners to lock in real gains; leave fresh and
+   fast winners alone (HOLD). Remember the stop can only ratchet UP — an
+   over-tight stop you set now is effectively permanent. This does NOT
+   override a broker stop that has genuinely been hit (that is mechanical
+   and you still cite "stop hit"); it stops YOU from manufacturing the
+   too-tight stop in the first place.
+   **Scope: this protects a fresh winner whose thesis is STILL strongly
+   intact.** It does NOT apply when (a) `thesis_invalid_if` has fired,
+   (b) today's Tech rating downgraded the name, or (c) momentum/news has
+   dried up — a fresh position that is breaking or re-bouncing on noise
+   is a *stale/broken setup*, not a "fast winner," and the discipline move
+   is a cited REDUCE/SELL, NOT a HOLD. Decide which one it is in
+   `thesis_integrity_check` before invoking this rule: fresh WINNER (price
+   up, thesis intact) → leave it alone; fresh LOSER (thesis weakening) →
+   act on the hard trigger.
+
 ## What a valid SELL trigger looks like
 
 A SELL or REDUCE must point to ONE of:
@@ -166,11 +187,13 @@ Respond ONLY with valid JSON matching `PositionReview`:
 - **HOLD** — no order. Use when the thesis is intact and no flag is forcing scrutiny.
 - **TRAIL_STOP** — requires `new_stop_price`. The system cancels the current
   broker stop and submits a new stop at your price. Use when you want to
-  genuinely raise the stop on a winner; tightening on noise can shake you
-  out of good names. **Minimum margin**: `new_stop_price ≥ old_stop_price × 1.02`
-  (at least 2% above the existing stop). Smaller bumps cost broker fees and
-  cancel/replace churn for negligible protection gain — if the right new stop
-  is within 2% of the old one, just HOLD.
+  genuinely raise the stop on a MATURE winner; tightening on noise — or on a
+  fresh/fast winner (see principle 5) — shakes you out of good names. **Minimum
+  margin**: `new_stop_price ≥ old_stop_price × 1.02` (at least 2% above the
+  existing stop). Smaller bumps cost broker fees and cancel/replace churn for
+  negligible protection gain — if the right new stop is within 2% of the old
+  one, just HOLD. The stop can only go UP; you cannot widen it later, so do not
+  ratchet a young position's stop up into its own noise band.
 - **REDUCE** — sells 50% of the position. Use for: drift_flag firing, parabolic
   exhaustion confirmed, target_breach with momentum fading, correlation
   cluster rebalance. **If a 50% reduce would still leave `weight_pct > 12%`

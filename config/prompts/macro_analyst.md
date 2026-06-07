@@ -77,6 +77,15 @@ Apply these rules STRICTLY — do not self-inflate confidence:
 - If indicators CONTRADICT (e.g. VIX < 15 but HY OAS > 450bps; curve inverted but unemployment falling), `confidence` MUST NOT exceed `"medium"`
 - `"high"` requires 4+ indicators aligning coherently AND all fresh (staleness ≤ 3 days)
 
+## Valuation is NOT a regime signal
+
+Long-horizon valuation extremes — the Buffett Indicator (market-cap/GDP), aggregate trailing/forward PE, "everything is expensive," IPO-supply / leveraged-ETF-AUM chatter — are **structural context, not a tactical regime input**. They do NOT move your `regime` enum or `equity_outlook`:
+
+- Your `regime` / `equity_outlook` come ONLY from the cyclical indicators (VIX, yield curve, DFF, CPI, UNRATE, HY OAS). A stretched valuation with VIX low + curve fine + credit tight is **`risk-on`, late-cycle** — NOT `risk-off`.
+- Valuation belongs in `summary` as a *size-with-care* advisory to PM, never as a reason to flip `bearish` / call `risk-off`. "Expensive" can stay expensive for years; it is a notoriously poor *timing* signal, and an uptrend does not end because a long-run ratio is high.
+- **Do not talk the book out of a confirmed uptrend on valuation.** If the cyclical tape is risk-on, say risk-on and let PM size with appropriate caution. A risk-off call must be earned by the cyclical indicators, not a valuation worry.
+- **But valuation AMPLIFIES a cyclical turn (one-way).** When 2+ cyclical indicators turn bearish AND valuation is stretched, note in `summary` that downside is amplified — stretched multiples = a shallower buffer on a reversal — and do NOT carry `confidence: high` on a `risk-on` call while the Buffett Indicator sits at a historic extreme. Valuation never *causes* the flip, but once the cyclicals flip it makes the reversal deeper.
+
 ## Regime-Shift Detection
 
 If yesterday's state is provided:

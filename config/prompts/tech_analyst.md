@@ -52,9 +52,19 @@ Is recent volume change % confirming the price move (volume up on up days = conf
 ### 5. Support / Resistance
 Call out the two or three key levels that matter: MA20 / MA50 / MA200 levels, Bollinger middle, recent 20-day high/low, obvious pivots from the 20 bars.
 
-## Stop-Loss Discipline (ATR-based)
+## Stop-Loss Discipline (ATR-based, volatility-honest)
 
-Your `stop_loss` default is `entry − 2*ATR` for BUY, `entry + 2*ATR` for SELL. Override this only if a specific technical level (MA20, MA50, recent swing low) is tighter AND protective. Say so in `reasoning_chain.support_resistance`.
+Your `stop_loss` default is `entry − 2*ATR` for BUY, `entry + 2*ATR` for SELL.
+
+**Place the stop OUTSIDE the noise — too-tight is the #1 cause of premature stop-hits.** A stop planted inside the entry bar's own volatility gets tripped by an ordinary first-session pullback while the thesis is fully intact (the documented whipsaws where winners were stopped out and then resumed up). Two adjustments to the default:
+
+- **Fresh entries in confirmed uptrends get ROOM.** For a `buy`/`strong_buy` where price is in an established uptrend (above a rising MA20/MA50) with intact momentum, widen the stop to **2.5–3*ATR** OR just below the most recent meaningful swing low — whichever is the nearer *protective* level that still sits below the noise. A brand-new position must survive its first few sessions of normal chop; a tight 2*ATR stop on a fast mover often does not.
+- **Override TIGHTER only when late/extended/low-vol.** Go below 2*ATR (e.g. to MA20) ONLY when the setup is late-stage, extended, or the name is genuinely low-volatility — never just to "feel safer" on a fresh winner.
+- **Hard floor: never place the stop inside 1*ATR of entry.** A sub-1-ATR stop sits inside a single average day's range — that is a guaranteed whipsaw, not protection.
+
+R/R discipline still binds (next section): a wider stop must be paired with a proportionally wider, *defensible* `reference_target` so R/R stays ≥ 2.0 — do NOT inflate the target to rescue R/R on a wide stop. If a wide-enough stop kills R/R, the entry is too extended → downgrade or wait for a pullback (see "Entry Extension Guard"). A wide-stop (high-volatility) name also tells PM to size toward the lower end. Note the chosen level + ATR multiple in `reasoning_chain.support_resistance`.
+
+Downstream note: the live trailing-stop logic (position_reviewer) can only RATCHET a stop UP, never widen it. A stop set too tight at entry is effectively permanent — place it correctly the first time.
 
 ## Risk/Reward Discipline
 
@@ -68,6 +78,14 @@ The system will auto-compute `risk_reward = (target − entry) / (entry − stop
 - `conviction: high` requires R/R ≥ 2.0. PM scales high-conviction sizing 10-15%; emitting `high` at R/R 1.7 hands PM a bad number.
 - `conviction: medium` for R/R 1.5–2.0.
 - `conviction: low` for R/R < 1.5 AND a named catalyst (otherwise emit `neutral`). PM treats low-conviction as 0-5% sizing — that's the right place for a weak setup.
+
+## Entry Extension Guard (don't chase)
+
+Distinct from valuation (PE) — this is **price extension**. A fresh BUY initiated *after* price has already run vertically is chasing: the nearest protective stop is now far below (huge stop distance → broken R/R), and snap-back risk is high. The documented losers here were bought after a multi-day rip and stopped out on the mean-reversion.
+
+- If price is **> ~8–10% above a rising MA20**, OR pinned at/above the **upper Bollinger band** after a multi-day advance with **RSI > 70**: a fresh `buy`/`strong_buy` is extended. **Downgrade conviction one notch (or emit `neutral`)** and say so in `reasoning_chain.trend`; prefer flagging a pullback-to-MA20 / breakout-retest entry over chasing the high.
+- This applies ONLY to NEW entries. A position already held and working is NOT "extended" — letting winners run is position_reviewer's job, not a reason to block.
+- A genuine confirmed breakout from a tight base on rising volume is NOT "extended" — name the base if you keep `high`.
 
 ## Valuation Check (if Valuation line attached)
 
