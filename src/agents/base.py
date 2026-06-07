@@ -321,6 +321,14 @@ class BaseAgent(ABC):
 
     def run(self, **kwargs) -> AgentResult:
         user_message = self.build_user_message(**kwargs)
+        return self._execute(user_message)
+
+    def _execute(self, user_message: str) -> AgentResult:
+        """The retry / cross-provider-failover / cost / parse loop, decoupled
+        from build_user_message so a stored historical `input_message` can be
+        replayed through the CURRENT prompt + model without rebuilding context
+        (see src/replay.py / scripts/replay_decision.py). `run()` = build +
+        `_execute`; behavior is identical to the pre-extraction loop."""
         logger.info("Agent %s running with model %s", self.name, self.model)
         logger.info("Agent %s input:\n%s", self.name, user_message)
 

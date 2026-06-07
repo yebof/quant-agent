@@ -9,6 +9,8 @@ pytest tests/ -v                                    # 全量测试
 python main.py --mode morning|midday|evening|live   # 手动跑
 ```
 
+**Prompt/CoT 改动验证（决策重放 harness，2026-06-07 加）**：prompt 改动这里没法回测,所以容易"听起来对就上"。`scripts/replay_decision.py` 把 `agent_logs` 里某次真实调用的 `input_message` 喂回**当前** prompt+model,结构化 diff 新旧决策(PM 比 per-symbol target 权重/conviction 的增删改),把"我觉得这版更好"变成"它在 N 个真实输入上具体怎么改了决策"。`--no-llm` 只列待重放、不烧 token；要 LLM 时需 `.env` key。核心逻辑在 `src/replay.py`(load/replay/diff,有单测),靠 `base.py:BaseAgent._execute(user_message)` 这个 seam(= `run()` 去掉 build_user_message 的部分)。**这是"先验证再改"的工具——P1-P5/#1-#2 这类软层改动应该用它在历史决策点上看效果,而不是只靠论证**。outcome-aware 评分(对比次日/5日真实走势判好坏)是它之上的下一层,尚未建。
+
 生产路径走 OS-level timer，不走 `--mode live`：
 - **Linux（当前部署，2026-05-11 起）**：systemd 用户 timer `~/.config/systemd/user/quant-agent@.timer` + service template，`Linger=yes` 让 user 退出登录后 timer 仍触发。状态：`systemctl --user list-timers 'quant-agent@*'`、日志：`journalctl --user -u 'quant-agent@*.service'`
 - **macOS（legacy）**：launchd `~/Library/LaunchAgents/com.quant-agent.*.plist`，配套 `scripts/install_plists.sh` 安装/重载。**2026-05-11 起 Mac 路径已停用**（迁到 Linux server）；plist 文件保留作 fallback，详细注意事项见下面 "macOS Sequoia" 段
