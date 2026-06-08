@@ -307,7 +307,22 @@ class BaseAgent(ABC):
             # SDK's own env magic) so it's visible + testable. The base_url must
             # include the API path prefix the relay serves (e.g. .../v1).
             base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
-            self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=_LLM_HTTP_TIMEOUT)
+            # OPENAI_CA_BUNDLE: trust a private CA for the relay's HTTPS (e.g. a
+            # relay behind Caddy's internal CA, whose self-signed chain the
+            # public trust store rejects). Path to a PEM of trust anchors (the
+            # relay's root CA). We still FULLY verify — cert chain + hostname/IP
+            # (the relay's leaf carries the IP in its SAN) — just against this CA
+            # instead of certifi. Scoped to the OpenAI client ONLY; the Anthropic
+            # failover keeps the public trust store. Unset => default public CAs.
+            ca_bundle = os.environ.get("OPENAI_CA_BUNDLE", "").strip()
+            if ca_bundle:
+                import httpx
+                self.client = OpenAI(
+                    api_key=api_key, base_url=base_url,
+                    http_client=httpx.Client(verify=ca_bundle, timeout=_LLM_HTTP_TIMEOUT),
+                )
+            else:
+                self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=_LLM_HTTP_TIMEOUT)
         else:
             from anthropic import Anthropic
             self.client = Anthropic(api_key=api_key, timeout=_LLM_HTTP_TIMEOUT)

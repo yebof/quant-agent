@@ -37,7 +37,8 @@ def _isolate_cwd(tmp_path, monkeypatch):
 
     monkeypatch.setattr(requests, "get", _no_network)
 
-    # Clear OPENAI_BASE_URL so a developer who `source .env`'d a relay endpoint
-    # into their shell doesn't change client-construction assertions. Tests that
-    # exercise relay routing set it explicitly via monkeypatch.
+    # Clear OPENAI_BASE_URL / OPENAI_CA_BUNDLE so a developer who `source .env`'d
+    # a relay endpoint into their shell doesn't change client-construction
+    # assertions. Tests that exercise relay routing set them via monkeypatch.
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_CA_BUNDLE", raising=False)

@@ -734,3 +734,35 @@ def test_deepseek_base_url_unaffected_by_openai_base_url(monkeypatch):
         oai_cls.return_value = MagicMock()
         ConcreteAgent(api_key="dk", model="deepseek-v4-flash", max_tokens=64)
         assert oai_cls.call_args.kwargs.get("base_url") == _DEEPSEEK_BASE_URL
+
+
+# === OPENAI_CA_BUNDLE — trust a private relay CA (Caddy-internal etc.) ===
+
+def test_openai_ca_bundle_trusts_relay_ca(monkeypatch, tmp_path):
+    """With OPENAI_CA_BUNDLE set, the OpenAI client is built with an httpx
+    client that verifies against THAT CA (full verification, just a private
+    trust anchor) and is passed as http_client."""
+    ca = tmp_path / "relay_ca.pem"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://relay.test/v1")
+    monkeypatch.setenv("OPENAI_CA_BUNDLE", str(ca))
+    with patch("openai.OpenAI") as oai_cls, patch("httpx.Client") as hc:
+        oai_cls.return_value = MagicMock()
+        hc.return_value = MagicMock()
+        ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)
+        # httpx client verifies against the pinned CA (NOT verify=False)
+        assert hc.call_args.kwargs.get("verify") == str(ca)
+        # and it's handed to the OpenAI SDK as the transport
+        assert "http_client" in oai_cls.call_args.kwargs
+        assert oai_cls.call_args.kwargs.get("base_url") == "https://relay.test/v1"
+
+
+def test_openai_no_ca_bundle_uses_default_trust(monkeypatch):
+    """Unset OPENAI_CA_BUNDLE → no custom http_client → SDK default (public CAs)."""
+    monkeypatch.delenv("OPENAI_CA_BUNDLE", raising=False)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://relay.test/v1")
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = MagicMock()
+        ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)
+        assert "http_client" not in oai_cls.call_args.kwargs
+        assert oai_cls.call_args.kwargs.get("timeout") is not None
