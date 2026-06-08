@@ -703,12 +703,12 @@ def test_deepseek_primary_no_failover_without_key(monkeypatch):
 def test_openai_base_url_routes_through_relay(monkeypatch):
     """When OPENAI_BASE_URL is set, the OpenAI client is built pointing at the
     relay (same chat/completions wire format, different host)."""
-    monkeypatch.setenv("OPENAI_BASE_URL", "http://165.154.193.90:8080/v1")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://relay.test/v1")
     with patch("openai.OpenAI") as oai_cls:
         oai_cls.return_value = MagicMock()
         ConcreteAgent(api_key="relay-key", model="gpt-5.5", max_tokens=64)
         _, kwargs = oai_cls.call_args
-        assert kwargs.get("base_url") == "http://165.154.193.90:8080/v1"
+        assert kwargs.get("base_url") == "http://relay.test/v1"
         assert kwargs.get("api_key") == "relay-key"
 
 
