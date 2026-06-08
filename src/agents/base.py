@@ -300,7 +300,14 @@ class BaseAgent(ABC):
                                  timeout=_LLM_HTTP_TIMEOUT)
         elif self._use_openai:
             from openai import OpenAI
-            self.client = OpenAI(api_key=api_key, timeout=_LLM_HTTP_TIMEOUT)
+            # OPENAI_BASE_URL lets OpenAI traffic go through an OpenAI-compatible
+            # relay/proxy (a "中转站") instead of api.openai.com — same chat/
+            # completions wire format, just a different host + key. Empty/unset
+            # => the SDK's default (api.openai.com). Read explicitly (not via the
+            # SDK's own env magic) so it's visible + testable. The base_url must
+            # include the API path prefix the relay serves (e.g. .../v1).
+            base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
+            self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=_LLM_HTTP_TIMEOUT)
         else:
             from anthropic import Anthropic
             self.client = Anthropic(api_key=api_key, timeout=_LLM_HTTP_TIMEOUT)

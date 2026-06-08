@@ -198,7 +198,9 @@ def test_openai_client_gets_explicit_http_timeout():
 
     with patch("openai.OpenAI") as mock_cls:
         ConcreteAgent(api_key="k", model="gpt-5.4", max_tokens=1024)
-        mock_cls.assert_called_once_with(api_key="k", timeout=_LLM_HTTP_TIMEOUT)
+        # base_url defaults to None (api.openai.com) unless OPENAI_BASE_URL is set
+        # for relay routing — see test_openai_base_url_routes_through_relay.
+        mock_cls.assert_called_once_with(api_key="k", base_url=None, timeout=_LLM_HTTP_TIMEOUT)
 
 
 def test_parse_json_prefers_agent_shape_over_larger_fragment():
@@ -694,3 +696,41 @@ def test_deepseek_primary_no_failover_without_key(monkeypatch):
         with pytest.raises(ConnectionError):
             agent.run(data="x")
         A.assert_not_called()
+
+
+# === OPENAI_BASE_URL relay routing (中转站) ===
+
+def test_openai_base_url_routes_through_relay(monkeypatch):
+    """When OPENAI_BASE_URL is set, the OpenAI client is built pointing at the
+    relay (same chat/completions wire format, different host)."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://165.154.193.90:8080/v1")
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = MagicMock()
+        ConcreteAgent(api_key="relay-key", model="gpt-5.5", max_tokens=64)
+        _, kwargs = oai_cls.call_args
+        assert kwargs.get("base_url") == "http://165.154.193.90:8080/v1"
+        assert kwargs.get("api_key") == "relay-key"
+
+
+def test_openai_base_url_defaults_none_when_unset(monkeypatch):
+    """Unset/empty OPENAI_BASE_URL → base_url=None → SDK default (api.openai.com)."""
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = MagicMock()
+        ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)
+        assert oai_cls.call_args.kwargs.get("base_url") is None
+    monkeypatch.setenv("OPENAI_BASE_URL", "   ")  # whitespace → treated as unset
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = MagicMock()
+        ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)
+        assert oai_cls.call_args.kwargs.get("base_url") is None
+
+
+def test_deepseek_base_url_unaffected_by_openai_base_url(monkeypatch):
+    """A deepseek-* model keeps its own base_url even if OPENAI_BASE_URL is set."""
+    from src.agents.base import _DEEPSEEK_BASE_URL
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://relay/v1")
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = MagicMock()
+        ConcreteAgent(api_key="dk", model="deepseek-v4-flash", max_tokens=64)
+        assert oai_cls.call_args.kwargs.get("base_url") == _DEEPSEEK_BASE_URL
