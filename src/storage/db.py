@@ -973,6 +973,25 @@ class Database:
             )
             self.conn.commit()
 
+    def backfill_equity_close(self, date: str, equity_close: float) -> bool:
+        """Fill in a still-NULL equity_close on an existing daily_pnl row.
+
+        Self-heal for the API-lag gap: portfolio_history doesn't have a
+        trading day's official close yet at the 20:00 ET evening run (it
+        lands hours later), so equity_close is stored NULL that night — but
+        it's available by the FOLLOWING evening's lookback fetch. Only
+        touches rows that are still NULL; never overwrites an already-
+        captured close. Returns True if a row was updated.
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                "UPDATE daily_pnl SET equity_close = ? "
+                "WHERE date = ? AND equity_close IS NULL",
+                (equity_close, date),
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+
     def get_daily_pnl(self, limit: int = 30, before_date: str | None = None) -> list[dict]:
         conditions = []
         params: list = []

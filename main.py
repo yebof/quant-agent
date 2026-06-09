@@ -50,7 +50,7 @@ def main():
         "--mode",
         choices=[
             "live", "once", "morning", "midday", "close", "evening",
-            "intra_check", "earnings_preprocess", "meta", "weekly",
+            "intra_check", "earnings_preprocess", "meta", "daily",
         ],
         default="once", help="Run mode",
     )
@@ -65,61 +65,70 @@ def main():
     )
     args = parser.parse_args()
 
-    config_path = Path(args.config)
-    if not config_path.is_absolute():
-        config_path = PROJECT_ROOT / config_path
-    if not config_path.exists():
-        logger.error("Config file not found: %s", config_path)
-        sys.exit(1)
-
-    config = load_config(config_path)
-    logger.info("Config loaded. Universe: %s, Paper: %s", config.trading.universe, config.alpaca.paper)
-
-    # Loud startup warning when running against the live Alpaca endpoint.
-    # Operators flipping `alpaca.paper: false` in the YAML is the single
-    # action that converts every subsequent BUY/SELL into a real-money
-    # order — make sure they SEE the change at every startup, not just
-    # the first one. Telegram operators who never look at logs still see
-    # the order list itself, but a launchd one-off run is the dangerous
-    # case (no Telegram, no live tail) where a misconfigured config
-    # could silently flip paper → live with no human-visible signal.
-    if not config.alpaca.paper:
-        logger.warning(
-            "LIVE TRADING ENABLED (alpaca.paper=false). Real-money orders "
-            "will be submitted via the Alpaca API key from .env. To revert "
-            "to paper trading, set `alpaca.paper: true` in your config."
-        )
-
-    # Refresh LLM pricing from LiteLLM's public JSON if our cache is
-    # stale (>24h). Best-effort: fetch failure or no-network falls back
-    # to the in-memory PRICING dict (cache or hardcoded baseline).
-    # Cost tracking is observability-only — a stale price table never
-    # blocks trading.
-    try:
-        refresh_pricing()
-    except Exception as exc:
-        logger.warning("pricing refresh failed at startup: %s", exc)
-
+    # Construct the notifier and the finally-block state FIRST — before
+    # anything that can crash (config loading, pricing refresh, pipeline
+    # construction). A crash in any of those used to be a complete blind
+    # spot: no notifier existed yet and the protective try/finally hadn't
+    # started, so nothing could tell the operator the session never ran
+    # (this was the root cause of the missing-Saturday-report incident —
+    # a pydantic ValidationError thrown by load_config() because .env
+    # hadn't been sourced).
     notifier = TelegramNotifier()
-
-    if args.mode == "live":
-        # The blocking scheduler runs forever and never reaches the
-        # finally block below. Per-session Telegram notifications are
-        # therefore emitted by TradingScheduler._run_safe (its own
-        # finally hook + format_session_result), which mirrors the
-        # one-shot path here. audit F6: this used to be only a comment
-        # claiming parity while _run_safe in fact just logged.
-        notifier.send("🟢 quant-agent live scheduler starting")
-        scheduler = TradingScheduler(config)
-        scheduler.setup()
-        scheduler.start()
-        return
-
-    pipeline = TradingPipeline(config)
     start = time.monotonic()
     result = None
     error: BaseException | None = None
     try:
+        config_path = Path(args.config)
+        if not config_path.is_absolute():
+            config_path = PROJECT_ROOT / config_path
+        if not config_path.exists():
+            logger.error("Config file not found: %s", config_path)
+            sys.exit(1)
+
+        config = load_config(config_path)
+        logger.info("Config loaded. Universe: %s, Paper: %s", config.trading.universe, config.alpaca.paper)
+
+        # Loud startup warning when running against the live Alpaca endpoint.
+        # Operators flipping `alpaca.paper: false` in the YAML is the single
+        # action that converts every subsequent BUY/SELL into a real-money
+        # order — make sure they SEE the change at every startup, not just
+        # the first one. Telegram operators who never look at logs still see
+        # the order list itself, but a launchd one-off run is the dangerous
+        # case (no Telegram, no live tail) where a misconfigured config
+        # could silently flip paper → live with no human-visible signal.
+        if not config.alpaca.paper:
+            logger.warning(
+                "LIVE TRADING ENABLED (alpaca.paper=false). Real-money orders "
+                "will be submitted via the Alpaca API key from .env. To revert "
+                "to paper trading, set `alpaca.paper: true` in your config."
+            )
+
+        # Refresh LLM pricing from LiteLLM's public JSON if our cache is
+        # stale (>24h). Best-effort: fetch failure or no-network falls back
+        # to the in-memory PRICING dict (cache or hardcoded baseline).
+        # Cost tracking is observability-only — a stale price table never
+        # blocks trading.
+        try:
+            refresh_pricing()
+        except Exception as exc:
+            logger.warning("pricing refresh failed at startup: %s", exc)
+
+        if args.mode == "live":
+            # The blocking scheduler runs forever in the normal case and
+            # never reaches the finally block below. Per-session Telegram
+            # notifications are therefore emitted by TradingScheduler._run_safe
+            # (its own finally hook + format_session_result), which mirrors
+            # the one-shot path here. audit F6: this used to be only a
+            # comment claiming parity while _run_safe in fact just logged.
+            # If the scheduler itself crashes at startup or exits, the
+            # finally block below now also catches it (previously silent).
+            notifier.send("🟢 quant-agent live scheduler starting")
+            scheduler = TradingScheduler(config)
+            scheduler.setup()
+            scheduler.start()
+            return
+
+        pipeline = TradingPipeline(config)
         if args.mode == "once" or args.mode == "morning":
             result = pipeline.run_morning()
         elif args.mode == "midday":
@@ -134,12 +143,13 @@ def main():
             result = pipeline.run_earnings_preprocess()
         elif args.mode == "meta":
             result = pipeline.run_quarterly_meta_reflection(force=args.force)
-        elif args.mode == "weekly":
-            result = pipeline.run_weekly()
+        elif args.mode == "daily":
+            result = pipeline.run_daily()
     except BaseException as exc:
         # Catch broadly (incl. SystemExit / KeyboardInterrupt) so a
-        # wrapper-kill or ctrl-C still gets a notification — but
-        # re-raise so the process exits with the proper status code.
+        # wrapper-kill, a config-load crash, or ctrl-C still gets a
+        # notification — but re-raise so the process exits with the
+        # proper status code.
         error = exc
         raise
     finally:

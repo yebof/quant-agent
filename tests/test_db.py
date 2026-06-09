@@ -700,3 +700,27 @@ def test_daily_pnl_reinsert_preserves_equity_close_when_none(db):
     assert row["daily_pnl"] == -550.0         # other columns still updated
     db.insert_daily_pnl("2026-05-28", 100_450.0, -550.0, -0.55, equity_close=100_600.0)
     assert db.get_daily_pnl(limit=1)[0]["equity_close"] == 100_600.0  # real value overwrites
+
+
+def test_backfill_equity_close_fills_null(db):
+    """[API-lag self-heal] A NULL equity_close (yesterday's portfolio_history
+    fetch hit the lag gap) gets filled once the API has caught up."""
+    db.insert_daily_pnl("2026-05-29", 100_000.0, -50.0, -0.05)  # equity_close NULL
+    assert db.backfill_equity_close("2026-05-29", 100_053.18) is True
+    row = [r for r in db.get_daily_pnl(limit=5) if r["date"] == "2026-05-29"][0]
+    assert row["equity_close"] == 100_053.18
+
+
+def test_backfill_equity_close_never_overwrites_existing(db):
+    """[API-lag self-heal] Must not clobber an already-captured 4pm close —
+    backfill is a gap-filler, not a corrector."""
+    db.insert_daily_pnl("2026-05-28", 100_400.0, -600.0, -0.59, equity_close=100_500.0)
+    assert db.backfill_equity_close("2026-05-28", 999_999.0) is False
+    row = [r for r in db.get_daily_pnl(limit=5) if r["date"] == "2026-05-28"][0]
+    assert row["equity_close"] == 100_500.0  # untouched
+
+
+def test_backfill_equity_close_no_row_for_date(db):
+    """[API-lag self-heal] Backfilling a date with no daily_pnl row is a
+    no-op, not a crash (e.g. lookback window predates the account's history)."""
+    assert db.backfill_equity_close("2020-01-01", 100_000.0) is False
