@@ -229,7 +229,9 @@ class TradingPipeline:
 
         def _key_for(model: str) -> str:
             """Return the right API key based on model name."""
-            from src.agents.base import _is_openai_model
+            from src.agents.base import _is_deepseek_model, _is_openai_model
+            if _is_deepseek_model(model):
+                return config.api_keys.deepseek
             if _is_openai_model(model):
                 return config.api_keys.openai
             return config.api_keys.anthropic
@@ -238,16 +240,19 @@ class TradingPipeline:
             api_key=_key_for(config.llm.tech_analyst_model),
             model=config.llm.tech_analyst_model,
             max_tokens=config.llm.get_max_tokens("tech_analyst"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.portfolio_manager = PortfolioManagerAgent(
             api_key=_key_for(config.llm.portfolio_manager_model),
             model=config.llm.portfolio_manager_model,
             max_tokens=config.llm.get_max_tokens("portfolio_manager"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.risk_manager = RiskManagerAgent(
             api_key=_key_for(config.llm.risk_manager_model),
             model=config.llm.risk_manager_model,
             max_tokens=config.llm.get_max_tokens("risk_manager"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.risk_engine = RiskRuleEngine(RiskConfig(
             max_position_pct=config.risk.max_position_pct,
@@ -267,21 +272,25 @@ class TradingPipeline:
             api_key=_key_for(config.llm.position_reviewer_model),
             model=config.llm.position_reviewer_model,
             max_tokens=config.llm.get_max_tokens("position_reviewer"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.evening_analyst = EveningAnalystAgent(
             api_key=_key_for(config.llm.evening_analyst_model),
             model=config.llm.evening_analyst_model,
             max_tokens=config.llm.get_max_tokens("evening_analyst"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.news_analyst = NewsAnalystAgent(
             api_key=_key_for(config.llm.news_analyst_model),
             model=config.llm.news_analyst_model,
             max_tokens=config.llm.get_max_tokens("news_analyst"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.macro_analyst = MacroAnalystAgent(
             api_key=_key_for(config.llm.macro_analyst_model),
             model=config.llm.macro_analyst_model,
             max_tokens=config.llm.get_max_tokens("macro_analyst"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.news_provider = NewsDataProvider()
         self.news_store = NewsStore()
@@ -291,11 +300,13 @@ class TradingPipeline:
             api_key=_key_for(config.llm.earnings_analyst_model),
             model=config.llm.earnings_analyst_model,
             max_tokens=config.llm.get_max_tokens("earnings_analyst"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.meta_reflector = MetaReflectorAgent(
             api_key=_key_for(config.llm.meta_reflector_model),
             model=config.llm.meta_reflector_model,
             max_tokens=config.llm.get_max_tokens("meta_reflector"),
+            fallback_api_key=config.api_keys.anthropic,
         )
         self.earnings_provider = EarningsDataProvider()
         self.broker = AlpacaBroker(
@@ -2708,6 +2719,30 @@ class TradingPipeline:
             return {"samples": [], "n": 0}
         pnl_by_date = {r["date"]: r.get("daily_return_pct") for r in (pnl_rows or [])}
 
+        # Ordered trading-day series for multi-day (trend) forward returns. The
+        # next-day return is NOISE in a trending tape (flat up-days score a
+        # bullish call as a "miss"); a 5-session forward cumulative return is
+        # the directional scorecard evening should actually weigh, so it stops
+        # mis-learning a low next-day hit rate into "default neutral".
+        import bisect
+        _ordered = sorted(
+            ((d, r) for d, r in pnl_by_date.items() if r is not None),
+            key=lambda x: x[0],
+        )
+        _ordered_dates = [d for d, _ in _ordered]
+
+        def _fwd_cumulative(pred_date_str: str, n: int = 5):
+            """Sum daily_return_pct over the first n trading days STRICTLY
+            after pred_date_str. Returns None unless the FULL n-session window
+            has resolved — a partial window (e.g. 1 of 5 days for a very recent
+            prediction) is just a relabeled next-day return, not a trend, so we
+            withhold it rather than feed a misleading number."""
+            i = bisect.bisect_right(_ordered_dates, pred_date_str)
+            window = _ordered[i:i + n]
+            if len(window) < n:
+                return None
+            return sum(r for _, r in window)
+
         from datetime import date as _date, timedelta as _td
         samples: list[dict] = []
         for ins in insights:
@@ -2740,12 +2775,25 @@ class TradingPipeline:
                 matched = actual < -NEUTRAL_BAND
             else:  # neutral
                 matched = -NEUTRAL_BAND <= actual <= NEUTRAL_BAND
+            # 5-session forward cumulative return — the trend/direction metric.
+            fwd5 = _fwd_cumulative(pred_date_str, 5)
+            TREND_BAND = 0.75  # wider neutral band over 5 sessions than the 1d 0.3
+            if fwd5 is None:
+                trend_matched = None
+            elif bias == "bullish":
+                trend_matched = fwd5 > TREND_BAND
+            elif bias == "bearish":
+                trend_matched = fwd5 < -TREND_BAND
+            else:  # neutral
+                trend_matched = -TREND_BAND <= fwd5 <= TREND_BAND
             samples.append({
                 "date": pred_date_str,
                 "predicted_bias": bias,
                 "predicted_conviction": conv,
                 "actual_return_pct": round(actual, 2),
                 "matched": bool(matched),
+                "fwd5_return_pct": round(fwd5, 2) if fwd5 is not None else None,
+                "trend_matched": (None if trend_matched is None else bool(trend_matched)),
             })
             if len(samples) >= lookback:
                 break
@@ -2757,15 +2805,27 @@ class TradingPipeline:
                 return None
             return round(100 * sum(1 for s in eligible if s["matched"]) / len(eligible), 1)
 
+        def _trend_rate(filter_fn):
+            # Only over samples with a resolved 5-session forward window.
+            eligible = [s for s in samples if filter_fn(s) and s.get("trend_matched") is not None]
+            if not eligible:
+                return None
+            return round(100 * sum(1 for s in eligible if s["trend_matched"]) / len(eligible), 1)
+
         return {
             "samples": samples,
             "n": n,
+            # Next-day hit rates — NOISE filter; do not read as a directional verdict.
             "overall_hit_rate_pct": _rate(lambda s: True),
             "bullish_hit_rate_pct": _rate(lambda s: s["predicted_bias"] == "bullish"),
             "bearish_hit_rate_pct": _rate(lambda s: s["predicted_bias"] == "bearish"),
             "neutral_hit_rate_pct": _rate(lambda s: s["predicted_bias"] == "neutral"),
             "high_conviction_hit_rate_pct": _rate(lambda s: s["predicted_conviction"] == "high"),
             "low_conviction_hit_rate_pct": _rate(lambda s: s["predicted_conviction"] == "low"),
+            # 5-session forward (trend) hit rates — the real directional scorecard.
+            "overall_trend_hit_rate_pct": _trend_rate(lambda s: True),
+            "bullish_trend_hit_rate_pct": _trend_rate(lambda s: s["predicted_bias"] == "bullish"),
+            "bearish_trend_hit_rate_pct": _trend_rate(lambda s: s["predicted_bias"] == "bearish"),
         }
 
     def _build_trade_grade_summary(self, lookback_days: int = 14) -> dict:
@@ -6183,10 +6243,14 @@ class TradingPipeline:
 
     def run_daily(self) -> dict:
         """Fetch full portfolio history from Alpaca, build a CSV, and send
-        via Telegram. No LLM calls — pure data export. Runs Mon-Fri.
+        via Telegram. No LLM calls — pure data export. Runs on weekdays.
 
-        Returns {"status": "sent", "rows": N} on success, or
-        {"status": "error", "error": "..."} on failure.
+        Returns {"status": "sent", "rows": N, "filename": ...} on delivery,
+        {"status": "skipped", ...} when Telegram is disabled (CSV built but no
+        sink), {"status": "error", ...} on a real failure. The status must be
+        honest: previously it reported "sent" even when the upload failed or
+        the notifier was disabled, so the operator couldn't tell a delivered
+        export from a silently-dropped one.
         """
         from src.notifier import build_daily_csv, TelegramNotifier
         from src.trading_calendar import et_today
@@ -6199,10 +6263,27 @@ class TradingPipeline:
             date_str = et_today().strftime("%Y-%m-%d")
             filename = f"pnl_history_{date_str}.csv"
             caption = f"📊 P&L History export — {date_str} ({len(closes)} trading days)"
-            TelegramNotifier().send_document(csv_bytes, filename, caption)
-            logger.info("run_daily: sent %d rows as %s", len(closes), filename)
-            return {"status": "sent", "rows": len(closes), "filename": filename}
+            notifier = TelegramNotifier()
+            delivered = notifier.send_document(csv_bytes, filename, caption)
+            base = {"rows": len(closes), "filename": filename}
+            if delivered:
+                logger.info("run_daily: sent %d rows as %s", len(closes), filename)
+                return {"status": "sent", **base}
+            if not notifier.enabled:
+                # CSV built fine; Telegram simply isn't configured — not a
+                # failure, just nowhere to deliver it.
+                logger.info(
+                    "run_daily: built %d-row CSV %s but Telegram is disabled",
+                    len(closes), filename,
+                )
+                return {"status": "skipped", **base}
+            # Enabled but the upload failed (network / API / rate limit).
+            logger.error("run_daily: Telegram delivery failed for %s", filename)
+            return {"status": "error", "error": "telegram delivery failed", **base}
         except Exception as exc:
             logger.error("run_daily failed: %s", exc, exc_info=True)
             return {"status": "error", "error": str(exc)}
 
+    def run_weekly(self) -> dict:
+        """Backward-compatible alias for legacy invocations/tests."""
+        return self.run_daily()

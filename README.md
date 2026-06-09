@@ -189,8 +189,9 @@ pip install -e ".[dev]"
 1. Create `.env` (set `chmod 600` after — these are secrets):
 ```bash
 cat > .env << 'EOF'
-ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_API_KEY=sk-ant-...           # also the cross-provider failover key (OpenAI/DeepSeek → Claude)
 OPENAI_API_KEY=sk-...                  # optional — only needed if any agent stays on a gpt-*/o*-* model
+DEEPSEEK_API_KEY=sk-...                # optional — only needed if any agent uses a deepseek-* model
 FRED_API_KEY=...
 ALPACA_API_KEY=...
 ALPACA_SECRET_KEY=...
@@ -202,7 +203,7 @@ EOF
 chmod 600 .env
 ```
 
-2. Edit `config/settings.yaml` — models per agent, risk parameters, trading universe, schedule. Default after 2026-05-11 is `claude-opus-4-7` for all 9 agents; flip individual agents to a `gpt-*` model name to route them through OpenAI instead.
+2. Edit `config/settings.yaml` — models per agent, risk parameters, trading universe, schedule. Current default is `gpt-5.5` (OpenAI) for all 9 agents; flip an agent's model name to a `claude-*` (Anthropic), `deepseek-*` (DeepSeek, OpenAI-compatible — use `deepseek-v4-flash`; the `deepseek-chat`/`deepseek-reasoner` aliases retire 2026-07-24), or another `gpt-*`/`o*-*` (OpenAI) id and routing/keys/cost/failover follow the prefix automatically.
 
 ### Optional env vars
 

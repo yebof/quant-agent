@@ -384,3 +384,167 @@ def test_fmt_cost_zero_uses_two_decimal_consistent_with_cents():
     assert fmt_cost(0.005) == "$0.0050"
     # Boundary: exactly $0.01 uses 2-decimal.
     assert fmt_cost(0.01) == "$0.01"
+
+
+# === On-demand resolution of unfamiliar models (the gpt-5.5 "$?.??" bug) ===
+import json as _json_mod
+import pytest
+
+
+@pytest.fixture
+def _restore_pricing():
+    """Snapshot + restore the mutable module globals (PRICING and the
+    _UNKNOWN_MODELS memo) so on-demand-resolution tests don't leak resolved
+    rates / negative memos into the rest of the session."""
+    from src import cost_table
+    pricing_snap = {k: dict(v) for k, v in cost_table.PRICING.items()}
+    unknown_snap = set(cost_table._UNKNOWN_MODELS)
+    yield
+    cost_table.PRICING.clear()
+    cost_table.PRICING.update(pricing_snap)
+    cost_table._UNKNOWN_MODELS.clear()
+    cost_table._UNKNOWN_MODELS.update(unknown_snap)
+
+
+def test_gpt_5_5_prices_from_baseline():
+    """THE reported bug: every agent is on gpt-5.5 and the push showed
+    '$?.??'. gpt-5.5 must now produce a real cost (it's in _PRICING_FALLBACK
+    and in LiteLLM at $5/$30 per M, verified 2026-06-05)."""
+    cost = estimate_cost("gpt-5.5", 1_000_000, 1_000_000)
+    assert cost is not None
+    assert cost == PRICING["gpt-5.5"]["input"] + PRICING["gpt-5.5"]["output"]
+    assert 20.0 < cost < 60.0  # sanity: not a 1000x unit error
+
+
+def test_claude_opus_4_8_prices():
+    """The current/newest Claude (and config.py default) must be priced too."""
+    cost = estimate_cost("claude-opus-4-8", 1_000_000, 0)
+    assert cost is not None
+    assert cost == PRICING["claude-opus-4-8"]["input"]
+
+
+def test_resolves_unknown_model_from_cache_without_network(tmp_path, monkeypatch, _restore_pricing):
+    """A model in NEITHER fallback NOR PRICING but present in the local
+    LiteLLM cache resolves from cache — and must NOT touch the network."""
+    from src import cost_table
+    cache = tmp_path / "pricing_cache.json"
+    cache.write_text(_json_mod.dumps(
+        {"nova-test-1": {"input_cost_per_token": 5e-6, "output_cost_per_token": 30e-6}}
+    ))
+    monkeypatch.setattr(cost_table, "_CACHE_PATH", cache)
+
+    def _boom():
+        raise AssertionError("cache hit must not trigger a network fetch")
+    monkeypatch.setattr(cost_table, "_fetch_litellm_dataset", _boom)
+
+    cost = cost_table.estimate_cost("nova-test-1", 1_000_000, 1_000_000)
+    assert cost == 35.0  # 5 + 30 per M
+    # memoised into PRICING so the next call is a plain dict hit
+    assert cost_table.PRICING["nova-test-1"] == {"input": 5.0, "output": 30.0}
+
+
+def test_resolves_unknown_model_via_live_fetch_when_cache_missing(tmp_path, monkeypatch, _restore_pricing):
+    """No cache (e.g. fresh CI checkout / a brand-new model) → exactly one
+    live fetch resolves it. This is 'look it up on first run'."""
+    from src import cost_table
+    monkeypatch.setattr(cost_table, "_CACHE_PATH", tmp_path / "absent.json")
+    monkeypatch.setattr(
+        cost_table, "_fetch_litellm_dataset",
+        lambda: {"nova-test-2": {"input_cost_per_token": 5e-6, "output_cost_per_token": 30e-6}},
+    )
+    cost = cost_table.estimate_cost("nova-test-2", 1_000_000, 1_000_000)
+    assert cost == 35.0
+    assert "nova-test-2" in cost_table.PRICING
+
+
+def test_unknown_model_absent_from_dataset_is_memoised(tmp_path, monkeypatch, _restore_pricing):
+    """A model genuinely not in LiteLLM → None (honest '$?.??', never a
+    fabricated price) and is memoised so we never re-read for it."""
+    from src import cost_table
+    cache = tmp_path / "pricing_cache.json"
+    cache.write_text(_json_mod.dumps(
+        {"some-other": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}}
+    ))
+    monkeypatch.setattr(cost_table, "_CACHE_PATH", cache)  # fresh (just written)
+
+    assert cost_table.estimate_cost("ghost-model", 100, 50) is None
+    assert "ghost-model" in cost_table._UNKNOWN_MODELS
+
+    # Second call must short-circuit on the memo — prove no cache re-read.
+    def _boom():
+        raise AssertionError("memoised miss must not re-read the dataset")
+    monkeypatch.setattr(cost_table, "_read_cache_dataset", _boom)
+    assert cost_table.estimate_cost("ghost-model", 100, 50) is None
+
+
+def test_unknown_model_not_memoised_when_dataset_unreachable(tmp_path, monkeypatch, _restore_pricing):
+    """If the lookup fails only because the dataset is unreachable (no cache +
+    network down), do NOT memoise — so it can resolve once connectivity
+    returns instead of being stuck at '$?.??' forever."""
+    from src import cost_table
+    monkeypatch.setattr(cost_table, "_CACHE_PATH", tmp_path / "absent.json")
+    monkeypatch.setattr(cost_table, "_fetch_litellm_dataset", lambda: None)  # network down
+    assert cost_table.estimate_cost("temp-outage-model", 100, 50) is None
+    assert "temp-outage-model" not in cost_table._UNKNOWN_MODELS
+
+
+def test_fresh_cache_lacking_model_skips_redundant_fetch(tmp_path, monkeypatch, _restore_pricing):
+    """A FRESH cache that lacks the model must NOT trigger a fetch (re-fetching
+    the same upstream snapshot can't surface it) — it's memoised as unknown."""
+    from src import cost_table
+    cache = tmp_path / "pricing_cache.json"
+    cache.write_text(_json_mod.dumps({"x": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}}))
+    monkeypatch.setattr(cost_table, "_CACHE_PATH", cache)
+
+    def _boom():
+        raise AssertionError("fresh cache lacking the model must not fetch")
+    monkeypatch.setattr(cost_table, "_fetch_litellm_dataset", _boom)
+    assert cost_table.estimate_cost("not-in-fresh-cache", 100, 50) is None
+
+
+def test_litellm_entry_resolves_provider_prefixed_key():
+    """LiteLLM sometimes keys a model as 'openai/<id>' rather than the bare id.
+    The resolver tries provider-prefixed variants."""
+    from src.cost_table import _litellm_entry
+    data = {"openai/exotic-model": {"input_cost_per_token": 2e-6, "output_cost_per_token": 4e-6}}
+    assert _litellm_entry(data, "exotic-model") == {"input": 2.0, "output": 4.0}
+
+
+def test_rates_from_entry_validation():
+    """The shared validator rejects malformed / bool / non-positive entries
+    and converts per-token → per-million on the happy path."""
+    from src.cost_table import _rates_from_entry
+    assert _rates_from_entry({"input_cost_per_token": 5e-6, "output_cost_per_token": 30e-6}) == {"input": 5.0, "output": 30.0}
+    assert _rates_from_entry({"input_cost_per_token": 0, "output_cost_per_token": 30e-6}) is None  # non-positive
+    assert _rates_from_entry({"input_cost_per_token": True, "output_cost_per_token": 30e-6}) is None  # bool
+    assert _rates_from_entry({"input_cost_per_token": "x", "output_cost_per_token": 30e-6}) is None  # non-numeric
+    assert _rates_from_entry({"input_cost_per_token": 5e-6}) is None  # missing output
+    assert _rates_from_entry(None) is None
+    assert _rates_from_entry("garbage") is None
+
+
+def test_deepseek_models_priced_from_official_rates():
+    """DeepSeek rows use the OFFICIAL /pricing rates ($0.14/$0.28), pinned so the
+    STALE LiteLLM snapshot ($0.28/$0.42, which IS in the cache for deepseek-chat/
+    -reasoner) can't clobber them on a refresh."""
+    assert abs(estimate_cost("deepseek-v4-flash", 1_000_000, 1_000_000) - (0.14 + 0.28)) < 1e-9
+    # legacy aliases priced same as v4-flash (they route to it) — pinned, NOT the
+    # LiteLLM $0.28 input that would win without the pin.
+    assert abs(estimate_cost("deepseek-chat", 1_000_000, 0) - 0.14) < 1e-9
+    assert abs(estimate_cost("deepseek-reasoner", 1_000_000, 0) - 0.14) < 1e-9
+    # pro tier is more expensive
+    assert abs(estimate_cost("deepseek-v4-pro", 0, 1_000_000) - 0.87) < 1e-9
+
+
+def test_deepseek_pinned_survives_cache_refresh(tmp_path, monkeypatch, _restore_pricing):
+    """A cache refresh carrying LiteLLM's stale deepseek-chat ($0.28/$0.42) must
+    NOT overwrite the pinned official rate."""
+    from src import cost_table
+    cache = tmp_path / "pricing_cache.json"
+    monkeypatch.setattr(cost_table, "_CACHE_PATH", cache)
+    monkeypatch.setattr(
+        cost_table, "_fetch_litellm_dataset",
+        lambda: {"deepseek-chat": {"input_cost_per_token": 0.28e-6, "output_cost_per_token": 0.42e-6}},
+    )
+    cost_table.refresh_pricing(force=True)
+    assert cost_table.PRICING["deepseek-chat"] == {"input": 0.14, "output": 0.28}  # pin held

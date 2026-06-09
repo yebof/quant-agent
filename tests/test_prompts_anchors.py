@@ -208,6 +208,62 @@ _HARD_ANCHORS = (
         "'swing-trade signals (typical holding period 5-15 days)' "
         "created false tension with the medium-long-term mandate",
     ),
+
+    # ---- 2026-06-07 profit-reflection optimizations (P1-P5) ----
+    # 2-month reflection: account +3.8% vs SPY +11.9% — winners whipsawed
+    # out by too-tight stops, chased extended entries, macro over-caution
+    # mis-learned into "default neutral". These anchors pin the fixes.
+    (
+        "tech_analyst.md", "never place the stop inside 1*ATR",
+        "P1: the hard floor that stops the documented winner-whipsaw — a "
+        "sub-1-ATR stop sits inside one day's range = guaranteed shakeout",
+    ),
+    (
+        "tech_analyst.md", "Entry Extension Guard",
+        "P2: don't-chase rule (downgrade fresh BUY when >8-10% above MA20 "
+        "/ upper-band + RSI>70). Bought-the-top losses (MSFT/ORCL)",
+    ),
+    (
+        "position_reviewer.md", "FRESH or FAST winner",
+        "P3: don't TRAIL_STOP-tighten a <5d / pace≥2x winner — tightening "
+        "into the noise band is the documented premature stop-hit cause",
+    ),
+    (
+        "macro_analyst.md", "Valuation is NOT a regime signal",
+        "P4a: long-run valuation (Buffett Indicator etc.) must NOT flip "
+        "regime/equity_outlook bearish — regime comes from cyclical "
+        "indicators only; valuation is a size-with-care advisory",
+    ),
+    (
+        "evening_analyst.md", "5-session",
+        "P4b: the multi-day trend hit-rate evening must weigh over the "
+        "noisy next-day hit rate (mirrors *_trend_hit_rate_pct from "
+        "pipeline._build_recent_outlook_calibration) so it stops "
+        "mis-learning a low next-day rate into 'default neutral'",
+    ),
+    (
+        "portfolio_manager.md", "Momentum-leader starter sleeve",
+        "P5: small (≤5%) starter in repeatedly-missed confirmed-uptrend "
+        "leaders, subordinate to all hard caps — stops the book "
+        "perpetually missing the trend's leaders",
+    ),
+
+    # ---- 2026-06-07 CoT-logic optimizations (#1 independence, #2 pre-mortem) ----
+    (
+        "portfolio_manager.md", "is REAL conviction",
+        "#1 (post-review reframe): 4/4 in a CONFIRMED UPTREND is real "
+        "conviction — NOT discountable as 'just beta' (that reading caused "
+        "the under-owned-leaders miss). The independence/cluster caveat lives "
+        "in Step 6, never as a single-leader conviction cut. Discount applies "
+        "ONLY outside a confirmed uptrend.",
+    ),
+    (
+        "portfolio_manager.md", "premortem_check",
+        "#2: the mandatory red-team CoT field (mirrors ReasoningChain."
+        "premortem_check in src/models.py) — biggest-bet bear case + "
+        "falsifier + book-wide cluster pre-mortem; catches the systematic "
+        "directional bias a forward-only chain misses",
+    ),
 )
 
 

@@ -436,3 +436,104 @@ storage:
     f.write_text(no_key_yaml)
     cfg = load_config(f)
     assert cfg.risk.allow_margin is False
+
+
+def test_llm_config_defaults_are_current_claude_model():
+    """Stale claude-*-4-6 defaults are gone — if settings.yaml omits a model,
+    agents fall back to a current, priced Claude model, not a 4-6."""
+    from src.config import LLMConfig
+    from src.cost_table import estimate_cost
+    defaults = {
+        f: LLMConfig.model_fields[f].default
+        for f in LLMConfig.model_fields if f.endswith("_model")
+    }
+    assert set(defaults.values()) == {"claude-opus-4-7"}, defaults
+    # and the default is actually priced (cost won't show $?.??)
+    assert estimate_cost("claude-opus-4-7", 1000, 1000) is not None
+
+
+def test_load_config_requires_deepseek_key_for_selected_deepseek_model(tmp_path):
+    """A deepseek-* model with no DEEPSEEK_API_KEY must fail naming that key —
+    NOT silently fall into the Anthropic bucket (the pre-fix regression)."""
+    yaml_content = """
+api_keys:
+  anthropic: "anthropic-key"
+  deepseek: ""
+  fred: "fred-key"
+  alpaca_key: "alpaca-key"
+  alpaca_secret: "alpaca-secret"
+alpaca:
+  base_url: "https://paper-api.alpaca.markets"
+  paper: true
+llm:
+  tech_analyst_model: "deepseek-v4-flash"
+  max_tokens: 4096
+risk:
+  max_position_pct: 20
+  max_total_position_pct: 90
+  max_daily_loss_pct: 3
+  max_sector_pct: 40
+  require_stop_loss: true
+trading:
+  universe: ["SPY"]
+  lookback_days: 60
+  schedule:
+    morning: "06:00"
+    midday: "12:00"
+    evening: "16:30"
+storage:
+  db_path: "data/test.db"
+"""
+    config_file = tmp_path / "settings.yaml"
+    config_file.write_text(yaml_content)
+    from src.config import load_config
+    with pytest.raises(Exception, match="DEEPSEEK_API_KEY"):
+        load_config(config_file)
+
+
+def test_load_config_deepseek_only_does_not_require_anthropic(tmp_path):
+    """All-DeepSeek config with the DeepSeek key set loads clean and does NOT
+    demand ANTHROPIC_API_KEY (failover is best-effort, not mandatory)."""
+    yaml_content = """
+api_keys:
+  anthropic: ""
+  deepseek: "deepseek-key"
+  fred: "fred-key"
+  alpaca_key: "alpaca-key"
+  alpaca_secret: "alpaca-secret"
+alpaca:
+  base_url: "https://paper-api.alpaca.markets"
+  paper: true
+llm:
+  tech_analyst_model: "deepseek-v4-flash"
+  news_analyst_model: "deepseek-v4-flash"
+  macro_analyst_model: "deepseek-v4-flash"
+  earnings_analyst_model: "deepseek-v4-flash"
+  portfolio_manager_model: "deepseek-v4-flash"
+  risk_manager_model: "deepseek-v4-flash"
+  position_reviewer_model: "deepseek-v4-flash"
+  evening_analyst_model: "deepseek-v4-flash"
+  meta_reflector_model: "deepseek-v4-flash"
+  max_tokens: 4096
+risk:
+  max_position_pct: 20
+  max_total_position_pct: 90
+  max_daily_loss_pct: 3
+  max_sector_pct: 40
+  require_stop_loss: true
+trading:
+  universe: ["SPY"]
+  lookback_days: 60
+  schedule:
+    morning: "06:00"
+    midday: "12:00"
+    evening: "16:30"
+storage:
+  db_path: "data/test.db"
+"""
+    config_file = tmp_path / "settings.yaml"
+    config_file.write_text(yaml_content)
+    from src.config import load_config
+    cfg = load_config(config_file)
+    assert cfg.api_keys.deepseek == "deepseek-key"
+    assert cfg.llm.tech_analyst_model == "deepseek-v4-flash"

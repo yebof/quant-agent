@@ -363,14 +363,20 @@ def test_prompt_embeds_calibration_numbers():
                 "neutral_hit_rate_pct": 50.0,
                 "high_conviction_hit_rate_pct": 40.0,
                 "low_conviction_hit_rate_pct": 70.0,
+                "overall_trend_hit_rate_pct": 80.0,
+                "bullish_trend_hit_rate_pct": 78.0,
+                "bearish_trend_hit_rate_pct": 50.0,
             },
         )
 
-    assert "Overall hit rate:" in msg
+    assert "NEXT-DAY hit rate" in msg
     assert "60%" in msg
     assert "high: 40%" in msg
     assert "low: 70%" in msg
     assert "2026-04-14" in msg
+    # the new multi-day trend metric must be rendered (the directional scorecard)
+    assert "TREND hit rate" in msg
+    assert "78%" in msg
 
 
 def test_prompt_says_insufficient_when_no_calibration_history():

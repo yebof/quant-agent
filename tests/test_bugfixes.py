@@ -1265,3 +1265,97 @@ def test_main_exits_zero_on_terminal_status(monkeypatch):
                     "emergency_sold", "no_data"):
         exc = _run_main_with_result(monkeypatch, {"status": status})
         assert exc is None, f"{status} must NOT raise SystemExit (exited {exc})"
+
+
+# === 2026-06-07 reflection P4c: trend (5-session) calibration metric ===
+
+def test_outlook_calibration_adds_5session_trend_metric():
+    """next-day hit rate is NOISE in a trend; the new 5-session forward
+    (trend) hit rate is the directional scorecard. Scenario: bullish calls
+    where every NEXT day is +0.2% (< 0.3 band → next-day MISS) but the
+    5-session cumulative is +1.0% (> 0.75 band → trend MATCH). The fix must
+    score next-day=0% but trend=100% so evening stops concluding 'too
+    bullish → default neutral'."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = MagicMock()
+    # insights returned most-recent-first; three bullish/high calls
+    pipeline.db.get_recent_insights = MagicMock(return_value=[
+        {"date": "2026-04-15", "tomorrow_bias": "bullish", "tomorrow_conviction": "high"},
+        {"date": "2026-04-14", "tomorrow_bias": "bullish", "tomorrow_conviction": "high"},
+        {"date": "2026-04-13", "tomorrow_bias": "bullish", "tomorrow_conviction": "high"},
+    ])
+    # trading days, each +0.2% (flat-positive: next-day miss, 5d sum positive)
+    days = ["2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17",
+            "2026-04-20", "2026-04-21", "2026-04-22", "2026-04-23"]
+    pipeline.db.get_daily_pnl = MagicMock(return_value=[
+        {"date": d, "daily_return_pct": 0.2} for d in days
+    ])
+
+    calib = pipeline._build_recent_outlook_calibration(lookback=10)
+
+    assert calib["n"] == 3
+    # next-day: every +0.2 < 0.3 band → all miss
+    assert calib["bullish_hit_rate_pct"] == 0.0
+    # 5-session: cumulative 5×0.2 = 1.0 > 0.75 band → all match
+    assert calib["bullish_trend_hit_rate_pct"] == 100.0
+    assert calib["overall_trend_hit_rate_pct"] == 100.0
+    # samples carry both metrics
+    s = calib["samples"][0]
+    assert s["matched"] is False
+    assert s["trend_matched"] is True
+    assert abs(s["fwd5_return_pct"] - 1.0) < 1e-9
+
+
+def test_outlook_calibration_trend_none_when_no_forward_window():
+    """A prediction at the very end of the series has no 5-session forward
+    window yet → trend_matched None, trend rates None (not a false 0%)."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.db = MagicMock()
+    pipeline.db.get_recent_insights = MagicMock(return_value=[
+        {"date": "2026-04-15", "tomorrow_bias": "bullish", "tomorrow_conviction": "high"},
+    ])
+    # only ONE forward day exists (next-day resolves; 5-session can't)
+    pipeline.db.get_daily_pnl = MagicMock(return_value=[
+        {"date": "2026-04-16", "daily_return_pct": 0.5},
+    ])
+    calib = pipeline._build_recent_outlook_calibration(lookback=10)
+    assert calib["n"] == 1
+    assert calib["samples"][0]["trend_matched"] is None
+    assert calib["bullish_trend_hit_rate_pct"] is None  # no resolved window
+
+
+# === 2026-06-07 CoT optimization #2: PM pre-mortem reasoning field ===
+
+def test_pm_reasoning_chain_premortem_optional_default_and_accepts_value():
+    """premortem_check follows the continuity_check pattern: optional-default
+    (zero blast radius on existing logs/tests that omit it) but the prompt
+    makes it mandatory. Adding it must NOT break a ReasoningChain built with
+    only the 7 required fields."""
+    from src.models import ReasoningChain
+    rc = ReasoningChain(
+        macro_filter="x", news_check="x", earnings_check="x",
+        signal_conflicts="x", sizing_logic="x", portfolio_balance="x",
+        cash_target="x",
+    )
+    assert rc.premortem_check == ""  # backward-compatible default
+    rc2 = ReasoningChain(
+        macro_filter="x", news_check="x", earnings_check="x",
+        signal_conflicts="x", sizing_logic="x", portfolio_balance="x",
+        cash_target="x", premortem_check="bear case: crowded beta; falsifier: MA50 break",
+    )
+    assert "falsifier" in rc2.premortem_check
+
+
+def test_pm_prompt_example_reasoning_chain_parses_with_premortem():
+    """The reasoning_chain example in portfolio_manager.md must stay parseable
+    into the model (incl. the new premortem_check) — pins prompt↔schema sync."""
+    import json, re
+    from pathlib import Path
+    from src.models import ReasoningChain
+    pm_path = Path(__file__).resolve().parent.parent / "config" / "prompts" / "portfolio_manager.md"
+    text = pm_path.read_text()
+    # pull the first reasoning_chain object out of the fenced JSON example
+    m = re.search(r'"reasoning_chain":\s*(\{.*?\n  \})', text, re.DOTALL)
+    assert m, "PM prompt no longer has a reasoning_chain JSON example"
+    rc = ReasoningChain(**json.loads(m.group(1)))
+    assert rc.premortem_check  # the example populates it (non-empty)

@@ -5,12 +5,13 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from src.agents.base import _is_openai_model
+from src.agents.base import _is_deepseek_model, _is_openai_model
 
 
 class ApiKeysConfig(BaseModel):
     anthropic: str
     openai: str = ""
+    deepseek: str = ""
     fred: str
     alpaca_key: str
     alpaca_secret: str
@@ -20,8 +21,10 @@ class ApiKeysConfig(BaseModel):
         for field_name in ("alpaca_key", "alpaca_secret", "fred"):
             if not getattr(self, field_name):
                 raise ValueError(f"Required API key '{field_name}' is empty — check your .env file")
-        if not self.anthropic and not self.openai:
-            raise ValueError("At least one of 'anthropic' or 'openai' API key must be set")
+        if not self.anthropic and not self.openai and not self.deepseek:
+            raise ValueError(
+                "At least one of 'anthropic', 'openai', or 'deepseek' API key must be set"
+            )
         return self
 
 
@@ -31,18 +34,18 @@ class AlpacaConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    tech_analyst_model: str = "claude-sonnet-4-6"
-    news_analyst_model: str = "claude-sonnet-4-6"
-    macro_analyst_model: str = "claude-sonnet-4-6"
-    earnings_analyst_model: str = "claude-opus-4-6"
-    portfolio_manager_model: str = "claude-opus-4-6"
-    risk_manager_model: str = "claude-opus-4-6"
-    position_reviewer_model: str = "claude-opus-4-6"
-    evening_analyst_model: str = "claude-opus-4-6"
+    tech_analyst_model: str = "claude-opus-4-7"
+    news_analyst_model: str = "claude-opus-4-7"
+    macro_analyst_model: str = "claude-opus-4-7"
+    earnings_analyst_model: str = "claude-opus-4-7"
+    portfolio_manager_model: str = "claude-opus-4-7"
+    risk_manager_model: str = "claude-opus-4-7"
+    position_reviewer_model: str = "claude-opus-4-7"
+    evening_analyst_model: str = "claude-opus-4-7"
     # Quarterly meta-reflector — strategic self-audit agent. Opus by default
     # because the input (deterministic digest) is dense and the output must
     # cite numbers precisely; a weaker model tends to vibe-reason.
-    meta_reflector_model: str = "claude-opus-4-6"
+    meta_reflector_model: str = "claude-opus-4-7"
     # Global fallback — used by any agent without an explicit override below.
     max_tokens: int
     # Per-agent overrides. Each agent emits a different output shape; the PM
@@ -245,11 +248,17 @@ class AppConfig(BaseModel):
     def _check_llm_provider_keys(self):
         openai_models = []
         anthropic_models = []
+        deepseek_models = []
 
         for field_name, model_name in self.llm.model_dump().items():
             if not field_name.endswith("_model"):
                 continue
-            if _is_openai_model(model_name):
+            # DeepSeek check FIRST: deepseek-* models don't match the OpenAI
+            # prefixes, but bucketing by elimination ("anything not OpenAI is
+            # Anthropic") would otherwise demand the wrong key for them.
+            if _is_deepseek_model(model_name):
+                deepseek_models.append(f"{field_name}={model_name}")
+            elif _is_openai_model(model_name):
                 openai_models.append(f"{field_name}={model_name}")
             else:
                 anthropic_models.append(f"{field_name}={model_name}")
@@ -258,6 +267,12 @@ class AppConfig(BaseModel):
             selected = ", ".join(openai_models)
             raise ValueError(
                 f"OPENAI_API_KEY is required for selected OpenAI models: {selected}"
+            )
+
+        if deepseek_models and not self.api_keys.deepseek:
+            selected = ", ".join(deepseek_models)
+            raise ValueError(
+                f"DEEPSEEK_API_KEY is required for selected DeepSeek models: {selected}"
             )
 
         if anthropic_models and not self.api_keys.anthropic:

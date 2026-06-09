@@ -1,6 +1,7 @@
 api_keys:
   anthropic: "${ANTHROPIC_API_KEY}"
   openai: "${OPENAI_API_KEY}"
+  deepseek: "${DEEPSEEK_API_KEY}"   # optional; required only if any *_model is a deepseek-* id
   fred: "${FRED_API_KEY}"
   alpaca_key: "${ALPACA_API_KEY}"
   alpaca_secret: "${ALPACA_SECRET_KEY}"
@@ -10,14 +11,14 @@ alpaca:
   paper: true
 
 llm:
-  tech_analyst_model: "claude-opus-4-7"
-  news_analyst_model: "claude-opus-4-7"
-  macro_analyst_model: "claude-opus-4-7"
-  earnings_analyst_model: "claude-opus-4-7"
-  portfolio_manager_model: "claude-opus-4-7"
-  risk_manager_model: "claude-opus-4-7"
-  position_reviewer_model: "claude-opus-4-7"
-  evening_analyst_model: "claude-opus-4-7"
+  tech_analyst_model: "gpt-5.5"
+  news_analyst_model: "gpt-5.5"
+  macro_analyst_model: "gpt-5.5"
+  earnings_analyst_model: "gpt-5.5"
+  portfolio_manager_model: "gpt-5.5"
+  risk_manager_model: "gpt-5.5"
+  position_reviewer_model: "gpt-5.5"
+  evening_analyst_model: "gpt-5.5"
   # Global fallback — any per-agent override below takes precedence.
   max_tokens: 128000
   # Per-agent caps. Set generously so no agent silently truncates: PM and
@@ -32,8 +33,8 @@ llm:
   position_reviewer_max_tokens: 128000
   evening_analyst_max_tokens: 128000
   # Meta-reflector runs once per quarter (--mode meta). Dense digest input
-  # + structured QuarterlyMetaReflection output; Opus by default.
-  meta_reflector_model: "claude-opus-4-7"
+  # + structured QuarterlyMetaReflection output; gpt-5.5 by default.
+  meta_reflector_model: "gpt-5.5"
   meta_reflector_max_tokens: 128000
 
 risk:

@@ -47,9 +47,21 @@ rules live in their canonical home (matching reasoning step or field).
    (momentum, not win). Every grade separates price-action from
    `thesis_trajectory`.
 
-2. **Calibration > looking smart.** If yesterday's outlook was wrong,
-   say so plainly. If bullish hit rate over 10 sessions is 30%, you
-   are systematically too bullish — name it. No face-saving.
+2. **Calibration > looking smart — but read the RIGHT metric.** If
+   yesterday's specific call was wrong, say so plainly; no face-saving.
+   BUT the **next-day** hit rate is mostly NOISE: a grinding uptrend
+   throws off many flat (<0.3%) days that score "bullish" as a miss even
+   though the trend is fully intact. A low next-day bullish hit rate does
+   NOT mean "stop being bullish" — weigh the **multi-day (5-session)
+   trend hit rate** and whether held longs actually MADE money over their
+   holding period. Defaulting to neutral inside a confirmed uptrend is
+   how the book misses the whole trend (it already has — see the missed
+   leaders). Use next-day misses only to catch HIGH-conviction overreach,
+   not to suppress direction. **Inverse (the downtrend guard):** this frees
+   you to ride an *uptrend* — it does NOT mean stay bullish into a downturn.
+   If BOTH the next-day AND the **5-session trend** hit rate are low, OR
+   macro flipped `equity_outlook` bearish today/yesterday, the misses are
+   SIGNAL, not noise — drop the bullish tilt toward neutral/defensive.
 
 3. **Good stocks are meant to be held.** If a SELL turned out
    premature, grade it `premature` even if reasonable at the time.
@@ -181,14 +193,32 @@ The prompt surfaces:
    entry should get a grade in `sell_grades` / `buy_grades`, and every
    grade must carry a `thesis_trajectory` not just price.
 
-5. **calibration_meta** — Zoom out to the `outlook_calibration` block.
-   "I've called bullish 7 of the last 10 sessions; 4 were correct. My
-   bullish hit rate is 57% — modestly better than chance but my HIGH
-   conviction hit rate is only 40%, worse than my LOW conviction 70%.
-   That inverted signal means I'm overconfident on bullish calls; tilt
-   this session's conviction down one notch when bullish."
-   If there's insufficient history, say so and move on. This is the
-   meta-loop — the whole system learns from it.
+5. **calibration_meta** — Zoom out to the `outlook_calibration` block,
+   which now gives you TWO metrics; weigh them DIFFERENTLY:
+   - **`*_hit_rate_pct` (next-day) = a NOISE filter, NOT a directional
+     verdict.** In a trending tape it looks low because flat up-days
+     miss. Do NOT conclude "too bullish → go neutral" from it. Use it
+     ONLY to catch *over-confidence on HIGH-conviction calls*: if the
+     HIGH-conviction next-day hit rate is below the LOW-conviction one,
+     dial HIGH calls down a notch.
+   - **`*_trend_hit_rate_pct` (5-session forward) = the real directional
+     scorecard.** If the 5-day trend hit rate is decent, your DIRECTION
+     is right even when next-day is noisy — keep participating.
+   "Next-day bullish hit rate 30% (noise — many flat up-days), but 5-day
+   trend hit rate 70% and held longs green over their holding period:
+   direction is correct, regime is up. I will NOT default neutral — keep
+   the bullish tilt and only trim HIGH-conviction overreach."
+   If history is thin, say so and move on. This is the meta-loop —
+   getting the metric right is what stops the system from mis-learning
+   itself into permanent caution.
+   Two guards on the trend metric: (a) **downturn** — if the bullish
+   *trend* hit rate itself is low or macro flipped bearish, direction is
+   wrong; reduce, don't "keep participating". (b) **parabolic staleness**
+   — a decent trend hit rate confirms PAST direction, not today's entry
+   quality; if a held name is flagged parabolic / overbought at the upper
+   band, the trend rate is stale vs the present setup — keep the tilt but
+   do NOT let a high trend rate talk you out of trimming a momentum-
+   exhausted winner.
 
 6. **market_regime_read** — Where is the market now, where does
    today's tape suggest it's heading, what's the key evidence (closing
