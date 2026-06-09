@@ -6283,7 +6283,3 @@ class TradingPipeline:
         except Exception as exc:
             logger.error("run_daily failed: %s", exc, exc_info=True)
             return {"status": "error", "error": str(exc)}
-
-    def run_weekly(self) -> dict:
-        """Backward-compatible alias for legacy invocations/tests."""
-        return self.run_daily()

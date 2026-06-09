@@ -210,7 +210,7 @@ def format_session_result(
         _append_intra_check_body(lines, result)
     elif mode == "meta":
         _append_meta_body(lines, result)
-    elif mode in ("daily", "weekly"):
+    elif mode == "daily":
         rows = result.get("rows", "?")
         filename = result.get("filename", "")
         lines.append(f"📊 {rows} rows → {filename}")
@@ -769,11 +769,6 @@ def build_daily_csv(closes: list[tuple[str, float]]) -> bytes:
         prev_spy = spy_close if spy_close else prev_spy
 
     return buf.getvalue().encode("utf-8")
-
-
-def build_weekly_csv(closes: list[tuple[str, float]]) -> bytes:
-    """Backward-compatible alias of build_daily_csv."""
-    return build_daily_csv(closes)
 
 
 def _attr_or_key(obj: Any, name: str) -> Any:

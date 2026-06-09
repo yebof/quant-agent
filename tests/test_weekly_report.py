@@ -1,9 +1,9 @@
-"""Weekly Saturday P&L CSV export (PR #98).
+"""Daily P&L CSV export (PR #98).
 
-Covers: build_weekly_csv settlement math (close-to-close, drawdown, return),
+Covers: build_daily_csv settlement math (close-to-close, drawdown, return),
 SPY column population + graceful degradation, broker.get_full_portfolio_history
-ET-date mapping + pre-funding skip, send_document, run_weekly orchestration,
-and the format_session_result weekly body.
+ET-date mapping + pre-funding skip, send_document, run_daily orchestration,
+and the format_session_result daily body.
 """
 import csv
 import io
@@ -17,7 +17,7 @@ def _parse_csv(b: bytes) -> list[dict]:
     return list(csv.DictReader(io.StringIO(b.decode("utf-8"))))
 
 
-def test_build_weekly_csv_close_to_close_pnl_and_drawdown(monkeypatch):
+def test_build_daily_csv_close_to_close_pnl_and_drawdown(monkeypatch):
     """Per-row Daily P&L = consecutive close diff; drawdown vs running peak."""
     from src import notifier
     # No network: force the SPY fetch to fail → SPY columns blank.
@@ -27,7 +27,7 @@ def test_build_weekly_csv_close_to_close_pnl_and_drawdown(monkeypatch):
         ("2026-05-27", 100_500.0),   # +500
         ("2026-05-28", 100_200.0),   # -300, drawdown from 100500
     ]
-    out = _parse_csv(notifier.build_weekly_csv(closes))
+    out = _parse_csv(notifier.build_daily_csv(closes))
     assert [r["Date"] for r in out] == ["2026-05-26", "2026-05-27", "2026-05-28"]
     assert out[0]["Daily P&L"] == "+0.00"          # first row has no predecessor
     assert out[1]["Daily P&L"] == "+500.00"
@@ -42,12 +42,12 @@ def test_build_weekly_csv_close_to_close_pnl_and_drawdown(monkeypatch):
     assert out[1]["SPY Close"] == "" and out[1]["SPY Return %"] == ""
 
 
-def test_build_weekly_csv_empty_returns_empty_bytes():
+def test_build_daily_csv_empty_returns_empty_bytes():
     from src import notifier
-    assert notifier.build_weekly_csv([]) == b""
+    assert notifier.build_daily_csv([]) == b""
 
 
-def test_build_weekly_csv_populates_spy(monkeypatch):
+def test_build_daily_csv_populates_spy(monkeypatch):
     """SPY Close + Return % populated when yfinance returns data."""
     import pandas as pd
     from src import notifier
@@ -55,7 +55,7 @@ def test_build_weekly_csv_populates_spy(monkeypatch):
     df = pd.DataFrame({"Close": [500.0, 505.0, 503.0]}, index=idx)
     monkeypatch.setattr("yfinance.download", lambda *a, **k: df)
     closes = [("2026-05-26", 100_000.0), ("2026-05-27", 100_500.0), ("2026-05-28", 100_200.0)]
-    out = _parse_csv(notifier.build_weekly_csv(closes))
+    out = _parse_csv(notifier.build_daily_csv(closes))
     assert out[0]["SPY Close"] == "500.00"
     assert out[1]["SPY Close"] == "505.00"
     # SPY return row1 = (505-500)/500 = +1.0000%
@@ -103,7 +103,7 @@ def test_send_document_posts_and_swallows(monkeypatch):
         assert n.send_document(b"x", "x.csv") is False   # swallowed
 
 
-def test_run_weekly_sends_and_reports(monkeypatch):
+def test_run_daily_sends_and_reports(monkeypatch):
     from src.pipeline import TradingPipeline
     pipe = TradingPipeline.__new__(TradingPipeline)
     pipe.broker = MagicMock()
@@ -114,29 +114,29 @@ def test_run_weekly_sends_and_reports(monkeypatch):
     sent = {}
     with patch("src.notifier.TelegramNotifier") as TN:
         TN.return_value.send_document = lambda b, f, c="": sent.update(filename=f, n=len(b)) or True
-        res = pipe.run_weekly()
+        res = pipe.run_daily()
     assert res["status"] == "sent"
     assert res["rows"] == 2
     assert res["filename"].startswith("pnl_history_") and res["filename"].endswith(".csv")
 
 
-def test_run_weekly_error_on_no_data():
+def test_run_daily_error_on_no_data():
     from src.pipeline import TradingPipeline
     pipe = TradingPipeline.__new__(TradingPipeline)
     pipe.broker = MagicMock()
     pipe.broker.get_full_portfolio_history.return_value = []
-    res = pipe.run_weekly()
+    res = pipe.run_daily()
     assert res["status"] == "error"
 
 
-def test_format_session_result_weekly_body():
+def test_format_session_result_daily_body():
     from src.notifier import format_session_result
-    msg = format_session_result("weekly", {"status": "sent", "run_id": "run-w", "rows": 42, "filename": "pnl_history_2026-05-30.csv"}, 3.0)
+    msg = format_session_result("daily", {"status": "sent", "run_id": "run-w", "rows": 42, "filename": "pnl_history_2026-05-30.csv"}, 3.0)
     assert msg is not None
     assert "42 rows" in msg and "pnl_history_2026-05-30.csv" in msg
 
 
-def test_build_weekly_csv_filters_nan_spy(monkeypatch):
+def test_build_daily_csv_filters_nan_spy(monkeypatch):
     """[Bug 1] A NaN SPY close (data gap/halt) must NOT render as '+nan' and
     must NOT poison prev_spy for later rows — the NaN day is dropped and the
     next valid day diffs against the last *valid* prior close."""
@@ -146,7 +146,7 @@ def test_build_weekly_csv_filters_nan_spy(monkeypatch):
     df = pd.DataFrame({"Close": [500.0, float("nan"), 503.0]}, index=idx)
     monkeypatch.setattr("yfinance.download", lambda *a, **k: df)
     closes = [("2026-05-26", 100_000.0), ("2026-05-27", 100_500.0), ("2026-05-28", 100_200.0)]
-    raw = notifier.build_weekly_csv(closes)
+    raw = notifier.build_daily_csv(closes)
     assert b"nan" not in raw.lower()              # no '+nan' leak anywhere
     out = _parse_csv(raw)
     assert out[1]["SPY Close"] == "" and out[1]["SPY Return %"] == ""   # NaN day blank
@@ -155,7 +155,7 @@ def test_build_weekly_csv_filters_nan_spy(monkeypatch):
     assert float(out[2]["SPY Return %"]) == pytest.approx(0.6, abs=1e-3)
 
 
-def test_run_weekly_skipped_when_telegram_disabled(monkeypatch):
+def test_run_daily_skipped_when_telegram_disabled(monkeypatch):
     """[Bug 2] Telegram disabled (no creds) → CSV built but undelivered →
     honest 'skipped', not 'sent'."""
     from src.pipeline import TradingPipeline
@@ -168,11 +168,11 @@ def test_run_weekly_skipped_when_telegram_disabled(monkeypatch):
     with patch("src.notifier.TelegramNotifier") as TN:
         TN.return_value.enabled = False
         TN.return_value.send_document.return_value = False
-        res = pipe.run_weekly()
+        res = pipe.run_daily()
     assert res["status"] == "skipped" and res["rows"] == 2
 
 
-def test_run_weekly_error_when_delivery_fails(monkeypatch):
+def test_run_daily_error_when_delivery_fails(monkeypatch):
     """[Bug 2] Telegram enabled but the upload failed → 'error', not 'sent'."""
     from src.pipeline import TradingPipeline
     pipe = TradingPipeline.__new__(TradingPipeline)
@@ -182,5 +182,5 @@ def test_run_weekly_error_when_delivery_fails(monkeypatch):
     with patch("src.notifier.TelegramNotifier") as TN:
         TN.return_value.enabled = True
         TN.return_value.send_document.return_value = False
-        res = pipe.run_weekly()
+        res = pipe.run_daily()
     assert res["status"] == "error"
