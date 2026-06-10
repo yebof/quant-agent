@@ -1,0 +1,17 @@
+# Fires the daily P&L CSV export Mon-Fri at 09:00 ET.
+[Unit]
+Description=quant-agent daily P&L CSV export — Mon-Fri 09:00 ET
+
+[Timer]
+# systemd resolves the IANA timezone, so this stays 09:00 New York across
+# DST — matching the project's everything-in-ET discipline. 09:00 ET also
+# guarantees yesterday's portfolio_history bar has settled (the 20:00 ET
+# evening run is often a day behind; by the next morning it never is).
+# Market holidays: the export still fires and simply re-sends history with
+# no new row — harmless, and simpler than teaching systemd the NYSE calendar.
+OnCalendar=Mon..Fri 09:00 America/New_York
+# Run a missed firing on boot (server was down at 09:00).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

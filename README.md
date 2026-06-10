@@ -280,6 +280,9 @@ python main.py --mode midday     # Position review + trailing stops
 python main.py --mode evening    # PnL report + insights for tomorrow
 python main.py --mode live       # APScheduler in-process (dev/legacy; production
                                  # uses systemd/launchd timers, not this)
+python main.py --mode daily      # P&L history CSV -> Telegram document
+                                 # (no LLM, no trading; full NAV/SPY/drawdown
+                                 # history from Alpaca portfolio_history)
 ```
 
 **Automated scheduling**: the production path is a 30-min OS-level timer (systemd `quant-agent@.timer` on Linux, launchd plist on macOS) that calls `scripts/run_if_et_window.sh <mode>` for each session. The wrapper checks the current **US/Eastern** wall clock against the target window, applies the cross-mode session lock (one heavy LLM session at a time, except `intra_check` which is exempt), and skips if the mode already ran today. Runs the right session at the right ET moment regardless of the host's timezone — handy when traveling. Windows (Mon-Fri ET, authoritative Python table at `src/trading_calendar.py` `SESSION_WINDOWS`, locked to the bash wrapper by `test_trading_calendar.py`):
@@ -289,6 +292,8 @@ python main.py --mode live       # APScheduler in-process (dev/legacy; productio
 - `midday` 13:00-14:30 ET — position review + real trailing stops (patient disposition)
 - `close` 15:30-16:00 ET — position review (act-on-trigger; window ≥ 30-min OS-timer tick so it never misses)
 - `evening` 20:00-22:00 ET — daily P&L + insights for next morning
+
+The **daily P&L CSV export** (`--mode daily`) is scheduled separately — it is a pure data export (no LLM, no orders), so it skips the window/lock wrapper entirely. A fixed-time systemd timer fires it Mon-Fri 09:00 ET via `scripts/run_daily_export.sh` (sources `.env`, 300s timeout). Units are tracked at `scripts/systemd/quant-agent-daily.{service,timer}`; install with `cp scripts/systemd/quant-agent-daily.* ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now quant-agent-daily.timer`. The CSV replaced the P&L history text table that the evening push used to embed.
 
 ## Trading Universe
 

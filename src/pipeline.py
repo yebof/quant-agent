@@ -5861,6 +5861,41 @@ class TradingPipeline:
                     "(API lag?) — evening uses the real-time P&L fallback",
                     closes[-1][0], today_str,
                 )
+            # Self-heal: when portfolio_history is a day behind at the
+            # 20:00 ET evening run (the "API lag?" branch above), that
+            # evening's equity_close landed NULL — but by a LATER evening
+            # the API has caught up on those dates, which are still inside
+            # this lookback window. Backfill any still-NULL rows now.
+            # today_str is excluded because today's row is owned by the
+            # branches above + save_evening_snapshot below: when today's
+            # bar is present the first branch already uses it as the
+            # official close, and when it's absent there is nothing to
+            # backfill yet.
+            for d, close_val in closes:
+                if d == today_str:
+                    continue
+                # Mirror the `prev_close > 0` guard above: Alpaca
+                # portfolio_history can emit 0.0 (pre-funding / account
+                # reset) or non-finite points, and a backfilled value is
+                # permanent (the fill targets NULL-only rows, so a bad
+                # write can never be corrected by a later run) — never
+                # freeze a corrupt equity in. NaN must be caught here
+                # anyway: sqlite binds it as NULL, which would make
+                # backfill report success while storing nothing.
+                if not (math.isfinite(close_val) and close_val > 0):
+                    logger.warning(
+                        "equity_close backfill skipped for %s: suspect "
+                        "equity value %r", d, close_val,
+                    )
+                    continue
+                try:
+                    if self.db.backfill_equity_close(d, close_val):
+                        logger.info(
+                            "equity_close backfilled for %s = %.2f (API lag self-heal)",
+                            d, close_val,
+                        )
+                except Exception as exc:
+                    logger.warning("equity_close backfill failed for %s: %s", d, exc)
         except Exception as e:
             logger.warning("4pm snapshot fetch failed: %s — using real-time P&L", e)
 
@@ -6223,9 +6258,9 @@ class TradingPipeline:
             "editor_report": editor_report,
         }
 
-    def run_weekly(self) -> dict:
+    def run_daily(self) -> dict:
         """Fetch full portfolio history from Alpaca, build a CSV, and send
-        via Telegram. No LLM calls — pure data export. Runs on Saturdays.
+        via Telegram. No LLM calls — pure data export. Runs on weekdays.
 
         Returns {"status": "sent", "rows": N, "filename": ...} on delivery,
         {"status": "skipped", ...} when Telegram is disabled (CSV built but no
@@ -6234,14 +6269,14 @@ class TradingPipeline:
         the notifier was disabled, so the operator couldn't tell a delivered
         export from a silently-dropped one.
         """
-        from src.notifier import build_weekly_csv, TelegramNotifier
+        from src.notifier import build_daily_csv, TelegramNotifier
         from src.trading_calendar import et_today
         try:
             closes = self.broker.get_full_portfolio_history()
             if not closes:
-                logger.warning("run_weekly: no portfolio history returned")
+                logger.warning("run_daily: no portfolio history returned")
                 return {"status": "error", "error": "no data from portfolio_history"}
-            csv_bytes = build_weekly_csv(closes)
+            csv_bytes = build_daily_csv(closes)
             date_str = et_today().strftime("%Y-%m-%d")
             filename = f"pnl_history_{date_str}.csv"
             caption = f"📊 P&L History export — {date_str} ({len(closes)} trading days)"
@@ -6249,20 +6284,19 @@ class TradingPipeline:
             delivered = notifier.send_document(csv_bytes, filename, caption)
             base = {"rows": len(closes), "filename": filename}
             if delivered:
-                logger.info("run_weekly: sent %d rows as %s", len(closes), filename)
+                logger.info("run_daily: sent %d rows as %s", len(closes), filename)
                 return {"status": "sent", **base}
             if not notifier.enabled:
                 # CSV built fine; Telegram simply isn't configured — not a
                 # failure, just nowhere to deliver it.
                 logger.info(
-                    "run_weekly: built %d-row CSV %s but Telegram is disabled",
+                    "run_daily: built %d-row CSV %s but Telegram is disabled",
                     len(closes), filename,
                 )
                 return {"status": "skipped", **base}
             # Enabled but the upload failed (network / API / rate limit).
-            logger.error("run_weekly: Telegram delivery failed for %s", filename)
+            logger.error("run_daily: Telegram delivery failed for %s", filename)
             return {"status": "error", "error": "telegram delivery failed", **base}
         except Exception as exc:
-            logger.error("run_weekly failed: %s", exc, exc_info=True)
+            logger.error("run_daily failed: %s", exc, exc_info=True)
             return {"status": "error", "error": str(exc)}
-

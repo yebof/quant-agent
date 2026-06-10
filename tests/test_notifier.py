@@ -353,8 +353,8 @@ def test_format_evening_return_pct_na_when_prior_equity_nonpositive():
     }
     msg = format_session_result("evening", result, 10.0)
     assert msg is not None
-    # Assert on the Daily P&L line specifically (the P&L history table,
-    # if a DB is present, legitimately contains "0.00%" elsewhere).
+    # Assert on the Daily P&L line specifically rather than bare "n/a"
+    # (other message sections could legitimately contain that text).
     assert "💰 Daily P&L: -$500.00 (n/a)" in msg, msg
 
 
@@ -937,9 +937,11 @@ def test_format_evening_missing_morning_session_is_red():
     assert "midday" in msg  # soft warning for the non-morning miss
 
 
-def test_format_evening_suggested_actions_precede_history_table():
-    """Suggested actions must appear ABOVE the long P&L history table so the
-    tail-clip truncation can't eat them on high-risk days."""
+def test_format_evening_suggested_actions_render_high_in_message():
+    """Suggested actions must appear high in the message (right after the
+    headline P&L) so the tail-clip truncation can't eat them on high-risk
+    days. (The P&L history table they used to precede was replaced by the
+    daily CSV export — PR #99.)"""
     result = {
         "status": "analyzed", "run_id": "r",
         "daily_pnl": -100.0, "total_value": 100_000.0,
@@ -952,7 +954,7 @@ def test_format_evening_suggested_actions_precede_history_table():
     msg = format_session_result("evening", result, 10.0)
     assert "⚡ Suggested actions:" in msg
     assert "Reduce NVDA exposure" in msg
-    # Appears before the Tomorrow block (which sits after the history table).
+    # Appears before the Tomorrow block (the tail of the message).
     assert msg.index("⚡ Suggested actions:") < msg.index("🔮 Tomorrow")
 
 
@@ -1052,36 +1054,3 @@ def test_deterministic_escalation_ignores_realtime_loss_when_4pm_small():
     }
     msg = format_session_result("evening", result, 10.0)
     assert "DETERMINISTIC ALERT" not in msg
-
-
-def test_pnl_history_table_uses_equity_close_for_4pm_consistency(tmp_path, monkeypatch):
-    """[C] The table anchors NAV + per-row P&L on equity_close, so today's row
-    shows the 4pm-to-4pm P&L (matching the headline) — NOT the real-time
-    daily_pnl. Regression against the headline/table contradiction."""
-    import sqlite3
-    from src.notifier import _pnl_history_table
-    db_dir = tmp_path / "data"; db_dir.mkdir()
-    dbp = db_dir / "quant_agent.db"
-    monkeypatch.setattr("src.notifier._DB_PATH", dbp)
-    monkeypatch.setattr("src.notifier._spy_daily_returns", lambda dates: {})  # no network
-    conn = sqlite3.connect(str(dbp))
-    conn.execute(
-        "CREATE TABLE daily_pnl (date TEXT PRIMARY KEY, total_value REAL, "
-        "daily_pnl REAL, daily_return_pct REAL, equity_close REAL)"
-    )
-    conn.executemany(
-        "INSERT INTO daily_pnl VALUES (?,?,?,?,?)",
-        [
-            # seed prior close = total_value - daily_pnl = 100000
-            ("2026-05-27", 100_400.0, 400.0, 0.40, 100_300.0),   # 4pm: +300
-            ("2026-05-28", 101_200.0, 1200.0, 1.20, 100_500.0),  # 4pm: 100500-100300 = +200
-        ],
-    )
-    conn.commit(); conn.close()
-
-    table = _pnl_history_table(lookback=10)
-    assert table is not None
-    today_line = [ln for ln in table.splitlines() if ln.startswith("2026-05-28")][0]
-    assert "+200.00" in today_line          # 4pm-to-4pm P&L
-    assert "+1,200" not in today_line        # NOT the real-time figure
-    assert "$100,500.00" in today_line       # NAV = today's 4pm close
