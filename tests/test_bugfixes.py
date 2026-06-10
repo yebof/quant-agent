@@ -1359,3 +1359,151 @@ def test_pm_prompt_example_reasoning_chain_parses_with_premortem():
     assert m, "PM prompt no longer has a reasoning_chain JSON example"
     rc = ReasoningChain(**json.loads(m.group(1)))
     assert rc.premortem_check  # the example populates it (non-empty)
+
+
+# ===========================================================================
+# PR #99: evening equity_close backfill — pipeline integration. The db-level
+# SQL is covered in test_db.py; these pin the run_evening loop itself: the
+# today_str exclusion (the only thing keeping an unsettled same-day bar out
+# of a permanent NULL-only fill), the corrupt-value guard, and the per-date
+# error isolation.
+# ===========================================================================
+
+def _evening_pipeline_with_closes(closes):
+    """Minimal run_evening harness (mirrors the evening tests above) with a
+    real get_recent_daily_closes payload so the backfill loop executes."""
+    pipeline = TradingPipeline.__new__(TradingPipeline)
+    pipeline.broker = MagicMock()
+    pipeline.db = MagicMock()
+    pipeline.macro = MagicMock()
+    pipeline.evening_analyst = MagicMock()
+    pipeline.config = MagicMock()
+    pipeline.config.llm.evening_analyst_model = "test-model"
+    pipeline.broker.is_trading_day.return_value = True
+    pipeline.broker.get_account.return_value = {"portfolio_value": 10_000.0, "last_equity": 10_000.0}
+    pipeline.broker.get_positions.return_value = []
+    pipeline.db.get_trades.return_value = []
+    pipeline.macro.get_macro_summary.return_value = {}
+    pipeline.evening_analyst.analyze.return_value = (
+        EveningReport(reasoning_chain=_valid_evening_rc(), daily_summary="Flat", lessons="n/a", tomorrow_outlook="Watch", risk_rating="low"),
+        AgentResult(raw_text="{}", tokens_used=10, model="test", user_message="test"),
+    )
+    pipeline.broker.get_recent_daily_closes.return_value = closes
+    return pipeline
+
+
+def test_evening_backfills_prior_dates_but_never_today():
+    """[PR #99] The API-lag self-heal must backfill PRIOR dates and must
+    NEVER write today's bar — today's row is owned by the 4pm-snapshot
+    branch + save_evening_snapshot, even when today's bar IS present."""
+    from src.trading_calendar import session_date_key
+    today = session_date_key()
+    closes = [("2026-01-02", 100_000.0), ("2026-01-05", 100_500.0), (today, 100_700.0)]
+    pipeline = _evening_pipeline_with_closes(closes)
+    pipeline.run_evening()
+    called_dates = [c.args[0] for c in pipeline.db.backfill_equity_close.call_args_list]
+    assert "2026-01-02" in called_dates and "2026-01-05" in called_dates
+    assert today not in called_dates
+
+
+def test_evening_backfill_runs_in_lag_case_without_today():
+    """[PR #99] The lag case (today's bar absent — the branch that motivates
+    the self-heal): every prior date is backfilled."""
+    closes = [("2026-01-02", 100_000.0), ("2026-01-05", 100_500.0)]
+    pipeline = _evening_pipeline_with_closes(closes)
+    pipeline.run_evening()
+    called_dates = [c.args[0] for c in pipeline.db.backfill_equity_close.call_args_list]
+    assert called_dates == ["2026-01-02", "2026-01-05"]
+
+
+def test_evening_backfill_skips_zero_and_nonfinite_values():
+    """[PR #99 review] A backfilled value is permanent (NULL-only fill), so
+    0.0 (pre-funding/reset), NaN (sqlite binds it as NULL → fake success
+    log forever), inf, and negatives must never reach the DB."""
+    closes = [
+        ("2026-01-02", 0.0),
+        ("2026-01-05", float("nan")),
+        ("2026-01-06", float("inf")),
+        ("2026-01-07", -5.0),
+        ("2026-01-08", 100_500.0),   # the one legit value
+    ]
+    pipeline = _evening_pipeline_with_closes(closes)
+    pipeline.run_evening()
+    called_dates = [c.args[0] for c in pipeline.db.backfill_equity_close.call_args_list]
+    assert called_dates == ["2026-01-08"]
+
+
+def test_evening_backfill_one_bad_date_does_not_abort_the_rest():
+    """[PR #99] A DB error on one date must not abort backfill of later
+    dates (per-date try/except) nor crash the evening run."""
+    closes = [("2026-01-02", 100_000.0), ("2026-01-05", 100_500.0)]
+    pipeline = _evening_pipeline_with_closes(closes)
+    pipeline.db.backfill_equity_close.side_effect = [RuntimeError("locked"), True]
+    pipeline.run_evening()   # must not raise
+    assert pipeline.db.backfill_equity_close.call_count == 2
+
+
+# ===========================================================================
+# PR #99: main.py crash-visibility net — early crashes (config load, missing
+# config file) must produce a FAILED Telegram push and still exit non-zero.
+# ===========================================================================
+
+def test_main_pushes_failed_notification_when_config_load_crashes(monkeypatch):
+    """[PR #99] A load_config crash (e.g. pydantic ValidationError) must
+    produce a FAILED push (when Telegram creds are available) AND re-raise
+    so the process exits non-zero."""
+    import main as main_mod
+
+    sent = []
+    fake_notifier = MagicMock()
+    fake_notifier.send = lambda msg: sent.append(msg) or True
+    monkeypatch.setattr(main_mod, "TelegramNotifier", lambda: fake_notifier)
+    monkeypatch.setattr(
+        main_mod, "load_config",
+        MagicMock(side_effect=RuntimeError("OPENAI_API_KEY is required")),
+    )
+    monkeypatch.setattr("sys.argv", ["main.py", "--mode", "morning"])
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        main_mod.main()
+
+    assert any("FAILED" in m and "OPENAI_API_KEY" in m for m in sent)
+
+
+def test_main_missing_config_file_push_carries_the_path(monkeypatch, tmp_path):
+    """[PR #99] The missing-config sys.exit must carry the path into the
+    push — str(SystemExit(1)) is just '1', useless from a phone."""
+    import main as main_mod
+
+    sent = []
+    fake_notifier = MagicMock()
+    fake_notifier.send = lambda msg: sent.append(msg) or True
+    monkeypatch.setattr(main_mod, "TelegramNotifier", lambda: fake_notifier)
+    missing = str(tmp_path / "nope.yaml")
+    monkeypatch.setattr("sys.argv", ["main.py", "--mode", "morning", "--config", missing])
+
+    with pytest.raises(SystemExit) as ei:
+        main_mod.main()
+
+    assert ei.value.code != 0          # non-zero exit preserved
+    assert any("FAILED" in m and "nope.yaml" in m for m in sent)
+
+
+def test_main_live_mode_graceful_scheduler_exit_notifies_clearly(monkeypatch):
+    """[PR #99] scheduler.start() returning gracefully must push a clear
+    'scheduler_exited' status, not '⚪ live returned non-dict result'."""
+    import main as main_mod
+
+    sent = []
+    fake_notifier = MagicMock()
+    fake_notifier.send = lambda msg: sent.append(msg) or True
+    monkeypatch.setattr(main_mod, "TelegramNotifier", lambda: fake_notifier)
+    monkeypatch.setattr(main_mod, "load_config", lambda _p: MagicMock())
+    monkeypatch.setattr(main_mod, "refresh_pricing", lambda: None)
+    monkeypatch.setattr(main_mod, "TradingScheduler", lambda _c: MagicMock())
+    monkeypatch.setattr("sys.argv", ["main.py", "--mode", "live"])
+
+    main_mod.main()
+
+    assert any("scheduler_exited" in m for m in sent)
+    assert not any("non-dict" in m for m in sent)

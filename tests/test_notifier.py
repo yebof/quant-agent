@@ -353,8 +353,8 @@ def test_format_evening_return_pct_na_when_prior_equity_nonpositive():
     }
     msg = format_session_result("evening", result, 10.0)
     assert msg is not None
-    # Assert on the Daily P&L line specifically (the P&L history table,
-    # if a DB is present, legitimately contains "0.00%" elsewhere).
+    # Assert on the Daily P&L line specifically rather than bare "n/a"
+    # (other message sections could legitimately contain that text).
     assert "💰 Daily P&L: -$500.00 (n/a)" in msg, msg
 
 
@@ -937,9 +937,11 @@ def test_format_evening_missing_morning_session_is_red():
     assert "midday" in msg  # soft warning for the non-morning miss
 
 
-def test_format_evening_suggested_actions_precede_history_table():
-    """Suggested actions must appear ABOVE the long P&L history table so the
-    tail-clip truncation can't eat them on high-risk days."""
+def test_format_evening_suggested_actions_render_high_in_message():
+    """Suggested actions must appear high in the message (right after the
+    headline P&L) so the tail-clip truncation can't eat them on high-risk
+    days. (The P&L history table they used to precede was replaced by the
+    daily CSV export — PR #99.)"""
     result = {
         "status": "analyzed", "run_id": "r",
         "daily_pnl": -100.0, "total_value": 100_000.0,
@@ -952,7 +954,7 @@ def test_format_evening_suggested_actions_precede_history_table():
     msg = format_session_result("evening", result, 10.0)
     assert "⚡ Suggested actions:" in msg
     assert "Reduce NVDA exposure" in msg
-    # Appears before the Tomorrow block (which sits after the history table).
+    # Appears before the Tomorrow block (the tail of the message).
     assert msg.index("⚡ Suggested actions:") < msg.index("🔮 Tomorrow")
 
 

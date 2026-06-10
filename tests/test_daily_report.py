@@ -1,9 +1,11 @@
-"""Daily P&L CSV export (PR #98).
+"""Daily P&L CSV export (weekly export shipped in PR #98; renamed
+daily-only in PR #99).
 
 Covers: build_daily_csv settlement math (close-to-close, drawdown, return),
 SPY column population + graceful degradation, broker.get_full_portfolio_history
 ET-date mapping + pre-funding skip, send_document, run_daily orchestration,
-and the format_session_result daily body.
+and the format_session_result daily noise policy (sent silent; error/skipped
+notify with the reason).
 """
 import csv
 import io
@@ -129,11 +131,54 @@ def test_run_daily_error_on_no_data():
     assert res["status"] == "error"
 
 
-def test_format_session_result_daily_body():
+def test_format_session_result_daily_sent_is_silent():
+    """'sent' → None: the CSV document push (with its caption) IS the
+    confirmation; a second status text every weekday is pure noise."""
     from src.notifier import format_session_result
     msg = format_session_result("daily", {"status": "sent", "run_id": "run-w", "rows": 42, "filename": "pnl_history_2026-05-30.csv"}, 3.0)
+    assert msg is None
+
+
+def test_format_session_result_daily_error_surfaces_reason():
+    """'error' notifies AND carries the reason — a bare '🔴 status: error'
+    is undebuggable from a phone. No filename → no dangling '📊 ? rows →'."""
+    from src.notifier import format_session_result
+    msg = format_session_result(
+        "daily",
+        {"status": "error", "run_id": "run-w", "error": "no data from portfolio_history"},
+        3.0,
+    )
+    assert msg is not None
+    assert "🔴" in msg and "status: error" in msg
+    assert "no data from portfolio_history" in msg
+    assert "📊" not in msg   # rows/filename line skipped when absent
+
+
+def test_format_session_result_daily_delivery_failure_keeps_rows_line():
+    """Delivery failure includes rows+filename (CSV was built) plus reason."""
+    from src.notifier import format_session_result
+    msg = format_session_result(
+        "daily",
+        {"status": "error", "error": "telegram delivery failed",
+         "rows": 42, "filename": "pnl_history_2026-05-30.csv"},
+        3.0,
+    )
     assert msg is not None
     assert "42 rows" in msg and "pnl_history_2026-05-30.csv" in msg
+    assert "telegram delivery failed" in msg
+
+
+def test_format_session_result_daily_skipped_notifies():
+    """'skipped' (Telegram unconfigured) still renders a message — moot in
+    production (send() no-ops without creds) but honest for manual runs."""
+    from src.notifier import format_session_result
+    msg = format_session_result(
+        "daily",
+        {"status": "skipped", "rows": 42, "filename": "pnl_history_2026-05-30.csv"},
+        3.0,
+    )
+    assert msg is not None
+    assert "status: skipped" in msg and "42 rows" in msg
 
 
 def test_build_daily_csv_filters_nan_spy(monkeypatch):

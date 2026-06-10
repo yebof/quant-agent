@@ -1,0 +1,17 @@
+# Daily P&L CSV export — pairs with quant-agent-daily.timer.
+# Install:
+#   cp scripts/systemd/quant-agent-daily.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now quant-agent-daily.timer
+[Unit]
+Description=quant-agent daily P&L CSV export (no LLM, no trading)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/yebo/quant-agent
+# The runner sources .env and applies its own 300s timeout.
+ExecStart=/home/yebo/quant-agent/scripts/run_daily_export.sh
+# systemd safety net above the runner's 300+30s kill.
+TimeoutStartSec=420
+StandardOutput=journal
+StandardError=journal

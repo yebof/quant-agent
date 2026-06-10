@@ -70,9 +70,17 @@ def main():
     # construction). A crash in any of those used to be a complete blind
     # spot: no notifier existed yet and the protective try/finally hadn't
     # started, so nothing could tell the operator the session never ran
-    # (this was the root cause of the missing-Saturday-report incident —
-    # a pydantic ValidationError thrown by load_config() because .env
-    # hadn't been sourced).
+    # (cf. the missing-Saturday-report incident — a pydantic
+    # ValidationError thrown by load_config()).
+    #
+    # HONEST LIMIT: the notifier reads TELEGRAM_* from os.environ at
+    # construction, so when the root cause is ".env was never sourced"
+    # (the Saturday incident's actual trigger) the creds are missing too
+    # and the FAILED push is silently dropped. This restructure covers
+    # every other early crash (bad YAML while creds are exported, broken
+    # pricing cache, TradingPipeline/scheduler construction); the
+    # no-env case is only catchable by an external dead-man's switch
+    # (see CLAUDE.md observability section).
     notifier = TelegramNotifier()
     start = time.monotonic()
     result = None
@@ -83,7 +91,11 @@ def main():
             config_path = PROJECT_ROOT / config_path
         if not config_path.exists():
             logger.error("Config file not found: %s", config_path)
-            sys.exit(1)
+            # Exit with the message, not a bare code: this SystemExit is
+            # caught below and pushed to Telegram, and str(SystemExit(1))
+            # is just "1" — useless from a phone. A string arg keeps the
+            # non-zero exit code AND gives the push (and stderr) the path.
+            sys.exit(f"Config file not found: {config_path}")
 
         config = load_config(config_path)
         logger.info("Config loaded. Universe: %s, Paper: %s", config.trading.universe, config.alpaca.paper)
@@ -126,6 +138,11 @@ def main():
             scheduler = TradingScheduler(config)
             scheduler.setup()
             scheduler.start()
+            # Reached only if the blocking scheduler returns gracefully
+            # (no exception). Without a result dict the finally block
+            # would push the cryptic "⚪ live returned non-dict result /
+            # type: NoneType" — say what actually happened instead.
+            result = {"status": "scheduler_exited", "run_id": "live"}
             return
 
         pipeline = TradingPipeline(config)

@@ -5861,15 +5861,32 @@ class TradingPipeline:
                     "(API lag?) — evening uses the real-time P&L fallback",
                     closes[-1][0], today_str,
                 )
-            # Self-heal: portfolio_history is consistently a day behind at the
-            # 20:00 ET evening run (the "API lag?" branch above fires every
-            # night), so PRIOR evenings' equity_close landed NULL too — but by
-            # TONIGHT the API has caught up on those dates, since they're still
-            # inside this lookback window. Backfill any still-NULL rows now
-            # (excluding today_str — if its bar is even present yet, it isn't
-            # settled, which is exactly why it took the fallback branch above).
+            # Self-heal: when portfolio_history is a day behind at the
+            # 20:00 ET evening run (the "API lag?" branch above), that
+            # evening's equity_close landed NULL — but by a LATER evening
+            # the API has caught up on those dates, which are still inside
+            # this lookback window. Backfill any still-NULL rows now.
+            # today_str is excluded because today's row is owned by the
+            # branches above + save_evening_snapshot below: when today's
+            # bar is present the first branch already uses it as the
+            # official close, and when it's absent there is nothing to
+            # backfill yet.
             for d, close_val in closes:
                 if d == today_str:
+                    continue
+                # Mirror the `prev_close > 0` guard above: Alpaca
+                # portfolio_history can emit 0.0 (pre-funding / account
+                # reset) or non-finite points, and a backfilled value is
+                # permanent (the fill targets NULL-only rows, so a bad
+                # write can never be corrected by a later run) — never
+                # freeze a corrupt equity in. NaN must be caught here
+                # anyway: sqlite binds it as NULL, which would make
+                # backfill report success while storing nothing.
+                if not (math.isfinite(close_val) and close_val > 0):
+                    logger.warning(
+                        "equity_close backfill skipped for %s: suspect "
+                        "equity value %r", d, close_val,
+                    )
                     continue
                 try:
                     if self.db.backfill_equity_close(d, close_val):

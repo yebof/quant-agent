@@ -12,6 +12,10 @@ Per-mode noise policy (see `format_session_result`):
   - intra_check: notify only on emergency action (skip the 14
     silent OK ticks per trading day)
   - meta: notify on actual run; skip "not_quarter_end" / etc.
+  - daily (P&L CSV export): the CSV itself goes out as a Telegram
+    document with a self-describing caption, so the "sent" status
+    text is suppressed (the document IS the confirmation); "error"
+    (with the reason) and "skipped" still notify
   - Any session that raised an exception: always notify
 """
 from __future__ import annotations
@@ -181,6 +185,11 @@ def format_session_result(
             return None
     if mode == "meta" and status == "skipped":
         return None  # quarter-end check fires daily; silent on non-Q-end
+    if mode == "daily" and status == "sent":
+        # The CSV document push (with its self-describing caption) IS
+        # the delivery confirmation — a second status text every weekday
+        # would be pure noise. error / skipped still notify below.
+        return None
 
     run_id = result.get("run_id", "?")
     emoji = _status_emoji(status)
@@ -211,9 +220,15 @@ def format_session_result(
     elif mode == "meta":
         _append_meta_body(lines, result)
     elif mode == "daily":
-        rows = result.get("rows", "?")
+        # Only error / skipped reach here ("sent" is silenced above).
+        # Surface the failure reason — a bare '🔴 status: error' is
+        # undebuggable from a phone.
         filename = result.get("filename", "")
-        lines.append(f"📊 {rows} rows → {filename}")
+        if filename:
+            lines.append(f"📊 {result.get('rows', '?')} rows → {filename}")
+        err = result.get("error")
+        if err:
+            lines.append(f"error: {err}")
 
     lines.append(f"elapsed: {elapsed_str}")
     return "\n".join(lines)
@@ -404,10 +419,12 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
         lines.append(f"   Equity: ${total_value:,.2f}")
 
     # Suggested actions — surfaced HIGH in the message (right after the
-    # headline P&L, before the ~1000-char history table) so the tail-clip
-    # truncation in send() can never eat them. On exactly the high-risk days
-    # where these are populated the message is longest, and these are the
-    # lines most worth reading. Only shown when risk_rating is elevated/high.
+    # headline P&L) so the tail-clip truncation in send() can never eat
+    # them. On exactly the high-risk days where these are populated the
+    # message is longest, and these are the lines most worth reading.
+    # Only shown when risk_rating is elevated/high. (The P&L history
+    # text table that used to follow was replaced by the daily CSV
+    # export — PR #99.)
     risk_for_actions = _attr_or_key(analysis, "risk_rating")
     if isinstance(risk_for_actions, str) and risk_for_actions.lower() in ("elevated", "high"):
         actions = _attr_or_key(analysis, "suggested_actions") or []
@@ -611,6 +628,7 @@ def _append_meta_body(lines: list[str], result: dict) -> None:
 def _status_emoji(status: str) -> str:
     if status in (
         "executed", "analyzed", "reviewed", "preprocessed", "reflected",
+        "sent",
     ):
         return "🟢"
     if status in (
