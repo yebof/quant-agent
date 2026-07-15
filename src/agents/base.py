@@ -3,6 +3,8 @@ import logging
 import os
 import random
 import re
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -99,6 +101,139 @@ def _retry_backoff_seconds(attempt: int) -> float:
 # src/execution/broker.py.
 _LLM_HTTP_TIMEOUT = 300.0
 
+# Wall-clock deadline for the PRIMARY retry loop in _execute(), seconds.
+#
+# Why a deadline at all: the attempt budget alone doesn't bound time. Under
+# the relay's Cloudflare 524 mode each attempt burned 120-380s, so exhausting
+# 7 attempts needed 40+ minutes — the wrapper SIGKILLed the session at 1200s
+# mid-loop and the Anthropic failover (which fires only AFTER the loop) never
+# ran in exactly the sustained-outage scenario it was built for (2026-06-08/09:
+# two days of mornings died with a funded failover key sitting idle).
+#
+# Why 480: it must leave room for one full failover call inside the wrapper's
+# 1200s kill. Worst-case failover = one Anthropic call bounded by
+# _LLM_HTTP_TIMEOUT (300s), so 480 + 300 = 780s per agent, ~420s of headroom
+# for the rest of the session. And 480s still allows 2-4 real primary attempts
+# even in the slow-failure mode (~120-380s each), so a transient blip is
+# ridden out before the failover engages.
+#
+# Overridable via QUANT_AGENT_RETRY_DEADLINE_S (read at call time, like
+# _max_retries, so tests can monkeypatch per case).
+_DEFAULT_RETRY_DEADLINE_S = 480.0
+
+
+def _retry_deadline_s() -> float:
+    raw = os.environ.get("QUANT_AGENT_RETRY_DEADLINE_S")
+    if raw is None:
+        return _DEFAULT_RETRY_DEADLINE_S
+    try:
+        v = float(raw)
+    except ValueError:
+        return _DEFAULT_RETRY_DEADLINE_S
+    return max(1.0, v)
+
+
+# Server-provided retry hints. The relay's 429 ("Concurrency limit exceeded")
+# and 524 payloads carry retry-after semantics (a Retry-After header and/or a
+# "retry_after": N field in the JSON body) that pure exponential jitter
+# ignored — agents retried in 2-15s against a server that said "come back in
+# 120s", burning attempts for nothing. We sleep max(backoff, hint), capped so
+# a hostile/buggy hint can't park an agent past the session window.
+_RETRY_AFTER_CAP_S = 120.0
+
+
+def _retry_after_hint_seconds(exc: Exception) -> float | None:
+    """Best-effort extraction of a server retry-after hint from an SDK error.
+
+    Looks in (a) the Retry-After header of the attached httpx response
+    (numeric-seconds form only — the HTTP-date form isn't worth parsing for
+    a hint), (b) a retry_after field in the error body dict, (c) the message
+    text (relay 524 bodies embed '"retry_after": 120'). Returns None when no
+    usable hint exists; never raises.
+    """
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            raw = headers.get("retry-after")
+        except Exception:  # noqa: BLE001 — a weird headers object must not mask the real error
+            raw = None
+        if raw is not None:
+            try:
+                return max(0.0, float(raw))
+            except (TypeError, ValueError):
+                pass
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        val = body.get("retry_after", body.get("retry-after"))
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return max(0.0, float(val))
+    m = re.search(r'retry[_-]after["\']?\s*[:=]\s*"?(\d+(?:\.\d+)?)', str(exc), re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+# Per-provider in-flight caps around the LLM HTTP call itself (NOT around
+# run() — building the user message / parsing must never hold a slot).
+#
+# Why: the relay enforces a per-user concurrency cap, and morning fans out
+# macro + news + tech (multi-chunk) + earnings through a
+# ThreadPoolExecutor(max_workers=4) on one relay account — the fan-out
+# self-inflicted "Concurrency limit exceeded" 429 storms (175 occurrences in
+# the 06-16..06-29 logs), and each kill-looped morning re-spawned the full
+# team into the already-limited relay. A module-level semaphore serializes
+# the excess instead of bouncing it off the server. Anthropic is direct
+# (no relay) so it gets a looser, independent cap — failover calls must not
+# queue behind a wedged relay slot.
+_OPENAI_MAX_CONCURRENT = _int_env("QUANT_AGENT_MAX_CONCURRENT_LLM", 3)
+_OPENAI_LLM_SEMAPHORE = threading.Semaphore(_OPENAI_MAX_CONCURRENT)
+_ANTHROPIC_MAX_CONCURRENT = 4
+_ANTHROPIC_LLM_SEMAPHORE = threading.Semaphore(_ANTHROPIC_MAX_CONCURRENT)
+
+
+# finish/stop reasons that mean "output hit a ceiling mid-generation".
+# Shared by the truncation flag in _execute() and the empty-content guards:
+# an empty body WITH one of these reasons is a legitimate truncation (e.g. a
+# reasoner burning the whole budget on CoT) that must surface as
+# truncated=True, NOT trigger retry/failover (truncation never fails over —
+# see CLAUDE.md). insufficient_system_resource is DeepSeek-specific: the
+# inference system ran out of resources and returned a cut-off body on a 200.
+_TRUNCATION_FINISH_REASONS = ("max_tokens", "length", "insufficient_system_resource")
+
+
+class LLMEmptyResponseError(RuntimeError):
+    """HTTP 200 whose body carries no usable content (choices empty /
+    content None or ""). Previously returned as a *successful* '' — which
+    parses to None downstream and masquerades as a deliberate no-signal,
+    consuming the agent's one shot for the session while bypassing both the
+    retry budget and the Anthropic failover. Raised instead, and classified
+    retryable (a degenerate 200 from a relay is transient territory)."""
+
+
+class LLMStreamInterruptedError(RuntimeError):
+    """A streamed response ended without a finish_reason — the connection
+    was cut mid-generation (relay/proxy drop, no error frame). Partial text
+    is NOT a success: a half-emitted PM decision parses like 'no trades'.
+    Retryable."""
+
+
+def _estimate_tokens(text: str) -> int:
+    """~4 chars/token heuristic — usage-chunk fallback only, so a relay that
+    doesn't honor stream_options include_usage still yields a nonzero cost
+    estimate instead of a 0/0 that run() flags as cost-unknown."""
+    return max(1, len(text) // 4) if text else 0
+
 
 def _max_retries() -> int:
     """Read at call time so tests can monkeypatch the env var per case
@@ -138,6 +273,10 @@ _RETRYABLE_EXC_NAMES = frozenset({
     "APIConnectionError", "APITimeoutError", "APIConnectionTimeoutError",
     "InternalServerError", "RateLimitError", "APIError",
     "Timeout", "ConnectionError", "ConnectTimeout", "ReadTimeout",
+    # Our own degenerate-response classes (see definitions above): explicit
+    # here so they stay retryable even if the unknown-exception fallback in
+    # _is_retryable is ever tightened.
+    "LLMEmptyResponseError", "LLMStreamInterruptedError",
 })
 
 
@@ -293,11 +432,17 @@ class BaseAgent(ABC):
         # back to Claude" can't crash construction. Empty => failover disabled.
         self._fallback_api_key = (fallback_api_key or "").strip()
 
+        # max_retries=0 on EVERY SDK client construction: both SDKs default to
+        # 2 internal retries on 429/5xx (incl. the relay's CF 524) with their
+        # own backoff, silently turning each _execute() attempt into ~3 HTTP
+        # calls (~380s under sustained 524s) and invalidating the retry-budget
+        # math documented at _DEFAULT_MAX_RETRIES. The agent-level loop in
+        # _execute() is the SINGLE owner of retry policy.
         if self._use_deepseek:
             # OpenAI-compatible endpoint at a custom base_url with the DeepSeek key.
             from openai import OpenAI
             self.client = OpenAI(api_key=api_key, base_url=_DEEPSEEK_BASE_URL,
-                                 timeout=_LLM_HTTP_TIMEOUT)
+                                 timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
         elif self._use_openai:
             from openai import OpenAI
             # OPENAI_BASE_URL lets OpenAI traffic go through an OpenAI-compatible
@@ -320,12 +465,14 @@ class BaseAgent(ABC):
                 self.client = OpenAI(
                     api_key=api_key, base_url=base_url,
                     http_client=httpx.Client(verify=ca_bundle, timeout=_LLM_HTTP_TIMEOUT),
+                    max_retries=0,
                 )
             else:
-                self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=_LLM_HTTP_TIMEOUT)
+                self.client = OpenAI(api_key=api_key, base_url=base_url,
+                                     timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
         else:
             from anthropic import Anthropic
-            self.client = Anthropic(api_key=api_key, timeout=_LLM_HTTP_TIMEOUT)
+            self.client = Anthropic(api_key=api_key, timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
 
     @property
     @abstractmethod
@@ -355,6 +502,8 @@ class BaseAgent(ABC):
         logger.info("Agent %s input:\n%s", self.name, user_message)
 
         max_retries = _max_retries()
+        deadline_s = _retry_deadline_s()
+        loop_start = time.monotonic()
         finish_reason: str | None = None
         primary_error: Exception | None = None
         for attempt in range(max_retries):
@@ -384,10 +533,30 @@ class BaseAgent(ABC):
                     logger.warning("Agent %s attempt %d failed: %s. Primary exhausted.",
                                    self.name, attempt + 1, e)
                     break
+                # Wall-clock deadline: the attempt budget alone doesn't bound
+                # time (each attempt can burn 120-380s in the relay-524 mode),
+                # so exhausting it can collide with the wrapper's 1200s kill —
+                # which is where the failover below became unreachable
+                # (2026-06-08/09). Past the deadline, abandon the primary NOW
+                # so failover fires while the session window still has room.
+                elapsed = time.monotonic() - loop_start
+                if elapsed >= deadline_s:
+                    logger.warning(
+                        "Agent %s attempt %d failed: %s. Retry deadline %.0fs "
+                        "exceeded (elapsed %.0fs) — abandoning primary, "
+                        "proceeding to failover if configured.",
+                        self.name, attempt + 1, e, deadline_s, elapsed,
+                    )
+                    break
                 wait = _retry_backoff_seconds(attempt)
+                # Honor a server retry-after hint (429/5xx): sleeping shorter
+                # than the server asked just burns attempts against a closed
+                # door. Capped so a hostile hint can't stall the session.
+                hint = _retry_after_hint_seconds(e)
+                if hint is not None:
+                    wait = min(max(wait, hint), _RETRY_AFTER_CAP_S)
                 logger.warning("Agent %s attempt %d failed: %s. Retrying in %.1fs...",
                                self.name, attempt + 1, e, wait)
-                import time
                 time.sleep(wait)
 
         # Model that actually produced the output — primary unless failover wins.
@@ -411,13 +580,11 @@ class BaseAgent(ABC):
         # Truncation detection: a max_tokens / length cutoff means the output
         # is incomplete, NOT a deliberate "no action". Flag + log loudly so a
         # truncated decision isn't silently collapsed into "no trades".
-        truncated = isinstance(finish_reason, str) and finish_reason.lower() in (
-            # max_tokens (Anthropic) / length (OpenAI+DeepSeek) = hit the ceiling.
-            # insufficient_system_resource is DeepSeek-specific: the inference
-            # system ran out of resources and returned a cut-off body on a 200 —
-            # incomplete output, so flag it the same as a token-limit truncation.
-            "max_tokens", "length", "insufficient_system_resource",
-        )
+        # max_tokens (Anthropic) / length (OpenAI+DeepSeek) = hit the ceiling;
+        # insufficient_system_resource = DeepSeek cut-off-on-200. Shared
+        # constant with the empty-content guards in the _call_* paths.
+        truncated = (isinstance(finish_reason, str)
+                     and finish_reason.lower() in _TRUNCATION_FINISH_REASONS)
         if truncated:
             logger.warning(
                 "Agent %s response was TRUNCATED (finish_reason=%s) — output is "
@@ -471,23 +638,30 @@ class BaseAgent(ABC):
         cache breakpoint (static per agent → cheaper + lower latency; no-op
         below the cache minimum, safe unconditionally).
         """
-        response = client.messages.create(
-            model=model,
-            max_tokens=self.max_tokens,
-            system=[{
-                "type": "text",
-                "text": self.system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }],
-            messages=[{"role": "user", "content": user_message}],
-        )
+        with _ANTHROPIC_LLM_SEMAPHORE:
+            response = client.messages.create(
+                model=model,
+                max_tokens=self.max_tokens,
+                system=[{
+                    "type": "text",
+                    "text": self.system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[{"role": "user", "content": user_message}],
+            )
         in_tok, out_tok = _extract_anthropic_usage(response, self.name)
         finish_reason = getattr(response, "stop_reason", None)
         if not isinstance(finish_reason, str):
             finish_reason = None
         if not response.content or not hasattr(response.content[0], "text"):
-            logger.warning("Anthropic returned empty content (stop_reason=%s)", finish_reason)
-            return ("", in_tok, out_tok, finish_reason)
+            if finish_reason in _TRUNCATION_FINISH_REASONS:
+                # Legit truncation (whole budget burned before any text) —
+                # surface as truncated '', don't retry/fail over.
+                logger.warning("Anthropic returned empty content (stop_reason=%s)", finish_reason)
+                return ("", in_tok, out_tok, finish_reason)
+            raise LLMEmptyResponseError(
+                f"Anthropic returned empty content (stop_reason={finish_reason})"
+            )
         return (response.content[0].text, in_tok, out_tok, finish_reason)
 
     def _call_anthropic(self, user_message: str) -> tuple[str, int, int, str | None]:
@@ -508,7 +682,8 @@ class BaseAgent(ABC):
         )
         try:
             from anthropic import Anthropic
-            client = Anthropic(api_key=self._fallback_api_key, timeout=_LLM_HTTP_TIMEOUT)
+            client = Anthropic(api_key=self._fallback_api_key,
+                               timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
             result = self._anthropic_call(client, _FALLBACK_MODEL, user_message)
             logger.warning(
                 "Agent %s: FAILOVER to %s SUCCEEDED (in=%d out=%d) — session "
@@ -523,23 +698,82 @@ class BaseAgent(ABC):
             return None
 
     def _call_openai(self, user_message: str) -> tuple[str, int, int, str | None]:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            max_completion_tokens=self.max_tokens,
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-        )
-        choice = response.choices[0]
-        content = choice.message.content or ""
-        if not content:
-            refusal = getattr(choice.message, "refusal", None)
-            logger.warning("OpenAI returned empty content (refusal=%s)", refusal)
-        in_tok, out_tok = _extract_openai_usage(response, self.name)
-        finish_reason = getattr(choice, "finish_reason", None)
-        if not isinstance(finish_reason, str):
-            finish_reason = None
+        """OpenAI path is STREAMED on purpose. The OPENAI_BASE_URL relay sits
+        behind Cloudflare, whose ~120s Proxy Read Timeout (HTTP 524) kills any
+        call that sends zero bytes until the model finishes — and PM / tech /
+        evening generations legitimately run 120s+, so non-streaming could
+        never succeed through the relay (the 2026-06-08/09 outage: every long
+        call 524'd, book froze sell-only). Streaming keeps bytes flowing so
+        the proxy window never trips; _LLM_HTTP_TIMEOUT becomes a per-chunk
+        read timeout, so a long *healthy* generation isn't axed either.
+
+        The semaphore covers create + iteration: for a streamed response the
+        request is in flight (and counts against the relay's per-user
+        concurrency cap) until the last chunk is read.
+        """
+        with _OPENAI_LLM_SEMAPHORE:
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                max_completion_tokens=self.max_tokens,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            parts: list[str] = []
+            finish_reason: str | None = None
+            usage = None
+            for chunk in stream:
+                # include_usage delivers usage on a final extra chunk whose
+                # choices list is empty.
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = getattr(choice, "delta", None)
+                piece = getattr(delta, "content", None) if delta is not None else None
+                if piece:
+                    parts.append(piece)
+                fr = getattr(choice, "finish_reason", None)
+                if isinstance(fr, str):
+                    finish_reason = fr
+        content = "".join(parts)
+        if finish_reason is None:
+            # Stream ended without a finish_reason = connection cut
+            # mid-generation (relay drop, no error frame). Partial text must
+            # NOT be returned as success — a half-emitted PM decision parses
+            # like 'no trades'. Raise retryable instead.
+            raise LLMStreamInterruptedError(
+                f"OpenAI stream ended without finish_reason after {len(content)} "
+                "chars — connection cut mid-generation; partial output discarded"
+            )
+        if not content and finish_reason not in _TRUNCATION_FINISH_REASONS:
+            # Degenerate 200 (empty body / refusal / stripped relay response):
+            # entering the retry → failover machinery beats masquerading as a
+            # clean no-signal. Truncation-family reasons are exempt — an empty
+            # body there is a legit ceiling hit, flagged via truncated=True.
+            raise LLMEmptyResponseError(
+                f"OpenAI returned empty content (finish_reason={finish_reason})"
+            )
+        if usage is not None:
+            in_tok = _coerce_token_count(getattr(usage, "prompt_tokens", 0))
+            out_tok = _coerce_token_count(getattr(usage, "completion_tokens", 0))
+        else:
+            # Relay didn't honor include_usage — estimate rather than report
+            # 0/0 (which run() flags as cost-unknown and can't sum into daily
+            # totals). Loud so the operator knows these numbers are soft.
+            in_tok = _estimate_tokens(self.system_prompt + user_message)
+            out_tok = _estimate_tokens(content)
+            logger.warning(
+                "OpenAI stream for %s carried no usage chunk — token counts "
+                "are chars/4 estimates (in≈%d out≈%d).",
+                self.name, in_tok, out_tok,
+            )
         return (content, in_tok, out_tok, finish_reason)
 
     def _deepseek_max_output(self) -> int:
@@ -576,6 +810,15 @@ class BaseAgent(ABC):
             finish_reason = None
         if not content:
             reasoning = getattr(choice.message, "reasoning_content", None)
+            if finish_reason not in _TRUNCATION_FINISH_REASONS:
+                # Same guard as _call_openai: a degenerate 200 must enter the
+                # retry/failover machinery, not pass as a clean no-signal.
+                raise LLMEmptyResponseError(
+                    f"DeepSeek returned empty content (finish_reason={finish_reason}, "
+                    f"reasoning_content present={bool(reasoning)})"
+                )
+            # Truncation-family: reasoner burned the whole budget on CoT —
+            # legit empty, surfaced via truncated=True downstream.
             logger.warning(
                 "DeepSeek returned empty content (finish_reason=%s, reasoning_content present=%s)",
                 finish_reason, bool(reasoning),
