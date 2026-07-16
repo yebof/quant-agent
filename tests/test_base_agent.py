@@ -955,6 +955,9 @@ def test_retry_deadline_abandons_primary_for_failover(monkeypatch):
     ticks = [0.0, 200.0, 600.0]
     monkeypatch.setattr("src.agents.base.time.monotonic",
                         lambda: ticks.pop(0) if ticks else 600.0)
+    # Pin the budget: the assertion below counts attempts, so an ambient
+    # QUANT_AGENT_MAX_RETRIES override must not change the arithmetic.
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "7")
     oai = MagicMock()
     oai.chat.completions.create.side_effect = ConnectionError("relay 524 storm")
     anth = MagicMock()

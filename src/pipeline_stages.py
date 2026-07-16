@@ -384,6 +384,23 @@ class DecisionStage:
         cash = ctx.cash
         last_equity = ctx.last_equity
 
+        # Cash-sweep view for the PM: the parked T-bill vehicle is presented
+        # as CASH, not as a position — PM sizes deployment against
+        # cash + parked (ExecutionStage liquidates the vehicle before BUYs
+        # submit), and never reasons about the vehicle itself.
+        # isinstance guard: stage tests stub `pipeline` with MagicMock, whose
+        # auto-attrs would otherwise duck-type as an enabled sweeper.
+        from src.execution.cash_sweep import CashSweeper
+        sweeper = getattr(pipeline, "_sweeper", None)
+        sweeper = sweeper() if callable(sweeper) else None
+        if isinstance(sweeper, CashSweeper):
+            positions, parked = sweeper.split_positions(positions)
+            if parked is not None:
+                import math as _math
+                mv = parked.market_value
+                if isinstance(mv, (int, float)) and _math.isfinite(mv) and mv > 0:
+                    cash = cash + mv
+
         yesterday_insights = pipeline.db.get_latest_insights(before_date=session_date_key())
         recent_performance = pipeline._compute_recent_performance(last_equity)
         if yesterday_insights:
@@ -863,6 +880,35 @@ class ExecutionStage:
                     loss_violation_now.message, len(buy_decisions),
                 )
                 buy_decisions = []
+
+        # Cash-sweep funding: the risk filter counted the parked T-bill
+        # vehicle's value as cash (cash-equivalent contract), so BUYs that
+        # passed it may exceed RAW cash. Release just enough parked cash
+        # to cover the planned notional before the BUY loop sizes against
+        # `available_cash`. Waits for the fill and refreshes ctx.
+        # isinstance guard: stage tests stub `pipeline` with MagicMock.
+        if buy_decisions:
+            from src.execution.cash_sweep import CashSweeper
+            sweeper = getattr(pipeline, "_sweeper", None)
+            sweeper = sweeper() if callable(sweeper) else None
+            if not isinstance(sweeper, CashSweeper):
+                sweeper = None
+            if sweeper is not None:
+                planned_notional = sum(
+                    total_value * d.allocation_pct / 100.0
+                    for d in buy_decisions
+                    if d.allocation_pct > 0
+                )
+                try:
+                    freed = sweeper.fund_buys(ctx, planned_notional)
+                except Exception as e:
+                    logger.warning("cash sweep: fund_buys failed (BUYs will "
+                                   "use raw cash only): %s", e)
+                    freed = 0.0
+                if freed > 0:
+                    positions = ctx.positions
+                    cash = ctx.cash
+                    total_value = ctx.total_value
 
         available_cash = cash
         for decision in buy_decisions:

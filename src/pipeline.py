@@ -348,6 +348,27 @@ class TradingPipeline:
         self.decision_stage = DecisionStage(pipeline=self)
         self.risk_stage = RiskStage(pipeline=self)
         self.execution_stage = ExecutionStage(pipeline=self)
+        # Idle-cash sweeper (SGOV parking). All consumers access it through
+        # self._sweeper() so tests that build the pipeline via __new__ (no
+        # __init__) degrade to a disabled sweeper instead of AttributeError.
+        from src.execution.cash_sweep import CashSweeper
+        self.cash_sweeper = CashSweeper(pipeline=self)
+
+    def _sweeper(self):
+        """The cash sweeper, or None when absent/disabled.
+
+        getattr-guarded because ~58 tests build TradingPipeline via
+        __new__() without __init__ — for them (and for enabled=False
+        configs) every sweep hook must be a structural no-op.
+        """
+        from src.execution.cash_sweep import CashSweeper
+        sweeper = getattr(self, "cash_sweeper", None)
+        if not isinstance(sweeper, CashSweeper):
+            return None
+        try:
+            return sweeper if sweeper.enabled() else None
+        except Exception:  # noqa: BLE001 — a broken config must not take down a session
+            return None
 
     @staticmethod
     def _format_qty(qty: float) -> str:
@@ -442,6 +463,19 @@ class TradingPipeline:
         pending_sector_investment: dict[str, float] = {}
         pending_symbol_investment: dict[str, float] = {}
         pending_cash_outflow = 0.0
+
+        # Cash-sweep view: the parked T-bill vehicle is cash-equivalent —
+        # exclude it from the position list (net-exposure / cluster math must
+        # not count parked cash as market exposure) and credit its market
+        # value to the cash budget (ExecutionStage liquidates it before BUYs
+        # submit, mirroring how SELL proceeds are pre-credited below).
+        sweeper = self._sweeper()
+        if sweeper is not None:
+            positions, parked = sweeper.split_positions(positions)
+            if parked is not None and cash is not None:
+                mv = parked.market_value
+                if isinstance(mv, (int, float)) and math.isfinite(mv) and mv > 0:
+                    cash = cash + mv
 
         # Pre-pass: sum the cash SELLs in this session will return. The
         # execution stage always runs SELLs before BUYs and waits for fills,
@@ -759,6 +793,8 @@ class TradingPipeline:
 
         gaps: list[dict] = []
         longs_checked = 0
+        sweeper = self._sweeper()
+        sweep_symbol = sweeper.symbol if sweeper is not None else None
         for p in positions:
             symbol = getattr(p, "symbol", None)
             try:
@@ -768,6 +804,11 @@ class TradingPipeline:
             # Longs only — a SELL-stop can't protect a short, and inverse-ETF
             # hedges have their own handling. Skip symbols the drain already owns.
             if not symbol or qty <= 0 or symbol in pending_syms:
+                continue
+            # The cash-sweep vehicle is deliberately stopless (cash-equivalent;
+            # see src/execution/cash_sweep.py) — flagging it every session
+            # would train the operator to ignore the 🔴 banner.
+            if sweep_symbol is not None and symbol == sweep_symbol:
                 continue
             longs_checked += 1
             try:
@@ -4711,6 +4752,10 @@ class TradingPipeline:
         # risk-wise they're opposite.
         #
         # Tier key (lower = sells earlier):
+        #  -1 → cash-sweep vehicle (parked T-bills ARE cash — always the
+        #       first thing to liquidate; selling anything else first would
+        #       realize market risk to cover a deficit that parked cash
+        #       can cover for free)
         #   0 → long (effective_mul > 0)
         #   1 → inverse-ETF hedge (effective_mul < 0)
         # Within each tier, classic biggest-loser-first ordering:
@@ -4718,7 +4763,11 @@ class TradingPipeline:
         #   - then larger market_value (clear deficit in fewer orders)
         #   - then symbol alphabetical (deterministic across runs)
         from src.risk.rules import _effective_multiplier
+        sweeper = self._sweeper()
+        sweep_symbol = sweeper.symbol if sweeper is not None else None
         def _tier(p):
+            if sweep_symbol is not None and p.symbol == sweep_symbol:
+                return -1
             return 0 if _effective_multiplier(p.symbol) > 0 else 1
         targets = sorted(
             sellable,
@@ -4950,6 +4999,18 @@ class TradingPipeline:
 
             # Phase 4 #1: execution stage — HOLDs logged, SELLs then BUYs submitted.
             orders = self._execution_stage(ctx)
+
+            # Bookend: park idle cash above the reserve into the sweep vehicle.
+            # After the BUY phase so open BUY limits are subtracted from the
+            # parkable excess (see CashSweeper.park_excess).
+            sweeper = self._sweeper()
+            if sweeper is not None:
+                try:
+                    sweep_order = sweeper.park_excess(ctx)
+                    if sweep_order:
+                        orders.append(sweep_order)
+                except Exception as e:
+                    logger.warning("cash sweep: park_excess failed (non-fatal): %s", e)
 
             logger.info("=== Morning run complete: %d orders executed ===", len(orders))
             return {
@@ -5262,7 +5323,16 @@ class TradingPipeline:
         # Pre-LLM orders (take-profit + ex-div) feed into the same bucket.
         orders = list(auto_tp_orders) + list(exdiv_orders)
 
-        if positions:
+        # LLM view: the cash-sweep vehicle is cash, not a position — the
+        # reviewer must never see it, hold-grade it, or sell it. Raw
+        # `positions` stays in scope for the paths that need broker truth
+        # (emergency liquidate below sells EVERYTHING, parked cash included).
+        review_positions = positions
+        sweeper = self._sweeper()
+        if sweeper is not None:
+            review_positions, _parked = sweeper.split_positions(positions)
+
+        if review_positions:
             # Sweep any straggler fills before building the reviewer prompt.
             # run_morning's final reconcile is run_id-scoped, so a BUY whose
             # fill landed AFTER morning's wait window stays at fill_status=
@@ -5684,6 +5754,13 @@ class TradingPipeline:
         ctx.total_value = total_value
         ctx.last_equity = last_equity
         ctx.daily_pnl = daily_pnl
+
+        # LLM view: hide the cash-sweep vehicle from evening's position
+        # narratives (facts / thesis-health / missed-ops held-set) — parked
+        # T-bills have no thesis to review. ctx keeps broker truth.
+        sweeper = self._sweeper()
+        if sweeper is not None:
+            positions, _parked = sweeper.split_positions(positions)
 
         # Sweep submitted orders before building the evening prompt so
         # canceled/expired orders do not get narrated as real trades, and

@@ -49,6 +49,18 @@ risk:
   # a mandatory de-lever directive when cash is already negative.
   allow_margin: false
 
+# Idle-cash sweep — park cash above the reserve in a T-bill ETF, release it
+# automatically before BUYs. The vehicle is cash-equivalent everywhere:
+# hidden from every LLM view, counted as cash by the risk engine, stopless
+# by design, first to liquidate in force_delever. Deterministic, zero-LLM.
+# (2026-07-16 forensics: ~84% idle cash for weeks = ~$300/mo risk-free carry
+# left on the table; see src/execution/cash_sweep.py.)
+cash_sweep:
+  enabled: true
+  symbol: "SGOV"        # iShares 0-3mo T-bills; BIL is the fallback choice
+  reserve_pct: 1.0      # % of equity kept as raw cash for fees/slippage
+  min_order_usd: 500    # don't churn sub-$500 parking orders
+
 trading:
   universe:
     # Index ETF
