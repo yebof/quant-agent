@@ -84,7 +84,14 @@ class PortfolioConstructor:
             target_pct = target.target_weight_pct
             delta_pct = target_pct - current_pct
 
-            if abs(delta_pct) < self.cfg.min_trade_weight_delta:
+            # target_weight_pct == 0 is PM saying "CLOSE this position", not
+            # "rebalance toward ~0". The churn filter must not swallow it: a
+            # 0.4%-weight dreg with an explicit close target was silently
+            # converted into a HOLD, so a position PM had decided to exit sat
+            # in the book indefinitely (2026-07-16 audit). Anything held with
+            # target 0 goes to the SELL builder, which emits a full exit.
+            closing = (target_pct == 0 and current_pct > 0)
+            if not closing and abs(delta_pct) < self.cfg.min_trade_weight_delta:
                 # No action — emit HOLD for audit continuity so PM's intent
                 # to keep this position at its current level is recorded.
                 if current_pct > 0:
@@ -240,7 +247,15 @@ class PortfolioConstructor:
 
         # Resolve stop — priority: target's suggested stop, then TA's stop,
         # then ATR-based default, then fallback % of entry.
+        # Round FIRST, then validate: the TradeDecision below ships
+        # round(stop_loss, 2), so validating the unrounded value let a stop
+        # that rounds UP to exactly the entry price through the
+        # `stop_loss < entry_price` check (e.g. entry $10.00, stop $9.999 →
+        # ships $10.00 == entry → risk_per_share = 0, and a stop at the entry
+        # fires on the first tick down). 2026-07-16 audit.
         stop_loss = self._resolve_stop(target, analysis, entry_price)
+        if stop_loss is not None:
+            stop_loss = round(stop_loss, 2)
         if stop_loss is None or stop_loss <= 0 or stop_loss >= entry_price:
             logger.warning(
                 "Constructor: BUY %s rejected — no valid stop below entry "
@@ -257,9 +272,24 @@ class PortfolioConstructor:
             stop_gap_pct = (entry_price - stop_loss) / entry_price
             take_profit = round(entry_price * (1 + 2 * stop_gap_pct), 2)
 
-        allocation_pct = target_pct - current_pct
+        # `target_pct` and `current_pct` are GROSS-leverage weights (see
+        # _current_weights), but every consumer of `allocation_pct` spends it
+        # as RAW notional: risk/rules.py does `total_value * alloc/100` and
+        # THEN applies the gross multiplier itself, and ExecutionStage sizes
+        # `qty = total_value * alloc/100 / price`. Emitting the gross delta
+        # raw therefore over-deployed leveraged/inverse ETFs by their
+        # multiplier (2026-07-16 audit: a PM target of 6% gross on SQQQ (3x)
+        # deployed $6k raw = 18% gross of a $100k book — and the NEXT session
+        # saw current_pct=18 vs target 6 and emitted SELL 67% of the hedge PM
+        # wanted held, repeating until raw ≈ 2%). Convert once, here, so the
+        # delta and every downstream consumer speak the same units. No-op for
+        # the ~99% of the universe with multiplier 1.0.
+        from src.risk.rules import _gross_multiplier
+        allocation_pct = (target_pct - current_pct) / _gross_multiplier(target.symbol)
         # Pull in vol-adj sizing in a uniform way: ensure qty (computed
         # downstream) doesn't put more than risk_budget_pct of equity at risk.
+        # NOTE: alloc_cap_by_risk below is computed in RAW notional terms, so
+        # this conversion must happen BEFORE the comparison.
         risk_per_share = entry_price - stop_loss
         risk_dollars_allowed = total_value * self.cfg.risk_budget_pct / 100
         # qty_by_risk = risk_dollars_allowed / risk_per_share
@@ -294,7 +324,7 @@ class PortfolioConstructor:
             symbol=target.symbol,
             allocation_pct=allocation_pct,
             entry_price=entry_price,
-            stop_loss=round(stop_loss, 2),
+            stop_loss=stop_loss,   # already rounded + validated above
             take_profit=take_profit,
             reasoning=reasoning[:500],
         )

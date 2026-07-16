@@ -92,6 +92,27 @@ class RiskRuleEngine:
             )
             baseline = total_value
 
+        # A single non-finite position market_value poisons every sum below.
+        # NaN comparisons are all False, so `sector_pct > cap` and
+        # `total_pct > cap` silently evaluate False — the exposure and sector
+        # caps switch OFF for the whole session on exactly the broken-snapshot
+        # day they matter most (2026-07-16 audit; Alpaca has been observed to
+        # return NaN market_value during market-open glitches). Block instead,
+        # mirroring the total_value guard above: no risk-check, no BUY.
+        bad_mv = [p.symbol for p in positions if not math.isfinite(p.market_value)]
+        if bad_mv:
+            return [RiskViolation(
+                rule="max_total_position_pct",   # in HARD_BLOCK_RULES
+                message=(
+                    f"non-finite market_value for {', '.join(sorted(bad_mv))} — "
+                    f"exposure / sector caps cannot be computed; refusing to "
+                    f"risk-check BUY for {decision.symbol}; blocking until the "
+                    f"next clean snapshot"
+                ),
+                value=0.0,
+                limit=0.0,
+            )]
+
         violations = []
         signed_mul = _effective_multiplier(decision.symbol)  # net direction
         gross_mul = _gross_multiplier(decision.symbol)       # size magnitude
@@ -170,9 +191,18 @@ class RiskRuleEngine:
                 # 3x notional, even though its directional sign cancels for
                 # NET exposure (#2). Pre-fix this rule treated SQQQ as 1x
                 # which silently under-counted cluster concentration.
+                # The cluster must include the BUY symbol's OWN existing
+                # position, not just its peers: `highly_correlated_peers`
+                # (correctly) excludes the symbol itself, so an ADD to the
+                # largest member of a cluster counted only the ADD's notional
+                # and none of the stack already held — the concentration this
+                # rule exists to catch was invisible exactly when it was worst
+                # (2026-07-16 audit). A symbol is trivially correlated 1.0
+                # with itself, so it belongs in its own cluster total.
+                cluster_symbols = set(peers) | {decision.symbol}
                 peer_value = sum(
                     p.market_value * _gross_multiplier(p.symbol)
-                    for p in positions if p.symbol in peers
+                    for p in positions if p.symbol in cluster_symbols
                 )
                 cluster_pct = (peer_value + gross_new) / total_value * 100
                 if cluster_pct > max_correlated_cluster_pct:

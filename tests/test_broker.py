@@ -95,14 +95,42 @@ def test_is_trading_day_uses_calendar(mock_tc_cls):
 
 @patch("src.execution.broker.TradingClient")
 def test_get_session_close_returns_et_datetime_on_trading_day(mock_tc_cls):
-    """Half-day detection path: calendar is queried; combines returned
-    date + close time into an ET-aware datetime. This is what the pipeline's
-    early-close guard compares `et_now()` against."""
+    """Half-day detection path, against the REAL SDK model.
+
+    2026-07-16 audit: this test used to build a MagicMock with
+    `entry.close = time(13, 0)`. The real `alpaca.trading.models.Calendar`
+    returns a full naive DATETIME, so production hit
+    `datetime.combine(date, datetime)` → TypeError → None on EVERY call and
+    the early-close guard was dead code — while this test stayed green.
+    Construct the real model so the shape can't drift silently again."""
+    from datetime import date as _date, datetime as _dt
+    from alpaca.trading.models import Calendar
+    from src.trading_calendar import ET
+
+    # Thanksgiving Friday — 13:00 early close
+    entry = Calendar(date="2026-11-27", open="09:30", close="13:00")
+    mock_client = MagicMock()
+    mock_client.get_calendar.return_value = [entry]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    close = broker.get_session_close(on_date=_date(2026, 11, 27))
+
+    assert close is not None, "early-close guard is dead if this returns None"
+    assert isinstance(close, _dt)
+    assert close.tzinfo is ET
+    assert close.hour == 13 and close.minute == 0
+    assert close.date() == _date(2026, 11, 27)
+
+
+@patch("src.execution.broker.TradingClient")
+def test_get_session_close_accepts_legacy_time_shape(mock_tc_cls):
+    """Older/alternative SDK shape (close as a `time`) must still combine."""
     from datetime import date as _date, time as _time, datetime as _dt
     from src.trading_calendar import ET
 
     entry = MagicMock()
-    entry.date = _date(2026, 11, 27)  # Thanksgiving Friday — 13:00 early close
+    entry.date = _date(2026, 11, 27)
     entry.close = _time(13, 0)
     mock_client = MagicMock()
     mock_client.get_calendar.return_value = [entry]
@@ -111,10 +139,7 @@ def test_get_session_close_returns_et_datetime_on_trading_day(mock_tc_cls):
     broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
     close = broker.get_session_close(on_date=_date(2026, 11, 27))
 
-    assert isinstance(close, _dt)
-    assert close.tzinfo is ET
-    assert close.hour == 13 and close.minute == 0
-    assert close.date() == _date(2026, 11, 27)
+    assert isinstance(close, _dt) and close.hour == 13 and close.tzinfo is ET
 
 
 @patch("src.execution.broker.TradingClient")

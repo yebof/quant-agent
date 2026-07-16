@@ -19,6 +19,34 @@ logger = logging.getLogger(__name__)
 # Index ETFs that have no single sector — bucket them as "Broad".
 _INDEX_ETFS = {"SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "IVV"}
 
+# Sector / thematic ETFs → their canonical sector bucket.
+#
+# WHY (2026-07-16 audit): yfinance's `.info` carries no `sector` key for ETFs,
+# so _get_sector fell through to "Unknown" for every one of them. Two silent
+# failures followed: (1) `max_sector_pct` is gated on `new_sector != "Unknown"`
+# (risk/rules.py), so a BUY of XLV/SMH/... skipped the sector cap ENTIRELY;
+# (2) a held ETF carries sector="Unknown", so it contributed $0 to the sector
+# bucket of a same-sector single name — a book that is 30% XLV would let an
+# LLY BUY through as if Healthcare exposure were zero. Both directions of the
+# cap were dead for these symbols despite the universe being ~20% ETFs.
+#
+# Deterministic table, consulted BEFORE the network fetch: an ETF's sector is
+# a fact about the product, not something to rediscover per process.
+_ETF_SECTORS = {
+    # SPDR sector suite
+    "XLF": "Financial Services", "XLE": "Energy", "XLV": "Healthcare",
+    "XLI": "Industrials", "XLP": "Consumer Defensive", "XLY": "Consumer Cyclical",
+    "XLU": "Utilities", "XLRE": "Real Estate", "XLB": "Basic Materials",
+    "XLK": "Technology", "XLC": "Communication Services",
+    # Semiconductor / AI thematics
+    "SMH": "Technology", "SOXX": "Technology", "DRAM": "Technology",
+    "CHPX": "Technology",
+    # Inverse / leveraged index ETFs track a BROAD index — they have no sector
+    # of their own. (Their leverage is handled separately by the signed/gross
+    # multipliers in risk/rules.py.)
+    "SH": "Broad", "SDS": "Broad", "PSQ": "Broad", "SQQQ": "Broad",
+}
+
 # Default HTTP timeout for ALL Alpaca SDK calls (connect, read).
 # Without this, a stalled TCP connection to the broker can hang the process
 # for hours under launchd — observed 2026-04-17 when the evening job sat for
@@ -123,6 +151,14 @@ def _get_sector(symbol: str) -> str:
         with _sector_lock:
             _sector_cache[symbol] = "Broad"
         return "Broad"
+    # Sector/thematic ETFs: yfinance .info has no `sector` for ETFs, so
+    # without this table they resolve to "Unknown" and silently switch the
+    # sector cap OFF (see _ETF_SECTORS). Deterministic, offline, before the fetch.
+    etf_sector = _ETF_SECTORS.get(symbol.upper())
+    if etf_sector is not None:
+        with _sector_lock:
+            _sector_cache[symbol] = etf_sector
+        return etf_sector
 
     def _fetch():
         try:
@@ -389,10 +425,21 @@ class AlpacaBroker:
         if entry_date is None or entry_close is None:
             return None
         try:
+            # alpaca-py's Calendar.close is a full naive DATETIME (already
+            # carrying the session date + ET wall clock), NOT a time. The old
+            # code called datetime.combine(date, datetime), which ALWAYS
+            # raised TypeError → logged → returned None → the early-close
+            # guard never fired and midday/close ran against a shut market on
+            # half-days, submitting orders that can only be rejected
+            # (2026-07-16 audit: dead code since it was written; the test that
+            # was supposed to cover it used a MagicMock with a `time`).
+            # Keep the `time` branch for the older SDK shape.
+            if isinstance(entry_close, _dt):
+                return entry_close.replace(tzinfo=ET)
             return _dt.combine(entry_date, entry_close).replace(tzinfo=ET)
         except Exception as exc:
             logger.warning(
-                "get_session_close: failed to combine date=%s close=%s: %s",
+                "get_session_close: failed to resolve date=%s close=%s: %s",
                 entry_date, entry_close, exc,
             )
             return None
@@ -672,13 +719,31 @@ class AlpacaBroker:
                 )
                 failed += 1
         if failed > 0:
+            restored = 0
+            rollback_failed: list[dict] = []
             if cancelled:
-                self._restore_stop_orders(symbol, cancelled)
-            logger.warning(
-                "cancel_snapshotted_stops: %d/%d cancel(s) failed for %s "
-                "(rolled back %d that succeeded); SELL won't proceed",
-                failed, len(specs), symbol, len(cancelled),
-            )
+                # _restore_stop_orders returns (restored_count, failed_specs)
+                # — the old code DISCARDED it, so a rollback that itself
+                # failed left the position with shrunk coverage and reported
+                # only a bare False. The SELL is skipped either way, but the
+                # operator (and the next session's coverage reconcile, which
+                # now auto-repairs) must be able to see it (2026-07-16 audit).
+                restored, rollback_failed = self._restore_stop_orders(symbol, cancelled)
+            if rollback_failed:
+                logger.error(
+                    "cancel_snapshotted_stops: %d/%d cancel(s) failed for %s AND "
+                    "the rollback could not restore %d of %d cancelled stop(s) — "
+                    "%s is now UNDER-PROTECTED; next session's coverage reconcile "
+                    "must repair it. SELL won't proceed.",
+                    failed, len(specs), symbol, len(rollback_failed), len(cancelled),
+                    symbol,
+                )
+            else:
+                logger.warning(
+                    "cancel_snapshotted_stops: %d/%d cancel(s) failed for %s "
+                    "(rolled back %d/%d that succeeded); SELL won't proceed",
+                    failed, len(specs), symbol, restored, len(cancelled),
+                )
             return False
         if cancelled:
             logger.info(

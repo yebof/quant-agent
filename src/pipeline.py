@@ -1327,9 +1327,21 @@ class TradingPipeline:
             # Codex r9 #1: previously this just returned False without
             # persisting, and the SELL-path callers ignored that bool —
             # the recovery intent was silently lost.
+            #
+            # Persist the PRE-sell qty, not `actual_residual` (2026-07-16
+            # audit): the drain replays this row through the same finalize
+            # core, which recomputes `position_qty_before_sell - fill_qty`
+            # from the SAME order. Passing the post-sell residual made the
+            # replay subtract the fill twice — for a SELL that filled exactly
+            # what it asked for, the recomputed residual hit 0, took the
+            # "full exit — nothing to re-protect" early return, reported
+            # success, and DELETED the row. Net effect: the residual position
+            # stayed naked forever and the recovery intent was destroyed.
+            # The drain's downward clip against the live broker position keeps
+            # this correct even if a concurrent SELL took shares meanwhile.
             if not from_drain:
                 self._persist_orphaned_protection_restore(
-                    order_id, symbol, actual_residual, cancelled_specs,
+                    order_id, symbol, position_qty_before_sell, cancelled_specs,
                     wal_row_id=wal_row_id,
                 )
             return False, list(cancelled_specs)
@@ -2187,7 +2199,24 @@ class TradingPipeline:
         """
         from datetime import timedelta as _td
         orders: list[dict] = []
-        tomorrow = et_today() + _td(days=1)
+        today = et_today()
+        # NEXT TRADING day, not calendar tomorrow (2026-07-16 audit): sessions
+        # only run Mon-Fri, so `today + 1 day` can never BE a Monday — every
+        # Monday ex-div silently went unadjusted, and Friday's sessions (the
+        # last chance to act) computed Saturday. Same hole for any ex-div the
+        # day after a holiday. Fall back to calendar+1 if the calendar lookup
+        # fails — degrading to today's behavior beats crashing the session.
+        next_trading_day = today + _td(days=1)
+        for _ in range(7):
+            try:
+                if self.broker.is_trading_day(next_trading_day):
+                    break
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ex-div: is_trading_day failed (%s) — falling back "
+                               "to calendar+1", e)
+                next_trading_day = today + _td(days=1)
+                break
+            next_trading_day += _td(days=1)
 
         for p in positions:
             if p.qty <= 0:
@@ -2215,11 +2244,13 @@ class TradingPipeline:
                 continue
             if not div:
                 continue
-            if div.get("date") != tomorrow:
-                # Only act the day BEFORE ex-div. On ex-div day itself, the
-                # gap has already happened at open — stop adjustment is too
-                # late, and "day after" adjustment is wrong (stock is
-                # re-pricing back to normal vol).
+            div_date = div.get("date")
+            if not (div_date and today < div_date <= next_trading_day):
+                # Only act on the session BEFORE ex-div. On ex-div day itself
+                # the gap has already happened at open — adjustment is too
+                # late — and "day after" is wrong (the stock is re-pricing
+                # back to normal vol). The window is (today, next_trading_day]
+                # so a Monday ex-div is caught by Friday's sessions.
                 continue
             amount = div.get("amount") or 0
             if amount <= 0:
@@ -5117,6 +5148,23 @@ class TradingPipeline:
             order, prot = sale
             pending_protections.append(prot)
             try:
+                # Count the proceeds BEFORE the ledger write: the SELL is
+                # already live at the broker, so its cash is coming whether or
+                # not we manage to record it. Booking it only after a
+                # successful insert_trade meant a DB hiccup left
+                # projected_proceeds short, and the loop force-sold the NEXT
+                # position to cover a deficit the in-flight order had already
+                # covered — liquidating real holdings over a bookkeeping
+                # failure (2026-07-16 audit).
+                # Conservative estimate: market × 0.99 (matches our limit).
+                projected_proceeds += p.market_value * 0.99
+                orders.append(order)
+                logger.info(
+                    "FORCE DE-LEVER SELL %s qty=%s @ limit=$%.2f "
+                    "(unrealized_pnl=$%.2f, mkt_value=$%.2f)",
+                    p.symbol, self._format_qty(qty), sell_limit,
+                    p.unrealized_pnl, p.market_value,
+                )
                 self.db.insert_trade(
                     symbol=p.symbol, action="FORCE_DELEVER", qty=qty,
                     price=p.current_price,
@@ -5129,17 +5177,12 @@ class TradingPipeline:
                     broker_order_id=order.get("id"),
                     fill_status="submitted",
                 )
-                orders.append(order)
-                # Conservative estimate: market × 0.99 (matches our limit).
-                projected_proceeds += p.market_value * 0.99
-                logger.info(
-                    "FORCE DE-LEVER SELL %s qty=%s @ limit=$%.2f "
-                    "(unrealized_pnl=$%.2f, mkt_value=$%.2f)",
-                    p.symbol, self._format_qty(qty), sell_limit,
-                    p.unrealized_pnl, p.market_value,
-                )
             except Exception as e:
-                logger.error("FORCE DE-LEVER SELL %s failed: %s", p.symbol, e)
+                logger.error(
+                    "FORCE DE-LEVER SELL %s failed: %s — the order may still be "
+                    "live at the broker; its proceeds are already counted so the "
+                    "sweep will not over-liquidate", p.symbol, e,
+                )
 
         # Block the session until fills land so the post-refresh cash is real.
         # Then finalize protection — if any limit didn't fill, restore the

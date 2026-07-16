@@ -16,6 +16,42 @@ def _atomic_write(path: Path, data: str) -> None:
     os.replace(str(tmp), str(path))
 
 
+# MacroAnalysis.sector_guidance is a LIST of {sector, stance, reason} where
+# stance ∈ overweight|neutral|underweight. Every consumer of the persisted
+# state (`_missed_ops_macro_sector_map`, thesis-health) wants a DICT keyed by
+# sector with bullish|neutral|bearish values. Convert once, on write.
+_STANCE_TO_DIRECTION = {
+    "overweight": "bullish",
+    "neutral": "neutral",
+    "underweight": "bearish",
+}
+
+
+def _normalize_sector_guidance(raw) -> dict[str, str]:
+    """[{sector, stance, reason}, ...] → {sector: bullish|neutral|bearish}.
+
+    Tolerates the already-normalized dict shape (idempotent) and drops
+    anything unrecognized. Never raises — a malformed guidance block must
+    not take down the macro save.
+    """
+    out: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for sector, direction in raw.items():
+            if isinstance(direction, str) and direction in ("bullish", "neutral", "bearish"):
+                out[str(sector)] = direction
+        return out
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        sector = item.get("sector")
+        direction = _STANCE_TO_DIRECTION.get(str(item.get("stance") or "").lower())
+        if sector and direction:
+            out[str(sector)] = direction
+    return out
+
+
 class MacroStore:
     def __init__(self, data_dir: str = "data/macro"):
         self.data_dir = Path(data_dir)
@@ -47,6 +83,19 @@ class MacroStore:
             "equity_outlook": analysis.get("equity_outlook"),
             "summary": analysis.get("summary"),
             "position_guidance": analysis.get("position_guidance"),
+            # 2026-07-16 audit: this key was never persisted, so EVERY
+            # downstream macro_sector_stance / macro_sector_tailwind was
+            # permanently "unknown" — the evening thesis-health step and every
+            # missed-opportunity snapshot rendered "Macro sector stance:
+            # unknown" for every position, every night, while macro was in fact
+            # emitting OW/UW calls. Stored pre-normalized (see
+            # _normalize_sector_guidance): the readers want {sector: direction}
+            # and the model carries a list of {sector, stance, reason}. The
+            # bulky `reason` strings stay out — this file's contract is "keep
+            # it small"; reasons live in agent_logs.
+            "sector_guidance": _normalize_sector_guidance(
+                analysis.get("sector_guidance")
+            ),
         }
         _atomic_write(self.last_state_path, json.dumps(snapshot, indent=2, ensure_ascii=False))
         logger.info("Saved macro last state → %s (regime=%s)",
