@@ -5660,7 +5660,7 @@ class TradingPipeline:
             raw_avg = calib.get("avg_hold_days")
             avg_hold_days = raw_avg if isinstance(raw_avg, (int, float)) else None
             position_facts = self._build_position_facts(
-                positions, morning_trades, total_value, avg_hold_days,
+                review_positions, morning_trades, total_value, avg_hold_days,
             )
 
             # Memory layers — share the same helpers PM uses.
@@ -5681,7 +5681,7 @@ class TradingPipeline:
             recent_performance = self._compute_recent_performance(last_equity)
 
             review, md_result = self.position_reviewer.review(
-                positions=positions,
+                positions=review_positions,
                 macro_summary=macro_summary,
                 cash_balance=cash,
                 total_value=total_value,
@@ -5705,7 +5705,7 @@ class TradingPipeline:
             self.db.insert_agent_log(
                 agent_name="position_reviewer", run_id=run_id,
                 input_summary=(
-                    f"{session_type} | {len(positions)} positions, ${total_value:.0f} total"
+                    f"{session_type} | {len(review_positions)} positions, ${total_value:.0f} total"
                 ),
                 input_message=md_result.user_message,
                 output_summary=review.overall_assessment if review else "parse_error",
@@ -5727,7 +5727,7 @@ class TradingPipeline:
                 ))
             else:
                 orders.extend(self._midday_execute_llm_actions(
-                    positions, review, run_id,
+                    review_positions, review, run_id,
                     blocked_symbols=blocked_position_symbols,
                     already_trimmed_today=already_trimmed_today,
                 ))
@@ -5739,6 +5739,21 @@ class TradingPipeline:
         # Reconcile everything still marked submitted (today's new orders +
         # any lingering from morning that didn't reach terminal in time).
         self._reconcile_fills()
+
+        # Bookend: park cash freed by this session's sells (and any still-idle
+        # excess) — without this, midday/close SELL proceeds sit unswept until
+        # tomorrow's morning bookend. park_excess refreshes account state and
+        # subtracts open-BUY holds itself; emergency paths returned earlier and
+        # deliberately skip parking.
+        sweeper = self._sweeper()
+        if sweeper is not None:
+            try:
+                sweep_order = sweeper.park_excess(ctx)
+                if sweep_order:
+                    orders.append(sweep_order)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("cash sweep: park_excess failed (non-fatal): %s", e)
+
         return {
             "status": "reviewed",
             "session": session_type,

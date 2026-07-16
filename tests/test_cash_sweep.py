@@ -297,3 +297,65 @@ def test_cash_sweep_config_defaults_disabled():
 
 def test_cash_sweep_config_uppercases_symbol():
     assert CashSweepConfig(symbol=" bil ").symbol == "BIL"
+
+
+# ---------- session integration: reviewer never sees the vehicle; midday parks ----------
+
+def test_position_review_hides_vehicle_and_parks_at_end(tmp_path):
+    """End-to-end through run_midday: (a) the reviewer's position list must
+    exclude the sweep vehicle (it would otherwise hold-grade / sell parked
+    cash), (b) the session bookend parks idle cash left by sells."""
+    from unittest.mock import patch
+    from src.models import PositionReview, PositionReasoningChain
+    from src.storage.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+
+    p = _sweep_pipeline()
+    p.db = db
+    p.broker.is_trading_day.return_value = True
+    p.broker.get_session_close = MagicMock(return_value=None)
+    p.broker.get_account.return_value = {
+        "cash": 85_000.0, "portfolio_value": 100_000.0, "last_equity": 100_000.0,
+    }
+    p.broker.get_positions.return_value = [SGOV, NVDA]
+    p.broker.open_buy_notional.return_value = 0.0
+    p.broker.get_latest_price.return_value = 100.60
+    p.broker.submit_order.return_value = {"id": "sweep-1", "status": "accepted"}
+    p.broker.snapshot_protective_stops.return_value = (True, [])
+    p.macro = MagicMock()
+    p.macro.get_macro_summary.return_value = {}
+    p.macro_store = MagicMock()
+    p.macro_store.load_last_state.return_value = None
+    p.config.llm = MagicMock()
+    p.config.llm.position_reviewer_model = "test-model"
+    p._auto_take_profit = MagicMock(return_value=[])
+    p._handle_ex_dividends = MagicMock(return_value=[])
+    p._run_news_update = MagicMock(return_value=None)
+    p._load_earnings_analyses = MagicMock(return_value=(None, []))
+    p._midday_execute_llm_actions = MagicMock(return_value=[])
+    p._reconcile_stop_coverage = MagicMock(return_value=[])
+    p.risk_engine = MagicMock()
+    p.risk_engine.check_daily_loss.return_value = None
+    p.position_reviewer = MagicMock()
+    p.position_reviewer.review.return_value = (
+        PositionReview(
+            reasoning_chain=PositionReasoningChain(
+                macro_continuity_check="x", thesis_progress_check="x",
+                thesis_integrity_check="x", winners_discipline_check="x",
+                session_disposition_check="x", execution_rationale="x",
+            ),
+            actions=[], overall_assessment="stable", risk_level="low",
+        ),
+        MagicMock(user_message="m", raw_text="{}", tokens_used=1,
+                  input_tokens=1, output_tokens=1, cost_usd=0.0),
+    )
+
+    result = p.run_midday()
+
+    assert result["status"] == "reviewed"
+    seen = p.position_reviewer.review.call_args.kwargs["positions"]
+    assert [x.symbol for x in seen] == ["NVDA"], "reviewer must not see SGOV"
+    # bookend parked the idle cash: a SWEEP_BUY order rides in the result
+    assert any(o.get("action") == "SWEEP_BUY" for o in result["orders"])
