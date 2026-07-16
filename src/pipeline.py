@@ -834,21 +834,92 @@ class TradingPipeline:
                 continue
             covered = sum(float(s.get("qty", 0) or 0) for s in (specs or []))
             if covered + 1e-6 < qty:
-                gaps.append({
-                    "symbol": symbol, "held_qty": qty, "covered_qty": covered,
-                })
+                gap = {"symbol": symbol, "held_qty": qty, "covered_qty": covered}
                 logger.warning(
                     "STOP-COVERAGE GAP: %s held=%.4f but only %.4f covered by "
                     "open protective stops — (partially) unprotected with no WAL "
-                    "recovery row. Manual review / re-protect needed.",
-                    symbol, qty, covered,
+                    "recovery row.", symbol, qty, covered,
                 )
+                gap["repaired"] = self._repair_stop_coverage(symbol, qty - covered)
+                gaps.append(gap)
         if longs_checked and not gaps:
             logger.info(
                 "Stop-coverage reconcile: all %d long position(s) adequately "
                 "stop-covered", longs_checked,
             )
         return gaps
+
+    def _repair_stop_coverage(self, symbol: str, uncovered_qty: float) -> bool:
+        """Best-effort: re-place a GTC protective stop on an uncovered long
+        using the stop level recorded on its last BUY. Returns True when a
+        stop was actually submitted.
+
+        Why this is now safe to auto-repair (it deliberately wasn't before):
+        the old objection was "the original protective level is unknown for a
+        position with no live stop, so picking one is a policy decision". It
+        isn't unknown — the BUY row carries the `stop_loss` the PM/RM agreed
+        and the constructor sized against. Repairing to THAT level restores the
+        reviewed intent rather than inventing a new one.
+
+        This is the belt for the 2026-07-16 CRITICAL (BUY-attached OTO stops
+        inherited a DAY tif and expired at the close, leaving positions naked
+        overnight) — both for any position that bug left uncovered, and for a
+        crash between an entry fill and `place_entry_protection`.
+
+        Guards: never place a stop at/above the current price (that would
+        instantly fire and turn a repair into a market-order exit — a decision
+        for the reviewer, not for a janitor), and never invent a level when the
+        BUY row has none.
+        """
+        if uncovered_qty <= 0:
+            return False
+        try:
+            buy = self.db.get_symbol_last_buy(symbol) or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("coverage repair: last-BUY lookup failed for %s: %s", symbol, exc)
+            return False
+        try:
+            stop_price = float(buy.get("stop_loss") or 0)
+        except (TypeError, ValueError):
+            stop_price = 0.0
+        if stop_price <= 0:
+            logger.warning(
+                "coverage repair: %s has no recorded BUY stop_loss — leaving the "
+                "gap flagged for manual review", symbol,
+            )
+            return False
+        try:
+            price = self.broker.get_latest_price(symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("coverage repair: price lookup failed for %s: %s", symbol, exc)
+            return False
+        if not (isinstance(price, (int, float)) and price > 0 and math.isfinite(price)):
+            return False
+        if stop_price >= price:
+            logger.warning(
+                "coverage repair: %s recorded stop $%.2f is at/above the live "
+                "price $%.2f — a repair would fire immediately. Leaving the gap "
+                "flagged; the reviewer owns this exit decision.",
+                symbol, stop_price, price,
+            )
+            return False
+        try:
+            self.broker._submit_stop_limit_order(
+                symbol=symbol, qty=uncovered_qty, stop_price=stop_price,
+                limit_price=stop_price * (1 - self.broker.STOP_LIMIT_BUFFER_PCT),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "coverage repair FAILED for %s (%.4f uncovered, stop $%.2f): %s",
+                symbol, uncovered_qty, stop_price, exc,
+            )
+            return False
+        logger.warning(
+            "COVERAGE REPAIRED: %s — placed GTC stop-limit for %.4f uncovered "
+            "share(s) at the recorded BUY stop $%.2f",
+            symbol, uncovered_qty, stop_price,
+        )
+        return True
 
     def _submit_protected_sell(
         self,

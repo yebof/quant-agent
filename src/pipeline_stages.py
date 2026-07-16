@@ -927,6 +927,7 @@ class ExecutionStage:
                     total_value = ctx.total_value
 
         available_cash = cash
+        pending_entry_stops: list[dict] = []
         for decision in buy_decisions:
             if decision.action != "BUY":
                 continue
@@ -1136,8 +1137,37 @@ class ExecutionStage:
                     "Executed: buy %d %s @ %s $%.2f",
                     qty, decision.symbol, order_type, executed_price,
                 )
+                # The entry still owes a protective stop: it is placed as a
+                # separate GTC order AFTER the fill, because an OTO leg would
+                # inherit the parent's DAY tif and be expired by the broker at
+                # 16:00 ET the same day (2026-07-16 audit — positions were
+                # naked every night). Deferred until all BUYs are submitted so
+                # the fill waits don't serialize the submission burst.
+                if isinstance(order, dict) and order.get("pending_stop_price"):
+                    pending_entry_stops.append({
+                        "symbol": decision.symbol,
+                        "order_id": order.get("id"),
+                        "stop_price": order["pending_stop_price"],
+                        "qty": qty,
+                    })
             except Exception as e:
                 logger.error("Order failed for %s %s: %s", decision.action, decision.symbol, e)
+
+        # Protect every filled entry (GTC stop-limit keyed to the ACTUAL fill).
+        for spec in pending_entry_stops:
+            if not spec.get("order_id"):
+                continue
+            try:
+                pipeline.broker.place_entry_protection(
+                    symbol=spec["symbol"], order_id=spec["order_id"],
+                    stop_price=spec["stop_price"], requested_qty=spec["qty"],
+                )
+            except Exception as e:  # noqa: BLE001 — never abort the session here
+                logger.error(
+                    "entry protection raised for %s: %s — position may be "
+                    "unprotected until the next coverage reconcile",
+                    spec["symbol"], e,
+                )
 
         ctx.orders = orders
         return orders

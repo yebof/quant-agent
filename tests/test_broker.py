@@ -1,5 +1,6 @@
 import pytest
 from unittest.mock import patch, MagicMock, PropertyMock
+from alpaca.trading.enums import TimeInForce
 from src.execution.broker import AlpacaBroker
 
 
@@ -505,7 +506,7 @@ def test_submit_order_quantizes_sub_penny_limit_price(mock_tc_cls):
     mock_tc_cls.return_value = mock_client
 
     broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
-    broker.submit_order(
+    result = broker.submit_order(
         symbol="UPS", qty=5, side="buy",
         limit_price=106.515,
         stop_loss_price=98.127,  # stop too — same tick rule applies
@@ -513,8 +514,11 @@ def test_submit_order_quantizes_sub_penny_limit_price(mock_tc_cls):
     req = mock_client.submit_order.call_args[0][0]
     assert isinstance(req, LimitOrderRequest)
     assert float(req.limit_price) == 106.52  # quantized to nearest cent
-    # The OTO stop_loss leg carries the stop_price on its own sub-object.
-    assert float(req.stop_loss.stop_price) == 98.13
+    # 2026-07-16 audit: the entry carries NO OTO stop leg any more (the leg
+    # would inherit the parent's DAY tif and be expired at the close). The
+    # quantized stop rides back on the result for post-fill GTC placement.
+    assert getattr(req, "stop_loss", None) is None
+    assert float(result["pending_stop_price"]) == 98.13
 
 
 @patch("src.execution.broker.TradingClient")
@@ -1530,3 +1534,93 @@ def test_get_recent_daily_closes_swallows_errors(mock_tc_cls):
     mock_tc_cls.return_value = mock_client
     broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
     assert broker.get_recent_daily_closes() == []   # best-effort, never raises
+
+
+# ============================================================================
+# 2026-07-16 audit, CRITICAL: BUY-attached protective stops were OTO legs that
+# inherited the parent's DAY time_in_force, so Alpaca expired them at 16:00 ET
+# the same session — every position bought in the morning and not later given a
+# midday/close TRAIL_STOP sat NAKED overnight (VST 06-26: stop $158.75 gone by
+# the close, exited 07-01 @ $152.77 for ~$185 more loss than the stop capped).
+# alpaca-py's StopLossRequest has no TIF field of its own, so the only fix is
+# to place the stop as a separate GTC order after the entry fills.
+# ============================================================================
+
+@patch("src.execution.broker.TradingClient")
+def test_buy_entry_carries_no_oto_leg(mock_tc_cls):
+    """The entry must be a plain DAY limit — an unfilled entry must still die
+    at the close, and the stop must NOT ride on the parent's tif."""
+    from alpaca.trading.requests import LimitOrderRequest
+
+    mock_client = MagicMock()
+    order = MagicMock(id="e1", status="accepted", symbol="NVDA")
+    mock_client.submit_order.return_value = order
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.submit_order(symbol="NVDA", qty=10, side="buy",
+                                 limit_price=100.0, stop_loss_price=90.0)
+
+    req = mock_client.submit_order.call_args[0][0]
+    assert isinstance(req, LimitOrderRequest)
+    assert getattr(req, "order_class", None) is None
+    assert getattr(req, "stop_loss", None) is None
+    assert req.time_in_force == TimeInForce.DAY   # entry still dies at the close
+    assert result["pending_stop_price"] == 90.0   # caller owes the stop
+
+
+@patch("src.execution.broker.TradingClient")
+def test_place_entry_protection_uses_gtc_and_actual_fill_qty(mock_tc_cls):
+    """The protective stop is GTC (survives the close) and is sized to the
+    ACTUAL fill — the old OTO leg was sized to the REQUESTED qty, so a partial
+    entry fill left a stop covering shares we never owned."""
+    from alpaca.trading.requests import StopLimitOrderRequest
+
+    mock_client = MagicMock()
+    stop_order = MagicMock(id="s1", status="new", symbol="NVDA")
+    mock_client.submit_order.return_value = stop_order
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    broker.wait_for_order_terminal = MagicMock(return_value="filled")
+    broker.get_order_fill_info = MagicMock(return_value={
+        "status": "filled", "filled_qty": 7.0, "filled_avg_price": 100.0,
+    })
+
+    out = broker.place_entry_protection(
+        symbol="NVDA", order_id="e1", stop_price=90.0, requested_qty=10,
+    )
+
+    assert out is not None
+    req = mock_client.submit_order.call_args[0][0]
+    assert isinstance(req, StopLimitOrderRequest)
+    assert req.time_in_force == TimeInForce.GTC     # THE fix — survives 16:00 ET
+    assert float(req.qty) == 7.0                    # actual fill, not the 10 requested
+    assert float(req.stop_price) == 90.0
+    assert float(req.limit_price) == 87.3           # 3% buffer below the stop
+
+
+@patch("src.execution.broker.TradingClient")
+def test_place_entry_protection_no_fill_places_nothing(mock_tc_cls):
+    mock_client = MagicMock()
+    mock_tc_cls.return_value = mock_client
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    broker.wait_for_order_terminal = MagicMock(return_value="canceled")
+    broker.get_order_fill_info = MagicMock(return_value={"filled_qty": 0.0})
+
+    assert broker.place_entry_protection("NVDA", "e1", 90.0) is None
+    mock_client.submit_order.assert_not_called()
+
+
+@patch("src.execution.broker.TradingClient")
+def test_place_entry_protection_swallows_stop_submit_failure(mock_tc_cls):
+    """A failed stop must not abort the session — it logs ERROR and leaves the
+    gap for the next coverage reconcile to repair."""
+    mock_client = MagicMock()
+    mock_client.submit_order.side_effect = RuntimeError("alpaca 500")
+    mock_tc_cls.return_value = mock_client
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    broker.wait_for_order_terminal = MagicMock(return_value="filled")
+    broker.get_order_fill_info = MagicMock(return_value={"filled_qty": 10.0})
+
+    assert broker.place_entry_protection("NVDA", "e1", 90.0) is None  # no raise
