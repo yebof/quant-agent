@@ -589,12 +589,26 @@ class TradingPipeline:
             projected_invested_pct = abs(existing_net + pending_investment) / total_value * 100
             deviation = projected_invested_pct - macro_target_invested_pct
             if abs(deviation) > 15:
+                # RC3: direction matters. The old symmetric message told RM
+                # to "consider scale_all_buys" for BOTH directions — for an
+                # UNDER-deployed book that advice compounds the exact drag
+                # it should be correcting (three months of 39% invested vs
+                # a 72-75% target).
+                if deviation < 0:
+                    guidance = (
+                        "advisory — book is UNDER macro's target; do NOT "
+                        "scale down the remaining BUYs for this reason. If "
+                        "cutting anything, name a risk specific to the trade, "
+                        "not the gap."
+                    )
+                else:
+                    guidance = "advisory — RM should consider scale_all_buys"
                 remaining_violations.append(RiskViolation(
                     rule="macro_exposure_deviation",
                     message=(
                         f"Projected net exposure {projected_invested_pct:.0f}% deviates "
                         f"from Macro target {macro_target_invested_pct:.0f}% by {deviation:+.0f}pp "
-                        f"(advisory — RM should consider scale_all_buys)"
+                        f"({guidance})"
                     ),
                     value=projected_invested_pct,
                     limit=macro_target_invested_pct,
@@ -4166,6 +4180,7 @@ class TradingPipeline:
         total_value: float,
         cash: float,
         recent_performance: dict,
+        macro_analysis=None,
     ) -> PMFacts:
         """Quantitative snapshot surfaced to PM as structured fields.
 
@@ -4269,6 +4284,20 @@ class TradingPipeline:
         f.rolling_5d_pct = recent_performance.get("rolling_5d_pct")
         f.rolling_20d_pct = recent_performance.get("rolling_20d_pct")
         f.in_drawdown = bool(recent_performance.get("in_drawdown"))
+
+        # RC3: deployment gap vs the macro target as a hard fact in PM's
+        # face. `invested_pct` above is sweep-aware (the DecisionStage view
+        # already counts parked T-bills as cash, not exposure).
+        try:
+            target = None
+            if macro_analysis is not None:
+                guidance = getattr(macro_analysis, "position_guidance", None)
+                target = getattr(guidance, "target_invested_pct", None)
+            if isinstance(target, (int, float)) and math.isfinite(target):
+                f.macro_target_invested_pct = float(target)
+                f.deployment_gap_pp = round(f.invested_pct - float(target), 1)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("pm_facts: deployment gap failed: %s", e)
 
         return f
 

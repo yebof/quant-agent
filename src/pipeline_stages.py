@@ -430,6 +430,7 @@ class DecisionStage:
             positions=positions, analyses=analyses,
             total_value=total_value, cash=cash,
             recent_performance=recent_performance,
+            macro_analysis=macro_analysis,
         )
         ctx.facts = pm_facts
 
