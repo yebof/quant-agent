@@ -2893,13 +2893,26 @@ class TradingPipeline:
             "repeat_premature_symbols": [],
             "repeat_wrong_symbols": [],
         }
+        def _with_reality(base: dict) -> dict:
+            # The deterministic post-exit block must ride along even when
+            # nightly grades are absent/corrupt — it's tape-derived, not
+            # grade-derived, and it's the part the grader can't sugar-coat.
+            try:
+                base["post_exit_reality"] = self._build_post_exit_reality(
+                    lookback_days=max(lookback_days, 14),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("post_exit_reality failed (summary degrades): %s", e)
+                base["post_exit_reality"] = None
+            return base
+
         try:
             rows = self.db.get_recent_insights(limit=lookback_days + 5)
         except Exception as e:
             logger.warning("trade_grade_summary: insights fetch failed: %s", e)
-            return empty
+            return _with_reality(empty)
         if not rows:
-            return empty
+            return _with_reality(empty)
 
         sell_counts = {"correct": 0, "premature": 0, "wrong": 0}
         buy_counts = {"correct": 0, "premature": 0, "wrong": 0}
@@ -2954,7 +2967,7 @@ class TradingPipeline:
                 if grade in buy_counts:
                     buy_counts[grade] += 1
 
-        return {
+        summary = {
             "n_sells": sum(sell_counts.values()),
             "n_buys": sum(buy_counts.values()),
             "sell_counts": sell_counts,
@@ -2965,6 +2978,101 @@ class TradingPipeline:
             "repeat_wrong_symbols": sorted(
                 s for s, c in sell_wrong_by_symbol.items() if c >= 2
             ),
+        }
+        # RC4 (2026-07-16): deterministic post-exit reality. The LLM grader
+        # scored 32/33 recent sells "correct" at t+1..t+3 while the tape
+        # showed 28/53 exits ≥5% higher within 20 days — self-assessment
+        # cannot be the only input to the patience tilt. These numbers come
+        # from trades × live prices, no LLM in the loop.
+        return _with_reality(summary)
+
+    # Realized-exit actions whose post-exit trajectory is worth auditing.
+    # SWEEP_SELL is deliberately absent — parking churn is not a decision.
+    _EXIT_AUDIT_ACTIONS = (
+        "SELL", "REDUCE", "EMERGENCY_SELL", "FORCE_DELEVER", "TAKE_PROFIT",
+    )
+
+    def _build_post_exit_reality(
+        self, lookback_days: int = 14, min_age_days: int = 2, max_symbols: int = 12,
+    ) -> dict | None:
+        """What actually happened after our recent exits — from the tape.
+
+        For every realized exit in the window (SELL family + filled
+        TRAIL_STOPs) at least `min_age_days` old, compare the exit price to
+        the live price. Returns None when there's nothing to audit.
+
+        {"n": int, "n_higher_5pct": int, "avg_move_pct": float,
+         "worst": [{"symbol", "date", "move_pct"} × ≤3]}   # worst = ran most
+        """
+        from datetime import datetime as _dt, timedelta, timezone
+        try:
+            rows = self.db.get_trades(limit=120)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("post_exit_reality: trades fetch failed: %s", e)
+            return None
+        now = _dt.now(timezone.utc)
+        window_start = now - timedelta(days=lookback_days)
+        age_cutoff = now - timedelta(days=min_age_days)
+        exits: list[dict] = []
+        for row in rows:
+            action = (row.get("action") or "").upper()
+            is_exit = (
+                action in self._EXIT_AUDIT_ACTIONS
+                or action.startswith("PARTIAL_SELL")
+                or (action == "TRAIL_STOP"
+                    and (row.get("fill_status") or "") == "filled")
+            )
+            if not is_exit:
+                continue
+            if action != "TRAIL_STOP" and (row.get("fill_status") or "") not in (
+                "filled", "submitted",
+            ):
+                continue
+            ts = row.get("timestamp") or ""
+            try:
+                dt = _dt.fromisoformat(ts.replace("Z", "+00:00")) if "T" in ts \
+                    else _dt.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if not (window_start <= dt <= age_cutoff):
+                continue
+            exit_px = row.get("fill_price") or row.get("price")
+            if not (isinstance(exit_px, (int, float)) and exit_px > 0):
+                continue
+            exits.append({
+                "symbol": row.get("symbol"), "date": ts[:10],
+                "exit_px": float(exit_px),
+            })
+        if not exits:
+            return None
+        # Live prices — one broker call per distinct symbol, capped.
+        prices: dict[str, float] = {}
+        for sym in list(dict.fromkeys(e["symbol"] for e in exits))[:max_symbols]:
+            try:
+                px = self.broker.get_latest_price(sym)
+            except Exception:  # noqa: BLE001
+                px = None
+            if isinstance(px, (int, float)) and px > 0:
+                prices[sym] = float(px)
+        moves: list[dict] = []
+        for e in exits:
+            cur = prices.get(e["symbol"])
+            if cur is None:
+                continue
+            moves.append({
+                "symbol": e["symbol"], "date": e["date"],
+                "move_pct": round((cur - e["exit_px"]) / e["exit_px"] * 100, 1),
+            })
+        if not moves:
+            return None
+        moves.sort(key=lambda m: -m["move_pct"])
+        return {
+            "n": len(moves),
+            "n_higher_5pct": sum(1 for m in moves if m["move_pct"] >= 5.0),
+            "avg_move_pct": round(sum(m["move_pct"] for m in moves) / len(moves), 1),
+            "worst": moves[:3],
         }
 
     def _build_recent_missed_lessons(self, lookback_days: int = 14) -> str:
@@ -2989,8 +3097,14 @@ class TradingPipeline:
             return ""
         if not rows:
             return ""
+        # RC4 (2026-07-16): value_entry_missed IS a real, actionable miss —
+        # it's the category evening uses for "we identified the entry and
+        # didn't take it" (SNDK was flagged 16×, ORCL 7×, and PM never saw
+        # any of it because this set filtered them out). Only the two
+        # "not-really-a-miss" categories stay excluded.
         real_miss_cats = {
-            "trend_timing_miss", "theme_blindspot", "fundamentals_mispricing"
+            "trend_timing_miss", "theme_blindspot", "fundamentals_mispricing",
+            "value_entry_missed",
         }
         theme_dates: dict[str, set[str]] = {}
         theme_symbols: dict[str, list[str]] = {}
@@ -3024,18 +3138,30 @@ class TradingPipeline:
                     continue
                 theme = (m.get("theme_if_any") or "").strip()
                 sym = (m.get("symbol") or "").strip().upper()
-                # Group key: theme name when present, else symbol (fall back so
-                # "no theme tagged but same symbol missed twice" still surfaces).
-                key = theme or f"sym:{sym}"
-                if not key:
+                # DUAL grouping keys. RC4 (2026-07-16): theme_if_any is LLM
+                # free text that almost never repeats verbatim (45 distinct
+                # themes, 0 recurring in the audit window) — keyed ONLY by
+                # theme, a symbol missed 16 times (SNDK) diluted into 16
+                # one-off "themes" and PM was shown "(no recurring missed
+                # themes)" every run. Symbol-keyed counting fixes that;
+                # theme-keyed counting is KEPT because cross-symbol theme
+                # recurrence (VST + OKLO both "nuclear/power") is a real,
+                # distinct signal a symbol key can't see.
+                keys = set()
+                if sym:
+                    keys.add(f"sym:{sym}")
+                if theme:
+                    keys.add(theme)
+                if not keys:
                     continue
-                theme_dates.setdefault(key, set()).add(row_date)
-                theme_symbols.setdefault(key, []).append(sym)
-                # Rows are newest-first; first lesson we see is the freshest.
-                if key not in theme_lessons:
-                    lesson = (m.get("lesson") or "").strip()
-                    if lesson:
-                        theme_lessons[key] = lesson[:200]
+                for key in keys:
+                    theme_dates.setdefault(key, set()).add(row_date)
+                    theme_symbols.setdefault(key, []).append(sym)
+                    # Rows are newest-first; first lesson seen is freshest.
+                    if key not in theme_lessons:
+                        lesson = (m.get("lesson") or "").strip()
+                        if lesson:
+                            theme_lessons[key] = lesson[:200]
         # Keep themes seen on ≥ 2 distinct dates.
         recurring = [
             (k, len(theme_dates[k])) for k in theme_dates

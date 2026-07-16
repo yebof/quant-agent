@@ -371,6 +371,34 @@ class PositionReviewerAgent(BaseAgent):
                 f"{tilt_note}\n"
             ).rstrip() + "\n"
 
+        # Deterministic post-exit reality (computed from trades × live
+        # prices, NO self-assessment): what the tape did after our recent
+        # exits. Rendered even when nightly grades are absent — the
+        # 2026-07-16 audit found grades said 97% "correct" while 53% of
+        # exits ran ≥5% higher within 20 days.
+        reality = trade_grade_summary.get("post_exit_reality") if trade_grade_summary else None
+        if reality and reality.get("n"):
+            worst_lines = "; ".join(
+                f"{w['symbol']} exited {w['date']} → {w['move_pct']:+.1f}% since"
+                for w in (reality.get("worst") or [])
+            )
+            frac = reality["n_higher_5pct"] / reality["n"]
+            reality_note = ""
+            if frac >= 0.5:
+                reality_note = (
+                    "⚠️ Over HALF of recent exits ran ≥5% after you sold — the "
+                    "tape says your exits fire too early. Any SELL/tighten today "
+                    "must name a hard trigger, not price action."
+                )
+            grade_section += (
+                f"### Post-exit reality check (deterministic, from price data)\n"
+                f"Exits in window: {reality['n']}; ran ≥5% higher after exit: "
+                f"{reality['n_higher_5pct']}; avg move since exit: "
+                f"{reality['avg_move_pct']:+.1f}%\n"
+                f"Biggest post-exit runs: {worst_lines}\n"
+                f"{reality_note}\n"
+            ).rstrip() + "\n"
+
         if recent_performance:
             r5 = recent_performance.get("rolling_5d_pct")
             r20 = recent_performance.get("rolling_20d_pct")
