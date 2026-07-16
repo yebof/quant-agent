@@ -5169,50 +5169,78 @@ class TradingPipeline:
                     "run_id": run_id,
                 }
 
-            # Phase 4 #1: research stage runs the parallel fan-out (macro / news /
-            # tech / earnings). Populates ctx fields; we unpack to local names so
-            # the downstream code keeps reading legibly.
-            self.morning_research_stage.run(ctx)
-            macro_summary = ctx.macro_summary
-            macro_analysis = ctx.macro_analysis
-            news_intel = ctx.news_intel
-            analyses = ctx.analyses
-            earnings_results = ctx.earnings_results
-            data_status = ctx.data_status
+            # RC2 resume lane: a prior morning tick may have been killed by
+            # the wrapper timeout AFTER the PM produced a plan but BEFORE the
+            # RiskStage reviewed it (the observed death mode: 61/61 BUY-
+            # proposal days destroyed at the PM→RM boundary during the
+            # 6/30-7/15 relay outage). If today's unconsumed checkpoint
+            # exists and is fresh, skip research+PM entirely — the full
+            # preamble above (drains, coverage audit, force_delever, circuit
+            # breaker, FRESH account snapshot) has already run, and the
+            # RiskStage + execution guards below all operate on live state.
+            # RM always re-runs; there is no resume-past-RM.
+            from src import decision_checkpoint as _dc
+            resumed = _dc.load("morning")
+            if resumed is not None:
+                logger.warning(
+                    "RESUME LANE: unconsumed decision checkpoint from %s "
+                    "(age %.0f min, %d decisions) — skipping research+PM, "
+                    "re-entering at RiskStage on fresh account state",
+                    resumed["run_id"], resumed["age_minutes"],
+                    len(resumed["portfolio_decision"].decisions),
+                )
+                ctx.macro_summary = resumed["macro_summary"]
+                ctx.macro_analysis = resumed["macro_analysis"]
+                ctx.news_intel = resumed["news_intel"]
+                ctx.analyses = resumed["analyses"]
+                ctx.earnings_results = resumed["earnings_results"]
+                ctx.data_status = resumed["data_status"]
+                ctx.portfolio_decision = resumed["portfolio_decision"]
+                portfolio_decision = ctx.portfolio_decision
+            else:
+                # Phase 4 #1: research stage runs the parallel fan-out (macro /
+                # news / tech / earnings). Populates ctx fields.
+                self.morning_research_stage.run(ctx)
+                analyses = ctx.analyses
 
-            # Late-breach check: research can take 5-10 min on slow OpenAI
-            # days. The pre-research circuit breaker (#45) caught open-gap
-            # losses; this catches the case where the tape crosses the
-            # daily-loss limit DURING research and the morning would
-            # otherwise bail to no_data/no_trades, leaving the breach for
-            # the next intra tick (30 min away). Mirror the pre-research
-            # bypass: deterministic emergency liquidate, no LLM dependency.
-            late_breach = self._check_late_breach_and_emergency_liquidate(
-                run_id, "post-research",
-            )
-            if late_breach is not None:
-                return late_breach
+                # Late-breach check: research can take 5-10 min on slow OpenAI
+                # days. The pre-research circuit breaker (#45) caught open-gap
+                # losses; this catches the case where the tape crosses the
+                # daily-loss limit DURING research and the morning would
+                # otherwise bail to no_data/no_trades, leaving the breach for
+                # the next intra tick (30 min away). Mirror the pre-research
+                # bypass: deterministic emergency liquidate, no LLM dependency.
+                late_breach = self._check_late_breach_and_emergency_liquidate(
+                    run_id, "post-research",
+                )
+                if late_breach is not None:
+                    return late_breach
 
-            if not analyses:
-                logger.warning("No analyses produced, skipping trading")
-                return {"status": "no_data", "orders": [], "run_id": run_id}
+                if not analyses:
+                    logger.warning("No analyses produced, skipping trading")
+                    return {"status": "no_data", "orders": [], "run_id": run_id}
 
-            # Phase 4 #1: decision stage — memory layers + PM + Constructor.
-            self._decision_stage(ctx)
-            portfolio_decision = ctx.portfolio_decision
+                # Phase 4 #1: decision stage — memory layers + PM + Constructor.
+                self._decision_stage(ctx)
+                portfolio_decision = ctx.portfolio_decision
 
-            # Second late-breach check: PM is itself a multi-second LLM
-            # call (memory layers + Constructor sizing). The post-research
-            # check (#60) caught breaches during research but a parse-fail
-            # or empty-plan exit at this point would still skip
-            # deterministic liquidation until the next intra tick. Codex
-            # r8 #1 caught this gap — same fix as #60, just one stage
-            # later in the pipeline.
-            late_breach = self._check_late_breach_and_emergency_liquidate(
-                run_id, "post-decision",
-            )
-            if late_breach is not None:
-                return late_breach
+                # Persist the plan the moment it exists — a kill anywhere
+                # between here and execution leaves a resumable checkpoint
+                # instead of a wasted research+PM spend.
+                _dc.write(ctx)
+
+                # Second late-breach check: PM is itself a multi-second LLM
+                # call (memory layers + Constructor sizing). The post-research
+                # check (#60) caught breaches during research but a parse-fail
+                # or empty-plan exit at this point would still skip
+                # deterministic liquidation until the next intra tick. Codex
+                # r8 #1 caught this gap — same fix as #60, just one stage
+                # later in the pipeline.
+                late_breach = self._check_late_breach_and_emergency_liquidate(
+                    run_id, "post-decision",
+                )
+                if late_breach is not None:
+                    return late_breach
 
             if not portfolio_decision:
                 logger.info("Portfolio manager: parse failed, no decision object")
@@ -5231,6 +5259,13 @@ class TradingPipeline:
 
             # Phase 4 #1: risk stage — hard filter + earnings cap + RM review + mods.
             early_exit = self._risk_stage(ctx)
+            # The plan has now been risk-reviewed — whatever the outcome, it
+            # must never be re-offered by the resume lane (an RM-rejected
+            # plan retried next tick would be a veto bypass), and marking
+            # BEFORE execution makes the execution at-most-once (a kill
+            # mid-execution is owned by the BUY write-ahead orphan sweep,
+            # not by re-running the plan).
+            _dc.mark_consumed("morning")
             if early_exit is not None:
                 early_exit["run_id"] = run_id
                 early_exit["data_status"] = dict(ctx.data_status)
