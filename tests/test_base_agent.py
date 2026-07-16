@@ -186,7 +186,9 @@ def test_anthropic_client_gets_explicit_http_timeout():
 
     with patch("anthropic.Anthropic") as mock_cls:
         ConcreteAgent(api_key="k", model="claude-sonnet-4-6-20250514", max_tokens=1024)
-        mock_cls.assert_called_once_with(api_key="k", timeout=_LLM_HTTP_TIMEOUT)
+        # max_retries=0: the SDK's 2 internal retries would silently triple
+        # every _execute() attempt — the agent loop is the single retry owner.
+        mock_cls.assert_called_once_with(api_key="k", timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
 
 
 def test_openai_client_gets_explicit_http_timeout():
@@ -200,7 +202,8 @@ def test_openai_client_gets_explicit_http_timeout():
         ConcreteAgent(api_key="k", model="gpt-5.4", max_tokens=1024)
         # base_url defaults to None (api.openai.com) unless OPENAI_BASE_URL is set
         # for relay routing — see test_openai_base_url_routes_through_relay.
-        mock_cls.assert_called_once_with(api_key="k", base_url=None, timeout=_LLM_HTTP_TIMEOUT)
+        mock_cls.assert_called_once_with(api_key="k", base_url=None,
+                                         timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
 
 
 def test_parse_json_prefers_agent_shape_over_larger_fragment():
@@ -582,9 +585,10 @@ def test_deepseek_sends_max_tokens_not_max_completion_tokens():
         assert "max_tokens" in call_kwargs
         assert "max_completion_tokens" not in call_kwargs
 
-    # mirror: the OpenAI path still uses max_completion_tokens
+    # mirror: the OpenAI path still uses max_completion_tokens (and streams —
+    # see the relay-hardening section at the end of this file)
     with patch("openai.OpenAI") as oai_cls:
-        client = _deepseek_oai_mock()
+        client = _openai_stream_mock()
         oai_cls.return_value = client
         agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=4096)
         agent.run(data="x")
@@ -766,3 +770,310 @@ def test_openai_no_ca_bundle_uses_default_trust(monkeypatch):
         ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)
         assert "http_client" not in oai_cls.call_args.kwargs
         assert oai_cls.call_args.kwargs.get("timeout") is not None
+
+
+# === streamed OpenAI path + relay hardening (CF-524 / 429 storms / degenerate 200s) ===
+
+def _stream_chunk(piece=None, finish_reason=None, usage=None):
+    """One streamed chunk. A usage-only chunk (include_usage's final extra
+    chunk) carries an empty choices list."""
+    chunk = MagicMock()
+    chunk.usage = usage  # explicit None — MagicMock auto-attrs would count as usage
+    if piece is None and finish_reason is None and usage is not None:
+        chunk.choices = []
+        return chunk
+    delta = MagicMock()
+    delta.content = piece
+    choice = MagicMock()
+    choice.delta = delta
+    choice.finish_reason = finish_reason
+    chunk.choices = [choice]
+    return chunk
+
+
+def _stream_usage(prompt=100, completion=50):
+    u = MagicMock()
+    u.prompt_tokens = prompt
+    u.completion_tokens = completion
+    return u
+
+
+def _openai_stream_mock(pieces=('{"result"', ': "ok"}'), finish_reason="stop", usage="default"):
+    """Mock OpenAI client whose chat.completions.create returns a streamed
+    (iterable-of-chunks) response — the shape _call_openai consumes.
+    finish_reason=None simulates a connection cut mid-generation (no final
+    chunk ever carries a finish_reason). usage=None simulates a relay that
+    ignores stream_options include_usage."""
+    oai = MagicMock()
+    chunks = [_stream_chunk(piece=p) for p in pieces]
+    if finish_reason is not None:
+        chunks.append(_stream_chunk(finish_reason=finish_reason))
+    if usage == "default":
+        usage = _stream_usage()
+    if usage is not None:
+        chunks.append(_stream_chunk(usage=usage))
+    oai.chat.completions.create.return_value = chunks
+    return oai
+
+
+def test_openai_path_streams_and_assembles_content():
+    """_call_openai streams (stream=True) on purpose: the relay sits behind
+    Cloudflare's ~120s proxy read timeout (HTTP 524), so a non-streamed 120s+
+    generation can never succeed through it (2026-06-08/09 outage). Content is
+    assembled from the deltas; usage arrives on the include_usage final chunk."""
+    with patch("openai.OpenAI") as oai_cls:
+        client = _openai_stream_mock()
+        oai_cls.return_value = client
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=4096)
+        result = agent.run(data="x")
+        kw = client.chat.completions.create.call_args.kwargs
+        assert kw.get("stream") is True
+        assert kw.get("stream_options") == {"include_usage": True}
+    assert result.raw_text == '{"result": "ok"}'
+    assert result.parse_json() == {"result": "ok"}
+    assert result.input_tokens == 100 and result.output_tokens == 50
+    assert result.truncated is False
+
+
+def test_openai_stream_without_usage_estimates_tokens():
+    """Relay ignored include_usage → chars/4 estimates, never 0/0 (0/0 would
+    flag the call cost-unknown and drop it from daily cost totals)."""
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = _openai_stream_mock(usage=None)
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=4096)
+        result = agent.run(data="x")
+    assert result.raw_text == '{"result": "ok"}'
+    assert result.input_tokens > 0 and result.output_tokens > 0
+
+
+def test_openai_stream_interrupted_discards_partial_and_retries(monkeypatch):
+    """finish_reason never arrives = connection cut mid-generation. Partial
+    text must be DISCARDED (a half-emitted PM decision parses like 'no
+    trades') and the error must be retryable."""
+    from src.agents.base import LLMStreamInterruptedError, _is_retryable
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+    with patch("openai.OpenAI") as oai_cls:
+        client = _openai_stream_mock(pieces=('{"half":',), finish_reason=None, usage=None)
+        oai_cls.return_value = client
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)
+        with pytest.raises(LLMStreamInterruptedError):
+            agent.run(data="x")
+        assert client.chat.completions.create.call_count == 2  # retried, then exhausted
+    assert _is_retryable(LLMStreamInterruptedError("x")) is True
+
+
+def test_openai_empty_content_raises_retryable_not_silent_success(monkeypatch):
+    """A degenerate 200 (finish_reason=stop, empty body) must enter the
+    retry/failover machinery — previously it returned '' as a SUCCESS,
+    masquerading as a deliberate no-signal and burning the agent's one shot
+    for the session."""
+    from src.agents.base import LLMEmptyResponseError, _is_retryable
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = _openai_stream_mock(pieces=(), finish_reason="stop")
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)
+        with pytest.raises(LLMEmptyResponseError):
+            agent.run(data="x")
+    assert _is_retryable(LLMEmptyResponseError("x")) is True
+
+
+def test_openai_empty_content_on_length_is_truncation_not_error():
+    """Empty body + truncation-family finish_reason = the whole budget burned
+    before any visible text. That's a legit truncation (truncated=True), NOT
+    a degenerate response — must not raise / retry / fail over."""
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = _openai_stream_mock(pieces=(), finish_reason="length")
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)
+        result = agent.run(data="x")
+    assert result.raw_text == ""
+    assert result.truncated is True
+
+
+def test_openai_empty_content_fails_over_to_anthropic(monkeypatch):
+    """The point of raising on empty: the Anthropic failover can rescue the
+    session instead of the agent silently contributing a blank."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+    anth = MagicMock()
+    anth.messages.create.return_value = _good_anthropic_response()
+    with patch("openai.OpenAI", return_value=_openai_stream_mock(pieces=(), finish_reason="stop")), \
+         patch("anthropic.Anthropic", return_value=anth):
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64, fallback_api_key="fk")
+        result = agent.run(data="x")
+    assert result.raw_text == '{"result": "ok"}'
+    assert result.model == "claude-opus-4-7"
+
+
+def test_anthropic_empty_content_raises_unless_truncation(monkeypatch):
+    """Same guard on the Anthropic path: end_turn + empty content raises
+    (degenerate 200); max_tokens + empty content is a legit whole-budget
+    truncation and returns '' flagged truncated."""
+    from src.agents.base import LLMEmptyResponseError
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "1")
+    with patch("anthropic.Anthropic") as anth_cls:
+        r = _good_anthropic_response()
+        r.content = []
+        anth_cls.return_value.messages.create.return_value = r
+        agent = ConcreteAgent(api_key="k", model="claude-opus-4-7", max_tokens=64)
+        with pytest.raises(LLMEmptyResponseError):
+            agent.run(data="x")
+    with patch("anthropic.Anthropic") as anth_cls:
+        r = _good_anthropic_response()
+        r.content = []
+        r.stop_reason = "max_tokens"
+        anth_cls.return_value.messages.create.return_value = r
+        agent = ConcreteAgent(api_key="k", model="claude-opus-4-7", max_tokens=64)
+        result = agent.run(data="x")
+        assert result.raw_text == "" and result.truncated is True
+
+
+def test_deepseek_empty_content_nontruncation_raises(monkeypatch):
+    """DeepSeek mirror of the degenerate-200 guard (the truncation-family
+    empty case is covered by test_deepseek_empty_content_with_reasoning...)."""
+    from src.agents.base import LLMEmptyResponseError
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "1")
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = _deepseek_oai_mock(content="", finish_reason="stop")
+        agent = ConcreteAgent(api_key="dk", model="deepseek-v4-flash", max_tokens=64)
+        with pytest.raises(LLMEmptyResponseError):
+            agent.run(data="x")
+
+
+def test_retry_deadline_abandons_primary_for_failover(monkeypatch):
+    """The attempt budget alone doesn't bound wall-clock: under the relay's
+    CF-524 mode each attempt burned 120-380s, so exhausting 7 attempts
+    collided with the wrapper's 1200s kill and the failover below the loop
+    never fired (2026-06-08/09 mornings). Past the deadline the primary is
+    abandoned with attempts still left, and failover fires."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    # monotonic: loop_start=0; attempt 1 fails at 200s (<480 → retry);
+    # attempt 2 fails at 600s (>=480 → abandon primary, fail over).
+    ticks = [0.0, 200.0, 600.0]
+    monkeypatch.setattr("src.agents.base.time.monotonic",
+                        lambda: ticks.pop(0) if ticks else 600.0)
+    oai = MagicMock()
+    oai.chat.completions.create.side_effect = ConnectionError("relay 524 storm")
+    anth = MagicMock()
+    anth.messages.create.return_value = _good_anthropic_response()
+    with patch("openai.OpenAI", return_value=oai), patch("anthropic.Anthropic", return_value=anth):
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64, fallback_api_key="fk")
+        result = agent.run(data="x")
+    assert oai.chat.completions.create.call_count == 2  # NOT the full 7-attempt budget
+    assert result.model == "claude-opus-4-7"
+
+
+def test_retry_deadline_env_override(monkeypatch):
+    from src.agents.base import _retry_deadline_s, _DEFAULT_RETRY_DEADLINE_S
+    monkeypatch.delenv("QUANT_AGENT_RETRY_DEADLINE_S", raising=False)
+    assert _retry_deadline_s() == _DEFAULT_RETRY_DEADLINE_S
+    monkeypatch.setenv("QUANT_AGENT_RETRY_DEADLINE_S", "60")
+    assert _retry_deadline_s() == 60.0
+    monkeypatch.setenv("QUANT_AGENT_RETRY_DEADLINE_S", "garbage")
+    assert _retry_deadline_s() == _DEFAULT_RETRY_DEADLINE_S
+    monkeypatch.setenv("QUANT_AGENT_RETRY_DEADLINE_S", "0")
+    assert _retry_deadline_s() == 1.0  # floor — 0/negative would break the loop
+
+
+def test_retry_after_hint_extraction():
+    from src.agents.base import _retry_after_hint_seconds
+
+    class HeaderErr(Exception):
+        pass
+    e = HeaderErr("429")
+    resp = MagicMock()
+    resp.headers = {"retry-after": "37"}
+    e.response = resp
+    assert _retry_after_hint_seconds(e) == 37.0
+
+    class BodyErr(Exception):
+        pass
+    b = BodyErr("429")
+    b.body = {"retry_after": 15}
+    assert _retry_after_hint_seconds(b) == 15.0
+
+    # relay 524 bodies embed the hint in the message text
+    m = Exception('Concurrency limit exceeded, "retry_after": 120')
+    assert _retry_after_hint_seconds(m) == 120.0
+
+    # bool must not pass the numeric check; plain errors carry no hint
+    t = BodyErr("429")
+    t.body = {"retry_after": True}
+    assert _retry_after_hint_seconds(t) is None
+    assert _retry_after_hint_seconds(Exception("plain connection error")) is None
+
+
+def test_retry_sleeps_at_least_the_server_hint(monkeypatch):
+    """Backoff honors a server retry-after hint — sleeping 2s against a
+    'come back in 90s' 429 just burns attempts against a closed door. A
+    hostile/buggy hint is capped so it can't park the agent past the
+    session window."""
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+
+    oai = MagicMock()
+    oai.chat.completions.create.side_effect = ConnectionError(
+        'Concurrency limit exceeded {"retry_after": 90}')
+    with patch("openai.OpenAI", return_value=oai):
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)
+        with pytest.raises(ConnectionError):
+            agent.run(data="x")
+    assert sleeps == [90.0]
+
+    sleeps.clear()
+    oai2 = MagicMock()
+    oai2.chat.completions.create.side_effect = ConnectionError(
+        'slow down {"retry_after": 6000}')
+    with patch("openai.OpenAI", return_value=oai2):
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)
+        with pytest.raises(ConnectionError):
+            agent.run(data="x")
+    assert sleeps == [120.0]  # _RETRY_AFTER_CAP_S
+
+
+def test_deepseek_client_disables_sdk_internal_retries():
+    """max_retries=0 on EVERY SDK client: both SDKs default to 2 internal
+    retries on 429/5xx, silently tripling each _execute() attempt and
+    invalidating the retry-budget/deadline math. The agent loop is the
+    single retry owner. (OpenAI/Anthropic primary constructors are asserted
+    in the http-timeout tests above; this covers the DeepSeek constructor.)"""
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = _deepseek_oai_mock()
+        ConcreteAgent(api_key="dk", model="deepseek-v4-flash", max_tokens=64)
+        assert oai_cls.call_args.kwargs.get("max_retries") == 0
+
+
+def test_failover_client_disables_sdk_internal_retries(monkeypatch):
+    """The failover Anthropic client is single-shot BY DESIGN — SDK-internal
+    retries would quietly turn it into 3 shots."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "1")
+    oai = MagicMock()
+    oai.chat.completions.create.side_effect = ConnectionError("down")
+    with patch("openai.OpenAI", return_value=oai), patch("anthropic.Anthropic") as anth_cls:
+        anth_cls.return_value.messages.create.return_value = _good_anthropic_response()
+        agent = ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64, fallback_api_key="fk")
+        agent.run(data="x")
+        assert anth_cls.call_args.kwargs.get("max_retries") == 0
+
+
+def test_llm_semaphore_released_after_success_and_failure(monkeypatch):
+    """The per-provider in-flight caps must never leak a slot — a leaked slot
+    would permanently shrink OpenAI concurrency for the whole process."""
+    from src.agents import base as base_mod
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "1")
+    start = base_mod._OPENAI_LLM_SEMAPHORE._value
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = _openai_stream_mock()
+        ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64).run(data="x")
+    assert base_mod._OPENAI_LLM_SEMAPHORE._value == start
+    with patch("openai.OpenAI") as oai_cls:
+        oai_cls.return_value = _openai_stream_mock(pieces=('{"half":',), finish_reason=None, usage=None)
+        with pytest.raises(Exception):
+            ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64).run(data="x")
+    assert base_mod._OPENAI_LLM_SEMAPHORE._value == start
