@@ -976,11 +976,42 @@ class ExecutionStage:
                     )
                     continue
 
+                # RC1: code-enforced ATR stop-distance floor at entry. The
+                # P1 prompt rule ("fresh-entry stops never tighter than
+                # 1×ATR") is advisory — LLM output still occasionally lands
+                # stops inside one day's range, which converts routine
+                # volatility into a same-week exit. Widen to 1×ATR(14) from
+                # bars already fetched by research; qty_by_risk below sizes
+                # against the wider distance, so per-trade $ risk is
+                # unchanged. No bars → no floor (behavior identical).
+                stop_price = decision.stop_loss
+                if stop_price > 0 and sizing_price > stop_price:
+                    try:
+                        bars = ctx.symbols_bars.get(decision.symbol) or []
+                        atr14 = None
+                        if len(bars) >= 15:
+                            from src.data.technical import compute_indicators
+                            atr14 = compute_indicators(decision.symbol, bars).atr_14
+                        if atr14 and atr14 > 0 and (sizing_price - stop_price) < atr14:
+                            widened = round(sizing_price - atr14, 2)
+                            logger.warning(
+                                "BUY %s: stop $%.2f is %.2f×ATR from entry "
+                                "$%.2f — widening to $%.2f (1×ATR14=$%.2f "
+                                "floor; qty sizing compensates)",
+                                decision.symbol, stop_price,
+                                (sizing_price - stop_price) / atr14,
+                                sizing_price, widened, atr14,
+                            )
+                            stop_price = widened
+                    except Exception as e:
+                        logger.warning("ATR stop floor skipped for %s: %s",
+                                       decision.symbol, e)
+
                 qty_by_alloc = int((total_value * decision.allocation_pct / 100) / sizing_price)
                 qty_by_risk = None
                 RISK_BUDGET_PCT = 0.5
-                if decision.stop_loss > 0 and sizing_price > decision.stop_loss:
-                    risk_per_share = sizing_price - decision.stop_loss
+                if stop_price > 0 and sizing_price > stop_price:
+                    risk_per_share = sizing_price - stop_price
                     if risk_per_share > 0:
                         risk_dollars = total_value * RISK_BUDGET_PCT / 100
                         qty_by_risk = int(risk_dollars / risk_per_share)
@@ -989,7 +1020,7 @@ class ExecutionStage:
                         "Vol-adjusted sizing for %s: qty_by_alloc=%d → qty_by_risk=%d "
                         "(risk %.2f/share, budget $%.0f = %.1f%% of equity)",
                         decision.symbol, qty_by_alloc, qty_by_risk,
-                        sizing_price - decision.stop_loss,
+                        sizing_price - stop_price,
                         total_value * RISK_BUDGET_PCT / 100, RISK_BUDGET_PCT,
                     )
                     qty = qty_by_risk
@@ -1022,7 +1053,7 @@ class ExecutionStage:
                 pending_row_id = pipeline.db.insert_trade(
                     symbol=decision.symbol, action="BUY", qty=qty,
                     price=executed_price, reasoning=decision.reasoning, run_id=run_id,
-                    stop_loss=decision.stop_loss, take_profit=decision.take_profit,
+                    stop_loss=stop_price, take_profit=decision.take_profit,
                     broker_order_id=None,
                     fill_status="pending_submit",
                 )
@@ -1031,7 +1062,7 @@ class ExecutionStage:
                     order = pipeline.broker.submit_order(
                         symbol=decision.symbol, qty=qty, side="buy",
                         limit_price=limit_price,
-                        stop_loss_price=decision.stop_loss if decision.stop_loss > 0 else None,
+                        stop_loss_price=stop_price if stop_price > 0 else None,
                         reference_price=market_price,
                     )
                 except Exception:

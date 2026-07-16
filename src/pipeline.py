@@ -4522,6 +4522,58 @@ class TradingPipeline:
                 out.add(sym)
         return out
 
+    def _atr_for_symbol(self, symbol: str) -> float | None:
+        """ATR(14) from ~30 days of daily bars; None when unknowable.
+
+        Used by the TRAIL_STOP noise-band clamp and the position-facts
+        vol-unit metrics. Failure is always None (callers degrade to the
+        pre-clamp behavior) — never raises.
+        """
+        try:
+            bars = self.market.get_ohlcv(symbol, 30) or []
+            if len(bars) < 15:
+                return None
+            from src.data.technical import compute_indicators
+            atr = compute_indicators(symbol, bars).atr_14
+            return float(atr) if atr and atr > 0 else None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ATR fetch failed for %s: %s", symbol, e)
+            return None
+
+    def _trail_tightened_recently(self, symbol: str, calendar_days: int = 4) -> bool:
+        """True when a non-canceled TRAIL_STOP for `symbol` landed within the
+        last `calendar_days` days (~2 trading days across a weekend).
+
+        RC1 forensics (2026-07-16): the reviewer's ≥1.02×old_stop min-bump
+        rule means every ACCEPTED trail tightens ≥2%; per-session trailing
+        marched stops into the daily-noise band in 3-4 sessions (GE was
+        ratcheted 325→350 in 8 sessions on one flag). A cooldown makes
+        tightening a considered, at-most-every-other-day act.
+        """
+        try:
+            rows = self.db.get_trades(symbol=symbol, limit=10)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("trail cooldown query failed for %s: %s", symbol, e)
+            return False
+        from datetime import datetime as _dt, timedelta, timezone
+        cutoff = _dt.now(timezone.utc) - timedelta(days=calendar_days)
+        for row in rows:
+            if (row.get("action") or "").upper() != "TRAIL_STOP":
+                continue
+            if (row.get("fill_status") or "") == "canceled":
+                continue
+            ts = row.get("timestamp") or ""
+            try:
+                dt = _dt.fromisoformat(ts.replace("Z", "+00:00")) if "T" in ts \
+                    else _dt.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt >= cutoff:
+                return True
+        return False
+
     def _midday_execute_llm_actions(
         self, positions, review, run_id: str, blocked_symbols: set[str] | None = None,
         already_trimmed_today: set[str] | None = None,
@@ -4631,6 +4683,38 @@ class TradingPipeline:
                             symbol, new_stop, existing[0].current_price,
                         )
                         continue
+                    # RC1 exit-quality clamps (2026-07-16 forensics: 5 trail
+                    # fills missed avg +30.7% post-exit; LLY was whipsawed
+                    # twice identically). A hard-trigger citation in the
+                    # reason bypasses both — mirroring the SELL/REDUCE gate.
+                    if not _reason_cites_hard_trigger(action_item.get("reason", "")):
+                        # (a) Ratchet cooldown: at most one accepted tighten
+                        # per ~2 trading days per symbol.
+                        if self._trail_tightened_recently(symbol):
+                            logger.warning(
+                                "Midday: TRAIL_STOP %s skipped — a trail was "
+                                "already tightened within the last 2 trading "
+                                "days (ratchet cooldown; cite a hard trigger "
+                                "to bypass)", symbol,
+                            )
+                            continue
+                        # (b) Noise-band clamp: a stop inside 1.25×ATR14 of
+                        # the current price sits inside one day's normal
+                        # range — it converts routine volatility into a
+                        # realized exit. Keep the old stop instead.
+                        atr = self._atr_for_symbol(symbol)
+                        if atr is not None:
+                            noise_floor = existing[0].current_price - 1.25 * atr
+                            if new_stop > noise_floor:
+                                logger.warning(
+                                    "Midday: TRAIL_STOP %s skipped — new_stop "
+                                    "$%.2f is inside the 1.25×ATR noise band "
+                                    "(floor $%.2f, ATR14 $%.2f); routine "
+                                    "volatility would fill it. Old stop kept; "
+                                    "cite a hard trigger to bypass.",
+                                    symbol, new_stop, noise_floor, atr,
+                                )
+                                continue
                     order = self.broker.replace_stop_loss(symbol, new_stop)
                     if order:
                         if isinstance(order, dict):
@@ -5067,6 +5151,16 @@ class TradingPipeline:
             stop_loss = float((buy or {}).get("stop_loss") or 0)
             take_profit = float((buy or {}).get("take_profit") or 0)
 
+            # RC1: after any TRAIL_STOP the BUY row's stop is stale-WIDE —
+            # the reviewer would see a fat distance_to_stop and keep
+            # ratcheting. Prefer live broker truth; fall back to the BUY row.
+            try:
+                live_stop = self.broker.get_current_stop_price(sym)
+            except Exception:  # noqa: BLE001
+                live_stop = None
+            if isinstance(live_stop, (int, float)) and live_stop > 0:
+                stop_loss = float(live_stop)
+
             # days_held — from BUY timestamp; fall back to None.
             days_held = None
             buy_ts = (buy or {}).get("timestamp")
@@ -5112,6 +5206,16 @@ class TradingPipeline:
             drift_flag = weight_pct > 12 and pnl_pct > 10
             target_breach_flag = progress_pct is not None and progress_pct > 150
 
+            # Vol-unit context so the reviewer reasons about stop distance
+            # in ATRs, not raw % (a 3% gap is roomy for KO, suicidal for
+            # RKLB). None when bars are unavailable — the prompt treats
+            # missing as "unknown", never as zero.
+            atr = self._atr_for_symbol(sym)
+            atr_pct = round(atr / cur * 100, 2) if (atr and cur > 0) else None
+            stop_distance_atrs = None
+            if atr and stop_loss and cur > stop_loss:
+                stop_distance_atrs = round((cur - stop_loss) / atr, 2)
+
             facts[sym] = {
                 "days_held": days_held,
                 "thesis_progress_pct": progress_pct,
@@ -5122,6 +5226,8 @@ class TradingPipeline:
                 "parabolic_flag": parabolic_flag,
                 "drift_flag": drift_flag,
                 "target_breach_flag": target_breach_flag,
+                "atr_pct": atr_pct,
+                "stop_distance_atrs": stop_distance_atrs,
             }
         return facts
 
