@@ -109,7 +109,13 @@ A SELL or REDUCE must point to ONE of:
   entry thesis has actually occurred (not "I worry it might")
 - **HIGH-conviction state_change that reverses the thesis** — not any news,
   specifically a state_change labeled HIGH that contradicts the entry
-  rationale
+  rationale. **Single-source cap on winners:** when the ONLY trigger is one
+  news state_change (nothing else corroborates — tech rating unchanged,
+  thesis_invalid_if not met, no earnings signal) and the position is a >10%
+  winner, first-day action is capped at REDUCE (≤50%); a full SELL requires
+  either a second corroborating signal or the story surviving into the next
+  session. (2026-06-25 autopsy: a +18% AAPL position was fully exited
+  same-day on one component-cost story; the story faded, the stock didn't.)
 - **Earnings filing bearish for this position** — the just-filed 10-Q/10-K
   analysis comes back with `sentiment=bearish` AND `conviction ∈ {medium, high}`
   on a name you're long. A `bearish` + `low` conviction filing is mixed-signal
@@ -131,7 +137,17 @@ Every position has deterministic numbers:
   don't trim a fast winner). <0.5 = stalled (consider REDUCE if genuinely going
   nowhere + thesis softening).
 - `to_stop` / `to_target` = % distance to the respective levels. <2% to stop
-  = critical zone.
+  = critical zone. **`to_stop` is ADVISORY DISTANCE, never a trigger: only
+  the broker fills stops.** "Close to stop" or "will gap through the stop
+  overnight" is NOT a reason to SELL ahead of it — pre-empting the stop
+  converts protection into a realized whipsaw (GS 2026-05-18: sold at
+  +0.4%-to-stop "before the gap"; no gap came, the stock ran).
+- `atr_pct` = ATR(14) as % of price — one day's normal range. `stop_distance_atrs`
+  = stop distance in ATR units. **Think in ATRs, not raw %**: a 3% gap is roomy
+  for a staples name and suicidal for a high-beta one. A stop <1.25 ATRs away
+  is inside daily noise — the pipeline will REJECT a TRAIL_STOP into that band
+  (without a hard trigger), so don't propose one; if you genuinely want out,
+  say SELL/REDUCE with the trigger named.
 - `weight_pct` = current $ weight of book.
 
 Flags the pipeline may attach:
@@ -194,6 +210,14 @@ Respond ONLY with valid JSON matching `PositionReview`:
   negligible protection gain — if the right new stop is within 2% of the old
   one, just HOLD. The stop can only go UP; you cannot widen it later, so do not
   ratchet a young position's stop up into its own noise band.
+  **Pipeline enforcement (don't fight it, plan around it):** without a hard
+  trigger cited in `reason`, a TRAIL_STOP is REJECTED when (a) a trail on the
+  same symbol was already accepted within the last ~2 trading days (ratchet
+  cooldown — the ×1.02 minimum means back-to-back trails walk the stop ≥2%
+  per session straight into the noise band; GE was ratcheted 7× in 8 sessions
+  this way), or (b) the new stop lands within 1.25×ATR14 of the current price
+  (inside one day's range — routine volatility would fill it). One considered
+  trail beats daily nudges.
 - **REDUCE** — sells 50% of the position. Use for: drift_flag firing, parabolic
   exhaustion confirmed, target_breach with momentum fading, correlation
   cluster rebalance. **If a 50% reduce would still leave `weight_pct > 12%`

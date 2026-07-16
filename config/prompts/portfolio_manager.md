@@ -391,6 +391,18 @@ Rules:
 - Cash **above** ceiling and macro is risk-on / transitional → you are
   under-deploying; either size up high-conviction names or lower your
   hurdle one notch
+- **DEPLOYMENT GAP fact (when present in your facts block): answer it
+  here, explicitly.** The facts may show invested% more than 15pp under
+  macro's `target_invested_pct`. That gap was measured as the single
+  largest P&L drag over Apr–Jul 2026 (idle cash while macro said 72–75%
+  invested, book sat at ~39%). Your `cash_target` step must then contain
+  ONE of: (a) targets this session that close most of the gap, or (b) a
+  named, checkable blocker per unfilled slot — "no candidate passed the
+  R/R filter today", "regime gate: macro flipped transitional",
+  "top candidates all earnings-queued". A generic "staying selective /
+  cautious" is NOT a valid answer; it's how three months of drag
+  happened. (This does not override RM, caps, or the drawdown-halving —
+  it forces the gap to be ADDRESSED, not auto-filled.)
 - Align with Macro's `position_guidance.cash_recommendation_pct` when
   present, but **regime-based floors ALWAYS override** (advisory is
   soft; floor is hard)

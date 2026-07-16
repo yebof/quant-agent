@@ -190,16 +190,49 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
     set +a
 fi
 
+# Best-effort Telegram push from BASH. RC5 (2026-07-16): when `timeout`
+# SIGTERM/SIGKILLs python, the finally-block notifier never runs — 13
+# straight days of morning kills produced ZERO failure notifications.
+# Python cannot be trusted to report its own violent death; the wrapper can.
+notify_telegram() {
+    local text="$1"
+    [[ "${TELEGRAM_DISABLED:-0}" == "1" ]] && return 0
+    [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]] && return 0
+    curl -sS --max-time 10 \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+        --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+}
+
+# External dead-man's switch (CLAUDE.md wishlist): if HEALTHCHECKS_URL is
+# set in .env, ping it on success and <url>/fail on failure. An absent ping
+# then alerts from OUTSIDE the host — the only coverage for total host
+# death / evening itself not firing.
+ping_healthcheck() {
+    local suffix="${1:-}"
+    [[ -z "${HEALTHCHECKS_URL:-}" ]] && return 0
+    curl -fsS --max-time 10 --retry 2 "${HEALTHCHECKS_URL}${suffix}" >/dev/null 2>&1 || true
+}
+
 if "$TIMEOUT" --kill-after=30 1200 "$PYTHON" main.py --mode "$MODE"; then
     # intra_check is intentionally guard-less (see last-run guard block above) —
     # we don't write the marker for it, so the next 30-min tick can fire freely.
     if [[ "$MODE" != "intra_check" ]]; then
         echo "${ET_DATE} ${NOW_UNIX}" > "$LAST_FILE"
     fi
+    ping_healthcheck
     exit 0
 else
     STATUS=$?
 fi
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ${MODE} failed with status ${STATUS}; not updating last-run guard" >&2
+# Bash-side push ONLY for violent deaths (124=timeout, 137=SIGKILL,
+# 143=SIGTERM) — those skip python's finally-block notifier entirely. For
+# ordinary non-zero exits python already pushed its own FAILED message;
+# pushing again here would just teach the operator to ignore duplicates.
+if [[ "$STATUS" -eq 124 || "$STATUS" -eq 137 || "$STATUS" -eq 143 ]]; then
+    notify_telegram "🔴 quant-agent ${MODE} KILLED (status ${STATUS}) on ${ET_DATE} — python got no chance to notify. Next tick retries (morning resumes from the decision checkpoint if one was written)."
+fi
+ping_healthcheck "/fail"
 exit "$STATUS"

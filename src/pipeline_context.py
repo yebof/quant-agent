@@ -132,6 +132,14 @@ class PMFacts:
     rolling_20d_pct: float | None = None
     in_drawdown: bool = False
 
+    # RC3 (2026-07-16): deployment vs the macro target. Macro demanded
+    # 72-75% invested for three months while realized invested% averaged
+    # 39% and NOTHING forced the gap into PM's face — every layer shaved
+    # sizes independently and no one reconciled the compound. None when
+    # macro didn't provide a target this session.
+    macro_target_invested_pct: float | None = None
+    deployment_gap_pp: float | None = None  # invested - target (negative = under)
+
     def render(self) -> str:
         """Format as a compact markdown block for PM's prompt."""
         def _pct(v: float | None) -> str:
@@ -162,4 +170,33 @@ class PMFacts:
 - signals={self.tech_signals_count} · median_age={_num(self.tech_signals_median_age_days)}d · stale(≥8d)={self.tech_signals_stale_count}
 
 ### System Performance
-- rolling 5d={_pct(self.rolling_5d_pct)} · 20d={_pct(self.rolling_20d_pct)} · in_drawdown={self.in_drawdown}"""
+- rolling 5d={_pct(self.rolling_5d_pct)} · 20d={_pct(self.rolling_20d_pct)} · in_drawdown={self.in_drawdown}{self._render_deployment_gap()}"""
+
+    def _render_deployment_gap(self) -> str:
+        if self.macro_target_invested_pct is None or self.deployment_gap_pp is None:
+            return ""
+        if self.deployment_gap_pp > 15:
+            return (
+                f"\n\n### Deployment vs Macro Target"
+                f"\n- invested={self.invested_pct:.1f}% vs macro target="
+                f"{self.macro_target_invested_pct:.0f}% — {self.deployment_gap_pp:.0f}pp OVER"
+                f" the target. The RM advisory will flag this; trims/rotation"
+                f" are a valid response, especially if macro is not risk-on."
+            )
+        if self.deployment_gap_pp >= -15:
+            return (
+                f"\n\n### Deployment vs Macro Target"
+                f"\n- invested={self.invested_pct:.1f}% vs macro target="
+                f"{self.macro_target_invested_pct:.0f}% (gap {self.deployment_gap_pp:+.0f}pp — within band)"
+            )
+        return (
+            f"\n\n### ⚠️ DEPLOYMENT GAP (address in cash_target step)"
+            f"\n- invested={self.invested_pct:.1f}% vs macro target="
+            f"{self.macro_target_invested_pct:.0f}% — you are {-self.deployment_gap_pp:.0f}pp UNDER the target"
+            f"\n- This gap has been the single largest P&L drag (idle cash in a"
+            f" rising market). In `cash_target`, either (a) close it with"
+            f" qualified candidates THIS session, or (b) name the concrete"
+            f" blocker per unfilled slot (no-qualified-setups after filters /"
+            f" regime gate / earnings-queue). \"Staying cautious\" without a"
+            f" named blocker is not an answer."
+        )

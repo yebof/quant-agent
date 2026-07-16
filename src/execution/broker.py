@@ -762,6 +762,59 @@ class AlpacaBroker:
             logger.warning("Failed to cancel open entry orders: %s", exc)
             return 0
 
+    def open_buy_notional(self) -> float | None:
+        """Dollar notional of all OPEN BUY orders, or None when the query fails.
+
+        Used by the cash sweeper: Alpaca's `cash` field does not subtract
+        open-order holds, so parking must leave room for still-working BUY
+        limits. The None-vs-0.0 distinction matters — a transient API failure
+        must read as "unknowable" (caller skips parking), never as "no
+        pending buys" (caller would sweep cash a pending fill needs).
+        """
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+
+            orders = self.client.get_orders(
+                filter=GetOrdersRequest(
+                    status=QueryOrderStatus.OPEN,
+                    side=OrderSide.BUY,
+                    nested=True,
+                )
+            )
+            total = 0.0
+            for order in orders or []:
+                order_side = getattr(getattr(order, "side", None), "value", getattr(order, "side", ""))
+                if str(order_side).lower() != "buy":
+                    continue
+                try:
+                    qty = float(getattr(order, "qty", 0) or 0)
+                except (TypeError, ValueError):
+                    qty = 0.0
+                price = None
+                for attr in ("limit_price", "stop_price"):
+                    raw = getattr(order, attr, None)
+                    if raw is not None:
+                        try:
+                            candidate = float(raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if candidate > 0:
+                            price = candidate
+                            break
+                if price is None:
+                    # Market order with no price attached — estimate from the
+                    # live quote; on failure treat the whole answer as
+                    # unknowable rather than under-counting the hold.
+                    live = self.get_latest_price(getattr(order, "symbol", ""))
+                    if not live or live <= 0:
+                        return None
+                    price = live
+                total += qty * price
+            return total
+        except Exception as exc:
+            logger.warning("open_buy_notional query failed: %s", exc)
+            return None
+
     def list_recent_orders(
         self, symbol: str, side: str, after,
     ) -> list[dict] | None:

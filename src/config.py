@@ -126,6 +126,42 @@ class RiskConfig(BaseModel):
     allow_margin: bool = False
 
 
+class CashSweepConfig(BaseModel):
+    """Idle-cash sweep into a T-bill ETF (default SGOV).
+
+    The sweep vehicle is treated as CASH-EQUIVALENT everywhere: excluded
+    from every LLM-facing position view, excluded from risk-engine exposure
+    math (its market value counts toward cash in the cash_only filter),
+    exempt from stop-coverage audits (it deliberately carries no stop), and
+    force_delever liquidates it FIRST. Deterministic and zero-LLM — the
+    LLM never decides to park or unpark; the pipeline bookends do.
+    """
+    enabled: bool = False
+    """Master switch. False = the sweeper is inert everywhere (no view
+    filtering, no funding sells, no parking buys)."""
+
+    symbol: str = "SGOV"
+    """The parking vehicle. Must be a cash-like T-bill ETF (SGOV/BIL);
+    anything with real market beta breaks the cash-equivalence assumption
+    that justifies every exemption listed above."""
+
+    reserve_pct: float = Field(default=1.0, ge=0, le=20)
+    """% of equity kept as raw cash (fees, slippage, partial fills).
+    Excess above the reserve is parked."""
+
+    min_order_usd: float = Field(default=500.0, ge=0)
+    """Don't churn sub-$500 parking orders — spread + noise beat the
+    few cents of yield."""
+
+    @field_validator("symbol")
+    @classmethod
+    def _symbol_nonempty(cls, v: str) -> str:
+        v = (v or "").strip().upper()
+        if not v:
+            raise ValueError("cash_sweep.symbol must be a non-empty ticker")
+        return v
+
+
 class ScheduleConfig(BaseModel):
     earnings_preprocess: str = "08:00"
     morning: str
@@ -243,6 +279,9 @@ class AppConfig(BaseModel):
     trading: TradingConfig
     storage: StorageConfig
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
+    # Optional section — a settings.yaml without it gets a disabled sweeper
+    # (enabled=False default), so older configs keep working unchanged.
+    cash_sweep: CashSweepConfig = Field(default_factory=CashSweepConfig)
 
     @model_validator(mode="after")
     def _check_llm_provider_keys(self):
