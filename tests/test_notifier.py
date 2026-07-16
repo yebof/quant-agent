@@ -741,14 +741,40 @@ def test_format_meta_skipped_is_silent():
 
 
 def test_format_meta_reflected_notifies():
+    # audit round 2 (#15/#19): use the REAL producer shape — counts live as
+    # LISTS nested in editor_report (ApplicationReport.to_dict), never as
+    # flat top-level ints. The old fixture pinned a shape the pipeline
+    # never emits, so the test passed green against dead code.
     result = {
         "status": "reflected", "run_id": "meta-q1",
-        "period": "2026-Q1", "applied": 3, "rejected": 1,
+        "period": "2026-Q1",
+        "proposed_learnings_count": 4,
+        "editor_report": {
+            "period": "2026-Q1",
+            "applied": [
+                {"agent_name": "tech_analyst", "operation": "append",
+                 "learning_text": "a", "content_hash": "h1",
+                 "period": "2026-Q1", "prompt_path": "x"},
+                {"agent_name": "news_analyst", "operation": "append",
+                 "learning_text": "b", "content_hash": "h2",
+                 "period": "2026-Q1", "prompt_path": "y"},
+                {"agent_name": "macro_analyst", "operation": "append",
+                 "learning_text": "c", "content_hash": "h3",
+                 "period": "2026-Q1", "prompt_path": "z"},
+            ],
+            "rejected": [
+                {"agent_name": "evening_analyst", "operation": "append",
+                 "learning_text": "d", "reason": "jaccard_similarity=0.80",
+                 "period": "2026-Q1"},
+            ],
+            "rolled_off": [], "agents_edited": 3, "git_commit": "abc",
+        },
     }
     msg = format_session_result("meta", result, 90.0)
     assert msg is not None
     assert "period: 2026-Q1" in msg
     assert "applied=3" in msg
+    assert "rejected=1" in msg
 
 
 def test_format_meta_digest_only_uses_yellow_warning_emoji():
@@ -827,17 +853,40 @@ def test_format_elapsed_formatting():
 
 def test_format_evening_surfaces_meta_dry_run_hint():
     """When evening's auto_meta result indicates the dry-run staged N
-    proposals (applied=0, rejected>0 because dry_run wraps each as
-    rejected with the 'dry_run' reason), the message must include a
-    line pointing to proposed_edits.json so the operator can review."""
+    proposals (each surfaced as a 'rejected' editor_report entry whose
+    reason carries 'dry_run'), the message must include a line pointing
+    to proposed_edits.json so the operator can review.
+
+    audit round 2 (#15/#19): fixture uses the REAL pipeline shape —
+    run_quarterly_meta_reflection nests the counts as LISTS inside
+    editor_report; there are no flat top-level applied/rejected ints.
+    The old flat-int fixture made this test pass against dead code."""
     result = {
         "status": "analyzed", "run_id": "run-e",
         "analysis": {"risk_rating": "moderate"},
         "auto_meta": {
             "status": "reflected",
             "period": "2026-Q1",
-            "applied": 0,
-            "rejected": 2,
+            "proposed_learnings_count": 2,
+            "editor_report": {
+                "period": "2026-Q1",
+                "applied": [],
+                "rejected": [
+                    {"agent_name": "tech_analyst", "operation": "append",
+                     "learning_text": "l1",
+                     "reason": ("dry_run=True; proposal staged to "
+                                "data/evolution/2026-Q1/proposed_edits.json "
+                                "for operator review"),
+                     "period": "2026-Q1"},
+                    {"agent_name": "news_analyst", "operation": "append",
+                     "learning_text": "l2",
+                     "reason": ("dry_run=True; proposal staged to "
+                                "data/evolution/2026-Q1/proposed_edits.json "
+                                "for operator review"),
+                     "period": "2026-Q1"},
+                ],
+                "rolled_off": [], "agents_edited": 0, "git_commit": None,
+            },
         },
     }
     msg = format_session_result("evening", result, 30.0)
@@ -849,16 +898,25 @@ def test_format_evening_surfaces_meta_dry_run_hint():
 
 def test_format_evening_surfaces_meta_live_apply_when_dry_run_off():
     """When dry_run=False (operator flipped it) the live apply happens.
-    The hint changes shape: 'applied N, rejected M' instead of the
-    staged-dry-run line."""
+    The hint changes shape: 'applied N' instead of the staged-dry-run
+    line. audit round 2 (#15/#19): real nested editor_report shape."""
     result = {
         "status": "analyzed", "run_id": "run-e",
         "analysis": {"risk_rating": "moderate"},
         "auto_meta": {
             "status": "reflected",
             "period": "2026-Q1",
-            "applied": 1,
-            "rejected": 0,
+            "proposed_learnings_count": 1,
+            "editor_report": {
+                "period": "2026-Q1",
+                "applied": [
+                    {"agent_name": "tech_analyst", "operation": "append",
+                     "learning_text": "l1", "content_hash": "h1",
+                     "period": "2026-Q1", "prompt_path": "p"},
+                ],
+                "rejected": [],
+                "rolled_off": [], "agents_edited": 1, "git_commit": "sha",
+            },
         },
     }
     msg = format_session_result("evening", result, 30.0)

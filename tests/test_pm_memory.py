@@ -222,23 +222,26 @@ def test_handle_ex_dividends_lowers_stop_day_before(tmp_path):
         "amount": 1.20,
     }
     pipeline.broker.get_current_stop_price.return_value = 185.00
-    pipeline.broker.replace_stop_loss.return_value = {
-        "id": "stop-1", "status": "accepted", "symbol": "JPM",
+    # audit round 2: ex-div shifts EVERY stop down (preserving per-lot
+    # levels) instead of a consolidating replace.
+    pipeline.broker.shift_stops_down.return_value = {
+        "id": "shift-JPM", "status": "accepted", "symbol": "JPM",
+        "shifted": 1, "total": 1,
     }
+    pipeline.broker.is_trading_day.side_effect = lambda d: d.weekday() < 5
 
     orders = pipeline._handle_ex_dividends([jpm], run_id="r1")
     assert len(orders) == 1
-    # Stop dropped from 185 → 183.80
-    args, kwargs = pipeline.broker.replace_stop_loss.call_args
+    # Every stop shifted down by the dividend
+    args, _ = pipeline.broker.shift_stops_down.call_args
     assert args[0] == "JPM"
-    assert args[1] == round(185.00 - 1.20, 2)
-    assert kwargs["allow_lowering"] is True
+    assert args[1] == 1.20
 
     # Running again same day → idempotent (no broker call repeat)
-    pipeline.broker.replace_stop_loss.reset_mock()
+    pipeline.broker.shift_stops_down.reset_mock()
     orders_2 = pipeline._handle_ex_dividends([jpm], run_id="r2")
     assert orders_2 == []
-    pipeline.broker.replace_stop_loss.assert_not_called()
+    pipeline.broker.shift_stops_down.assert_not_called()
 
 
 def test_handle_ex_dividends_skips_when_ex_div_is_today(tmp_path):

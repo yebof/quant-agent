@@ -23,7 +23,11 @@ CLUSTER_CORRELATION_THRESHOLD = 0.7
 
 
 def _returns_from_bars(bars: list[OHLCV]) -> pd.Series | None:
-    if not bars or len(bars) < 10:
+    # 21 bars → 20 returns, matching df.corr(min_periods=20) below —
+    # 10-20-bar symbols used to pass this gate, land in the matrix with an
+    # all-NaN (empty) row, and silently disable the cluster advisory for
+    # themselves without a WARNING (audit round 2).
+    if not bars or len(bars) < 21:
         return None
     closes = pd.Series([b.close for b in bars], index=[b.date for b in bars])
     returns = closes.pct_change().dropna()

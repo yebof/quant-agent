@@ -267,10 +267,13 @@ def test_execution_stage_allows_buy_when_entry_price_within_5pct():
     ctx.portfolio_decision = PortfolioDecision(
         reasoning_chain=_pm_rc(),
         decisions=[
-            # LLM says $98, market $100 → 2% off → proceed.
+            # LLM says $98, market $100 → 2% off → proceed. TP=140 keeps
+            # the raised-to-market R/R at (140-100)/(100-72)=1.43 — above the
+            # audit-round-2 executed-geometry floor of 1.2 (a TP of 130 would
+            # now be correctly SKIPPED at 1.07; that case has its own test).
             TradeDecision(
                 action="BUY", symbol="SPY", allocation_pct=10,
-                entry_price=98.0, stop_loss=72.0, take_profit=130.0,
+                entry_price=98.0, stop_loss=72.0, take_profit=140.0,
                 reasoning="fresh setup",
             ),
         ],

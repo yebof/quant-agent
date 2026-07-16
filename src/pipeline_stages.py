@@ -263,6 +263,11 @@ class MorningResearchStage:
         # Macro
         try:
             macro_summary, macro_analysis, ma_result = macro_future.result()
+            # audit round 2: commit the analysis to ctx BEFORE the agent_logs
+            # write — a DB lock/timeout on the log write used to discard a
+            # fully successful macro run (ctx fields were assigned after it).
+            ctx.macro_summary = macro_summary
+            ctx.macro_analysis = macro_analysis
             self.db.insert_agent_log(
                 agent_name="macro_analyst", run_id=ctx.run_id,
                 input_summary=f"VIX={macro_summary.get('vix', {}).get('current')}",
@@ -666,6 +671,11 @@ class RiskStage:
                 sum(1 for d in portfolio_decision.decisions if d.action == "BUY"),
             )
 
+        # Sweep-adjusted cash: parked T-bill value counts as cash for RM,
+        # consistent with the PM's view and the hard filter's credit.
+        rm_cash = ctx.cash
+        if isinstance(sweeper, CashSweeper):
+            rm_cash = ctx.cash + sweeper.parked_value(ctx.positions)
         verdict, rm_result = pipeline.risk_manager.review(
             portfolio_decision=portfolio_decision,
             positions=rm_positions,
@@ -674,6 +684,10 @@ class RiskStage:
             tech_analyses=analyses,
             news_intel=news_intel,
             earnings_analyses=earnings_results,
+            # audit round 2: the veto layer's rr_audit / sizing_sanity steps
+            # ran blind — no equity, no cash, no weights.
+            total_value=total_value,
+            cash=rm_cash,
         )
 
         pipeline.db.insert_agent_log(
@@ -1036,27 +1050,36 @@ class ExecutionStage:
                                 sizing_price, widened, atr14,
                             )
                             stop_price = widened
-                            # Review fix: widening happens AFTER the RM
-                            # audited this trade's R/R. If the honest
-                            # geometry (real stop distance vs the same
-                            # target) collapses the R/R below a sane floor,
-                            # the setup RM approved never existed — skip
-                            # rather than execute a trade nobody reviewed.
-                            if decision.take_profit > 0:
-                                reward = decision.take_profit - sizing_price
-                                risk = sizing_price - stop_price
-                                if risk > 0 and reward / risk < 1.2:
-                                    logger.warning(
-                                        "BUY %s skipped: ATR-widened stop "
-                                        "makes R/R %.2f (<1.2) — RM approved "
-                                        "a tighter-stop geometry that daily "
-                                        "noise would have destroyed.",
-                                        decision.symbol, reward / risk,
-                                    )
-                                    continue
                     except Exception as e:
                         logger.warning("ATR stop floor skipped for %s: %s",
                                        decision.symbol, e)
+
+                # R/R re-check whenever EXECUTION changed the geometry the RM
+                # audited — either the stop was ATR-widened OR the limit was
+                # raised to market (audit round 2: the raise-to-market path
+                # GROWS the stop distance, dodging the ATR gate, yet shrinks
+                # reward against the unchanged target — the one case the old
+                # nested check could never see). If the honest geometry
+                # collapses below a sane floor, the setup RM approved never
+                # existed — skip rather than execute a trade nobody reviewed.
+                geometry_changed = (
+                    stop_price != decision.stop_loss
+                    or (decision.entry_price > 0 and sizing_price > decision.entry_price)
+                )
+                if (geometry_changed and decision.take_profit > 0
+                        and stop_price > 0 and sizing_price > stop_price):
+                    reward = decision.take_profit - sizing_price
+                    risk = sizing_price - stop_price
+                    if risk > 0 and reward / risk < 1.2:
+                        logger.warning(
+                            "BUY %s skipped: executed geometry makes R/R %.2f "
+                            "(<1.2) — RM approved entry $%.2f / stop $%.2f, "
+                            "execution moved it to $%.2f / $%.2f.",
+                            decision.symbol, reward / risk,
+                            decision.entry_price, decision.stop_loss,
+                            sizing_price, stop_price,
+                        )
+                        continue
 
                 qty_by_alloc = int((total_value * decision.allocation_pct / 100) / sizing_price)
                 qty_by_risk = None

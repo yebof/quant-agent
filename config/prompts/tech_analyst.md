@@ -166,6 +166,7 @@ Respond ONLY with a valid JSON array. For every actionable rating (buy / strong_
 - Do not inflate `conviction` to `high` without 3+ aligned signals.
 - For `neutral`, skip all price fields (set to null).
 - The top-level `reasoning` is a 1-2 sentence summary of the most decisive point — complement to, not substitute for, `reasoning_chain`.
+- Emit exactly one object per requested symbol, keyed by the SAME symbol string you were given. To correct an earlier row, re-emit the SAME symbol (a later row overrides an earlier one). NEVER invent variant symbols like `AAPL_CORRECTION` / `ZS_FINAL` — rows for symbols not in the request are dropped, and your correction would be lost while the superseded row survives.
 
 ## Inputs you read
 

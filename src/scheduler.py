@@ -58,12 +58,19 @@ class TradingScheduler:
         return OrTrigger(triggers)
 
     def setup(self):
+        # audit round 2 (#14): every CronTrigger below carries timezone=ET
+        # explicitly. APScheduler does NOT inject the scheduler's timezone
+        # into pre-built trigger instances — CronTrigger(timezone=None)
+        # resolves to the HOST's local zone, so on a non-ET host (prod is
+        # Asia/Singapore) 5 of 6 jobs fired at wall-clock 09:30 local =
+        # 21:30 ET etc. _build_intra_check_trigger already did this right;
+        # the other five had been missed.
         schedule = self.config.trading.schedule
 
         # Pre-market earnings ingestion so morning sees confirmed analyses.
         h, m = self._parse_time(schedule.earnings_preprocess)
         self.scheduler.add_job(
-            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
+            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
             args=[self.pipeline.run_earnings_preprocess, "earnings_preprocess"],
             id="earnings_preprocess",
         )
@@ -71,7 +78,7 @@ class TradingScheduler:
         # Morning run — pre-market analysis + trading
         h, m = self._parse_time(schedule.morning)
         self.scheduler.add_job(
-            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
+            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
             args=[self.pipeline.run_morning, "morning"],
             id="morning_run",
         )
@@ -99,7 +106,7 @@ class TradingScheduler:
         # Midday check (position reviewer, patient disposition)
         h, m = self._parse_time(schedule.midday)
         self.scheduler.add_job(
-            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
+            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
             args=[self.pipeline.run_midday, "midday"],
             id="midday_check",
         )
@@ -109,7 +116,7 @@ class TradingScheduler:
         # rather than waiting for tomorrow morning).
         h, m = self._parse_time(schedule.close)
         self.scheduler.add_job(
-            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
+            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
             args=[self.pipeline.run_close, "close"],
             id="close_check",
         )
@@ -117,7 +124,7 @@ class TradingScheduler:
         # Evening report
         h, m = self._parse_time(schedule.evening)
         self.scheduler.add_job(
-            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
+            self._run_safe, CronTrigger(hour=h, minute=m, day_of_week="mon-fri", timezone=ET),
             args=[self.pipeline.run_evening, "evening"],
             id="evening_report",
         )

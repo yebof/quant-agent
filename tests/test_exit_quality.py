@@ -124,16 +124,24 @@ def test_trail_ratchet_cooldown_blocks_repeat_tighten():
     pipeline.broker.replace_stop_loss.assert_not_called()
 
 
-def test_trail_cooldown_ignores_old_and_canceled_rows():
+def test_trail_cooldown_counts_superseded_rows_but_not_old_ones():
+    """audit round 2: a TRAIL_STOP row is only written after the broker
+    ACCEPTED the replace, so fill_status='canceled' means superseded-by-a-
+    later-trail — the tighten still happened and still counts for the
+    cooldown. Only age (and ex-div rows) exclude."""
+    from datetime import datetime, timezone
     pipeline = _mk_pipeline(GE)
     pipeline._atr_for_symbol = lambda s: 8.0
     pipeline.db.get_trades.return_value = [
-        {"action": "TRAIL_STOP", "fill_status": "canceled",
-         "timestamp": "2026-07-16T14:00:00+00:00"},
         {"action": "TRAIL_STOP", "fill_status": "submitted",
-         "timestamp": "2026-06-01T14:00:00+00:00"},   # weeks old
+         "timestamp": "2026-06-01T14:00:00+00:00"},   # weeks old → excluded
     ]
     assert pipeline._trail_tightened_recently("GE") is False
+    pipeline.db.get_trades.return_value = [
+        {"action": "TRAIL_STOP", "fill_status": "canceled",
+         "timestamp": datetime.now(timezone.utc).isoformat()},  # superseded today
+    ]
+    assert pipeline._trail_tightened_recently("GE") is True
 
 
 # ---------- live stop reference in position facts ----------

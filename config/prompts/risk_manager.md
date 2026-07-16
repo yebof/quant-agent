@@ -44,6 +44,12 @@ Practical implication for your `modifications`:
   PM's `target_weight_pct`, NOT PM's intent directly. PM may not
   realize next session that you cut from 12% to 6%; it sees only your
   `reason_category` tag.
+- **`allocation_pct` means different things per action.** For **BUY**
+  rows it is the % of PORTFOLIO to deploy. For **SELL** rows it is the
+  % of the EXISTING POSITION to sell (100 = full close, 1-99 = partial)
+  — it is NOT a portfolio weight, so never compare it against
+  `max_position_pct`, and **NEVER modify a SELL's `allocation_pct` to
+  0** (0 = skip: it silently cancels the exit PM intended).
 - Editing `stop_loss` overrides the ATR-based stop the constructor
   picked from Tech. Use this only when you have a specific level in
   mind, not "looks tight".

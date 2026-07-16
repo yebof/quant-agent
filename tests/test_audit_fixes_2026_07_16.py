@@ -167,7 +167,11 @@ def _exdiv_pipeline(div_date, today):
     p.broker = MagicMock()
     p.broker.is_trading_day.side_effect = lambda d: d.weekday() < 5
     p.broker.get_current_stop_price.return_value = 61.80
-    p.broker.replace_stop_loss.return_value = {"id": "s1", "status": "accepted"}
+    # audit round 2: ex-div now shifts EVERY stop (preserving per-lot levels)
+    # instead of a consolidating replace.
+    p.broker.shift_stops_down.return_value = {
+        "id": "shift-KO", "status": "accepted", "shifted": 1, "total": 1,
+    }
     p._format_qty = lambda q: str(q)
     return p
 
@@ -183,7 +187,7 @@ def test_monday_ex_div_is_caught_by_friday_session():
     with patch("src.pipeline.et_today", return_value=friday):
         orders = p._handle_ex_dividends([pos], run_id="r1")
     assert len(orders) == 1
-    p.broker.replace_stop_loss.assert_called_once()
+    p.broker.shift_stops_down.assert_called_once_with("KO", 0.51)
 
 
 def test_midweek_ex_div_still_uses_tomorrow():
@@ -202,7 +206,7 @@ def test_far_future_ex_div_is_not_acted_on_early():
                    market_value=12_480, unrealized_pnl=480, sector="Consumer Defensive")
     with patch("src.pipeline.et_today", return_value=wed):
         assert p._handle_ex_dividends([pos], run_id="r1") == []
-    p.broker.replace_stop_loss.assert_not_called()
+    p.broker.shift_stops_down.assert_not_called()
 
 
 # ---------- macro sector guidance must survive the round-trip ----------

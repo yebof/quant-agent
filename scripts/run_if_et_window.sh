@@ -196,7 +196,15 @@ fi
 # Python cannot be trusted to report its own violent death; the wrapper can.
 notify_telegram() {
     local text="$1"
-    [[ "${TELEGRAM_DISABLED:-0}" == "1" ]] && return 0
+    # audit round 2 (#44): match the SAME kill-switch spellings python's
+    # notifier accepts (notifier.py: "1"/"true"/"yes", case-insensitive;
+    # "on" added as a harmless superset). Previously only the literal "1"
+    # muted the bash-side KILLED push, so TELEGRAM_DISABLED=true silenced
+    # python but the wrapper still fired on violent kills. tr-based
+    # lowercasing keeps macOS bash 3.2 compatibility.
+    case "$(printf '%s' "${TELEGRAM_DISABLED:-}" | tr '[:upper:]' '[:lower:]' | xargs)" in
+        1|true|yes|on) return 0 ;;
+    esac
     [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]] && return 0
     curl -sS --max-time 10 \
         "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -220,7 +228,15 @@ if "$TIMEOUT" --kill-after=30 1200 "$PYTHON" main.py --mode "$MODE"; then
     if [[ "$MODE" != "intra_check" ]]; then
         echo "${ET_DATE} ${NOW_UNIX}" > "$LAST_FILE"
     fi
-    ping_healthcheck
+    # audit round 2 (#43): do NOT success-ping for intra_check. All six
+    # modes share one HEALTHCHECKS_URL, and intra_check's ~14 OK ticks/day
+    # would pin the shared check green even when morning/evening silently
+    # die — defeating the dead-man's switch this ping exists for. Failure
+    # pings (below) still fire for ALL modes, intra_check included, so a
+    # crashing circuit breaker is still visible externally.
+    if [[ "$MODE" != "intra_check" ]]; then
+        ping_healthcheck
+    fi
     exit 0
 else
     STATUS=$?

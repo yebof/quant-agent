@@ -591,6 +591,13 @@ class AlpacaBroker:
         except Exception as exc:
             logger.warning("get_current_stop_price failed for %s: %s", symbol, exc)
             return None
+        # Post-#102 a position can legitimately carry SEVERAL sell-stops
+        # (one GTC stop per entry BUY, plus coverage-repair top-ups). The
+        # old first-match return made "the current stop" depend on Alpaca's
+        # ordering (audit round 2). Consumers want the level that fires
+        # FIRST on the way down = the HIGHEST stop; qty-weighting would
+        # blur two real levels into a price nobody set.
+        stops: list[float] = []
         for order in orders or []:
             order_type = str(getattr(getattr(order, "order_type", None), "value",
                                     getattr(order, "order_type", ""))).lower()
@@ -598,10 +605,20 @@ class AlpacaBroker:
                                     getattr(order, "side", ""))).lower()
             if "stop" in order_type and order_side == "sell":
                 try:
-                    return float(getattr(order, "stop_price", 0) or 0) or None
+                    px = float(getattr(order, "stop_price", 0) or 0)
                 except (TypeError, ValueError):
                     continue
-        return None
+                if px > 0:
+                    stops.append(px)
+        if not stops:
+            return None
+        if len(stops) > 1:
+            logger.info(
+                "get_current_stop_price: %s carries %d sell-stops %s — "
+                "reporting the highest (first to trigger)",
+                symbol, len(stops), sorted(stops),
+            )
+        return max(stops)
 
     def get_latest_price(self, symbol: str) -> float | None:
         try:
@@ -800,18 +817,23 @@ class AlpacaBroker:
             return False, []
         return True, specs
 
-    def cancel_open_entry_orders(self) -> int:
-        """Cancel open BUY/entry orders while preserving protective SELL legs."""
+    def cancel_open_entry_orders(self, symbol: str | None = None) -> int:
+        """Cancel open BUY/entry orders while preserving protective SELL legs.
+
+        `symbol` scopes the cancel to one name — used by the full-exit SELL
+        discipline (audit round 2: a fully-exited symbol could still carry the
+        same day's resting DAY entry BUY, which would silently re-open the
+        position — or, in the emergency-liquidation case, re-buy into the
+        crash the breaker just sold).
+        """
         try:
             from alpaca.trading.requests import GetOrdersRequest
 
-            orders = self.client.get_orders(
-                filter=GetOrdersRequest(
-                    status=QueryOrderStatus.OPEN,
-                    side=OrderSide.BUY,
-                    nested=True,
-                )
-            )
+            req_kwargs = dict(status=QueryOrderStatus.OPEN, side=OrderSide.BUY,
+                              nested=True)
+            if symbol:
+                req_kwargs["symbols"] = [symbol]
+            orders = self.client.get_orders(filter=GetOrdersRequest(**req_kwargs))
             count = 0
             for order in orders or []:
                 order_id = getattr(order, "id", None)
@@ -1114,6 +1136,12 @@ class AlpacaBroker:
     # won't fill and the position stays open until a session can act.
     STOP_LIMIT_BUFFER_PCT = 0.03
 
+    # Order states that mean "this order can never fill another share".
+    _TERMINAL_ORDER_STATES = frozenset({
+        "filled", "canceled", "cancelled", "expired", "rejected",
+        "done_for_day", "stopped", "suspended",
+    })
+
     def place_entry_protection(
         self, symbol: str, order_id: str, stop_price: float,
         *, requested_qty: float | None = None,
@@ -1121,11 +1149,19 @@ class AlpacaBroker:
         """Wait for an entry order to reach terminal, then place a GTC
         protective stop-limit for the ACTUAL filled qty.
 
+        If the entry is STILL WORKING after the wait (slow tape, wide limit),
+        the unfilled remainder is CANCELLED first — audit round 2: the 15s
+        wait treated "still live" identically to "terminal 0-fill" and walked
+        away, so a DAY entry limit could fill hours later with no stop
+        watching it (and a resting BUY could even re-buy into a crash after an
+        emergency liquidation). Cancelling converges the order; whatever DID
+        fill by then gets its stop from the post-cancel re-read. Losing the
+        unfilled remainder is the accepted cost of protection-first.
+
         Returns the stop order dict, or None when nothing was placed (entry
-        didn't fill / didn't converge / stop submit failed). Never raises —
-        a failure here must not abort the session, but it DOES leave the
-        position naked, so it logs at ERROR and relies on the next session's
-        `_reconcile_stop_coverage` auto-repair as the belt.
+        filled 0 / stop submit failed). Never raises — a failure here must not
+        abort the session, but it DOES leave the position naked, so it logs
+        at ERROR and relies on the coverage-reconcile auto-repair belt.
         """
         try:
             status = self.wait_for_order_terminal(order_id)
@@ -1133,6 +1169,30 @@ class AlpacaBroker:
             logger.warning("entry protection: wait failed for %s (%s): %s",
                            symbol, order_id, exc)
             status = None
+
+        if (status or "").lower() not in self._TERMINAL_ORDER_STATES:
+            # Still working — cancel the remainder so it can't fill unwatched.
+            # A fill can land during cancel propagation; the post-cancel
+            # re-read below protects whatever landed.
+            logger.warning(
+                "entry protection: %s entry %s still working after wait "
+                "(status=%s) — cancelling the unfilled remainder so no share "
+                "can fill without a stop watching it",
+                symbol, order_id, status or "unknown",
+            )
+            try:
+                self.client.cancel_order_by_id(order_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "entry protection: cancel of still-working entry %s (%s) "
+                    "failed: %s — a later fill will be UNPROTECTED until the "
+                    "next coverage reconcile", symbol, order_id, exc,
+                )
+            try:
+                self.wait_for_order_terminal(order_id, timeout_seconds=10.0)
+            except Exception:  # noqa: BLE001
+                pass
+
         try:
             info = self.get_order_fill_info(order_id) or {}
         except Exception as exc:  # noqa: BLE001
@@ -1363,6 +1423,62 @@ class AlpacaBroker:
                     restored, len(stop_specs), symbol,
                 )
         return restored, failed_specs
+
+    def shift_stops_down(self, symbol: str, amount: float) -> dict | None:
+        """Lower EVERY open sell-stop for `symbol` by `amount`, preserving
+        each stop's own level and qty.
+
+        Ex-dividend flow (audit round 2): the old path read ONE stop level
+        (first-match) and replace_stop_loss'd ALL stops with a single
+        consolidated order — with per-BUY GTC stops now the steady state,
+        that collapsed distinct per-lot levels into one and could TIGHTEN a
+        wide lot's stop to the tightest lot's level. Shifting each spec
+        keeps the per-lot geometry and just absorbs the mechanical gap.
+
+        Returns {"id", "status", "symbol", "shifted", "total"} (id of the
+        first re-placed stop) or None when nothing was shifted. Best-effort
+        with rollback: cancel failures roll back already-cancelled stops;
+        re-place failures restore the ORIGINAL spec for that stop.
+        """
+        if amount <= 0:
+            return None
+        specs: list[dict] = []
+        for order in self._list_open_sell_stop_orders(symbol):
+            spec = self._snapshot_stop_order(order)
+            if spec is None:
+                logger.warning(
+                    "shift_stops_down: cannot snapshot stop %s for %s — aborting",
+                    getattr(order, "id", "<unknown>"), symbol,
+                )
+                return None
+            specs.append(spec)
+        if not specs:
+            return None
+        if not self.cancel_snapshotted_stops(symbol, specs):
+            return None   # rollback already handled inside
+        shifted = [{
+            **spec,
+            "stop_price": _quantize_price(spec["stop_price"] - amount),
+            "limit_price": (_quantize_price(spec["limit_price"] - amount)
+                            if spec.get("limit_price") else None),
+        } for spec in specs]
+        restored, failed = self._restore_stop_orders(symbol, shifted)
+        if failed:
+            # Put the ORIGINAL levels back for whatever couldn't be shifted —
+            # protection at the old level beats no protection.
+            originals = [s for s in specs if any(
+                f.get("qty") == s["qty"] and abs(f.get("stop_price", 0) -
+                (s["stop_price"] - amount)) < 0.02 for f in failed)]
+            if originals:
+                self._restore_stop_orders(symbol, originals)
+            logger.error(
+                "shift_stops_down: %d/%d stop(s) failed to shift for %s — "
+                "originals restored where possible", len(failed), len(specs), symbol,
+            )
+        if restored <= 0:
+            return None
+        return {"id": f"shift-{symbol}", "status": "accepted", "symbol": symbol,
+                "shifted": restored, "total": len(specs)}
 
     def replace_stop_loss(
         self,

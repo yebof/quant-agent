@@ -62,6 +62,32 @@ Analyze this filing and respond with JSON. Cite specific numbers from the text a
         results = []
 
         for report in reports:
+            try:
+                results.extend(self._analyze_one(report))
+            except Exception as e:  # noqa: BLE001 — audit round 2: one bad
+                # filing (corrupt text, LLM error escaping _analyze_new, disk
+                # failure in _save_analysis) must not abort the WHOLE batch —
+                # the remaining symbols' filings would silently go unanalyzed
+                # while record_failure never ticked for them.
+                logger.error("earnings: analysis failed for %s %s — isolating: %s",
+                             report.symbol, report.form_type, e)
+                try:
+                    self.earnings_provider_record_failure(report)
+                except Exception:  # noqa: BLE001
+                    pass
+        return results
+
+    def earnings_provider_record_failure(self, report) -> None:
+        """Overridable seam: batch-isolation failure ticks the same 3-strike
+        counter as an in-analysis failure. No-op default when the provider
+        isn't wired (tests)."""
+        provider = getattr(self, "earnings_provider", None)
+        if provider is not None:
+            provider.record_failure(report)
+
+    def _analyze_one(self, report: EarningsReport) -> list[dict]:
+        results = []
+        if True:
             if report.is_new and report.text_excerpt:
                 # New filing — run LLM analysis
                 analysis, agent_result = self._analyze_new(report)
@@ -96,12 +122,26 @@ Analyze this filing and respond with JSON. Cite specific numbers from the text a
         # Check for prior analysis to provide context
         prior = ""
         symbol_dir = Path(report.analysis_path).parent
-        prior_analyses = sorted(symbol_dir.glob("analysis_*.md"), reverse=True)
+
+        # Sort by FILING DATE, not filename (audit round 2): names are
+        # analysis_{form}_{date}.md, so a lexicographic sort ranks every
+        # 10-Q above every 10-K ("Q" > "K") regardless of date — the "most
+        # recent prior" could be a year-old 10-Q while last month's 10-K
+        # sat ignored. Mirrors data/earnings._get_existing_analysis.
+        def _filing_date_key(path: Path) -> str:
+            parts = path.stem.split("_")
+            return parts[-1] if parts else ""
+
+        prior_analyses = sorted(symbol_dir.glob("analysis_*.md"),
+                                key=_filing_date_key, reverse=True)
         if prior_analyses:
             # Read the most recent prior analysis (skip current)
             for p in prior_analyses:
                 if str(p) != report.analysis_path:
-                    prior = p.read_text()[:5000]  # First 5K chars of prior analysis
+                    try:
+                        prior = p.read_text()[:5000]
+                    except OSError:
+                        continue
                     break
 
         result = self.run(

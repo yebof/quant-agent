@@ -265,6 +265,21 @@ def _append_coverage_gap_banner(lines: list[str], result: dict) -> None:
 
 
 def _append_trade_session_body(lines: list[str], result: dict) -> None:
+    # audit round 2: "analysis_error" from a trading session means the PM
+    # decision was never produced (LLM output unparseable / analysis step
+    # failed) — its zero orders are a FAILURE artifact, not a deliberate
+    # hold. Before this line the push looked identical to a quiet no-trade
+    # day, so the operator could not tell "PM chose to sit out" from "PM
+    # never spoke". Rendered first: it reframes everything below it.
+    if str(result.get("status", "")) == "analysis_error":
+        lines.append(
+            "🔴 PM output unparseable — no decisions were made today; "
+            "this is NOT a deliberate hold (wrapper retries next 30-min tick)"
+        )
+        err = result.get("error")
+        if err:
+            lines.append(f"error: {str(err)[:300]}")
+
     # System-health first: a naked long is more urgent than the order list.
     _append_coverage_gap_banner(lines, result)
     orders = result.get("orders") or []
@@ -478,23 +493,62 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
     # before next quarter.
     auto_meta = result.get("auto_meta")
     if isinstance(auto_meta, dict):
-        applied = auto_meta.get("applied", 0)
-        rejected = auto_meta.get("rejected", 0)
+        # audit round 2 (#15/#19): the producer
+        # (run_quarterly_meta_reflection) never emits top-level
+        # "applied"/"rejected" ints — the counts exist only as LISTS nested
+        # inside editor_report (ApplicationReport.to_dict). The old flat
+        # .get("applied", 0)/.get("rejected", 0) reads always yielded 0/0,
+        # so both hint branches were dead code and the once-a-quarter
+        # "review proposed_edits.json" operator prompt never fired (the
+        # 2026-06-30 quarter end went through this dead path). Stage-only
+        # proposals surface as "rejected" entries whose reason carries
+        # "dry_run" — count those separately for accurate wording.
+        report = auto_meta.get("editor_report") or {}
+        applied = len(report.get("applied") or [])
+        rej_list = report.get("rejected") or []
+        rejected = len(rej_list)
+        staged = sum(
+            1 for r in rej_list
+            if isinstance(r, dict) and "dry_run" in str(r.get("reason", ""))
+        )
+        proposed = int(auto_meta.get("proposed_learnings_count") or 0)
         period = auto_meta.get("period", "?")
         status = auto_meta.get("status", "?")
         if status == "auto_meta_error":
             err = auto_meta.get("error", "?")[:200]
             lines.append(f"🧪 meta {period}: ERROR — {err}")
-        elif applied == 0 and rejected > 0:
-            # Dry-run staged proposals (none actually applied).
+        elif status == "digest_only":
+            # LLM reflection step failed after the digest was written —
+            # the learning loop is broken until next quarter.
             lines.append(
-                f"🧪 meta {period}: {rejected} proposal(s) staged "
-                f"(dry-run — see data/evolution/{period}/proposed_edits.json)"
+                f"🧪 meta {period}: digest written but LLM reflection "
+                f"FAILED — check logs"
             )
         elif applied > 0:
             lines.append(
                 f"🧪 meta {period}: applied {applied} learning(s); "
                 f"rejected {rejected}"
+            )
+        elif staged > 0:
+            # Dry-run staged proposals (none actually applied).
+            lines.append(
+                f"🧪 meta {period}: {staged} proposal(s) staged "
+                f"(dry-run — see data/evolution/{period}/proposed_edits.json)"
+            )
+        elif rejected > 0:
+            # Live/off mode with everything rejected by guardrails or the
+            # enabled=false short-circuit — still worth one line.
+            lines.append(
+                f"🧪 meta {period}: 0 applied / {rejected} rejected "
+                f"(see data/evolution/edits.jsonl)"
+            )
+        elif proposed > 0:
+            # editor_report missing (editor crashed) but the reflection
+            # carried proposals — surface the review hint rather than
+            # nothing (idx 19 fallback).
+            lines.append(
+                f"🧪 meta {period}: {proposed} proposal(s) generated but "
+                f"prompt-editor report missing — check logs"
             )
         # status='skipped' (not quarter-end) → no line, normal evening.
 
@@ -640,10 +694,30 @@ def _append_meta_body(lines: list[str], result: dict) -> None:
     period = result.get("period")
     if period:
         lines.append(f"period: {period}")
-    applied = result.get("applied", 0)
-    rejected = result.get("rejected", 0)
+    # audit round 2 (#15/#19): run_quarterly_meta_reflection has no flat
+    # "applied"/"rejected" keys — derive the counts from the nested
+    # editor_report lists (ApplicationReport.to_dict), same as the evening
+    # auto-meta consumer. The old flat reads rendered nothing, ever.
+    report = result.get("editor_report") or {}
+    applied = len(report.get("applied") or [])
+    rej_list = report.get("rejected") or []
+    rejected = len(rej_list)
+    staged = sum(
+        1 for r in rej_list
+        if isinstance(r, dict) and "dry_run" in str(r.get("reason", ""))
+    )
     if applied or rejected:
         lines.append(f"learnings: applied={applied} rejected={rejected}")
+        if staged:
+            lines.append(
+                f"🧪 {staged} proposal(s) staged for review — "
+                f"data/evolution/{period}/proposed_edits.json"
+            )
+    elif result.get("proposed_learnings_count"):
+        lines.append(
+            f"⚠️ {result['proposed_learnings_count']} proposal(s) generated "
+            f"but prompt-editor report missing — check logs"
+        )
     reason = result.get("reason")
     if reason:
         lines.append(f"reason: {reason}")

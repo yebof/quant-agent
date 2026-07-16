@@ -113,6 +113,21 @@ class RiskRuleEngine:
                 limit=0.0,
             )]
 
+        # Non-finite cash disables the cash_only comparison the same silent
+        # way a NaN market_value disabled the caps (audit round 2:
+        # `NaN < 0` is False, so every BUY passed). Fail closed.
+        if cash is not None and not math.isfinite(cash):
+            return [RiskViolation(
+                rule="max_total_position_pct",   # in HARD_BLOCK_RULES
+                message=(
+                    f"non-finite cash={cash} — cash_only cannot be evaluated; "
+                    f"refusing to risk-check BUY for {decision.symbol}; "
+                    f"blocking until the next clean snapshot"
+                ),
+                value=0.0,
+                limit=0.0,
+            )]
+
         violations = []
         signed_mul = _effective_multiplier(decision.symbol)  # net direction
         gross_mul = _gross_multiplier(decision.symbol)       # size magnitude

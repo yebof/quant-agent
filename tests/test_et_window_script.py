@@ -403,12 +403,20 @@ def test_wrapper_does_not_duplicate_python_notifier_on_plain_failure(tmp_path):
 
 
 def test_wrapper_respects_telegram_kill_switch(tmp_path):
-    env = _base_env(tmp_path, "exit 137")
-    env |= {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "42",
-            "TELEGRAM_DISABLED": "1"}
-    _run(env)
-    log_file = tmp_path / "curl.log"
-    assert not log_file.exists() or "sendMessage" not in log_file.read_text()
+    # audit round 2 (#44): the wrapper must honour every spelling python's
+    # notifier accepts ("1"/"true"/"yes", case-insensitive) — previously
+    # only the literal "1" muted the bash-side KILLED push.
+    for i, disabled in enumerate(("1", "true", "YES", " on ")):
+        sub = tmp_path / f"case{i}"
+        sub.mkdir()
+        env = _base_env(sub, "exit 137")
+        env |= {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "42",
+                "TELEGRAM_DISABLED": disabled}
+        _run(env)
+        log_file = sub / "curl.log"
+        assert not log_file.exists() or "sendMessage" not in log_file.read_text(), (
+            f"TELEGRAM_DISABLED={disabled!r} must mute the bash-side push"
+        )
 
 
 def test_wrapper_pings_healthchecks_on_success_and_fail(tmp_path):

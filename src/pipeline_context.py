@@ -153,11 +153,27 @@ class PMFacts:
             for s, w in sorted(self.sector_weights.items(), key=lambda kv: -kv[1])[:8]
         ) or "  (none)"
 
+        # audit round 2 #35: the denominator is rm_verdicts_seen (the query
+        # is limit=5 but can return 0-5 rows), not a hardcoded 5 — a fresh
+        # deployment with 2 verdicts, both overrides, used to render "2/5"
+        # (40%) when the true override rate was 2/2 (100%). PM must cite
+        # these numbers verbatim, so the block itself has to be honest.
+        if self.rm_verdicts_seen > 0:
+            rm_block = (
+                f"### RM Discipline (last {self.rm_verdicts_seen} verdicts)\n"
+                f"- scale_all_buys<1.0 count: {self.rm_scale_downs_last5}/{self.rm_verdicts_seen}"
+                f" · mods emitted: {self.rm_mods_last5}/{self.rm_verdicts_seen}"
+            )
+        else:
+            rm_block = (
+                "### RM Discipline\n"
+                "- (no RM verdicts on record — cite as [UNSOURCED:no_rm_history])"
+            )
+
         return f"""### Calibration (last 30d closed trades)
 - n={self.closed_trades_30d} · win_rate={_pct(self.win_rate_30d_pct)} · avg_return={_pct(self.avg_return_30d_pct)} · avg_hold={_num(self.avg_hold_days_30d)}d
 
-### RM Discipline (last 5 verdicts)
-- scale_all_buys<1.0 count: {self.rm_scale_downs_last5}/5 · mods emitted: {self.rm_mods_last5}/5
+{rm_block}
 
 ### Book State (current)
 - invested={self.invested_pct:.1f}% · cash={self.cash_pct:.1f}% · positions={self.position_count}

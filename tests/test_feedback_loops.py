@@ -32,11 +32,13 @@ def _insights_row(date: str, misses: list[dict]) -> dict:
 def test_value_entry_missed_counts_as_real_miss():
     pipeline = _mk_pipeline()
     pipeline.db.get_recent_insights.return_value = [
+        # >5 days apart = two distinct EPISODES (audit round 2: consecutive
+        # evenings are one rolling-window re-emission, not recurrence).
         _insights_row("2026-07-15", [
             {"miss_category": "value_entry_missed", "symbol": "SNDK",
              "theme_if_any": "memory upcycle pricing power", "lesson": "buy the dip"},
         ]),
-        _insights_row("2026-07-14", [
+        _insights_row("2026-07-07", [
             {"miss_category": "value_entry_missed", "symbol": "SNDK",
              "theme_if_any": "NAND tightness into H2", "lesson": "still cheap"},
         ]),
@@ -55,7 +57,7 @@ def test_misses_group_by_symbol_not_freetext_theme():
             {"miss_category": "trend_timing_miss", "symbol": "ORCL",
              "theme_if_any": "AI capex second wave", "lesson": "x"},
         ]),
-        _insights_row("2026-07-13", [
+        _insights_row("2026-07-06", [
             {"miss_category": "trend_timing_miss", "symbol": "ORCL",
              "theme_if_any": "hyperscaler backlog acceleration", "lesson": "y"},
         ]),

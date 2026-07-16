@@ -545,6 +545,13 @@ Semantics of `target_weight_pct`:
 - Held symbols NOT in your targets list → held at current weight (no
   change)
 - Never set `target_weight_pct > 20` (single-name cap is 20%)
+- **All weights are GROSS-leverage weights.** The `Weight:` tag on each
+  position (and the current weight the constructor diffs your target
+  against) multiplies a leveraged/inverse ETF's market value by
+  |leverage| — e.g. $6k of 3x SQQQ on a $100k book shows `Weight: 18.0%
+  (gross, 3x leveraged)`, not 6%. State targets on the same gross basis;
+  restating a leveraged ETF's raw dollar weight would be read as a
+  large trim.
 
 ```json
 {

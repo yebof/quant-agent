@@ -244,11 +244,21 @@ Current close: {current_price}""")
             indicators = s.get("indicators")
             if sym and indicators is not None:
                 input_indicators_by_sym[sym] = getattr(indicators, "atr_14", None)
+        submitted = {s.get("symbol") for s in symbols_data if isinstance(s, dict)}
         analyses: dict[str, TechAnalysisResult] = {}
         failed_symbols: list[str] = []
+        unsubmitted_symbols: list[str] = []
         for item in items:
             try:
                 analysis = TechAnalysisResult(**item)
+                # audit round 2 #23: drop rows for symbols never submitted in
+                # this chunk. Production showed the LLM inventing phantom keys
+                # like "AAPL_CORRECTION" / "ZS_FINAL" — those rows leaked into
+                # PM/RM prompts and were persisted forever in the tech store,
+                # while the superseded original row survived as the real key.
+                if analysis.symbol not in submitted:
+                    unsubmitted_symbols.append(analysis.symbol)
+                    continue
                 # Carry ATR through from the input data (LLM doesn't emit it).
                 atr = input_indicators_by_sym.get(analysis.symbol)
                 if atr is not None:
@@ -258,7 +268,11 @@ Current close: {current_price}""")
                 bad_symbol = str((item or {}).get("symbol", "?")) if isinstance(item, dict) else "?"
                 failed_symbols.append(bad_symbol)
                 logger.error("Failed to parse tech analysis item for %s: %s", bad_symbol, e)
-        submitted = {s.get("symbol") for s in symbols_data if isinstance(s, dict)}
+        if unsubmitted_symbols:
+            logger.warning(
+                "Tech analyst emitted %d row(s) for symbols not in the submitted "
+                "chunk — dropped: %s", len(unsubmitted_symbols), unsubmitted_symbols,
+            )
         missing = submitted - set(analyses.keys())
         if missing or failed_symbols:
             logger.warning(

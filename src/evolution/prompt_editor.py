@@ -53,6 +53,29 @@ the rest regardless of LLM):
     undoes a whole quarter's evolution in one shot. Commit failures
     are logged and swallowed — prompt edits aren't rolled back if
     git misbehaves (we already wrote the file atomically).
+    To keep that revert clean, a prompt file that already carries
+    uncommitted operator edits is SKIPPED (rejection logged) rather
+    than swept into the evolution commit (audit round 2, #48).
+
+11. **Single-line entries.** learning_text is whitespace-normalized
+    (newlines/tabs/runs collapsed to single spaces) BEFORE any
+    guardrail runs and before writing — entries are line-based, so an
+    embedded newline would otherwise defeat FIFO cap, Jaccard dedup,
+    prohibited-words and the retract path all at once (audit round 2,
+    #21).
+
+12. **Apply-from-file lane (audit round 2, #20).** The documented
+    human-review gate is "review proposed_edits.json, then apply". A
+    plain `--mode meta --force` re-run REGENERATES the reflection with
+    a fresh non-deterministic LLM call — applying content nobody
+    reviewed. Setting env `EVOLUTION_APPLY_SAVED=1` (use the incoming
+    reflection's period) or `EVOLUTION_APPLY_SAVED=<period>` (e.g.
+    `2026-Q2`, for late applies where the fresh run would mislabel the
+    period) makes `apply_reflection` DISCARD the freshly-generated
+    reflection and instead apply the persisted
+    `data/evolution/{period}/reflection.json` — exactly what the human
+    reviewed. If the saved file is missing/invalid the editor fails
+    safe: nothing is applied. See `load_saved_reflection`.
 """
 
 from __future__ import annotations
@@ -181,13 +204,132 @@ class PromptEditor:
 
     def apply_reflection(
         self,
-        reflection: "QuarterlyMetaReflection",
+        reflection: "QuarterlyMetaReflection | dict",
     ) -> ApplicationReport:
         """Apply every proposed_learning in `reflection` in order. Respects:
           - config.enabled: short-circuit with all-rejected report when off
           - config.max_agents_per_cycle across the whole call
           - Pydantic-layer invariants already on the reflection object
+
+        `reflection` may also be a plain dict (e.g. a reflection.json
+        loaded from disk); it is validated through the
+        QuarterlyMetaReflection schema before anything runs.
+
+        Env `EVOLUTION_APPLY_SAVED` (audit round 2, #20): when set, the
+        incoming (freshly-generated) reflection is DISCARDED and the
+        persisted `data/evolution/{period}/reflection.json` is applied
+        instead — so what the human reviewed is exactly what gets
+        applied. Value `1`/`true`/`yes` → same period as the incoming
+        reflection; any other value → explicit period (e.g. `2026-Q2`).
+        Missing/invalid saved file → fail safe, nothing applied.
         """
+        # Dict → model coercion so callers can feed a loaded reflection.json
+        # directly (audit round 2, #20).
+        if isinstance(reflection, dict):
+            from src.models import QuarterlyMetaReflection
+            reflection = QuarterlyMetaReflection.model_validate(reflection)
+
+        # audit round 2 (#20): apply-from-file lane — see docstring.
+        saved_flag = os.getenv("EVOLUTION_APPLY_SAVED", "").strip()
+        if saved_flag and saved_flag != "0":
+            period = (
+                reflection.period
+                if saved_flag.lower() in ("1", "true", "yes")
+                else saved_flag
+            )
+            saved = load_saved_reflection(period, evolution_dir=self.evolution_dir)
+            if saved is None:
+                # Fail SAFE: do NOT fall back to the fresh reflection — the
+                # operator explicitly asked for reviewed content only.
+                logger.error(
+                    "EVOLUTION_APPLY_SAVED=%s but no valid saved reflection "
+                    "for period %s under %s — applying NOTHING (fail-safe; "
+                    "the freshly-generated reflection is not a reviewed "
+                    "artifact)", saved_flag, period, self.evolution_dir,
+                )
+                report = ApplicationReport(period=period)
+                for learning in reflection.proposed_learnings:
+                    report.rejected.append(Rejection(
+                        agent_name=learning.agent_name,
+                        operation=learning.operation,
+                        learning_text=learning.learning_text,
+                        reason=(
+                            f"EVOLUTION_APPLY_SAVED={saved_flag} set but "
+                            f"{Path(self.evolution_dir) / period / 'reflection.json'} "
+                            f"is missing/invalid — fresh reflection not applied"
+                        ),
+                        period=period,
+                    ))
+                self._audit_log(report)
+                return report
+            # Same-period re-run hazard: the pipeline persists the FRESH
+            # reflection to {period}/reflection.json BEFORE invoking the
+            # editor, so on a same-quarter re-run the "saved" file we just
+            # loaded may actually be the fresh regeneration. The staged
+            # proposed_edits.json is NOT rewritten by a live-apply run
+            # (dry_run=false skips staging) — cross-check against it and
+            # fail safe on mismatch rather than apply unreviewed content.
+            staged_path = (
+                Path(self.evolution_dir) / period / "proposed_edits.json"
+            )
+            if staged_path.exists():
+                mismatch = False
+                try:
+                    staged = json.loads(staged_path.read_text())
+                    staged_set = {
+                        (p.get("agent_name"), p.get("operation"),
+                         p.get("learning_text"))
+                        for p in (staged.get("proposals") or [])
+                    }
+                    saved_set = {
+                        (ln.agent_name, ln.operation, ln.learning_text)
+                        for ln in saved.proposed_learnings
+                    }
+                    mismatch = staged_set != saved_set
+                except Exception as exc:  # unreadable staging file → warn only
+                    logger.warning(
+                        "EVOLUTION_APPLY_SAVED: could not cross-check %s "
+                        "(%s); proceeding on reflection.json alone",
+                        staged_path, exc,
+                    )
+                if mismatch:
+                    logger.error(
+                        "EVOLUTION_APPLY_SAVED=%s: %s does not match the "
+                        "staged proposals in %s — reflection.json was "
+                        "probably overwritten by a fresh same-period LLM "
+                        "run before the editor read it. Applying NOTHING "
+                        "(fail-safe).",
+                        saved_flag,
+                        Path(self.evolution_dir) / period / "reflection.json",
+                        staged_path,
+                    )
+                    report = ApplicationReport(period=period)
+                    for learning in saved.proposed_learnings:
+                        report.rejected.append(Rejection(
+                            agent_name=learning.agent_name,
+                            operation=learning.operation,
+                            learning_text=learning.learning_text,
+                            reason=(
+                                "EVOLUTION_APPLY_SAVED: reflection.json "
+                                "disagrees with the reviewed "
+                                "proposed_edits.json — not applied"
+                            ),
+                            period=period,
+                        ))
+                    self._audit_log(report)
+                    return report
+            logger.warning(
+                "EVOLUTION_APPLY_SAVED=%s: applying SAVED reflection %s "
+                "(%d proposed learning(s)); the freshly-generated "
+                "reflection for %s is DISCARDED so that what the human "
+                "reviewed is exactly what gets applied",
+                saved_flag,
+                Path(self.evolution_dir) / period / "reflection.json",
+                len(saved.proposed_learnings),
+                reflection.period,
+            )
+            reflection = saved
+
         report = ApplicationReport(period=reflection.period)
 
         # Loudly log the EFFECTIVE mode so the operator never has to infer it
@@ -229,8 +371,10 @@ class PromptEditor:
             # NOT commit. The proposed_edits.json artifact has enough
             # detail that a human can either (a) edit the prompts by
             # hand using it as reference, or (b) flip
-            # evolution.dry_run=false in settings.yaml and re-run
-            # `python main.py --mode meta --force` to apply.
+            # evolution.dry_run=false in settings.yaml, set
+            # EVOLUTION_APPLY_SAVED=<period> and re-run
+            # `python main.py --mode meta --force` to apply the SAVED
+            # (reviewed) reflection — see the module docstring, #12.
             self._write_dry_run_proposal(reflection, report)
             self._audit_log(report)
             return report
@@ -295,6 +439,26 @@ class PromptEditor:
     ) -> AppliedEdit | None:
         """Validate + apply one learning. Returns the AppliedEdit on success,
         or None after pushing a Rejection into the report."""
+        # audit round 2 (#21): entries are LINE-based (_ENTRY_RE matches one
+        # line). A learning_text with an embedded newline used to sail past
+        # every guardrail at once — invisible to Jaccard dedup (re-appendable
+        # every quarter), uncounted by the FIFO cap (immortal entry), and
+        # unreachable by the retract-by-hash path — while its second line
+        # rendered as a bare unattributed paragraph in the agent prompt.
+        # Collapse ALL internal whitespace to single spaces BEFORE any
+        # guardrail check and before writing. An LLM newline is benign
+        # formatting, so normalize rather than reject.
+        normalized = " ".join(learning.learning_text.split())
+        if normalized != learning.learning_text:
+            logger.warning(
+                "prompt_editor: learning_text for %s contained newlines/"
+                "irregular whitespace — normalized to a single line before "
+                "guardrail checks", learning.agent_name,
+            )
+            learning = learning.model_copy(
+                update={"learning_text": normalized},
+            )
+
         reason = self._validate_learning(learning)
         if reason is not None:
             report.rejected.append(Rejection(
@@ -313,6 +477,33 @@ class PromptEditor:
                 operation=learning.operation,
                 learning_text=learning.learning_text,
                 reason=f"prompt file not found: {prompt_path}",
+                period=period,
+            ))
+            return None
+
+        # audit round 2 (#48): when auto_commit is on, refuse to edit a
+        # prompt file that already carries uncommitted operator changes.
+        # The consolidated `git add + commit` at the end of the cycle would
+        # sweep that operator work into the "quarterly meta-reflection"
+        # commit, breaking the documented `git revert <sha>` contract (the
+        # revert would also destroy the operator's edits). Skipping is safe:
+        # the learning stays reviewable in reflection.json / the audit log.
+        if self._auto_commit and self._prompt_file_dirty(prompt_path, report):
+            logger.error(
+                "prompt_editor: %s has uncommitted operator edits — "
+                "skipping %s's learning so the evolution git commit stays "
+                "revert-clean (commit or stash your changes, then re-apply)",
+                prompt_path, learning.agent_name,
+            )
+            report.rejected.append(Rejection(
+                agent_name=learning.agent_name,
+                operation=learning.operation,
+                learning_text=learning.learning_text,
+                reason=(
+                    f"prompt file has uncommitted operator edits "
+                    f"({prompt_path}) — skipped to keep the evolution "
+                    f"commit revert-clean"
+                ),
                 period=period,
             ))
             return None
@@ -454,6 +645,41 @@ class PromptEditor:
     def _prompt_path_for(self, agent_name: str) -> Path:
         return self.prompts_dir / f"{agent_name}.md"
 
+    def _prompt_file_dirty(
+        self,
+        prompt_path: Path,
+        report: ApplicationReport,
+    ) -> bool:
+        """audit round 2 (#48): True when `prompt_path` has uncommitted
+        changes (modified OR untracked) that predate this cycle.
+
+        - Files WE already edited earlier in this same cycle are exempt
+          (they're dirty because of us; committing them is the whole point).
+        - Any git failure (not a repo, git missing, mocked subprocess in
+          tests) degrades to "not dirty" — the sweep hazard only exists
+          when the later `git add + commit` would actually succeed, and
+          that path already handles git absence gracefully.
+        """
+        if str(prompt_path) in {e.prompt_path for e in report.applied}:
+            return False
+        try:
+            proc = subprocess.run(
+                [
+                    "git", "-C", str(prompt_path.parent),
+                    "status", "--porcelain", "--", str(prompt_path),
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            return False
+        rc = proc.returncode
+        if not isinstance(rc, int) or rc != 0:
+            return False
+        out = proc.stdout
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        return bool(out.strip()) if isinstance(out, str) else False
+
     # -- dry-run staging ----------------------------------------------------
 
     def _write_dry_run_proposal(
@@ -497,13 +723,25 @@ class PromptEditor:
             "generated_at": datetime.now(tz=timezone.utc).isoformat(),
             "proposed_count": len(proposals),
             "proposals": proposals,
+            # audit round 2 (#20): a bare `--mode meta --force` re-run
+            # REGENERATES the reflection with a fresh non-deterministic LLM
+            # call — the operator would apply content they never reviewed.
+            # EVOLUTION_APPLY_SAVED pins the apply to the persisted (=
+            # reviewed) reflection.json for this period.
             "instructions": (
-                "To apply these proposals: (1) flip evolution.dry_run=false "
-                "in config/settings.yaml AND re-run "
-                "`python main.py --mode meta --force`, OR (2) edit the "
+                "To apply these proposals EXACTLY as reviewed: (1) flip "
+                "evolution.dry_run=false in config/settings.yaml, set env "
+                f"EVOLUTION_APPLY_SAVED={reflection.period} and re-run "
+                "`python main.py --mode meta --force` — the editor then "
+                "applies the SAVED data/evolution/"
+                f"{reflection.period}/reflection.json instead of whatever "
+                "a fresh LLM run would regenerate; OR (2) edit the "
                 "target_prompt_path file by hand, appending each "
                 "learning_text to its `## Learnings (system-evolved)` "
-                "section. Option (1) is reversible via `git revert`."
+                "section. Option (1) is reversible via `git revert`. "
+                "WARNING: without EVOLUTION_APPLY_SAVED, re-running "
+                "--mode meta --force makes a NEW non-deterministic LLM "
+                "call and applies content nobody reviewed."
             ),
         }
 
@@ -551,7 +789,21 @@ class PromptEditor:
             rows.append({"ts": ts, "period": report.period,
                          "kind": "rolled_off", **roll})
         if not rows:
-            return
+            # audit round 2 (#1): never return without writing. The 2026-Q2
+            # production run proposed exactly one learning, meta_reflector
+            # dropped it pre-editor (schema over-length), and the empty
+            # report early-returned here — the quarter's only apply attempt
+            # left ZERO durable trace in edits.jsonl, contradicting the
+            # audit-log invariant in the module docstring. Write a single
+            # marker row so every apply_reflection run is reconstructible.
+            rows.append({
+                "ts": ts, "period": report.period, "kind": "empty",
+                "note": (
+                    "apply_reflection ran with no applied/rejected/"
+                    "rolled_off entries (reflection carried zero "
+                    "proposed_learnings by the time it reached the editor)"
+                ),
+            })
         try:
             with log_path.open("a") as f:
                 for row in rows:
@@ -615,14 +867,65 @@ class PromptEditor:
 
 
 # ---------------------------------------------------------------------------
+# Apply-from-file loader (audit round 2, #20)
+# ---------------------------------------------------------------------------
+
+def load_saved_reflection(
+    period: str,
+    *,
+    evolution_dir: Path | str = "data/evolution",
+) -> "QuarterlyMetaReflection | None":
+    """Load + schema-validate the persisted reflection for `period` from
+    `{evolution_dir}/{period}/reflection.json` (written by
+    meta_reflector.persist_reflection at quarter end).
+
+    This is the artifact the operator actually reviewed alongside
+    proposed_edits.json — feeding it back through
+    `PromptEditor.apply_reflection` (via env EVOLUTION_APPLY_SAVED, or
+    directly) guarantees the applied content is byte-identical to the
+    reviewed content, instead of a fresh non-deterministic LLM
+    regeneration. Returns None (with an ERROR log) when the file is
+    missing, unparseable, or fails QuarterlyMetaReflection validation —
+    callers must treat None as "apply nothing".
+    """
+    from src.models import QuarterlyMetaReflection
+
+    path = Path(evolution_dir) / str(period) / "reflection.json"
+    if not path.exists():
+        logger.error("load_saved_reflection: %s does not exist", path)
+        return None
+    try:
+        data = json.loads(path.read_text())
+        reflection = QuarterlyMetaReflection.model_validate(data)
+    except Exception as exc:
+        logger.error(
+            "load_saved_reflection: %s failed to parse/validate: %s",
+            path, exc,
+        )
+        return None
+    logger.info(
+        "load_saved_reflection: loaded reviewed reflection %s "
+        "(%d proposed learning(s))",
+        path, len(reflection.proposed_learnings),
+    )
+    return reflection
+
+
+# ---------------------------------------------------------------------------
 # Pure helpers — parsing / writing / similarity
 # ---------------------------------------------------------------------------
 
 def _hash_text(text: str) -> str:
     """Stable content hash for retract-targeting. First 12 hex chars of
     SHA-256 — low collision probability for the corpus size (≤ 10
-    entries × 6 agents × many years)."""
-    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:12]
+    entries × 6 agents × many years).
+
+    audit round 2 (#21): whitespace-normalized (not just stripped) so the
+    hash computed from an LLM's newline-bearing learning_text matches the
+    hash stored on the single-line entry `_append_entry` writes — retract
+    lookups must agree with what's on disk."""
+    normalized = " ".join(text.split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
 
 
 def _jaccard(a: str, b: str) -> float:
@@ -687,8 +990,11 @@ def _append_entry(
     if absent. Enforces FIFO by removing the OLDEST auto-entry when count
     would exceed `max_entries`. Returns (new_file_text, rolled_off_list)."""
     text = full_text.rstrip() + "\n"  # normalize trailing newline
+    # audit round 2 (#21): collapse internal whitespace — the entry MUST be
+    # a single line or _ENTRY_RE (FIFO / dedup / retract) can never see it.
     new_entry = (
-        f"- [{period}] {learning_text.strip()} <!--hash:{content_hash}-->"
+        f"- [{period}] {' '.join(learning_text.split())} "
+        f"<!--hash:{content_hash}-->"
     )
 
     if _extract_section_body(text) is None:
