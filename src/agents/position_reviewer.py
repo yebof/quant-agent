@@ -186,6 +186,16 @@ class PositionReviewerAgent(BaseAgent):
                 metric_bits.append(f"to_stop={pf['distance_to_stop_pct']:.1f}%")
             if pf.get("distance_to_target_pct") is not None:
                 metric_bits.append(f"to_target={pf['distance_to_target_pct']:.1f}%")
+            # Vol units. The prompt tells the reviewer to reason in ATRs ("a
+            # stop <1.25 ATRs away is inside daily noise") and the pipeline
+            # pays for an ATR fetch per position to compute these — but they
+            # were never rendered, so the instruction referred to data the
+            # model could not see (2026-07-16 audit; drift introduced with the
+            # exit-quality work). None => omit: unknown must not read as zero.
+            if pf.get("atr_pct") is not None:
+                metric_bits.append(f"atr={pf['atr_pct']:.2f}%")
+            if pf.get("stop_distance_atrs") is not None:
+                metric_bits.append(f"stop_distance={pf['stop_distance_atrs']:.2f}×ATR")
             if pf.get("weight_pct") is not None:
                 metric_bits.append(f"weight={pf['weight_pct']:.1f}%")
             if metric_bits:

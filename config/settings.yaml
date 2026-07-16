@@ -182,7 +182,17 @@ trading:
     # Data Center REITs (AI infra exposure — interconnect + hyperscale)
     - EQIX   # Equinix (global #1 interconnection / colocation)
     - DLR    # Digital Realty (hyperscale data-center REIT)
-  lookback_days: 120
+  # CALENDAR days of OHLCV history — market.get_ohlcv does
+  # `start = today - timedelta(days=lookback_days)`, so the usable BAR count is
+  # only ~69% of this (120 gave ~82 bars).
+  #
+  # 2026-07-16 audit: MA200 needs 200 bars, so `ma_200` was unconditionally
+  # None in production and the tech_analyst prompt rendered "MA200=None" for
+  # every symbol every day — the analyst was asked to judge trend with the
+  # most-used long-term reference permanently absent. 320 calendar days ≈ 220
+  # trading days: enough for MA200 with holiday headroom. Pinned by
+  # tests/test_audit_fixes_2026_07_16.py against every advertised indicator.
+  lookback_days: 320
   # NOTE: these times are only consumed by `main.py --mode live` (APScheduler).
   # Production runs via launchd — see `src/trading_calendar.py SESSION_WINDOWS`
   # for the authoritative ET windows and `scripts/run_if_et_window.sh` for the

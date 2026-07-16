@@ -622,12 +622,38 @@ class EarningsDataProvider:
             )
             return self._get_existing_analysis(symbol, form_type=latest.form_type)
 
-        if last_known == latest.filing_date:
+        # "Already processed" must mean SUCCEEDED, not merely attempted.
+        #
+        # 2026-07-16 audit: record_failure() writes the new filing_date into
+        # the manifest alongside failed_attempts=1 and logs "will retry next
+        # session" — but this gate then saw last_known == latest.filing_date,
+        # found the PRIOR quarter's analysis on disk, and returned it with
+        # is_new=False. The pipeline only re-queues is_new reports, so the
+        # filing was never re-analyzed, record_failure never ticked again, the
+        # 3-strike budget never reached `abandoned`, and PM was served last
+        # quarter's numbers labelled "[from cache]" as if they were current.
+        # One transient LLM failure permanently dropped that quarter's filing —
+        # for every symbol that already had a same-form analysis on disk, i.e.
+        # the whole universe in steady state.
+        # confirm_filing() writes failed_attempts=0 on success, so a genuinely
+        # processed filing still short-circuits here. Attempts 1-2 now fall
+        # through to re-download → is_new=True → re-analysis; on the 3rd
+        # failure the `abandoned` branch above takes over as designed.
+        try:
+            prior_failures = int(entry.get("failed_attempts", 0) or 0)
+        except (TypeError, ValueError):
+            prior_failures = 0
+        if last_known == latest.filing_date and not prior_failures:
             # Already processed this filing — return existing analysis matching this form_type
             existing = self._get_existing_analysis(symbol, form_type=latest.form_type)
             if existing:
                 return existing
             # Analysis file missing (e.g. killed mid-analysis) — re-download
+        elif last_known == latest.filing_date and prior_failures:
+            logger.info(
+                "%s %s (%s): retrying after %d failed analysis attempt(s)",
+                symbol, latest.form_type, latest.filing_date, prior_failures,
+            )
 
         # New filing — download it
         local_path = self._download_filing(cik, latest)

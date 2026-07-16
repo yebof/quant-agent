@@ -37,6 +37,14 @@ logger = logging.getLogger(__name__)
 # the caller's CWD.
 _DB_PATH = Path(__file__).resolve().parent.parent / "data" / "quant_agent.db"
 
+# Cash-sweep parking vehicles — cash equivalents, never "deployed capital".
+# The notifier reads the DB directly (it deliberately doesn't thread config
+# in — see the comment at the sqlite3 connect), so it can't ask
+# CashSweepConfig for the configured symbol. Cover the supported vehicles;
+# an unknown custom symbol degrades to today's behaviour (counted as a
+# position), which is visible rather than silent.
+_SWEEP_SYMBOLS = frozenset({"SGOV", "BIL"})
+
 
 class TelegramNotifier:
     """Best-effort Telegram Bot API notifier.
@@ -562,6 +570,15 @@ def _append_position_snapshot(lines: list[str], total_value: float | None) -> No
         return
     if not rows:
         return
+    # The cash-sweep vehicle is parked CASH, not deployed capital (that's its
+    # whole contract: hidden from every LLM view, credited as cash by the risk
+    # engine, first to liquidate in force_delever). Counting it here reported a
+    # ~99%-deployed book on a night the money was entirely in T-bills —
+    # inverting the operator's one nightly glance at exposure, and listing SGOV
+    # among the P&L movers (2026-07-16 audit).
+    parked = sum(r[4] for r in rows
+                 if r[0] in _SWEEP_SYMBOLS and r[4] is not None)
+    rows = [r for r in rows if r[0] not in _SWEEP_SYMBOLS]
     invested = sum(r[4] for r in rows if r[4] is not None)
     cash_pct = None
     if total_value and total_value > 0:
@@ -569,7 +586,11 @@ def _append_position_snapshot(lines: list[str], total_value: float | None) -> No
     summary = f"   Positions: {len(rows)}  invested ${invested:,.0f}"
     if cash_pct is not None:
         summary += f"  ({100 - cash_pct:.0f}% deployed / {cash_pct:.0f}% cash)"
+    if parked > 0:
+        summary += f"  [+${parked:,.0f} parked in T-bills]"
     lines.append(summary)
+    if not rows:
+        return
 
     def _row_line(r: tuple) -> str:
         sym, qty, avg, curr, mv, pnl = r
