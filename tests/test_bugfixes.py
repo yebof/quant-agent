@@ -577,7 +577,9 @@ def test_evening_reconciles_before_loading_trade_inputs():
     pipeline.run_evening()
 
     assert events[0] == "reconcile"
-    assert ("get_trades", {"limit": 20, "today_only": True, "executed_only": True}) in events
+    # limit 30: evening fetches headroom so the SWEEP_* filter can't shrink
+    # the real-trade view below the original 20 (feat/returns-optimization)
+    assert ("get_trades", {"limit": 30, "today_only": True, "executed_only": True}) in events
     assert pipeline._reconcile_fills.call_count == 2
 
 

@@ -3027,9 +3027,16 @@ class TradingPipeline:
         now = _dt.now(timezone.utc)
         window_start = now - timedelta(days=lookback_days)
         age_cutoff = now - timedelta(days=min_age_days)
+        sweeper = self._sweeper()
+        sweep_symbol = sweeper.symbol if sweeper is not None else None
         exits: list[dict] = []
         for row in rows:
             action = (row.get("action") or "").upper()
+            # Belt on top of the SWEEP_* action exclusion: an emergency
+            # liquidation can exit the sweep vehicle under EMERGENCY_SELL —
+            # a ~0% T-bill "move" is noise in a decision-quality audit.
+            if sweep_symbol is not None and (row.get("symbol") or "") == sweep_symbol:
+                continue
             is_exit = (
                 action in self._EXIT_AUDIT_ACTIONS
                 or action.startswith("PARTIAL_SELL")
@@ -4717,6 +4724,12 @@ class TradingPipeline:
                 continue
             if (row.get("fill_status") or "") == "canceled":
                 continue
+            # Ex-div adjustments also write TRAIL_STOP rows, but they LOWER
+            # the stop (dividend-drop compensation) — counting them as a
+            # "tighten" would hand every dividend payer a spurious cooldown.
+            # Same idiom as the ex-div idempotence check.
+            if "ex-div" in (row.get("reasoning") or "").lower():
+                continue
             ts = row.get("timestamp") or ""
             try:
                 dt = _dt.fromisoformat(ts.replace("Z", "+00:00")) if "T" in ts \
@@ -5163,6 +5176,12 @@ class TradingPipeline:
                     loss_violation.message,
                 )
                 orders = self._midday_emergency_liquidate(positions, loss_violation, run_id)
+                # Any same-day plan is superseded by the liquidation — a
+                # stale unconsumed checkpoint must not resume, and the
+                # dead-man probe must not read this as a killed morning.
+                from src import decision_checkpoint as _dc
+                _dc.mark_consumed("morning")
+                _dc.write_status("morning", "emergency_sold")
                 return {
                     "status": "emergency_sold",
                     "orders": orders,
@@ -5197,6 +5216,22 @@ class TradingPipeline:
                 ctx.data_status = resumed["data_status"]
                 ctx.portfolio_decision = resumed["portfolio_decision"]
                 portfolio_decision = ctx.portfolio_decision
+                # Rehydrate bars for the plan's BUY symbols (zero-LLM, fresh
+                # data). The checkpoint deliberately omits symbols_bars
+                # (huge); without this the entry ATR stop floor silently
+                # no-ops and the correlation advisory false-fires on resume.
+                bars: dict = {}
+                for d in portfolio_decision.decisions:
+                    if d.action != "BUY":
+                        continue
+                    try:
+                        bars[d.symbol] = self.market.get_ohlcv(
+                            d.symbol, self.config.trading.lookback_days,
+                        ) or []
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("resume: bar rehydrate failed for %s: %s",
+                                       d.symbol, e)
+                ctx.symbols_bars = bars
             else:
                 # Phase 4 #1: research stage runs the parallel fan-out (macro /
                 # news / tech / earnings). Populates ctx fields.
@@ -5214,10 +5249,16 @@ class TradingPipeline:
                     run_id, "post-research",
                 )
                 if late_breach is not None:
+                    _dc.mark_consumed("morning")
+                    _dc.write_status("morning", "emergency_sold")
                     return late_breach
 
                 if not analyses:
                     logger.warning("No analyses produced, skipping trading")
+                    # Legit PM-less completion — record it so the evening
+                    # dead-man probe doesn't read "research rows, no PM row"
+                    # as a killed morning.
+                    _dc.write_status("morning", "no_data")
                     return {"status": "no_data", "orders": [], "run_id": run_id}
 
                 # Phase 4 #1: decision stage — memory layers + PM + Constructor.
@@ -5240,6 +5281,10 @@ class TradingPipeline:
                     run_id, "post-decision",
                 )
                 if late_breach is not None:
+                    # The just-written checkpoint is superseded by the
+                    # emergency liquidation — never resume it.
+                    _dc.mark_consumed("morning")
+                    _dc.write_status("morning", "emergency_sold")
                     return late_breach
 
             if not portfolio_decision:
@@ -5722,9 +5767,25 @@ class TradingPipeline:
             daily_pnl = total_value - last_equity
             loss_violation = self.risk_engine.check_daily_loss(last_equity, daily_pnl)
             if loss_violation:
+                # Review fix: this branch previously FELL THROUGH to the park
+                # bookend — the system would buy SGOV with ~all equity minutes
+                # after force-selling everything, and the next intra tick
+                # would emergency-sell the fresh SGOV lot (spurious 🚨 alert +
+                # a full round-trip on the worst possible day). Mirror the
+                # pre-review breaker: reconcile and return, never park.
                 orders.extend(self._midday_emergency_liquidate(
                     positions, loss_violation, run_id,
                 ))
+                self._reconcile_fills()
+                return {
+                    "status": "emergency_sold",
+                    "session": session_type,
+                    "positions": len(positions),
+                    "review": review.model_dump() if review else None,
+                    "orders": orders,
+                    "run_id": run_id,
+                    "stop_coverage_gaps": coverage_gaps,
+                }
             else:
                 orders.extend(self._midday_execute_llm_actions(
                     review_positions, review, run_id,
@@ -6093,10 +6154,15 @@ class TradingPipeline:
 
         # 3. LLM evening analysis — daily review and tomorrow outlook
         macro_summary = self.macro.get_macro_summary()
+        # Sweep churn (SWEEP_BUY/SWEEP_SELL) is cash parking, not a trading
+        # decision — narrating it to the evening analyst would feed the
+        # learning loops noise (review finding). Fetch extra rows so the
+        # filter doesn't shrink the real-trade view.
         today_trades = [
             self._actualize_trade_row(t)
-            for t in self.db.get_trades(limit=20, today_only=True, executed_only=True)
-        ]
+            for t in self.db.get_trades(limit=30, today_only=True, executed_only=True)
+            if (t.get("action") or "") not in ("SWEEP_BUY", "SWEEP_SELL")
+        ][:20]
         # Feed yesterday's insights back so evening can grade its own prior outlook
         # against today's reality — enables calibration over time.
         prior_outlook = self.db.get_latest_insights(before_date=today_str)
@@ -6430,10 +6496,18 @@ class TradingPipeline:
         # kill, so 13 straight days of morning deaths passed this check and
         # the 🔴 banner never fired. Two sharper probes:
         if "morning" not in missing and "run" in present:
+            # A legit PM-less completion (no_data / emergency_sold) records a
+            # status marker — skip both probes for it.
+            try:
+                from src import decision_checkpoint as _dc0
+                legit_early_exit = _dc0.read_status("morning") is not None
+            except Exception:  # noqa: BLE001
+                legit_early_exit = False
             #  (a) research logged but the PM never ran → died during research.
             try:
                 agents = self.db.agent_names_logged_on("run-")
-                if agents and "portfolio_manager" not in agents:
+                if (not legit_early_exit and agents
+                        and "portfolio_manager" not in agents):
                     missing.append("morning (research ran, PM never did — killed mid-run?)")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("missing-session check: agent probe failed: %s", exc)

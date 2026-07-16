@@ -135,25 +135,68 @@ def load(session: str, max_age_minutes: float = MAX_AGE_MINUTES) -> dict | None:
         return None
 
 
-def mark_consumed(session: str) -> None:
-    """Flip consumed=true in place. Never raises.
+def mark_consumed(session: str) -> bool:
+    """Flip consumed=true in place; returns True when the checkpoint is
+    guaranteed dead (consumed or gone). Never raises.
 
-    Called (a) right before ExecutionStage submits (at-most-once for BUYs)
-    and (b) on any RiskStage early-exit — an RM-rejected or hard-blocked
-    plan must never be re-offered by the resume lane.
+    Called (a) right before ExecutionStage submits (at-most-once for BUYs),
+    (b) on any RiskStage early-exit — an RM-rejected or hard-blocked plan
+    must never be re-offered — and (c) on emergency-liquidation exits.
+
+    Fail-CLOSED: if rewriting the file fails (disk full, permissions), fall
+    back to deleting it — for load() a missing checkpoint equals a consumed
+    one, and unlink succeeds under ENOSPC where write_text cannot. A
+    swallowed failure here would leave the plan live, which is the unsafe
+    direction for the at-most-once contract.
     """
+    path = checkpoint_path(session)
     try:
-        path = checkpoint_path(session)
         if not path.exists():
-            return
+            return True
         payload = json.loads(path.read_text())
         if payload.get("consumed") is True:
-            return
+            return True
         payload["consumed"] = True
         payload["consumed_at_utc"] = datetime.now(timezone.utc).isoformat()
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))
         tmp.replace(path)
         logger.info("decision checkpoint %s marked consumed", path)
+        return True
     except Exception as e:  # noqa: BLE001
-        logger.warning("decision checkpoint consume-mark failed: %s", e)
+        logger.error("decision checkpoint consume-mark failed (%s) — "
+                     "deleting the checkpoint instead (fail-closed)", e)
+        try:
+            path.unlink(missing_ok=True)
+            return True
+        except Exception as e2:  # noqa: BLE001
+            logger.error("decision checkpoint delete also failed: %s — "
+                         "resume lane may re-offer this plan!", e2)
+            return False
+
+
+def write_status(session: str, status: str) -> None:
+    """Record a legitimate PM-less terminal status for the ET day
+    (no_data / emergency_sold). The evening dead-man probe reads this to
+    avoid false 'morning killed mid-run' alarms. Never raises.
+    """
+    try:
+        path = checkpoint_path(session).with_suffix(".status")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "status": status,
+            "at_utc": datetime.now(timezone.utc).isoformat(),
+        }))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("session status write failed: %s", e)
+
+
+def read_status(session: str) -> str | None:
+    """Today's recorded terminal status, or None. Never raises."""
+    try:
+        path = checkpoint_path(session).with_suffix(".status")
+        if not path.exists():
+            return None
+        return json.loads(path.read_text()).get("status")
+    except Exception:  # noqa: BLE001
+        return None

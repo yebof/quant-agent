@@ -248,11 +248,14 @@ class CashSweeper:
         if not (isinstance(price, (int, float)) and price > 0 and math.isfinite(price)):
             logger.warning("cash sweep: no price for %s — skipping park", cfg.symbol)
             return None
-        qty = int(excess / price)
+        # Size against the LIMIT price (what a fill can actually cost), not
+        # the quote — sizing on the quote could overdraw raw cash by the pad
+        # amount when the reserve is configured thin (review finding; SWEEP
+        # orders don't pass through the cash_only engine).
+        limit_price = round(price * _BUY_LIMIT_PAD, 2)
+        qty = int(excess / limit_price)
         if qty <= 0:
             return None
-
-        limit_price = round(price * _BUY_LIMIT_PAD, 2)
         # Write-ahead row before the broker call — same crash-recovery
         # pattern as ExecutionStage BUYs (orphan sweep matches on
         # fill_status='pending_submit').

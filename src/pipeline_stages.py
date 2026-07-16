@@ -548,6 +548,21 @@ class RiskStage:
         news_intel = ctx.news_intel
         data_status = ctx.data_status
 
+        # Cash-sweep view — same contract as DecisionStage: the RiskManager
+        # must see parked T-bills as CASH, never as an 84%-of-book "position"
+        # (review finding: PM and RM otherwise get contradictory views of the
+        # same dollars in the same run, and RM's veto acts on the corrupted
+        # one). IMPORTANT: only the LLM-facing uses (RM prompt, correlation
+        # pool, has_book_to_check) take the scrubbed list — the hard filter
+        # keeps RAW positions because it derives the parked-cash credit from
+        # finding the vehicle in the list itself.
+        from src.execution.cash_sweep import CashSweeper
+        sweeper = getattr(pipeline, "_sweeper", None)
+        sweeper = sweeper() if callable(sweeper) else None
+        rm_positions = positions
+        if isinstance(sweeper, CashSweeper):
+            rm_positions, _parked = sweeper.split_positions(positions)
+
         # Symbol guard
         portfolio_decision.decisions, symbol_blocked_reasons = pipeline._filter_supported_symbols(
             portfolio_decision.decisions, analyses, positions,
@@ -577,7 +592,7 @@ class RiskStage:
         try:
             from src.data.correlation import build_correlation_matrix
             pool_bars = dict(ctx.symbols_bars)
-            for p in positions:
+            for p in rm_positions:
                 if p.symbol not in pool_bars:
                     pool_bars[p.symbol] = pipeline.market.get_ohlcv(
                         p.symbol, pipeline.config.trading.lookback_days,
@@ -622,7 +637,7 @@ class RiskStage:
             ))
             logger.warning("Morning data degradation: %s", data_status)
 
-        has_book_to_check = len(positions) >= 2 or any(
+        has_book_to_check = len(rm_positions) >= 2 or any(
             d.action == "BUY" for d in portfolio_decision.decisions
         )
         if (not correlation_matrix) and has_book_to_check:
@@ -647,7 +662,7 @@ class RiskStage:
 
         verdict, rm_result = pipeline.risk_manager.review(
             portfolio_decision=portfolio_decision,
-            positions=positions,
+            positions=rm_positions,
             macro_summary=ctx.macro_summary,
             rule_violations=rule_violations,
             tech_analyses=analyses,
@@ -1004,6 +1019,24 @@ class ExecutionStage:
                                 sizing_price, widened, atr14,
                             )
                             stop_price = widened
+                            # Review fix: widening happens AFTER the RM
+                            # audited this trade's R/R. If the honest
+                            # geometry (real stop distance vs the same
+                            # target) collapses the R/R below a sane floor,
+                            # the setup RM approved never existed — skip
+                            # rather than execute a trade nobody reviewed.
+                            if decision.take_profit > 0:
+                                reward = decision.take_profit - sizing_price
+                                risk = sizing_price - stop_price
+                                if risk > 0 and reward / risk < 1.2:
+                                    logger.warning(
+                                        "BUY %s skipped: ATR-widened stop "
+                                        "makes R/R %.2f (<1.2) — RM approved "
+                                        "a tighter-stop geometry that daily "
+                                        "noise would have destroyed.",
+                                        decision.symbol, reward / risk,
+                                    )
+                                    continue
                     except Exception as e:
                         logger.warning("ATR stop floor skipped for %s: %s",
                                        decision.symbol, e)

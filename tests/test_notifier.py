@@ -933,7 +933,7 @@ def test_format_evening_missing_morning_session_is_red():
         "analysis": {"risk_rating": "low"},
     }
     msg = format_session_result("evening", result, 10.0)
-    assert "🔴 SESSION DID NOT RUN TODAY: morning" in msg
+    assert "🔴 MORNING SESSION INCOMPLETE TODAY: morning" in msg
     assert "midday" in msg  # soft warning for the non-morning miss
 
 

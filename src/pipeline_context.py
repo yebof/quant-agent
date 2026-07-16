@@ -175,6 +175,14 @@ class PMFacts:
     def _render_deployment_gap(self) -> str:
         if self.macro_target_invested_pct is None or self.deployment_gap_pp is None:
             return ""
+        if self.deployment_gap_pp > 15:
+            return (
+                f"\n\n### Deployment vs Macro Target"
+                f"\n- invested={self.invested_pct:.1f}% vs macro target="
+                f"{self.macro_target_invested_pct:.0f}% — {self.deployment_gap_pp:.0f}pp OVER"
+                f" the target. The RM advisory will flag this; trims/rotation"
+                f" are a valid response, especially if macro is not risk-on."
+            )
         if self.deployment_gap_pp >= -15:
             return (
                 f"\n\n### Deployment vs Macro Target"

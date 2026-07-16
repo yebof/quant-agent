@@ -144,6 +144,10 @@ def _resume_pipeline():
     p.execution_stage = MagicMock()
     p.execution_stage.run.return_value = [{"id": "o1", "action": "BUY"}]
     p.decision_stage = MagicMock()
+    p.market = MagicMock()
+    p.market.get_ohlcv.return_value = []
+    p.config = MagicMock()
+    p.config.trading.lookback_days = 120
     return p
 
 

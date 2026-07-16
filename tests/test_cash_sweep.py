@@ -243,8 +243,10 @@ def test_park_excess_buys_vehicle_with_idle_cash():
     assert order is not None and order["action"] == "SWEEP_BUY"
     kwargs = p.broker.submit_order.call_args.kwargs
     assert kwargs["symbol"] == "SGOV" and kwargs["side"] == "buy"
-    # excess = 90k - 1%·100k - 0 = 89k → int(89000/100.60) = 884 shares
-    assert kwargs["qty"] == 884
+    # excess = 90k - 1%·100k - 0 = 89k; sized on the LIMIT price
+    # (100.60×1.001 → 100.70) so a padded fill can't overdraw raw cash:
+    # int(89000/100.70) = 883 shares
+    assert kwargs["qty"] == 883
     assert kwargs["stop_loss_price"] is None      # deliberately stopless
     p.db.confirm_trade_submitted.assert_called_once()
 
@@ -359,3 +361,62 @@ def test_position_review_hides_vehicle_and_parks_at_end(tmp_path):
     assert [x.symbol for x in seen] == ["NVDA"], "reviewer must not see SGOV"
     # bookend parked the idle cash: a SWEEP_BUY order rides in the result
     assert any(o.get("action") == "SWEEP_BUY" for o in result["orders"])
+
+
+def test_risk_stage_rm_view_excludes_vehicle():
+    """Review finding: RM (the veto layer) must see parked T-bills as cash,
+    not as an 84%-of-book position — otherwise PM and RM get contradictory
+    views of the same dollars in the same run and RM's veto acts on the
+    corrupted one."""
+    from src.pipeline_stages import RiskStage
+    from src.models import PortfolioDecision, ReasoningChain, RiskVerdict, RiskReasoningChain
+
+    p = _sweep_pipeline()
+    p.market = MagicMock()
+    p.market.get_ohlcv.return_value = []
+    p._filter_supported_symbols = MagicMock(side_effect=lambda d, a, pos: (d, []))
+    p._clamp_queued_earnings_buys = MagicMock(side_effect=lambda d, e: d)
+    p._filter_hard_risk_decisions = MagicMock(side_effect=lambda d, *a, **k: (d, [], []))
+    p.risk_manager = MagicMock()
+    p.risk_manager.review.return_value = (
+        RiskVerdict(
+            approved=True, modifications=[], reasoning="ok",
+            reasoning_chain=RiskReasoningChain(
+                rr_audit="x", signal_fidelity="x", correlation_check="x",
+                event_risk="x", sizing_sanity="x", overall="x",
+            ),
+        ),
+        MagicMock(user_message="m", raw_text="{}", tokens_used=1,
+                  input_tokens=1, output_tokens=1, cost_usd=0.0),
+    )
+    p.db = MagicMock()
+    p.config.llm = MagicMock()
+    p.config.llm.risk_manager_model = "test-model"
+    p.config.trading = MagicMock()
+    p.config.trading.lookback_days = 120
+
+    from src.pipeline_context import RunContext
+    ctx = RunContext.start("morning")
+    ctx.positions = [SGOV, NVDA]
+    ctx.total_value = 100_000.0
+    ctx.last_equity = 100_000.0
+    ctx.cash = 10_000.0
+    ctx.portfolio_decision = PortfolioDecision(
+        reasoning_chain=ReasoningChain(
+            macro_filter="x", news_check="x", earnings_check="x",
+            signal_conflicts="x", sizing_logic="x",
+            portfolio_balance="x", cash_target="x",
+        ),
+        decisions=[_buy(alloc=5.0)], portfolio_view="v",
+    )
+    ctx.symbols_bars = {}
+    ctx.data_status = {}
+
+    RiskStage(pipeline=p).run(ctx)
+
+    rm_seen = p.risk_manager.review.call_args.kwargs["positions"]
+    assert [x.symbol for x in rm_seen] == ["NVDA"], "RM must not see SGOV"
+    # but the HARD filter received the RAW list (it derives the parked-cash
+    # credit from finding the vehicle itself)
+    filter_positions = p._filter_hard_risk_decisions.call_args_list[0].args[1]
+    assert any(x.symbol == "SGOV" for x in filter_positions)
