@@ -6408,7 +6408,33 @@ class TradingPipeline:
             return []
         # run_id prefix -> display name; morning's prefix is 'run'.
         expected = {"run": "morning", "midday": "midday", "close": "close"}
-        return [name for prefix, name in expected.items() if prefix not in present]
+        missing = [name for prefix, name in expected.items() if prefix not in present]
+
+        # RC5 (2026-07-16): "any run- row exists" cannot tell a completed
+        # morning from one killed mid-flight — research rows land BEFORE the
+        # kill, so 13 straight days of morning deaths passed this check and
+        # the 🔴 banner never fired. Two sharper probes:
+        if "morning" not in missing and "run" in present:
+            #  (a) research logged but the PM never ran → died during research.
+            try:
+                agents = self.db.agent_names_logged_on("run-")
+                if agents and "portfolio_manager" not in agents:
+                    missing.append("morning (research ran, PM never did — killed mid-run?)")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("missing-session check: agent probe failed: %s", exc)
+            #  (b) PM plan checkpointed but never consumed → killed before the
+            #      RiskStage reviewed it (the observed 6/30-7/15 death mode).
+            try:
+                import json as _json
+                from src import decision_checkpoint as _dc
+                p = _dc.checkpoint_path("morning")
+                if p.exists() and _json.loads(p.read_text()).get("consumed") is False:
+                    missing.append(
+                        "morning (PM plan never risk-reviewed — checkpoint unconsumed)"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("missing-session check: checkpoint probe failed: %s", exc)
+        return missing
 
     def _maybe_run_quarterly_meta(self) -> dict | None:
         """Evening-time piggyback for the quarterly meta-reflection loop.

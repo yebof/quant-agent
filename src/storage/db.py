@@ -846,6 +846,26 @@ class Database:
             prefixes.add(rid.rsplit("-", 1)[0] if "-" in rid else rid)
         return prefixes
 
+    def agent_names_logged_on(self, run_id_prefix: str,
+                              trading_day: date | None = None) -> set[str]:
+        """Distinct agent_name values logged on the given ET trading day for
+        run_ids starting with `run_id_prefix` (e.g. 'run-' for morning).
+
+        RC5 (2026-07-16): the prefix check above can't tell a COMPLETED
+        morning from one killed mid-flight — research rows land before the
+        kill, so 'run' shows present while PM/RM never ran. This lets the
+        dead-man's check ask "did the pipeline actually reach the decision
+        stage?"
+        """
+        start_utc, end_utc = self._et_day_utc_bounds(trading_day)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT agent_name FROM agent_logs "
+                "WHERE timestamp >= ? AND timestamp < ? AND run_id LIKE ?",
+                (start_utc, end_utc, f"{run_id_prefix}%"),
+            ).fetchall()
+        return {r[0] for r in rows if r[0]}
+
     def sum_session_cost(self, run_id: str) -> tuple[float | None, int]:
         """Total cost + per-call count for a session's run_id.
 

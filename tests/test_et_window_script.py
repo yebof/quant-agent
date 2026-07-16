@@ -339,3 +339,87 @@ def test_run_if_et_window_intra_check_skips_outside_window(tmp_path):
 
     # Neither tick should have exec'd the fake-python
     assert not counter_file.exists()
+
+
+# ============================================================================
+# RC5 (2026-07-16): bash-side kill notification + external dead-man ping.
+# When `timeout` SIGTERM/SIGKILLs python, the in-process finally-block
+# notifier never runs — 13 straight days of morning kills produced zero
+# failure pushes. The wrapper must report violent deaths itself, and ping
+# HEALTHCHECKS_URL so an EXTERNAL monitor sees liveness.
+# ============================================================================
+
+def _base_env(tmp_path, python_body: str) -> dict:
+    project_root = tmp_path / "project"
+    project_root.mkdir(exist_ok=True)
+    (project_root / ".env").write_text("")
+    timeout_bin = tmp_path / "timeout"
+    python_bin = tmp_path / "fake-python"
+    curl_log = tmp_path / "curl.log"
+    curl_bin = tmp_path / "curl"
+    _write_executable(timeout_bin, "#!/bin/bash\nshift 2\nexec \"$@\"\n")
+    _write_executable(python_bin, f"#!/bin/bash\n{python_body}\n")
+    _write_executable(curl_bin, f"#!/bin/bash\necho \"$@\" >> {curl_log}\nexit 0\n")
+    env = os.environ | {
+        "PROJECT_ROOT_OVERRIDE": str(project_root),
+        "PYTHON_OVERRIDE": str(python_bin),
+        "TIMEOUT_OVERRIDE": str(timeout_bin),
+        "LAST_RUN_DIR_OVERRIDE": str(tmp_path / "cache"),
+        "ET_DOW_OVERRIDE": "1",
+        "ET_HOUR_OVERRIDE": "08",
+        "ET_MIN_OVERRIDE": "30",
+        "ET_DATE_OVERRIDE": "2026-07-16",
+        "NOW_UNIX_OVERRIDE": "1234567890",
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",  # fake curl first
+    }
+    return env
+
+
+def _run(script_env, mode="earnings_preprocess"):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "run_if_et_window.sh"
+    return subprocess.run(["bash", str(script), mode], env=script_env,
+                          capture_output=True, text=True, check=False)
+
+
+def test_wrapper_notifies_telegram_on_timeout_kill(tmp_path):
+    env = _base_env(tmp_path, "exit 124")
+    env |= {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "42"}
+    result = _run(env)
+    assert result.returncode == 124
+    log = (tmp_path / "curl.log").read_text()
+    assert "sendMessage" in log
+    assert "KILLED" in log
+
+
+def test_wrapper_does_not_duplicate_python_notifier_on_plain_failure(tmp_path):
+    """Ordinary non-zero exits: python's own finally-block already pushed —
+    a second bash push would train the operator to ignore duplicates."""
+    env = _base_env(tmp_path, "exit 1")
+    env |= {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "42"}
+    result = _run(env)
+    assert result.returncode == 1
+    log_file = tmp_path / "curl.log"
+    assert not log_file.exists() or "sendMessage" not in log_file.read_text()
+
+
+def test_wrapper_respects_telegram_kill_switch(tmp_path):
+    env = _base_env(tmp_path, "exit 137")
+    env |= {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "42",
+            "TELEGRAM_DISABLED": "1"}
+    _run(env)
+    log_file = tmp_path / "curl.log"
+    assert not log_file.exists() or "sendMessage" not in log_file.read_text()
+
+
+def test_wrapper_pings_healthchecks_on_success_and_fail(tmp_path):
+    env = _base_env(tmp_path, "exit 0")
+    env |= {"HEALTHCHECKS_URL": "https://hc-ping.example/uuid-1"}
+    assert _run(env).returncode == 0
+    assert "https://hc-ping.example/uuid-1" in (tmp_path / "curl.log").read_text()
+
+    second = tmp_path / "second"
+    second.mkdir()
+    env2 = _base_env(second, "exit 124")
+    env2 |= {"HEALTHCHECKS_URL": "https://hc-ping.example/uuid-1"}
+    _run(env2)
+    assert "https://hc-ping.example/uuid-1/fail" in (second / "curl.log").read_text()
