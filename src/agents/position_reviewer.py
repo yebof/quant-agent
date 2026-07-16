@@ -36,6 +36,15 @@ logger = logging.getLogger(__name__)
 
 PROMPT_PATH = Path(__file__).parent.parent.parent / "config" / "prompts" / "position_reviewer.md"
 
+
+def _fmt_or_na(value, suffix: str = "") -> str:
+    """Render a macro metric, falling back to 'N/A' when the provider
+    returned None (FRED outage). The macro provider always ships every
+    key with None values on failure, so `.get(key, 'N/A')` defaults never
+    fire — prompts were literally rendering 'VIX: None' / 'Nonebps'
+    (audit round 2 #34)."""
+    return "N/A" if value is None else f"{value}{suffix}"
+
 _SESSION_LABEL = {
     "midday": "Midday (13:00 ET) — afternoon still open",
     "close": "Close (15:30 ET) — ~25 min to close, 17.5h until next intraday control",
@@ -160,9 +169,25 @@ class PositionReviewerAgent(BaseAgent):
             )
             lines = [header]
 
+            # Deterministic per-position metrics (computed by pipeline).
+            pf = position_facts.get(p.symbol) or {}
+
             ctx = trade_context.get(p.symbol) or {}
             sl = ctx.get("stop_loss") or 0
             tp = ctx.get("take_profit") or 0
+            # audit round 2 #4: trade_context only covers TODAY's BUY rows
+            # (pipeline fetches morning trades with today_only=True), so for
+            # any position opened on a prior day the stop/target/thesis lines
+            # silently vanished — while the Metrics line still rendered
+            # to_stop/to_target derived from the very same data. Back-compute
+            # the levels from the position_facts distance metrics (which
+            # prefer the LIVE broker stop over the stale BUY row) so the
+            # reviewer always sees the actual protection levels it is asked
+            # to reason about (new_stop >= old_stop*1.02 rule).
+            if not sl and pf.get("distance_to_stop_pct") is not None and p.current_price > 0:
+                sl = p.current_price * (1 - pf["distance_to_stop_pct"] / 100)
+            if not tp and pf.get("distance_to_target_pct") is not None and p.current_price > 0:
+                tp = p.current_price * (1 + pf["distance_to_target_pct"] / 100)
             if sl:
                 lines.append(f"  Hard stop (broker): ${sl:.2f}")
             if tp:
@@ -172,9 +197,15 @@ class PositionReviewerAgent(BaseAgent):
             entry_reasoning = (ctx.get("reasoning") or "").strip()
             if entry_reasoning:
                 lines.append(f"  Entry thesis: {entry_reasoning[:220]}")
-
-            # Deterministic per-position metrics (computed by pipeline).
-            pf = position_facts.get(p.symbol) or {}
+            else:
+                # audit round 2 #4: make the absence explicit — a missing
+                # thesis line must read as "data unavailable", not "this
+                # position has no thesis / no thesis_invalid_if condition".
+                lines.append(
+                    "  Entry thesis: (unavailable — position opened before "
+                    "today; judge integrity via Metrics, tech trail, and "
+                    "memory sections, do not invent one)"
+                )
             metric_bits: list[str] = []
             if pf.get("days_held") is not None:
                 metric_bits.append(f"days_held={pf['days_held']}")
@@ -336,7 +367,14 @@ class PositionReviewerAgent(BaseAgent):
         # grades over the last 14 days. When premature + wrong >= correct,
         # tilt toward patience — you've been cutting winners too early.
         grade_section = ""
-        if trade_grade_summary and trade_grade_summary.get("n_sells", 0) > 0:
+        # audit round 2 #36: gate on sells OR buys — a quiet fortnight with
+        # entries but no exits (n_sells=0, n_buys>0) used to suppress the
+        # whole section, hiding BUY-grade calibration ("wrong" = thesis
+        # broken) that is material to hold-vs-sell judgment.
+        if trade_grade_summary and (
+            trade_grade_summary.get("n_sells", 0) > 0
+            or trade_grade_summary.get("n_buys", 0) > 0
+        ):
             sc = trade_grade_summary.get("sell_counts") or {}
             bc = trade_grade_summary.get("buy_counts") or {}
             n_sells = trade_grade_summary.get("n_sells", 0)
@@ -473,7 +511,9 @@ class PositionReviewerAgent(BaseAgent):
                 "already harvested them. Trimming a second time on the same flag is the "
                 "mechanical loop that produced the 2026-05-04 AMZN incident "
                 "(41 → 21 → 11 shares in one day on a strengthening thesis).\n"
-                "TRAIL_STOP is permitted (it adjusts protection, doesn't sell shares).\n"
+                "TRAIL_STOP is exempt from THIS gate (it adjusts protection, "
+                "doesn't sell shares) — but its own ratchet-cooldown / "
+                "ATR-noise-band clamps still apply without a hard trigger.\n"
             )
         else:
             already_trimmed_section = ""
@@ -498,9 +538,9 @@ class PositionReviewerAgent(BaseAgent):
 
 ### Macro
 {macro_regime_line}
-- VIX: {vix.get('current', 'N/A')} (trend: {vix.get('trend', 'N/A')})
-- HY OAS: {hy.get('current_bps', 'N/A')}bps (30d Δ: {hy.get('change_30d_bps', 'N/A')}bps)
-- Core CPI YoY: {infl.get('core_cpi_yoy', 'N/A')}%
+- VIX: {_fmt_or_na(vix.get('current'))} (trend: {_fmt_or_na(vix.get('trend'))})
+- HY OAS: {_fmt_or_na(hy.get('current_bps'), 'bps')} (30d Δ: {_fmt_or_na(hy.get('change_30d_bps'), 'bps')})
+- Core CPI YoY: {_fmt_or_na(infl.get('core_cpi_yoy'), '%')}
 
 {trajectory_section}
 {active_changes_section}

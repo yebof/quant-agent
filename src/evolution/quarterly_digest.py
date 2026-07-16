@@ -1130,9 +1130,11 @@ def _extract_agent_prompt_snapshot(
       }
 
     Always returns a dict even on empty/weird inputs — callers don't need
-    None-guards. If `char_budget` is exceeded, trailing sections are
-    dropped (rather than mid-body-cut) so each surfaced section is
-    complete; the last dropped position triggers `truncated=True`.
+    None-guards. If `char_budget` is exceeded, over-budget sections are
+    skipped whole (rather than mid-body-cut) so each surfaced section is
+    complete; any skip sets `truncated=True`. The scan always continues
+    to end-of-file so the Learnings section (which lives at EOF) is
+    captured even when earlier sections blew the budget (audit round 2).
     """
     out: dict[str, Any] = {
         "intro": "",
@@ -1198,7 +1200,16 @@ def _extract_agent_prompt_snapshot(
         candidate_chunk = f"## {heading}\n\n{body}".strip()
         if running_chars + len(candidate_chunk) > char_budget:
             out["truncated"] = True
-            break
+            # audit round 2 (#0): `continue`, NOT `break`. The Learnings
+            # capture above runs before this budget check, and the
+            # "## Learnings (system-evolved)" section lives at end-of-file
+            # (prompt_editor appends it there) — a `break` on the first
+            # over-budget section meant the loop never reached EOF, so
+            # `learnings` was ALWAYS empty for real-size prompts and the
+            # meta-reflector's existing_prompt_audit step was blind to
+            # prior auto-evolutions (it then re-proposes paraphrase
+            # duplicates that FIFO-evict genuine learnings).
+            continue
         key_sections.append({
             "heading": heading,
             "body": body,

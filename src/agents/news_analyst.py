@@ -55,6 +55,19 @@ class NewsAnalystAgent(BaseAgent):
             "line saying 'unchanged from morning'). Prioritize HIGH-conviction "
             "developments touching held symbols."
         ),
+        # audit round 2 #24: the close session (15:30 ET) had no entry and
+        # silently fell back to MORNING guidance — mislabeling the run as a
+        # "fresh book" full rebuild 30 minutes before the bell.
+        "close": (
+            "CLOSE mode — DELTA focus, ~30 minutes to the bell. The most "
+            "recent prior snapshot (midday or morning) may be shown below as "
+            "the baseline. Surface what CHANGED since that snapshot: new or "
+            "reversing state changes and fresh stock catalysts that could "
+            "trigger an exit before the close or move held positions "
+            "overnight. Keep unchanged sections to one line ('unchanged "
+            "since midday'). Prioritize HIGH-conviction developments "
+            "touching held symbols."
+        ),
         "evening": (
             "EVENING mode — SUMMARY focus. Two prior snapshots (morning, midday) "
             "may be shown below. Synthesize: which narratives STUCK (confirmed "
@@ -112,17 +125,33 @@ State changes captured earlier:
         else:
             narrative_section = "## Previous Macro Narrative\nNo previous narrative. Build one from scratch using today's news.\n"
 
-        # Stock-specific news section
+        # Stock-specific news section.
+        # audit round 2 #12: the loop used to discard the symbol key and,
+        # because tag_symbol_mentions files a multi-symbol headline under
+        # EVERY matching ticker, render the same headline N times with no
+        # attribution. Invert to item → [symbols]: each headline renders
+        # once, prefixed with the tickers it was tagged for.
         if stock_mentions:
-            stock_lines = []
+            grouped: dict[tuple, list[str]] = {}
+            item_by_key: dict[tuple, object] = {}
+            order: list[tuple] = []
             for symbol, items in sorted(stock_mentions.items()):
                 for item in items[:5]:  # max 5 per symbol
-                    source = getattr(item, "source", "")
-                    title = getattr(item, "title", str(item))
-                    summary = getattr(item, "summary", "")
-                    stock_lines.append(f"  [{source}] {title}")
-                    if summary:
-                        stock_lines.append(f"    > {summary[:200]}")
+                    key = (getattr(item, "source", ""), getattr(item, "title", str(item)))
+                    if key not in grouped:
+                        grouped[key] = []
+                        item_by_key[key] = item
+                        order.append(key)
+                    if symbol not in grouped[key]:
+                        grouped[key].append(symbol)
+            stock_lines = []
+            for key in order:
+                source, title = key
+                syms = ", ".join(grouped[key])
+                stock_lines.append(f"  [{source}] ({syms}) {title}")
+                summary = getattr(item_by_key[key], "summary", "")
+                if summary:
+                    stock_lines.append(f"    > {summary[:200]}")
             stock_section = f"## Stock-Specific News (mentions of universe symbols)\n\n" + "\n".join(stock_lines)
         else:
             stock_section = "## Stock-Specific News\nNo universe symbols detected in today's headlines."
@@ -180,14 +209,25 @@ Analyze all the above and produce your intelligence report as JSON."""
             to let the model carry forward / resolve a morning event even
             when fresh headlines don't repeat it verbatim).
 
-        Matching is case-insensitive substring. Not perfect for paraphrasing,
-        but dropping a correctly-interpreted-but-reworded change is far less
-        costly than letting a fabricated change reach PM sizing logic.
+        Matching: event keywords are case-insensitive substring (safe — the
+        4-char floor + stopwords already exclude generic tokens); ticker
+        symbols are whole-token matches (audit round 2 #25 — 1-2 letter
+        tickers are substrings of almost anything). Not perfect for
+        paraphrasing, but dropping a correctly-interpreted-but-reworded
+        change is far less costly than letting a fabricated change reach
+        PM sizing logic.
         """
         if not report.state_changes or not news_text:
             return report
 
         text_lower = news_text.lower()
+        # audit round 2 #25: symbol hits must be whole-token matches, not raw
+        # substrings — universe tickers like V / MA / GE are substrings of
+        # virtually any headline blob ("nvidia" contains "v"), which let a
+        # fabricated state_change tagged with a short ticker sail through
+        # this filter. Mirrors the word-boundary discipline of
+        # src/data/news.py:tag_symbol_mentions.
+        text_tokens = set(re.findall(r"[a-z0-9.\-]+", text_lower))
         # Build a supplementary token pool from the prior session's
         # state_changes so events carried forward across sessions survive.
         prior_tokens: set[str] = set()
@@ -206,7 +246,7 @@ Analyze all the above and produce your intelligence report as JSON."""
         for sc in report.state_changes:
             event_kws = cls._extract_event_keywords(sc.event)
             affected = [s for s in (sc.affected_symbols or []) if s]
-            symbol_hits = [s for s in affected if s.lower() in text_lower]
+            symbol_hits = [s for s in affected if s.lower() in text_tokens]
             kw_hits = [k for k in event_kws if k in text_lower]
             prior_kw_hit = bool(event_kws & prior_tokens)
             prior_sym_hit = any(s.lower() in prior_symbols for s in affected)

@@ -1157,19 +1157,15 @@ class MissedOpportunity(BaseModel):
                 )
         return self
 
-    @model_validator(mode="after")
-    def _theme_durability_required_when_themed(self) -> "MissedOpportunity":
-        # If theme_if_any is set, the LLM must commit to a durability
-        # judgment — "is this a 2-month fad or a decade trend?" is what
-        # distinguishes a value-investor "add" from a momentum chase.
-        # "unknown" is allowed but should be rare when a theme name exists.
-        if (self.theme_if_any or "").strip():
-            if self.theme_durability is None:
-                raise ValueError(
-                    "theme_if_any is set but theme_durability is None; pick "
-                    "multi_year_secular / 1_3_year_cycle / months_fad / unknown"
-                )
-        return self
+    # audit round 2 #31: the former `_theme_durability_required_when_themed`
+    # validator (raise when theme_if_any set and theme_durability is None)
+    # was provably unreachable dead code: theme_durability is a non-Optional
+    # Literal with default "unknown", so an omitted field silently becomes
+    # "unknown" and an explicit null fails FIELD-level Literal validation
+    # before any mode="after" model validator runs. Deleted rather than
+    # "wired" — the docstring above explicitly permits "unknown" as an
+    # allowed (if rare) value, so raising on it would contradict the schema
+    # contract and get whole entries dropped by the evening pre-filter.
 
     @model_validator(mode="after")
     def _addition_recommendation_consistency(self) -> "MissedOpportunity":

@@ -202,10 +202,18 @@ def test_snapshot_empty_input_returns_empty_shape():
 
 def test_snapshot_preserves_learnings_even_near_budget():
     """Learnings is high-priority content; even when budget is tight, it
-    should truncate the body rather than be dropped entirely."""
+    should truncate the body rather than be dropped entirely.
+
+    audit round 2 (#0): the "## Rules" section here is deliberately
+    LARGER than char_budget so the over-budget branch actually fires
+    before the Learnings heading is reached. The old fixture (Rules
+    smaller than budget) never exercised that branch, hiding the bug
+    where a `break` on the first over-budget section skipped straight
+    past the EOF Learnings section — `learnings` came back empty for
+    every real-size prompt."""
     from src.evolution.quarterly_digest import _extract_agent_prompt_snapshot
 
-    big = "r" * 1200
+    big = "r" * 2000  # > char_budget → the budget check MUST trip on Rules
     learnings_body = "- [2026-Q1] learning one." + ("L" * 800)
     md = f"""# A
 
@@ -220,6 +228,7 @@ intro.
 {learnings_body}
 """
     out = _extract_agent_prompt_snapshot(md, char_budget=1400)
+    assert out["truncated"] is True, "Rules section must have blown the budget"
     # Learnings kept, possibly truncated
     assert out["learnings"], "learnings must not be empty"
     assert "[2026-Q1] learning one" in out["learnings"]

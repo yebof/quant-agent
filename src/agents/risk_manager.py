@@ -15,6 +15,15 @@ logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).parent.parent.parent / "config" / "prompts" / "risk_manager.md"
 
 
+def _fmt_or_na(value, suffix: str = "") -> str:
+    """Render a macro metric, falling back to 'N/A' when the provider
+    returned None (FRED outage). The macro provider always ships every
+    key with None values on failure, so `.get(key, 'N/A')` defaults never
+    fire — the prompt was literally rendering 'VIX: None' / 'inverted:
+    None' on outage days (audit round 2 #34)."""
+    return "N/A" if value is None else f"{value}{suffix}"
+
+
 class RiskManagerAgent(BaseAgent):
     @property
     def name(self) -> str:
@@ -34,15 +43,70 @@ class RiskManagerAgent(BaseAgent):
         tech_analyses: list[TechAnalysisResult] = kwargs.get("tech_analyses", []) or []
         news_intel: NewsIntelligenceReport | None = kwargs.get("news_intel")
         earnings_analyses: list[dict] = kwargs.get("earnings_analyses", []) or []
+        total_value: float | None = kwargs.get("total_value")
+        cash: float | None = kwargs.get("cash")
+
+        # audit round 2 #6: allocation_pct has TWO meanings — %-of-portfolio
+        # for BUY vs %-of-current-position for SELL (100 = full close,
+        # 0 = skip). Rendering both with the same "% allocation" template
+        # made the RM misread SELL fractions as portfolio weights and emit
+        # allocation_pct mods that silently downgraded PM-sized exits.
+        def _fmt_decision(d) -> str:  # d: TradeDecision
+            if d.action == "SELL":
+                alloc = (
+                    f"sell {d.allocation_pct}% OF CURRENT POSITION "
+                    f"(100 = full close; NOT a portfolio weight — never set to 0, 0 = skip)"
+                )
+            else:
+                alloc = f"{d.allocation_pct}% of portfolio"
+            return (
+                f"- {d.action} {d.symbol}: {alloc} | Entry: ${d.entry_price} | "
+                f"Stop: ${d.stop_loss} | Target: ${d.take_profit}\n  Reasoning: {d.reasoning}"
+            )
 
         decisions_text = "\n".join(
-            f"- {d.action} {d.symbol}: {d.allocation_pct}% allocation | Entry: ${d.entry_price} | Stop: ${d.stop_loss} | Target: ${d.take_profit}\n  Reasoning: {d.reasoning}"
-            for d in portfolio_decision.decisions
+            _fmt_decision(d) for d in portfolio_decision.decisions
         )
 
+        # audit round 2 #5: RM's rr_audit / sizing_sanity / concentration
+        # checks were running blind — no equity, no cash, no per-position
+        # weights. When the caller doesn't pass total_value, approximate the
+        # denominator with the sum of listed position values (understates
+        # true equity by the cash balance — flagged in the header).
+        approx_book = sum(p.market_value for p in positions) if positions else 0.0
+        denom = total_value if (total_value or 0) > 0 else approx_book
+        if (total_value or 0) > 0:
+            cash_bit = ""
+            if cash is not None:
+                cash_pct = (cash / total_value * 100) if total_value else 0.0
+                cash_bit = f" | Cash: ${cash:,.0f} ({cash_pct:.1f}%)"
+            account_section = (
+                f"## Account\n- Total equity: ${total_value:,.0f}{cash_bit}\n"
+            )
+        elif approx_book > 0:
+            account_section = (
+                f"## Account\n- Total book (approx = sum of listed positions; "
+                f"broker equity not provided, so weights below slightly "
+                f"overstate true %-of-equity): ${approx_book:,.0f}\n"
+            )
+        else:
+            account_section = ""
+
+        def _fmt_position(p: Position) -> str:
+            weight_bit = ""
+            if denom > 0:
+                weight_bit = (
+                    f" | Value: ${p.market_value:,.0f} "
+                    f"({p.market_value / denom * 100:.1f}% of book)"
+                )
+            return (
+                f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | "
+                f"Current: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f}"
+                f"{weight_bit} | Sector: {p.sector}"
+            )
+
         positions_text = "\n".join(
-            f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Current: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} | Sector: {p.sector}"
-            for p in positions
+            _fmt_position(p) for p in positions
         ) if positions else "No current positions."
 
         violations_text = "\n".join(
@@ -149,18 +213,18 @@ Overall sentiment: {news_intel.market_sentiment} ({news_intel.confidence})
 
 Portfolio View: {portfolio_decision.portfolio_view}
 
-## Current Positions
+{account_section}## Current Positions
 {positions_text}
 
 {tech_section}
 
 {news_section}
 {earnings_section}## Macro Context
-- VIX: {vix.get('current', 'N/A')} (5d avg: {vix.get('mean_5d', 'N/A')}, trend: {vix.get('trend', 'N/A')})
-- 2Y Treasury: {treasury.get('us2y', 'N/A')}%
-- 10Y Treasury: {treasury.get('us10y', 'N/A')}%
-- 2Y-10Y Spread: {treasury.get('spread_2_10', 'N/A')}% (inverted: {treasury.get('inverted', 'N/A')})
-- Fed Funds Rate: {fed_funds if fed_funds is not None else 'N/A'}%
+- VIX: {_fmt_or_na(vix.get('current'))} (5d avg: {_fmt_or_na(vix.get('mean_5d'))}, trend: {_fmt_or_na(vix.get('trend'))})
+- 2Y Treasury: {_fmt_or_na(treasury.get('us2y'), '%')}
+- 10Y Treasury: {_fmt_or_na(treasury.get('us10y'), '%')}
+- 2Y-10Y Spread: {_fmt_or_na(treasury.get('spread_2_10'), '%')} (inverted: {_fmt_or_na(treasury.get('inverted'))})
+- Fed Funds Rate: {_fmt_or_na(fed_funds, '%')}
 
 ## Hard Risk Rule Check Results
 {violations_text}
@@ -171,7 +235,12 @@ Review these proposed trades and provide your verdict as JSON."""
                macro_summary: dict, rule_violations: list[RiskViolation],
                tech_analyses: list[TechAnalysisResult] | None = None,
                news_intel: NewsIntelligenceReport | None = None,
-               earnings_analyses: list[dict] | None = None) -> tuple[RiskVerdict | None, "AgentResult"]:
+               earnings_analyses: list[dict] | None = None,
+               total_value: float | None = None,
+               cash: float | None = None) -> tuple[RiskVerdict | None, "AgentResult"]:
+        # audit round 2 #5: total_value / cash are optional so existing call
+        # sites keep working; when omitted, build_user_message approximates
+        # the book denominator from the sum of position market values.
         result = self.run(
             portfolio_decision=portfolio_decision,
             positions=positions,
@@ -180,6 +249,8 @@ Review these proposed trades and provide your verdict as JSON."""
             tech_analyses=tech_analyses or [],
             news_intel=news_intel,
             earnings_analyses=earnings_analyses or [],
+            total_value=total_value,
+            cash=cash,
         )
         parsed = result.parse_json()
         if parsed is None:

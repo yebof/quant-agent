@@ -1076,17 +1076,30 @@ class Database:
             )
             self.conn.commit()
 
-    def get_symbol_last_buy(self, symbol: str) -> dict | None:
+    def get_symbol_last_buy(self, symbol: str,
+                            include_in_flight: bool = False) -> dict | None:
         """Most recent executed BUY row for a symbol.
 
         Submitted-but-never-filled BUYs must not show up in PM memory, but a
         partial fill that later ended canceled or expired still created real
         exposure and should be surfaced.
+
+        `include_in_flight=True` also accepts fill_status in
+        ('submitted', 'pending_submit') — used by the stop-coverage repair
+        (audit round 2): a same-session BUY whose fill hasn't been reconciled
+        yet is invisible under the executed predicate, so the repair either
+        no-op'd or read a MONTHS-OLD prior BUY's stop level in exactly the
+        crash/late-fill scenarios the belt exists for. An in-flight BUY's
+        recorded stop_loss is precisely the reviewed intent the repair wants.
+        PM-memory callers keep the strict default.
         """
+        predicate = self._executed_trade_predicate()
+        if include_in_flight:
+            predicate = f"({predicate} OR fill_status IN ('submitted', 'pending_submit'))"
         with self._lock:
             row = self.conn.execute(
                 "SELECT * FROM trades WHERE symbol = ? AND action = 'BUY' "
-                f"AND {self._executed_trade_predicate()} "
+                f"AND {predicate} "
                 "ORDER BY timestamp DESC, id DESC LIMIT 1",
                 (symbol,),
             ).fetchone()
@@ -1128,13 +1141,17 @@ class Database:
             # Skip orders that never executed. Legacy rows with NULL fill_status
             # pre-date reconciliation and are treated as filled for backward
             # compatibility.
+            # BUY lots seed from FULL history; only the window bound on
+            # EXITS below decides what counts as a "recent closed trade"
+            # (audit round 2: windowing both sides made a SELL that closed a
+            # pre-window lot FIFO-match an unrelated newer in-window BUY —
+            # wrong entry price, wrong hold time, phantom remainder).
             rows = self.conn.execute(
                 "SELECT symbol, action, qty, price, timestamp, fill_qty, "
                 "fill_price, fill_status "
-                "FROM trades WHERE timestamp > datetime('now', ?) "
-                f"AND {self._executed_trade_predicate()} "
+                "FROM trades "
+                f"WHERE {self._executed_trade_predicate()} "
                 "ORDER BY timestamp",
-                (f"-{lookback_days} days",),
             ).fetchall()
         # FIFO queue of open BUY lots per symbol
         from collections import defaultdict
@@ -1180,6 +1197,20 @@ class Database:
                         hold_days = 0
                     ret_pct = (price / lot["price"] - 1) * 100 if lot["price"] > 0 else 0
                     entry_usd = closed_qty * lot["price"]
+                    # Window applies to the EXIT date only: lots seed from
+                    # full history (see the SELECT above), FIFO state always
+                    # advances, but only exits inside the lookback count as
+                    # "recent closed trades".
+                    try:
+                        sell_age_days = (datetime.utcnow() - sell_dt).days
+                    except (TypeError, ValueError, UnboundLocalError):
+                        sell_age_days = 0
+                    if sell_age_days > lookback_days:
+                        lot["qty"] -= closed_qty
+                        remaining -= closed_qty
+                        if lot["qty"] <= 1e-9:
+                            lots.pop(0)
+                        continue
                     closed.append({
                         "symbol": sym,
                         "return_pct": ret_pct,

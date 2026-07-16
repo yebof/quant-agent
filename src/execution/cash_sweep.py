@@ -183,18 +183,28 @@ class CashSweeper:
         self._pipeline._finalize_pending_protections([prot], context="CASH SWEEP")
 
         freed = qty * price
+        # Commit each snapshot the moment it's in hand (audit round 2): the
+        # old order fetched account THEN positions and assigned ctx only after
+        # both — a raise on the second call discarded the already-fetched
+        # cash figure while `freed>0` told the BUY loop cash was released,
+        # leaving ctx.cash at its stale pre-sale value.
         try:
             account = self._pipeline.broker.get_account()
-            ctx.positions = self._pipeline.broker.get_positions()
             ctx.cash = account["cash"]
             ctx.total_value = account["portfolio_value"]
-            logger.info(
-                "cash sweep: released ~$%.0f from %s (%s sh) — post-refresh "
-                "cash=$%.2f", freed, parked.symbol,
-                self._pipeline._format_qty(qty), ctx.cash,
-            )
         except Exception as e:  # noqa: BLE001
-            logger.warning("cash sweep: broker refresh after funding sell failed: %s", e)
+            # Best-effort estimate keeps ctx coherent with freed > 0.
+            ctx.cash = cash + freed
+            logger.warning("cash sweep: account refresh after funding sell "
+                           "failed (%s) — estimating cash=$%.2f", e, ctx.cash)
+        try:
+            ctx.positions = self._pipeline.broker.get_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("cash sweep: position refresh after funding sell failed: %s", e)
+        logger.info(
+            "cash sweep: released ~$%.0f from %s (%s sh) — post-refresh cash=$%.2f",
+            freed, parked.symbol, self._pipeline._format_qty(qty), ctx.cash,
+        )
         return freed
 
     # ---------- parking (after a session's trading is done) ----------
@@ -224,6 +234,30 @@ class CashSweeper:
         ctx.positions = positions
         ctx.cash = cash
         ctx.total_value = total_value
+
+        # NEVER park on a daily-loss-breach day (audit round 2). The breach
+        # persists all day (P&L basis = last_equity), so parking after an
+        # emergency liquidation started a deterministic wash loop: the
+        # bookend buys ~99% of equity into the vehicle → the next intra
+        # tick's breaker EMERGENCY_SELLs it with a spurious 🚨 push → the
+        # next bookend parks again — 2-4 full-equity round trips per breach
+        # day, violating the no-new-orders-on-breach invariant. One choke
+        # point here guards every current and future call site.
+        try:
+            last_equity = account.get("last_equity", total_value)
+            breach = pipeline.risk_engine.check_daily_loss(
+                last_equity, total_value - last_equity,
+            )
+        except Exception as e:  # noqa: BLE001 — unknowable breach state must not park
+            logger.warning("cash sweep: breach check failed (%s) — skipping "
+                           "park (conservative)", e)
+            return None
+        if breach is not None:
+            logger.warning(
+                "cash sweep: daily-loss breaker active (%s) — not parking on "
+                "a breach day", breach.message,
+            )
+            return None
 
         # Alpaca's `cash` does not subtract open-order holds. Sweeping cash
         # that a pending BUY limit needs would make its fill reject later.

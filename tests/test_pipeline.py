@@ -2583,7 +2583,12 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
     result = pipeline.run_morning()
 
     assert result["status"] == "executed"
-    assert mock_broker.cancel_open_entry_orders.call_count == 1
+    # Global stale-entry cancel in the preamble (no symbol) exactly once;
+    # audit round 2 added SYMBOL-SCOPED cancels on full-exit SELLs, which is
+    # why total call_count may exceed 1.
+    global_cancels = [c for c in mock_broker.cancel_open_entry_orders.call_args_list
+                      if not c.args and not c.kwargs.get("symbol")]
+    assert len(global_cancels) == 1
     mock_broker.cancel_open_orders.assert_not_called()
     assert mock_broker.wait_for_order_terminal.call_count == 1
     sell_kw = mock_broker.submit_order.call_args_list[0].kwargs

@@ -44,6 +44,27 @@ class MarketDataProvider:
     def set_fallback_bars(self, fn) -> None:
         self._fallback_bars = fn
 
+    def _try_fallback(self, symbol: str, lookback_days: int, reason: str) -> list:
+        """Route through the Alpaca fallback source; [] when unavailable."""
+        if self._fallback_bars is None:
+            return []
+        try:
+            bars = self._fallback_bars(symbol, lookback_days) or []
+            if bars:
+                logger.info("%s for %s, fallback source returned %d bars",
+                            reason, symbol, len(bars))
+            if not bars:
+                # audit round 2: an ALL-NaN frame passed the `df.empty` gate
+                # (it isn't empty) and only died at the dropna scrub below it —
+                # returning [] without ever trying the Alpaca fallback that the
+                # truly-empty path uses. Same degraded feed, different route.
+                return self._try_fallback(symbol, lookback_days,
+                                          reason="yfinance all-NaN")
+            return bars
+        except Exception as e:  # noqa: BLE001
+            logger.warning("fallback_bars failed for %s: %s", symbol, e)
+            return []
+
     def get_ohlcv(self, symbol: str, lookback_days: int = 120) -> list[OHLCV]:
         end = et_today()  # yfinance end (exclusive) — use ET to match US-market sessions
         start = end - timedelta(days=lookback_days)
@@ -61,18 +82,7 @@ class MarketDataProvider:
             logger.warning("yfinance download crashed for %s: %s", symbol, e)
         if df is None or df.empty:
             # yfinance returned nothing — try fallback before giving up.
-            if self._fallback_bars is not None:
-                try:
-                    bars = self._fallback_bars(symbol, lookback_days) or []
-                    if bars:
-                        logger.info(
-                            "yfinance empty for %s, fallback source returned %d bars",
-                            symbol, len(bars),
-                        )
-                        return bars
-                except Exception as e:
-                    logger.warning("fallback_bars failed for %s: %s", symbol, e)
-            return []
+            return self._try_fallback(symbol, lookback_days, reason="yfinance empty")
         # yfinance may return MultiIndex columns for single ticker
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -143,7 +153,10 @@ class MarketDataProvider:
         if ex_ts is None or amount is None:
             return {}
         try:
-            ex_date = _date.fromtimestamp(float(ex_ts))
+            # audit round 2: exDividendDate is UTC-midnight epoch; a host-local
+            # parse shifts the date on any TZ east of UTC (SG host: +1 day off).
+            from datetime import datetime as _dtt, timezone as _tz
+            ex_date = _dtt.fromtimestamp(float(ex_ts), tz=_tz.utc).date()
         except (TypeError, ValueError, OSError):
             return {}
         try:

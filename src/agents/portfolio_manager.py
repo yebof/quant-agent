@@ -9,6 +9,7 @@ from src.models import (
     NewsIntelligenceReport, PortfolioDecision, Position, TargetPosition,
     TechAnalysisResult,
 )
+from src.risk.rules import _gross_multiplier
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,18 @@ class PortfolioManagerAgent(BaseAgent):
         position_history: dict = kwargs.get("position_history") or {}
 
         def _fmt_position(p: Position) -> str:
-            weight_pct = (p.market_value / total_value * 100) if total_value > 0 else 0.0
+            # audit round 2 #22: show the GROSS weight — the same basis
+            # PortfolioConstructor uses when comparing target_weight_pct to
+            # current weights (leveraged/inverse ETF market value × |mult|).
+            # Rendering the raw weight made PM restate e.g. a 3x SQQQ's 6%
+            # as its target, which the constructor read as "cut from 18% to
+            # 6%" and emitted a 67% SELL the PM never intended.
+            gross_mul = _gross_multiplier(p.symbol)
+            weight_pct = (
+                (p.market_value * gross_mul / total_value * 100)
+                if total_value > 0 else 0.0
+            )
+            lev_note = f" (gross, {gross_mul:g}x leveraged)" if gross_mul != 1.0 else ""
             # Flag drift candidates directly in the line so PM can't miss them.
             # P&L% tells PM whether the weight came from price appreciation (drift)
             # or a large entry.
@@ -64,7 +76,7 @@ class PortfolioManagerAgent(BaseAgent):
             core = (
                 f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | "
                 f"Current: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} ({pnl_pct:+.1f}%) | "
-                f"Weight: {weight_pct:.1f}% | Sector: {p.sector}{drift_flag}"
+                f"Weight: {weight_pct:.1f}%{lev_note} | Sector: {p.sector}{drift_flag}"
             )
             hist = position_history.get(p.symbol) or {}
             lines = [core]

@@ -168,6 +168,41 @@ def _fmt_corrigibility(corr: dict | None) -> str:
     )
 
 
+def _fmt_watchlist_candidates(wl: dict | None) -> str:
+    """Render digest['watchlist_candidates'] — the aggregated evening
+    `add`/`watch` recommendations for universe expansion.
+
+    audit round 2 #26: the digest computes this section and
+    meta_reflector.md orders the LLM to surface these symbols in
+    `theme_coverage_report.emerging_themes_to_watch`, but the section was
+    never rendered into the prompt — the reflection confabulated symbols
+    from other sections instead. Bounded to the top 10 candidates.
+    """
+    if not wl or not wl.get("candidates"):
+        return "(no watchlist candidates this period)"
+    high = ", ".join(wl.get("high_conviction") or []) or "(none)"
+    lines = [
+        f"- Total candidates: {wl.get('total_candidates', 0)} "
+        f"over {wl.get('window_days', '?')} days",
+        f"- High-conviction (add_count >= 2 — seriously consider): {high}",
+        "- Top candidates:",
+    ]
+    for c in (wl.get("candidates") or [])[:10]:
+        if not isinstance(c, dict):
+            continue
+        themes = ", ".join(c.get("themes") or []) or "-"
+        reason = (c.get("latest_reason") or "").strip()[:160]
+        cat = c.get("latest_miss_category") or "?"
+        line = (
+            f"  - {c.get('symbol', '?')}: add×{c.get('add_count', 0)} / "
+            f"watch×{c.get('watch_count', 0)} | themes [{themes}] | {cat}"
+        )
+        if reason:
+            line += f" | latest reason: {reason}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _fmt_agent_prompts_snapshot(snapshot: dict | None) -> str:
     """Render the agent_prompts_snapshot section — the existing-prompt
     state each target agent is running with right now.
@@ -267,6 +302,7 @@ class MetaReflectorAgent(BaseAgent):
         losses_section = _fmt_loss_patterns(digest.get("loss_patterns"))
         activity_section = _fmt_agent_activity(digest.get("agent_signal_activity"))
         corrigibility_section = _fmt_corrigibility(digest.get("corrigibility_trend"))
+        watchlist_section = _fmt_watchlist_candidates(digest.get("watchlist_candidates"))
         prompts_snapshot_section = _fmt_agent_prompts_snapshot(
             digest.get("agent_prompts_snapshot"),
         )
@@ -316,6 +352,9 @@ Window: {period_start} → {period_end} ({lookback_days} days)
 
 ### Corrigibility Trend (vs prior quarter)
 {corrigibility_section}
+
+### Watchlist Candidates (universe-expansion candidates from evening missed_opportunities)
+{watchlist_section}
 
 ## CURRENT AGENT PROMPTS — the rules each agent is running with RIGHT NOW
 Read these BEFORE proposing any learning. Any proposed learning that

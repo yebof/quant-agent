@@ -91,8 +91,14 @@ class MacroDataProvider:
         try:
             latest = pd.Timestamp(series.index[-1]).normalize()
             today = pd.Timestamp(et_today())
-            delta = today - latest
-            return max(0, int(delta.days))
+            # Business days, as the docstring promises (audit round 2:
+            # calendar days made every Monday read "3 days stale" and
+            # spuriously tripped the macro staleness sanity check after
+            # each weekend/holiday).
+            import numpy as _np
+            return max(0, int(_np.busday_count(
+                latest.date(), today.date(),
+            )))
         except Exception:
             return None
 
