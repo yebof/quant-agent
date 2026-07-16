@@ -225,7 +225,21 @@ class MacroDataProvider:
         if series.empty:
             return {"current_bps": None, "change_30d_bps": None, "staleness_days": None}
         current = float(series.iloc[-1]) * 100  # FRED returns % — convert to bps
-        prior_30d = float(series.iloc[0]) * 100 if len(series) >= 2 else current
+        # Anchor the reference to a DATE, not to the head of the window.
+        #
+        # 2026-07-16 audit: `series.iloc[0]` is the OLDEST observation in a
+        # 60-CALENDAR-day fetch, so "change_30d_bps" was really a ~57-60 day
+        # change — about 2x the advertised window, and on a live check it even
+        # flipped the sign (code said -11.0 bps; the true 30-day change was
+        # +6.0 bps). BAMLH0A0HYM2 is business-daily; keep the 60d fetch as
+        # buffer for holidays/gaps, but take the last observation at or before
+        # T-30d. (The wide window was inherited verbatim from the earlier
+        # MONTHLY FEDFUNDS fetcher, where iloc[0] was harmless.)
+        prior_30d = current
+        if len(series) >= 2:
+            cutoff = series.index[-1] - pd.Timedelta(days=30)
+            prior = series[series.index <= cutoff]
+            prior_30d = float(prior.iloc[-1] if not prior.empty else series.iloc[0]) * 100
         return {
             "current_bps": round(current, 1),
             "change_30d_bps": round(current - prior_30d, 1),

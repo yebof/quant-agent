@@ -1857,13 +1857,25 @@ class TradingPipeline:
         decisions: list[TradeDecision],
         earnings_results: list[dict],
         max_pct: float = 5.0,
+        positions: list | None = None,
+        total_value: float | None = None,
     ) -> list[TradeDecision]:
-        """Hard-cap BUY allocation on symbols with queued (just-filed) earnings.
+        """Hard-cap the RESULTING position weight on symbols with queued
+        (just-filed) earnings.
 
         A 10-Q filed today but not yet analyzed by the LLM can move the stock
         ±10% overnight. PM shouldn't size up before the analyst has read it.
-        Prompt rule asks PM to self-comply; this is the belt that keeps things
-        safe even if the LLM ignores the rule.
+        The prompt rule asks PM to self-comply ("cap at target_weight_pct <=
+        5.0"); this is the belt that holds when the LLM ignores it.
+
+        2026-07-16 audit: the belt capped the wrong number. By this point in
+        the pipeline `allocation_pct` is the constructor's DELTA (target minus
+        current weight), not the target — so a name already held at 15% with
+        an unread filing could be topped up to 20% because the ADD itself was
+        <= 5%. The cap now measures what it documents: existing weight + add.
+        `positions`/`total_value` are optional so the old delta-only behavior
+        remains for callers that can't supply a book (tests, and any future
+        caller with no position context) rather than crashing.
         """
         queued_symbols = {
             (ea.get("symbol") or "").strip().upper()
@@ -1873,20 +1885,49 @@ class TradingPipeline:
         queued_symbols.discard("")
         if not queued_symbols:
             return decisions
+
+        # Existing GROSS weights, same convention as the risk engine.
+        current: dict[str, float] = {}
+        if positions and total_value and total_value > 0:
+            try:
+                from src.portfolio_constructor import PortfolioConstructor
+                current = PortfolioConstructor._current_weights(positions, total_value)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Earnings-queued cap: weight lookup failed (%s) — "
+                               "falling back to delta-only capping", e)
+                current = {}
+
         clamped: list[TradeDecision] = []
         for d in decisions:
-            if d.action == "BUY" and d.symbol.upper() in queued_symbols and d.allocation_pct > max_pct:
-                try:
-                    reduced = d.model_copy(update={"allocation_pct": max_pct})
-                    logger.warning(
-                        "Earnings-queued cap: %s BUY %.2f%% → %.2f%% (fresh filing not yet analyzed)",
-                        d.symbol, d.allocation_pct, max_pct,
-                    )
-                    clamped.append(reduced)
-                except Exception as e:
-                    logger.warning("Earnings-queued cap copy failed for %s: %s — keeping original", d.symbol, e)
-                    clamped.append(d)
-            else:
+            if d.action != "BUY" or d.symbol.upper() not in queued_symbols:
+                clamped.append(d)
+                continue
+            from src.risk.rules import _gross_multiplier
+            held_pct = current.get(d.symbol.upper(), 0.0)
+            # Room left under the cap, expressed in the RAW notional units
+            # `allocation_pct` is spent in (see PortfolioConstructor._build_buy).
+            allowed_raw = max(0.0, max_pct - held_pct) / _gross_multiplier(d.symbol)
+            if d.allocation_pct <= allowed_raw:
+                clamped.append(d)
+                continue
+            if allowed_raw <= 0:
+                logger.warning(
+                    "Earnings-queued cap: DROPPING %s BUY %.2f%% — already at "
+                    "%.1f%% weight, at/over the %.1f%% cap with a fresh filing "
+                    "not yet analyzed",
+                    d.symbol, d.allocation_pct, held_pct, max_pct,
+                )
+                continue   # a BUY with allocation_pct=0 is not a valid no-op downstream
+            try:
+                reduced = d.model_copy(update={"allocation_pct": round(allowed_raw, 2)})
+                logger.warning(
+                    "Earnings-queued cap: %s BUY %.2f%% → %.2f%% (held %.1f%%, "
+                    "cap %.1f%%; fresh filing not yet analyzed)",
+                    d.symbol, d.allocation_pct, allowed_raw, held_pct, max_pct,
+                )
+                clamped.append(reduced)
+            except Exception as e:
+                logger.warning("Earnings-queued cap copy failed for %s: %s — keeping original", d.symbol, e)
                 clamped.append(d)
         return clamped
 
@@ -3064,14 +3105,35 @@ class TradingPipeline:
             return v
 
         rows_in_window = rows[:lookback_days]  # newest first from get_recent_insights
+        # One SELL, one vote. `_build_recent_sells_for_grading` uses a 2-day
+        # window with no already-graded filter, so evening re-grades the same
+        # trade on 2-3 consecutive nights and each re-grade used to count as an
+        # independent sell — inflating the premature/wrong counts that drive
+        # the reviewer's patience tilt (2026-07-16 audit; the production
+        # insights rows show the duplicates). Rows arrive newest-first, so the
+        # FIRST grade seen for a (symbol, sell_date) is the freshest — and the
+        # one with the most post-exit price history behind it.
+        seen_sells: set[tuple] = set()
         for row in rows_in_window:
             for g in _load("sell_grades_json", row):
                 if not isinstance(g, dict):
                     continue
+                sym = g.get("symbol")
+                sell_date = g.get("sell_date")
+                # Dedup only with a real (symbol, sell_date) key — SellGrade
+                # requires sell_date, so this is the normal path. A malformed
+                # row without one is counted rather than collapsed: keying on
+                # (symbol, None) would fold every distinct sell of that symbol
+                # into a single vote, which is a worse error than the
+                # double-count this dedup removes.
+                if sym and sell_date:
+                    key = (sym, sell_date)
+                    if key in seen_sells:
+                        continue
+                    seen_sells.add(key)
                 grade = g.get("grade")
                 if grade in sell_counts:
                     sell_counts[grade] += 1
-                sym = g.get("symbol")
                 if sym and grade == "premature":
                     sell_premature_by_symbol[sym] = sell_premature_by_symbol.get(sym, 0) + 1
                 if sym and grade == "wrong":
@@ -4754,10 +4816,13 @@ class TradingPipeline:
         EMERGENCY_SELL / FORCE_DELEVER. TRAIL_STOP and HOLD do NOT count
         (TRAIL_STOP is stop adjustment, HOLD is no-op).
 
-        Filters out canceled / rejected / expired fills — if a SELL was
-        submitted earlier and broker rejected, the symbol is fair game for
-        re-trying. Pending (`submitted`) and `filled` rows both block, so
-        we never double-submit on the same symbol within one day.
+        Filters out canceled / rejected / expired orders that filled ZERO
+        shares — if a SELL was submitted earlier and the broker rejected it,
+        the symbol is fair game for re-trying. A PARTIAL fill still blocks:
+        those shares left the book, so a second trim today would be the
+        double-application this guard exists to prevent. Pending (`submitted`)
+        and `filled` rows both block, so we never double-submit on the same
+        symbol within one day.
         """
         try:
             rows = self.db.get_trades(today_only=True, limit=200)
@@ -4770,7 +4835,6 @@ class TradingPipeline:
             "REDUCE", "SELL", "TAKE_PROFIT",
             "EMERGENCY_SELL", "FORCE_DELEVER",
         }
-        bad_status = {"canceled", "cancelled", "rejected", "expired", "done_for_day"}
         out: set[str] = set()
         for r in rows:
             action = (r.get("action") or "").upper()
@@ -4778,8 +4842,16 @@ class TradingPipeline:
             base_action = action.split("(", 1)[0].strip()
             if base_action not in sell_actions and base_action != "PARTIAL_SELL":
                 continue
-            status = (r.get("fill_status") or "").lower()
-            if status in bad_status:
+            # A terminal-fail status that nevertheless moved shares IS a trim.
+            # Filtering on fill_status alone (2026-07-16 audit) let a
+            # partially-filled-then-canceled REDUCE fall through: the shares
+            # left the book at midday, but close saw a clean slate and was free
+            # to trim the same name again on the same soft flag — the exact
+            # 2026-05-04 AMZN 41→21→11 double-trim this guard exists to stop.
+            # `_trade_executed_or_pending` is the codebase's existing contract
+            # for this (NULL/submitted/filled → yes; canceled/rejected/expired
+            # → only when fill_qty > 0), and matches db._executed_trade_predicate.
+            if not self._trade_executed_or_pending(r):
                 continue
             sym = r.get("symbol")
             if sym:

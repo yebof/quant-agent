@@ -577,8 +577,14 @@ class RiskStage:
                 len(portfolio_decision.decisions),
             )
 
+        # Pass the book so the cap measures the RESULTING weight, not just the
+        # add: allocation_pct here is the constructor's delta, so a name already
+        # at 15% with an unread filing could otherwise be topped up to 20%.
+        # rm_positions (sweep-vehicle-free) is the right basis — parked T-bills
+        # are cash and never carry an earnings filing.
         portfolio_decision.decisions = pipeline._clamp_queued_earnings_buys(
             portfolio_decision.decisions, earnings_results,
+            positions=rm_positions, total_value=total_value,
         )
 
         daily_pnl = total_value - last_equity

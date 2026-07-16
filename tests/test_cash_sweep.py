@@ -375,7 +375,7 @@ def test_risk_stage_rm_view_excludes_vehicle():
     p.market = MagicMock()
     p.market.get_ohlcv.return_value = []
     p._filter_supported_symbols = MagicMock(side_effect=lambda d, a, pos: (d, []))
-    p._clamp_queued_earnings_buys = MagicMock(side_effect=lambda d, e: d)
+    p._clamp_queued_earnings_buys = MagicMock(side_effect=lambda d, e, **kw: d)
     p._filter_hard_risk_decisions = MagicMock(side_effect=lambda d, *a, **k: (d, [], []))
     p.risk_manager = MagicMock()
     p.risk_manager.review.return_value = (
