@@ -361,6 +361,18 @@ class AgentResult:
     @staticmethod
     def _shape_score(parsed) -> int:
         """How 'agent-output shaped' a JSON candidate looks. Higher is better."""
+        # A top-level LIST is a first-class agent shape: tech_analyst returns
+        # an array of per-symbol analyses (tech_analyst.py: `items = parsed if
+        # isinstance(parsed, list) else [parsed]`). Scoring it 0 meant that
+        # whenever the model wrapped the array in ANY prose (so the clean
+        # json.loads happy path missed), the candidate scan compared the array
+        # (score 0) against each of its own elements (score > 0) and returned
+        # the LAST ELEMENT — silently discarding every other symbol's analysis
+        # in the chunk. Score the container by the SUM of its elements so it
+        # strictly outranks any single element it contains (2026-07-16 audit;
+        # reproduced: a 3-analysis array returned 1 dict).
+        if isinstance(parsed, list):
+            return sum(AgentResult._shape_score(item) for item in parsed)
         if not isinstance(parsed, dict):
             return 0
         keys = set(parsed.keys())

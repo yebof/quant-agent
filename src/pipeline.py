@@ -5783,9 +5783,20 @@ class TradingPipeline:
         # `positions` stays in scope for the paths that need broker truth
         # (emergency liquidate below sells EVERYTHING, parked cash included).
         review_positions = positions
+        review_cash = cash
         sweeper = self._sweeper()
         if sweeper is not None:
-            review_positions, _parked = sweeper.split_positions(positions)
+            review_positions, parked = sweeper.split_positions(positions)
+            # ...and the cash side of that same contract: stripping the
+            # vehicle from the position list while showing RAW cash told the
+            # reviewer the book was ~all-in with a few hundred dollars spare,
+            # when most of the equity was parked and instantly available. Its
+            # de-lever mandate and weight reasoning both key off this number
+            # (2026-07-16 audit; DecisionStage already credits it for the PM).
+            if parked is not None:
+                mv = parked.market_value
+                if isinstance(mv, (int, float)) and math.isfinite(mv) and mv > 0:
+                    review_cash = cash + mv
 
         if review_positions:
             # Sweep any straggler fills before building the reviewer prompt.
@@ -5842,7 +5853,7 @@ class TradingPipeline:
             review, md_result = self.position_reviewer.review(
                 positions=review_positions,
                 macro_summary=macro_summary,
-                cash_balance=cash,
+                cash_balance=review_cash,
                 total_value=total_value,
                 session_type=session_type,
                 position_facts=position_facts,

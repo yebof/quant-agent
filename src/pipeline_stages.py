@@ -879,12 +879,22 @@ class ExecutionStage:
         # snapshot.
         if buy_decisions:
             if not sell_decisions:
-                account, positions, _ = pipeline._refresh_account_state()
+                # Take the FRESH price_map too (2026-07-16 audit): it was
+                # discarded into `_`, leaving `price_map` at research-time
+                # position prices from 5-10 minutes earlier. For an ADD to a
+                # held name that stale price is what the 5% entry-staleness
+                # guard compares the LLM's entry against, and what sizes the
+                # order — so the guard could pass a genuinely stale entry (or
+                # reject a good one) on exactly the fast-moving tape where it
+                # matters. New symbols were unaffected (they miss the map and
+                # fall through to a live quote).
+                account, positions, fresh_prices = pipeline._refresh_account_state()
                 cash = account["cash"]
                 total_value = account["portfolio_value"]
                 ctx.positions = positions
                 ctx.cash = cash
                 ctx.total_value = total_value
+                price_map = {**price_map, **fresh_prices}
             daily_pnl_now = total_value - ctx.last_equity
             loss_violation_now = pipeline.risk_engine.check_daily_loss(
                 ctx.last_equity, daily_pnl_now,

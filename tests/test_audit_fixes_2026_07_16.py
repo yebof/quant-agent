@@ -276,3 +276,84 @@ def test_finalize_persists_pre_sell_qty_so_the_drain_can_reprotect():
     assert persisted_qty == 100.0, (
         "must persist the PRE-sell qty; the drain re-derives residual = pre - fill"
     )
+
+
+# ---------- parse_json must not drop a top-level array ----------
+
+def test_parse_json_keeps_a_prose_wrapped_top_level_array():
+    """tech_analyst returns an ARRAY of per-symbol analyses. Scoring lists 0
+    meant the candidate scan compared the array against its own elements and
+    returned the LAST one — silently discarding 24 of 25 symbols in a chunk
+    whenever the model wrapped its JSON in any prose."""
+    from src.agents.base import AgentResult
+    raw = (
+        "Here are the analyses:\n"
+        '[{"symbol": "AAPL", "rating": "buy"}, '
+        '{"symbol": "NVDA", "rating": "hold"}, '
+        '{"symbol": "MSFT", "rating": "sell"}]\n'
+    )
+    out = AgentResult(raw_text=raw, tokens_used=0, model="m").parse_json()
+    assert isinstance(out, list) and len(out) == 3
+    assert [x["symbol"] for x in out] == ["AAPL", "NVDA", "MSFT"]
+
+
+def test_parse_json_single_dict_response_still_wins():
+    from src.agents.base import AgentResult
+    raw = 'Result: {"decisions": [], "portfolio_view": "flat"}'
+    out = AgentResult(raw_text=raw, tokens_used=0, model="m").parse_json()
+    assert isinstance(out, dict) and out["portfolio_view"] == "flat"
+
+
+# ---------- indicator windows must fit in the configured lookback ----------
+
+def test_configured_lookback_supplies_every_advertised_indicator():
+    """`ma_200` was unconditionally None: lookback_days is CALENDAR days, so
+    120 yielded ~82 bars and `len(df) >= 200` never held — the tech_analyst
+    prompt rendered "MA200=None" for every symbol, every day."""
+    from pathlib import Path
+    import yaml
+    cfg = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config" / "settings.yaml").read_text()
+    )
+    calendar_days = cfg["trading"]["lookback_days"]
+    # ~252 trading days per 365 calendar days
+    approx_bars = calendar_days * 252 / 365
+    assert approx_bars >= 200, (
+        f"lookback_days={calendar_days} yields ~{approx_bars:.0f} bars; MA200 "
+        f"needs 200 and technical.py gates on `len(df) >= 200`"
+    )
+
+
+# ---------- reviewer view: ATR metrics rendered, parked cash credited ----------
+
+def _reviewer():
+    from src.agents.position_reviewer import PositionReviewerAgent
+    with patch("anthropic.Anthropic"):
+        return PositionReviewerAgent(api_key="k", model="claude-opus-4-7",
+                                     max_tokens=1024)
+
+
+def test_reviewer_prompt_renders_the_atr_metrics_it_is_told_to_use():
+    """The prompt instructs "think in ATRs" and the pipeline pays for an ATR
+    fetch per position — but build_user_message never rendered them."""
+    pos = Position(symbol="GE", qty=26, avg_entry=316, current_price=360,
+                   market_value=9_360, unrealized_pnl=1_144, sector="Industrials")
+    msg = _reviewer().build_user_message(
+        positions=[pos], macro_summary={}, cash_balance=1_000.0,
+        total_value=100_000.0, session_type="midday",
+        position_facts={"GE": {"atr_pct": 2.22, "stop_distance_atrs": 1.25,
+                               "distance_to_stop_pct": 2.8}},
+    )
+    assert "atr=2.22%" in msg
+    assert "stop_distance=1.25×ATR" in msg
+
+
+def test_reviewer_prompt_omits_unknown_atr_rather_than_showing_zero():
+    pos = Position(symbol="GE", qty=26, avg_entry=316, current_price=360,
+                   market_value=9_360, unrealized_pnl=1_144, sector="Industrials")
+    msg = _reviewer().build_user_message(
+        positions=[pos], macro_summary={}, cash_balance=1_000.0,
+        total_value=100_000.0, session_type="midday",
+        position_facts={"GE": {"atr_pct": None, "stop_distance_atrs": None}},
+    )
+    assert "atr=" not in msg and "stop_distance=" not in msg
