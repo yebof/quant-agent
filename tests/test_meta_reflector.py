@@ -724,7 +724,10 @@ def test_maybe_run_quarterly_meta_fires_on_quarter_end(tmp_path):
 
     assert result is not None
     assert result["status"] == "reflected"
-    p.run_quarterly_meta_reflection.assert_called_once_with(force=False)
+    # The gate already decided quarter-end (with fallback semantics), so the
+    # inner call is forced — re-checking the calendar could disagree.
+    p.run_quarterly_meta_reflection.assert_called_once_with(force=True)
+    assert result["calendar_fallback"] is False
 
 
 def test_maybe_run_quarterly_meta_swallows_meta_failure(tmp_path):
@@ -744,15 +747,140 @@ def test_maybe_run_quarterly_meta_swallows_meta_failure(tmp_path):
     assert "boom" in result["error"]
 
 
-def test_maybe_run_quarterly_meta_swallows_broker_check_failure(tmp_path):
-    """If the quarter-end probe itself raises (broker API down at
-    20:00 ET), treat as not-quarter-end and return None — evening
-    proceeds normally rather than auto-meta failing."""
+def test_maybe_run_quarterly_meta_reports_broker_check_failure(tmp_path, monkeypatch):
+    """If the quarter-end probe raises / returns None (broker API down at
+    20:00 ET) on a NON quarter-end weekday, evening proceeds but the
+    result says so (status=skipped, reason=quarter_end_check_failed,
+    calendar_fallback=True) — 2026-09-22 review: it used to return None,
+    identical to a normal day, so a calendar hiccup on quarter-end day
+    would have silently skipped the one-shot LIVE-APPLY cycle."""
+    monkeypatch.setattr("src.trading_calendar.et_today", lambda: date(2026, 9, 22))
     p = _pipeline_for_meta(tmp_path)
     p.broker.is_last_trading_day_of_quarter.side_effect = ConnectionError("alpaca down")
     p.run_quarterly_meta_reflection = MagicMock()
 
     result = p._maybe_run_quarterly_meta()
 
-    assert result is None
+    assert result == {
+        "status": "skipped", "reason": "quarter_end_check_failed",
+        "period": "2026-Q3", "calendar_fallback": True,
+    }
     p.run_quarterly_meta_reflection.assert_not_called()
+
+
+def test_maybe_run_quarterly_meta_falls_back_to_weekday_heuristic(tmp_path, monkeypatch):
+    """Calendar unavailable ON quarter-end day (Wed 2026-09-30): the weekday
+    heuristic says last business day → meta still fires, flagged
+    calendar_fallback=True so the Telegram line says how it was decided."""
+    monkeypatch.setattr("src.trading_calendar.et_today", lambda: date(2026, 9, 30))
+    p = _pipeline_for_meta(tmp_path)
+    p.broker.is_last_trading_day_of_quarter.return_value = None  # tri-state UNKNOWN
+    p.run_quarterly_meta_reflection = MagicMock(
+        return_value={"status": "reflected", "period": "2026-Q3"}
+    )
+
+    result = p._maybe_run_quarterly_meta()
+
+    assert result["status"] == "reflected"
+    assert result["calendar_fallback"] is True
+    p.run_quarterly_meta_reflection.assert_called_once_with(force=True)
+
+
+def test_maybe_run_quarterly_meta_calendar_failure_outside_quarter_month_is_silent(tmp_path, monkeypatch):
+    """Calendar failure in a non-quarter-end month → plain None (nothing to
+    decide, keep the evening push quiet)."""
+    monkeypatch.setattr("src.trading_calendar.et_today", lambda: date(2026, 8, 12))
+    p = _pipeline_for_meta(tmp_path)
+    p.broker.is_last_trading_day_of_quarter.return_value = None
+    p.run_quarterly_meta_reflection = MagicMock()
+    assert p._maybe_run_quarterly_meta() is None
+    p.run_quarterly_meta_reflection.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-22 review: schema caps are head-truncated, never fatal; every
+# dropped learning is recorded in `dropped_learnings`
+# ---------------------------------------------------------------------------
+
+def test_drop_invalid_meta_lists_head_truncates_over_cap_lists():
+    """A 6th persistent_blindspot / 4th valid learning / 6th valid
+    top_pattern / 2001-char portrait used to fail QuarterlyMetaReflection
+    wholesale (status digest_only, editor never runs, no retry until next
+    quarter). Now each is truncated to its schema cap."""
+    from src.agents.meta_reflector import MetaReflectorAgent
+    from src.models import QuarterlyMetaReflection
+
+    parsed = _valid_meta_json()
+    parsed["persistent_blindspots"] = [f"b{i}" for i in range(6)]
+    parsed["root_cause_hypotheses"] = [f"h{i}" for i in range(7)]
+    parsed["style_self_portrait"] = "p" * 2500
+    parsed["proposed_learnings"] = [
+        _valid_prompt_learning(a) for a in
+        ("portfolio_manager", "news_analyst", "tech_analyst", "macro_analyst")
+    ]
+    parsed["loss_pattern_report"]["top_patterns"] = [
+        _valid_loss_pattern() for _ in range(6)
+    ]
+    cleaned = MetaReflectorAgent._drop_invalid_meta_lists(parsed)
+    reflection = QuarterlyMetaReflection(**cleaned)   # must not raise
+    assert reflection.persistent_blindspots == ["b0", "b1", "b2", "b3", "b4"]
+    assert len(reflection.root_cause_hypotheses) == 5
+    assert len(reflection.style_self_portrait) == 2000
+    assert [l.agent_name for l in reflection.proposed_learnings] == [
+        "portfolio_manager", "news_analyst", "tech_analyst",
+    ]
+    assert len(reflection.loss_pattern_report.top_patterns) == 5
+    # The 4th learning is recorded, not lost.
+    assert len(reflection.dropped_learnings) == 1
+    assert reflection.dropped_learnings[0].agent_name == "macro_analyst"
+    assert "cap of 3" in reflection.dropped_learnings[0].error
+
+
+def test_drop_invalid_meta_lists_records_schema_invalid_learning():
+    """The 2026-Q2 reflector's only proposal (282 chars under the old 200
+    cap) vanished with only a log warning; reflection.json showed
+    proposed_learnings=[]. Schema-invalid learnings must land in
+    dropped_learnings with the validation error."""
+    from src.agents.meta_reflector import MetaReflectorAgent
+    from src.models import QuarterlyMetaReflection
+
+    parsed = _valid_meta_json()
+    too_long = {**_valid_prompt_learning("portfolio_manager"),
+                "learning_text": "y" * 350}
+    parsed["proposed_learnings"] = [too_long, _valid_prompt_learning("news_analyst")]
+    cleaned = MetaReflectorAgent._drop_invalid_meta_lists(parsed)
+    reflection = QuarterlyMetaReflection(**cleaned)
+    assert [l.agent_name for l in reflection.proposed_learnings] == ["news_analyst"]
+    assert len(reflection.dropped_learnings) == 1
+    d = reflection.dropped_learnings[0]
+    assert d.agent_name == "portfolio_manager"
+    assert d.learning_text == "y" * 350
+    assert "schema" in d.error and "300" in d.error
+    # Round-trips through model_dump → reflection.json
+    assert reflection.model_dump()["dropped_learnings"][0]["agent_name"] == "portfolio_manager"
+
+
+def test_drop_invalid_meta_lists_llm_cannot_inject_dropped_learnings():
+    from src.agents.meta_reflector import MetaReflectorAgent
+
+    parsed = _valid_meta_json()
+    parsed["dropped_learnings"] = [{"agent_name": "risk_manager",
+                                    "learning_text": "injected", "error": ""}]
+    parsed["proposed_learnings"] = [_valid_prompt_learning()]
+    cleaned = MetaReflectorAgent._drop_invalid_meta_lists(parsed)
+    assert cleaned["dropped_learnings"] == []
+
+
+def test_quarterly_meta_reflection_period_is_pattern_locked():
+    """period is a filesystem path segment, the `[period]` bullet tag and
+    the git commit message — an LLM string like '../x' or 'Q3 2026' must
+    fail validation."""
+    from pydantic import ValidationError
+    from src.models import QuarterlyMetaReflection
+
+    parsed = _valid_meta_json()
+    parsed["proposed_learnings"] = []
+    QuarterlyMetaReflection(**{**parsed, "period": "2026-Q3"})
+    for bad in ("../2026-Q3", "Q3 2026", "2026-Q5", "2026-q3", ""):
+        with pytest.raises(ValidationError):
+            QuarterlyMetaReflection(**{**parsed, "period": bad})

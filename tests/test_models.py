@@ -880,7 +880,9 @@ def test_prompt_learning_rejects_protected_agents_via_literal():
 
 
 def test_prompt_learning_length_bounded():
-    """learning_text must be ≥20 and ≤200 chars — forces concise, useful edits."""
+    """learning_text must be ≥20 and ≤300 chars — forces concise, useful edits.
+    (Cap raised 200→300 on 2026-09-06: the 2026-Q2 reflector's only proposal
+    was 282 chars and was silently dropped by the old cap.)"""
     from src.models import PromptLearning
 
     with pytest.raises(ValidationError):
@@ -892,7 +894,7 @@ def test_prompt_learning_length_bounded():
     with pytest.raises(ValidationError):
         PromptLearning(
             agent_name="tech_analyst", operation="append",
-            learning_text="y" * 250,  # too long
+            learning_text="y" * 350,  # too long (cap is 300)
             justification="Q1 2026 showed issues" + "y" * 30,
         )
 

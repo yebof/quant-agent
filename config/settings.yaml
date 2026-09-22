@@ -229,12 +229,22 @@ evolution:
   # auto-apply is left OFF until a track record of staged proposals justifies
   # it — review proposed_edits.json by hand and apply with --mode meta --force
   # after flipping dry_run to false for that run.
+  # 2026-09-06: switched to LIVE-APPLY for ONE cycle — the 2026-Q3 quarter-end
+  # run on Wed 2026-09-30 (auto-invoked from evening) — so the WWW '27 paper can
+  # report a real applied evolution cycle. Flip back to dry_run: true afterwards
+  # if the stage-only posture is wanted again. Rollback of the applied edits is
+  # `git revert <sha>` of the auto-commit. Runbook:
+  # ~/quant-agent-paper/RUNBOOK-Q3-evolution.md
   enabled: true
-  dry_run: true            # explicit (was relying on the schema default)
+  dry_run: false           # LIVE-APPLY for the 2026-Q3 cycle (see note above)
   auto_commit: true
   max_agents_per_cycle: 3
   max_learnings_per_agent: 10
-  max_learning_chars: 200
+  # 300 (was 200): the Q2 reflector's only proposal was 282 chars and was
+  # silently dropped by the 200-char schema cap before reaching the editor.
+  # Must match PromptLearning.learning_text max_length in src/models.py and
+  # the "20-300 chars" rule in config/prompts/meta_reflector.md.
+  max_learning_chars: 300
   min_justification_chars: 40
   jaccard_dedup_threshold: 0.6
   prohibited_words:

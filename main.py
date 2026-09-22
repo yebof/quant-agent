@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import logging
 import sys
 import time
@@ -63,7 +64,22 @@ def main():
             "manual invocation / dry runs."
         ),
     )
+    parser.add_argument(
+        "--period-end",
+        type=datetime.date.fromisoformat,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help=(
+            "For --mode meta: the quarter-end date to reflect on (implies "
+            "--force). REQUIRED for a catch-up run after the quarter has "
+            "rolled over — without it the period is labelled from today's "
+            "date (e.g. a run on 2026-10-01 would be filed as 2026-Q4 and the "
+            "learnings tagged [2026-Q4]). Example: --period-end 2026-09-30"
+        ),
+    )
     args = parser.parse_args()
+    if args.period_end is not None and args.mode != "meta":
+        parser.error("--period-end is only valid with --mode meta")
 
     # Construct the notifier and the finally-block state FIRST — before
     # anything that can crash (config loading, pricing refresh, pipeline
@@ -159,7 +175,10 @@ def main():
         elif args.mode == "earnings_preprocess":
             result = pipeline.run_earnings_preprocess()
         elif args.mode == "meta":
-            result = pipeline.run_quarterly_meta_reflection(force=args.force)
+            result = pipeline.run_quarterly_meta_reflection(
+                force=args.force or args.period_end is not None,
+                period_end=args.period_end,
+            )
         elif args.mode == "daily":
             result = pipeline.run_daily()
     except BaseException as exc:

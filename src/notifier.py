@@ -11,7 +11,12 @@ Per-mode noise policy (see `format_session_result`):
     (skip "nothing_new" — happens most pre-market days)
   - intra_check: notify only on emergency action (skip the 14
     silent OK ticks per trading day)
-  - meta: notify on actual run; skip "not_quarter_end" / etc.
+  - meta: notify on actual run; skip "not_quarter_end" (but a
+    "quarter_end_check_failed" skip is a failure and notifies)
+  - evening auto_meta (quarter-end piggyback): any dict result
+    renders exactly one 🧪 line, including "ran but 0 proposals"
+    and "skipped: calendar check failed"; only auto_meta=None
+    (an ordinary evening) is silent
   - daily (P&L CSV export): the CSV itself goes out as a Telegram
     document with a self-describing caption, so the "sent" status
     text is suppressed (the document IS the confirmation); "error"
@@ -192,7 +197,10 @@ def format_session_result(
         if status == "market_holiday":
             return None
     if mode == "meta" and status == "skipped":
-        return None  # quarter-end check fires daily; silent on non-Q-end
+        if result.get("reason") == "quarter_end_check_failed":
+            pass  # a failure to decide, not a routine skip — notify below
+        else:
+            return None  # quarter-end check fires daily; silent on non-Q-end
     if mode == "daily" and status == "sent":
         # The CSV document push (with its self-describing caption) IS
         # the delivery confirmation — a second status text every weekday
@@ -215,6 +223,17 @@ def format_session_result(
     cost_line = _session_cost_line(run_id)
     if cost_line:
         lines.append(cost_line)
+
+    # review 2026-09-22: the trading-day gate can now return broker_error
+    # (calendar unavailable — tri-state instead of "assume closed"). That
+    # status is retryable (main.py exits 1 → wrapper re-runs next tick), but
+    # the operator still needs the reason on the phone. Render it for every
+    # mode here rather than in each body; analysis_error keeps its own
+    # dedicated banner in the trade-session body.
+    if status in ("broker_error", "fetch_error"):
+        err = result.get("error")
+        if err:
+            lines.append(f"error: {str(err)[:300]}")
 
     # === Mode-specific body ===
     if mode in ("morning", "midday", "close", "once"):
@@ -292,10 +311,15 @@ def _append_trade_session_body(lines: list[str], result: dict) -> None:
     # otherwise — operator's most important "system intervened" signal
     # would be invisible without this banner. Prepended before the
     # order list so it's the first thing read.
+    # review 2026-09-22: COVER_SHORT is the session-entry guard buying back
+    # an UNINTENDED short (qty < 0 — e.g. a SELL that landed after the
+    # GTC stop had already flattened the lot, opening a short; CCJ -17
+    # 2026-09-01). It is an intervention too, but a buy-to-cover rather
+    # than a sell, so it gets its own label and is tagged on the BUY side.
     forced = [
         o for o in orders
         if isinstance(o, dict) and str(o.get("action", "")).upper() in (
-            "FORCE_DELEVER", "EMERGENCY_SELL"
+            "FORCE_DELEVER", "EMERGENCY_SELL", "COVER_SHORT",
         )
     ]
     if forced:
@@ -305,6 +329,14 @@ def _append_trade_session_body(lines: list[str], result: dict) -> None:
             f"🚨 AUTONOMOUS INTERVENTION ({', '.join(actions)}): "
             f"{len(forced)} order(s) on {', '.join(symbols)}"
         )
+        covers = [o for o in forced
+                  if str(o.get("action", "")).upper() == "COVER_SHORT"]
+        if covers:
+            cover_syms = sorted({str(o.get("symbol", "?")) for o in covers})
+            lines.append(
+                f"🩹 COVER_SHORT (unintended short closed): "
+                f"{', '.join(cover_syms)}"
+            )
 
     if orders:
         buys = [o for o in orders if _order_side(o) == "buy"]
@@ -326,7 +358,11 @@ def _append_trade_session_body(lines: list[str], result: dict) -> None:
                 label = "  🚨EMER "
             lines.append(f"{label}{_order_summary(o)}")
         for o in buys[:10]:
-            lines.append(f"  BUY   {_order_summary(o)}")
+            action = str(o.get("action", "")).upper() if isinstance(o, dict) else ""
+            label = "  BUY   "
+            if action == "COVER_SHORT":
+                label = "  🩹COVER"
+            lines.append(f"{label}{_order_summary(o)}")
         omitted = max(0, len(buys) - 10) + max(0, len(sells) - 10)
         if omitted:
             lines.append(f"  (+{omitted} more — see audit log)")
@@ -512,33 +548,56 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
             if isinstance(r, dict) and "dry_run" in str(r.get("reason", ""))
         )
         proposed = int(auto_meta.get("proposed_learnings_count") or 0)
+        dropped = int(auto_meta.get("dropped_learnings_count") or 0)
         period = auto_meta.get("period", "?")
         status = auto_meta.get("status", "?")
+        git_commit = report.get("git_commit")
+        # review 2026-09-22: every auto_meta DICT must render exactly one
+        # 🧪 line. The 2026-Q2 run ended "reflected / 0 proposals" (the
+        # only proposal was schema-dropped pre-editor) and fell through
+        # every branch below — the evening push looked like a normal day
+        # and the operator never learned the quarterly cycle had fired
+        # and produced nothing. Silence is reserved for auto_meta=None
+        # (a plain non-quarter-end evening).
         if status == "auto_meta_error":
-            err = auto_meta.get("error", "?")[:200]
-            lines.append(f"🧪 meta {period}: ERROR — {err}")
+            err = str(auto_meta.get("error", "?"))[:200]
+            line = f"🧪 meta {period}: ERROR — {err}"
         elif status == "digest_only":
             # LLM reflection step failed after the digest was written —
             # the learning loop is broken until next quarter.
-            lines.append(
+            line = (
                 f"🧪 meta {period}: digest written but LLM reflection "
                 f"FAILED — check logs"
             )
+        elif status == "skipped":
+            reason = auto_meta.get("reason", "?")
+            line = f"🧪 meta {period}: skipped — {reason}"
         elif applied > 0:
-            lines.append(
+            line = (
                 f"🧪 meta {period}: applied {applied} learning(s); "
                 f"rejected {rejected}"
             )
+            if git_commit:
+                line += f" commit={str(git_commit)[:7]}"
+            else:
+                # Prompts were rewritten on disk but the auto-commit did
+                # not land: the documented `git revert <sha>` rollback has
+                # no sha, and the next apply would treat the files as
+                # operator-dirty. Operator must resolve by hand.
+                line += (
+                    " ⚠️ COMMIT FAILED — prompts edited but uncommitted; "
+                    "run `git status config/prompts/`"
+                )
         elif staged > 0:
             # Dry-run staged proposals (none actually applied).
-            lines.append(
+            line = (
                 f"🧪 meta {period}: {staged} proposal(s) staged "
                 f"(dry-run — see data/evolution/{period}/proposed_edits.json)"
             )
         elif rejected > 0:
             # Live/off mode with everything rejected by guardrails or the
             # enabled=false short-circuit — still worth one line.
-            lines.append(
+            line = (
                 f"🧪 meta {period}: 0 applied / {rejected} rejected "
                 f"(see data/evolution/edits.jsonl)"
             )
@@ -546,11 +605,27 @@ def _append_evening_body(lines: list[str], result: dict) -> None:
             # editor_report missing (editor crashed) but the reflection
             # carried proposals — surface the review hint rather than
             # nothing (idx 19 fallback).
-            lines.append(
+            line = (
                 f"🧪 meta {period}: {proposed} proposal(s) generated but "
                 f"prompt-editor report missing — check logs"
             )
-        # status='skipped' (not quarter-end) → no line, normal evening.
+        else:
+            # Ran to completion with nothing to apply: either the LLM
+            # proposed 0 learnings or every proposal was schema-dropped
+            # before the editor (the exact 2026-Q2 outcome).
+            line = (
+                f"🧪 meta {period}: ran, 0 proposal(s) survived schema "
+                f"({dropped} dropped pre-editor — see "
+                f"data/evolution/{period}/reflection.json dropped_learnings)"
+            )
+        if dropped > 0 and "dropped pre-editor" not in line:
+            line += f" ({dropped} dropped pre-editor)"
+        if auto_meta.get("calendar_fallback"):
+            line += (
+                " (quarter-end decided by weekday fallback — Alpaca "
+                "calendar failed)"
+            )
+        lines.append(line)
 
 
 def _session_cost_line(run_id: str | None) -> str | None:
@@ -694,6 +769,15 @@ def _append_meta_body(lines: list[str], result: dict) -> None:
     period = result.get("period")
     if period:
         lines.append(f"period: {period}")
+    status = str(result.get("status", ""))
+    if status == "skipped" and result.get("reason") == "quarter_end_check_failed":
+        # The quarter-end gate could not be evaluated (Alpaca calendar
+        # unavailable) — a failure, not the routine non-quarter-end skip.
+        lines.append(
+            "⚠️ quarter-end check FAILED (Alpaca calendar unavailable) — "
+            "meta did not run; re-run with --force / --period-end once "
+            "the broker is reachable"
+        )
     # audit round 2 (#15/#19): run_quarterly_meta_reflection has no flat
     # "applied"/"rejected" keys — derive the counts from the nested
     # editor_report lists (ApplicationReport.to_dict), same as the evening
@@ -706,8 +790,18 @@ def _append_meta_body(lines: list[str], result: dict) -> None:
         1 for r in rej_list
         if isinstance(r, dict) and "dry_run" in str(r.get("reason", ""))
     )
+    dropped = int(result.get("dropped_learnings_count") or 0)
     if applied or rejected:
         lines.append(f"learnings: applied={applied} rejected={rejected}")
+        if applied:
+            git_commit = report.get("git_commit")
+            if git_commit:
+                lines.append(f"commit: {str(git_commit)[:7]}")
+            else:
+                lines.append(
+                    "⚠️ COMMIT FAILED — prompts edited but uncommitted; "
+                    "run `git status config/prompts/`"
+                )
         if staged:
             lines.append(
                 f"🧪 {staged} proposal(s) staged for review — "
@@ -717,6 +811,18 @@ def _append_meta_body(lines: list[str], result: dict) -> None:
         lines.append(
             f"⚠️ {result['proposed_learnings_count']} proposal(s) generated "
             f"but prompt-editor report missing — check logs"
+        )
+    elif status in ("reflected", "applied_saved"):
+        lines.append(
+            f"🧪 ran, 0 proposal(s) survived schema ({dropped} dropped "
+            f"pre-editor — see data/evolution/{period}/reflection.json "
+            f"dropped_learnings)"
+        )
+    if dropped and not any("dropped pre-editor" in ln for ln in lines):
+        lines.append(f"⚠️ {dropped} proposal(s) dropped pre-editor (schema)")
+    if result.get("calendar_fallback"):
+        lines.append(
+            "⚠️ quarter-end decided by weekday fallback — Alpaca calendar failed"
         )
     reason = result.get("reason")
     if reason:
@@ -763,7 +869,7 @@ def _order_side(order: Any) -> str:
         "FORCE_DELEVER", "PARTIAL_SELL",
     )):
         return "sell"
-    if action == "BUY":
+    if action in ("BUY", "COVER_SHORT"):
         return "buy"
     return ""
 

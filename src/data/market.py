@@ -53,13 +53,13 @@ class MarketDataProvider:
             if bars:
                 logger.info("%s for %s, fallback source returned %d bars",
                             reason, symbol, len(bars))
-            if not bars:
-                # audit round 2: an ALL-NaN frame passed the `df.empty` gate
-                # (it isn't empty) and only died at the dropna scrub below it —
-                # returning [] without ever trying the Alpaca fallback that the
-                # truly-empty path uses. Same degraded feed, different route.
-                return self._try_fallback(symbol, lookback_days,
-                                          reason="yfinance all-NaN")
+            # 2026-09-22 review: this used to recurse into itself when the
+            # fallback returned [] ("all-NaN" retry) — an unbounded recursion
+            # that burned ~1000 Alpaca calls / ~4 min per delisted ticker
+            # (AT on 9/16, OIG on 9/19) inside the evening session. An empty
+            # fallback is deterministic (delisted symbol, outage); retrying
+            # the identical request cannot help. The all-NaN case is handled
+            # in get_ohlcv after the dropna scrub, where it belongs.
             return bars
         except Exception as e:  # noqa: BLE001
             logger.warning("fallback_bars failed for %s: %s", symbol, e)
@@ -96,6 +96,12 @@ class MarketDataProvider:
         # always see clean bars or an empty list.
         required_cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]
         clean_df = df.dropna(subset=required_cols) if required_cols else df
+        if required_cols and clean_df.empty:
+            # audit round 2: an ALL-NaN frame passes the `df.empty` gate (it
+            # isn't empty) — same degraded feed as "empty", so route it to
+            # the Alpaca fallback too. Single attempt, no recursion.
+            logger.warning("yfinance returned only NaN rows for %s — trying fallback", symbol)
+            return self._try_fallback(symbol, lookback_days, reason="yfinance all-NaN")
         if len(clean_df) < len(df):
             logger.warning(
                 "yfinance returned %d row(s) with NaN OHLCV for %s — dropped; "

@@ -435,10 +435,11 @@ def test_meta_prompt_flags_per_agent_error_entries():
     assert "skip edits targeting this agent" in msg
 
 
-def test_meta_prompt_shows_truncation_marker():
-    """When snapshot was budget-truncated, the LLM should see a
-    `[snapshot tail-truncated …]` note so it knows content may have
-    been cut rather than not existing."""
+def test_meta_prompt_names_budget_skipped_sections():
+    """2026-09-22 review: when the snapshot was budget-truncated, the LLM
+    must be told WHICH sections it cannot see and be forbidden from
+    proposing edits against them. The old wording ("request a focused
+    re-run") promised a mechanism that does not exist."""
     agent = _make_meta_agent()
     snap = {
         "portfolio_manager": {
@@ -449,10 +450,82 @@ def test_meta_prompt_shows_truncation_marker():
             "learnings": "",
             "total_chars": 3000,
             "truncated": True,
+            "skipped_sections": ["7-Step Decision Framework", "Output"],
         },
     }
     msg = agent.build_user_message(digest=_digest_with_snapshot(snap))
-    assert "tail-truncated" in msg
+    assert "budget-skipped sections: 7-Step Decision Framework, Output" in msg
+    assert "propose NO learning" in msg
+    assert "re-run" not in msg
+
+
+def test_meta_prompt_truncated_without_section_list_still_warns():
+    """Legacy digest.json (pre skipped_sections key) — still warn."""
+    agent = _make_meta_agent()
+    snap = {
+        "portfolio_manager": {
+            "intro": "intro.", "key_sections": [], "learnings": "",
+            "total_chars": 3000, "truncated": True,
+        },
+    }
+    msg = agent.build_user_message(digest=_digest_with_snapshot(snap))
+    assert "snapshot truncated for budget" in msg
+    assert "propose NO learning" in msg
+
+
+def test_real_prompts_snapshot_untruncated_and_covers_rule_sections():
+    """2026-09-22 review: with the old 3_000 budget the two largest prompts
+    (portfolio_manager ~35KB, evening ~34KB) surfaced 7% / 3% of their
+    content — the whole 7-Step Decision Framework and every Guardrails
+    section were invisible to the meta-reflector's existing_prompt_audit
+    step. Run the extractor on the REAL config/prompts dir and pin that
+    every editable agent comes back complete."""
+    from src.evolution.quarterly_digest import _build_agent_prompts_snapshot
+
+    snap = _build_agent_prompts_snapshot()
+    for agent, payload in snap.items():
+        assert "error" not in payload, agent
+        assert payload["truncated"] is False, (agent, payload["skipped_sections"])
+        assert payload["skipped_sections"] == [], agent
+        headings = [k["heading"] for k in payload["key_sections"]]
+        assert "Guardrails" in headings, (agent, headings)
+        # Meta-description sections must never eat budget.
+        assert "Outputs consumed by" not in headings, agent
+        assert "Inputs you read" not in headings, agent
+    pm_headings = [k["heading"] for k in snap["portfolio_manager"]["key_sections"]]
+    assert "7-Step Decision Framework" in pm_headings
+    ev_headings = [k["heading"] for k in snap["evening_analyst"]["key_sections"]]
+    assert any(h.startswith("Core principles") for h in ev_headings)
+    assert any(h.startswith("Required output") for h in ev_headings)
+
+
+def test_snapshot_records_skipped_sections_when_over_budget():
+    from src.evolution.quarterly_digest import _extract_agent_prompt_snapshot
+
+    md = (
+        "# A\n\nIntro.\n\n## Rules\n\n" + ("r" * 200) + "\n\n"
+        "## Guardrails\n\n" + ("g" * 200) + "\n\n"
+        "## Output\n\nshort.\n"
+    )
+    out = _extract_agent_prompt_snapshot(md, char_budget=260)
+    assert out["truncated"] is True
+    assert "Guardrails" in out["skipped_sections"]
+    kept = [k["heading"] for k in out["key_sections"]]
+    assert "Rules" in kept
+    assert "Guardrails" not in kept
+
+
+def test_snapshot_denylist_excludes_io_contract_headings():
+    from src.evolution.quarterly_digest import _heading_is_interesting
+
+    assert _heading_is_interesting("Guardrails")
+    assert _heading_is_interesting("Core principles — frame every grade")
+    assert _heading_is_interesting("CRITICAL: Detect STATE CHANGES")
+    assert _heading_is_interesting("Missed Opportunities classification")
+    assert not _heading_is_interesting("Outputs consumed by")
+    assert not _heading_is_interesting("Inputs you read")
+    assert not _heading_is_interesting("What you produce")
+    assert not _heading_is_interesting("Example output shape")
 
 
 # ---------------------------------------------------------------------------

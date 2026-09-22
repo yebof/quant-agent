@@ -388,8 +388,10 @@ class EveningAnalystAgent(BaseAgent):
                 reason = (b.get("reasoning") or "").strip()[:140]
                 # Python-injected SPY benchmark over the same window. Lets the
                 # LLM classify a "wrong" BUY as alpha-destruction vs systemic
-                # without us telling it which. Positive mkt_rel = we
-                # underperformed the tape; ~0 or negative = whole market fell.
+                # without us telling it which. Sign: market_relative =
+                # pct_move_since_buy - SPY move, so NEGATIVE = we
+                # underperformed SPY (alpha destruction); ~0 = the whole
+                # market fell with us (systemic).
                 mkt_rel_raw = b.get("market_relative_move_pct")
                 if mkt_rel_raw is not None:
                     try:

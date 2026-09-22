@@ -59,10 +59,20 @@ _SNAPSHOT_AGENTS: tuple[str, ...] = (
     "evening_analyst",
 )
 
-# Per-agent character budget for the snapshot. 6 agents × 3_000 = 18_000
-# chars ≈ ~5k tokens — bounded cost for quarterly call, leaves plenty of
-# room for facts + LLM output within context.
-_SNAPSHOT_PER_AGENT_CHAR_BUDGET = 3_000
+# Per-agent character budget for the snapshot.
+#
+# 2026-09-22 review: the original 3_000 budget, combined with the
+# "skip a section whole when it doesn't fit" policy below, meant the two
+# largest prompts (portfolio_manager.md ~35KB, evening_analyst.md ~34KB)
+# surfaced 7% / 3% of their content — the entire 7-Step Decision Framework
+# (~19.6K chars once its ### steps are folded in) could never fit, so the
+# meta-reflector's `existing_prompt_audit` step was structurally blind for
+# exactly the agents it edits most. The 2026-Q2 reflection literally says
+# "PM snapshot shows only persona intro visible ... cannot fully verify"
+# and then proposed a PM learning anyway. 40_000 fits every current prompt
+# untruncated with headroom for the Learnings section to grow (6 agents
+# ≈ 87K chars ≈ 22k tokens, once a quarter — cheap).
+_SNAPSHOT_PER_AGENT_CHAR_BUDGET = 40_000
 
 # Regex: section headers (## or ###) that are interesting for meta-
 # reflection. Keyword match is lowercase / word-boundary-ish.
@@ -77,7 +87,21 @@ _INTERESTING_HEADING_KEYWORDS = (
     "cheat sheet", "cheatsheet",
     "learnings",  # The system-evolved section — critical to surface
     "auto-evolved",
+    # 2026-09-22 review: the hard-rule sections were never matched.
+    "guard", "guardrail", "principle", "critical", "classification",
 )
+
+# Headings that are meta-descriptions of the prompt's I/O contract (they
+# describe which agent feeds/consumes what) — not rules. They previously
+# leaked in via the "output" substring ("Outputs consumed by") and ate
+# budget that a rule section then lost. Exact, case-insensitive match on
+# the heading text.
+_SNAPSHOT_DENYLIST_HEADINGS = frozenset({
+    "inputs you read",
+    "outputs consumed by",
+    "what you produce",
+    "example output shape",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -787,34 +811,60 @@ def _count_tech_signals(
     }
 
 
+# agent_logs.agent_name values the news / earnings agents actually write.
+# The pipeline logs news per session (`news_analyst_{morning,midday,close,
+# evening}`, pipeline.run_news) and earnings as `earnings_analyst_preprocess`;
+# the bare names are legacy (pre-2026-Q2 rows). db.get_recent_agent_outputs
+# is an exact match, so counting under the bare name alone reported both
+# agents as SILENT for the whole quarter (2026-09-22 review) — and the
+# meta-reflector prompt treats "silent agent" as a prompt-edit trigger.
+_NEWS_AGENT_LOG_NAMES: tuple[str, ...] = (
+    "news_analyst",
+    "news_analyst_morning",
+    "news_analyst_midday",
+    "news_analyst_close",
+    "news_analyst_evening",
+)
+_EARNINGS_AGENT_LOG_NAMES: tuple[str, ...] = (
+    "earnings_analyst",
+    "earnings_analyst_preprocess",
+)
+
+
 def _count_news_signals(
     db: "Database", period_start: date, period_end: date
 ) -> dict:
+    n_sessions = 0
     n_state_changes = 0
     n_high_conv = 0
     n_bullish = 0
     n_bearish = 0
     n_neutral = 0
-    for _, data in _iter_agent_logs_in_window(
-        db, "news_analyst", period_start, period_end,
-    ):
-        if not isinstance(data, dict):
-            continue
-        sentiment = (data.get("market_sentiment") or "").strip()
-        if sentiment == "bullish":
-            n_bullish += 1
-        elif sentiment == "bearish":
-            n_bearish += 1
-        elif sentiment == "neutral":
-            n_neutral += 1
-        for ch in (data.get("state_changes") or []):
-            if not isinstance(ch, dict):
+    for agent_log_name in _NEWS_AGENT_LOG_NAMES:
+        for _, data in _iter_agent_logs_in_window(
+            db, agent_log_name, period_start, period_end,
+        ):
+            if not isinstance(data, dict):
                 continue
-            n_state_changes += 1
-            if (ch.get("conviction") or "").lower() == "high":
-                n_high_conv += 1
+            n_sessions += 1
+            # Substring-tolerant: production emits variants such as
+            # "cautiously_bullish" / "neutral-to-bearish" that an exact
+            # literal match silently ignored.
+            sentiment = (data.get("market_sentiment") or "").strip().lower()
+            if "bullish" in sentiment:
+                n_bullish += 1
+            elif "bearish" in sentiment:
+                n_bearish += 1
+            elif "neutral" in sentiment:
+                n_neutral += 1
+            for ch in (data.get("state_changes") or []):
+                if not isinstance(ch, dict):
+                    continue
+                n_state_changes += 1
+                if (ch.get("conviction") or "").lower() == "high":
+                    n_high_conv += 1
     return {
-        "n_sessions": n_bullish + n_bearish + n_neutral,
+        "n_sessions": n_sessions,
         "n_state_changes_total": n_state_changes,
         "n_high_conviction_state_changes": n_high_conv,
         "n_bullish_sessions": n_bullish,
@@ -856,15 +906,16 @@ def _count_earnings_signals(
     db: "Database", period_start: date, period_end: date
 ) -> dict:
     sentiment_counts: Counter = Counter()
-    for _, data in _iter_agent_logs_in_window(
-        db, "earnings_analyst", period_start, period_end, limit_hint=200,
-    ):
-        if not isinstance(data, dict):
-            continue
-        impl = data.get("investment_implications") or {}
-        sentiment = (impl.get("sentiment") or "").strip()
-        if sentiment:
-            sentiment_counts[sentiment] += 1
+    for agent_log_name in _EARNINGS_AGENT_LOG_NAMES:
+        for _, data in _iter_agent_logs_in_window(
+            db, agent_log_name, period_start, period_end, limit_hint=200,
+        ):
+            if not isinstance(data, dict):
+                continue
+            impl = data.get("investment_implications") or {}
+            sentiment = (impl.get("sentiment") or "").strip()
+            if sentiment:
+                sentiment_counts[sentiment] += 1
     total = sum(sentiment_counts.values())
     return {
         "n_filings_analyzed": total,
@@ -1044,21 +1095,26 @@ def _corrigibility_trend(digest: dict, prev: dict) -> dict:
 #                       reflector MUST see these before proposing to
 #                       add duplicates)
 #
-# Per-agent char budget (_SNAPSHOT_PER_AGENT_CHAR_BUDGET = 3_000) caps
-# total size; longer selections are tail-truncated with an ellipsis
-# marker so the meta-reflector can tell the snapshot was cut.
+# Per-agent char budget (_SNAPSHOT_PER_AGENT_CHAR_BUDGET = 40_000) caps
+# total size; a section that does not fit is skipped WHOLE and its heading
+# is recorded in `skipped_sections` so the meta-reflector is told exactly
+# which rule sections it could NOT audit (and must not edit against).
+# I/O-contract headings (_SNAPSHOT_DENYLIST_HEADINGS) are never included.
 
 _HEADING_RE = re.compile(r"^(#{2,3})\s+(.+?)\s*$", re.MULTILINE)
 
 
 def _heading_is_interesting(heading: str) -> bool:
     """Return True iff the heading text contains any keyword from
-    `_INTERESTING_HEADING_KEYWORDS`. Case-insensitive, substring match.
+    `_INTERESTING_HEADING_KEYWORDS` and is not a denylisted I/O-contract
+    heading. Case-insensitive, substring match.
 
     Intentionally permissive — false positives are cheap (a harmless
     section ends up in the snapshot), false negatives are expensive (a
     rule section is omitted and the meta-reflector re-proposes it)."""
-    h = heading.lower()
+    h = heading.lower().strip()
+    if h in _SNAPSHOT_DENYLIST_HEADINGS:
+        return False
     return any(kw in h for kw in _INTERESTING_HEADING_KEYWORDS)
 
 
@@ -1127,6 +1183,7 @@ def _extract_agent_prompt_snapshot(
         "learnings":    str,            # "## Learnings" body (maybe "")
         "total_chars":  int,            # actual compressed size
         "truncated":    bool,           # True iff budget was hit
+        "skipped_sections": [str],      # headings dropped for budget
       }
 
     Always returns a dict even on empty/weird inputs — callers don't need
@@ -1142,6 +1199,7 @@ def _extract_agent_prompt_snapshot(
         "learnings": "",
         "total_chars": 0,
         "truncated": False,
+        "skipped_sections": [],
     }
     if not prompt_text or not prompt_text.strip():
         return out
@@ -1200,6 +1258,7 @@ def _extract_agent_prompt_snapshot(
         candidate_chunk = f"## {heading}\n\n{body}".strip()
         if running_chars + len(candidate_chunk) > char_budget:
             out["truncated"] = True
+            out["skipped_sections"].append(heading)
             # audit round 2 (#0): `continue`, NOT `break`. The Learnings
             # capture above runs before this budget check, and the
             # "## Learnings (system-evolved)" section lives at end-of-file
@@ -1260,6 +1319,7 @@ def _build_agent_prompts_snapshot(
                 "learnings": "",
                 "total_chars": 0,
                 "truncated": False,
+                "skipped_sections": [],
                 "error": "prompt_file_missing",
             }
             continue
@@ -1275,6 +1335,7 @@ def _build_agent_prompts_snapshot(
                 "learnings": "",
                 "total_chars": 0,
                 "truncated": False,
+                "skipped_sections": [],
                 "error": f"read_failed: {exc}",
             }
             continue

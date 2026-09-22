@@ -942,11 +942,14 @@ class BuyGrade(BaseModel):
     # aggregate patterns and propose targeted prompt edits. Optional on
     # correct/premature so existing fixtures stay valid.
     loss_root_cause: BuyLossRootCause | None = None
-    # SPY return over the same window as pct_move_since_buy. Python-injected
-    # by the pipeline before passing to the LLM. Positive number when we
-    # under-performed the market (alpha destruction); ~0 or negative when
-    # the whole market fell (systemic). Lets the LLM distinguish greed_top_chasing
-    # from systemic_drawdown without pattern-matching prose.
+    # Our move minus SPY's move over the same window as pct_move_since_buy
+    # (pipeline: `pct - spy_pct`). Python-injected before passing to the
+    # LLM and back-filled by the pipeline after parsing, so it persists
+    # regardless of whether the LLM echoes it. Sign convention: NEGATIVE =
+    # we under-performed SPY (alpha destruction); ~0 = the whole market
+    # fell with us (systemic). Lets the LLM (and the quarterly digest's
+    # alpha_destruction_pct) distinguish greed_top_chasing from
+    # systemic_drawdown without pattern-matching prose.
     market_relative_move_pct: float | None = None
     # Required when loss_root_cause == "macro_warning_ignored": the specific
     # warning that was visible at entry and dismissed. Format expected:
@@ -1470,8 +1473,12 @@ class PromptLearning(BaseModel):
     """
     agent_name: MetaReflectionAgentName
     operation: Literal["append", "retract"]
-    learning_text: str = Field(min_length=20, max_length=200)
-    """1-2 concrete sentences. The PR 4 editor rejects entries containing
+    learning_text: str = Field(min_length=20, max_length=300)
+    """1-2 concrete sentences (300 chars max; was 200 until 2026-09-06 — the
+    2026-Q2 reflector's only proposal was 282 chars and got silently dropped
+    here, see data/evolution/2026-Q2). Keep in sync with
+    evolution.max_learning_chars in settings.yaml and the meta_reflector
+    prompt. The PR 4 editor rejects entries containing
     "always"/"never"/"override"/"must always"/"must never" as these
     directly conflict with the hard-invariant wording in core prompts."""
     justification: str = Field(min_length=40)
@@ -1505,11 +1512,29 @@ class PromptLearning(BaseModel):
         return self
 
 
+class DroppedLearning(BaseModel):
+    """A `proposed_learnings` entry the meta-reflector emitted but that did
+    NOT survive to the editor — schema-invalid (over-length, prohibited
+    shape, protected agent) or beyond the 3-per-quarter cap. Lenient on
+    purpose (no length caps): this is the audit record of what was lost,
+    so the operator can review it in reflection.json instead of digging
+    through agent_logs (the 2026-Q2 proposal vanished exactly that way).
+    Populated ONLY by MetaReflectorAgent._drop_invalid_meta_lists — the
+    LLM cannot inject it."""
+    agent_name: str = ""
+    operation: str = ""
+    learning_text: str = ""
+    error: str = ""
+
+
 class QuarterlyMetaReflection(BaseModel):
     """Top-level meta-reflector output. Persisted to
     data/evolution/{period}/reflection.json alongside the digest."""
-    period: str
-    """e.g. '2026-Q1' — matches the digest's period label."""
+    period: str = Field(pattern=r"^\d{4}-Q[1-4]$")
+    """e.g. '2026-Q1' — matches the digest's period label. Pattern-locked
+    because it is used as a filesystem path segment
+    (data/evolution/{period}/), the `[period]` tag on every Learnings
+    bullet and the evolution git commit message."""
     meta_reasoning_chain: MetaReasoningChain
     style_self_portrait: str = Field(default="", max_length=2000)
     """Multi-sentence honest self-description for ongoing audit. Optional:
@@ -1527,6 +1552,11 @@ class QuarterlyMetaReflection(BaseModel):
     """System enforces max 3 agents edited per quarter AFTER schema
     validation — see PR 4's prompt_editor for the enforcement layer.
     This schema max is the upper bound the LLM sees."""
+    dropped_learnings: list[DroppedLearning] = Field(default_factory=list)
+    """Learnings the LLM proposed that were dropped pre-editor (schema-
+    invalid or past the cap of 3). Audit trail only — never applied.
+    The pipeline reports `len(dropped_learnings)` in the session result
+    and the evening Telegram push."""
     confidence: Literal["high", "medium", "low"] = "medium"
     """Meta-confidence — with only 1-2 quarters of data the LLM should
     self-report 'low' and propose at most 1 learning. PR 4's editor
