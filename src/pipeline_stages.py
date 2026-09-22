@@ -405,6 +405,18 @@ class DecisionStage:
                 mv = parked.market_value
                 if isinstance(mv, (int, float)) and _math.isfinite(mv) and mv > 0:
                     cash = cash + mv
+        # Core beta sleeve: hidden as a position, credited as fundable cash,
+        # described in one line so the PM knows the deployment gap it sees
+        # is the SINGLE-NAME gap and that SPY is not its to trade.
+        from src.execution.core_beta import CoreBetaSleeve
+        core = getattr(pipeline, "_core_beta", None)
+        core = core() if callable(core) else None
+        core_beta_note = ""
+        if isinstance(core, CoreBetaSleeve):
+            core_beta_note = core.note(ctx.positions, total_value)
+            positions, core_pos = core.split_positions(positions)
+            if core_pos is not None:
+                cash = cash + core.core_value([core_pos])
 
         yesterday_insights = pipeline.db.get_latest_insights(before_date=session_date_key())
         recent_performance = pipeline._compute_recent_performance(last_equity)
@@ -454,6 +466,7 @@ class DecisionStage:
             macro_trajectory=macro_trajectory,
             active_state_changes=active_state_changes,
             rm_recent_verdicts=rm_recent_verdicts,
+            core_beta_note=core_beta_note,
             pm_recent_decisions=pm_recent_decisions,
             projected_portfolio=projected_portfolio,
             calibration_note=calibration_note,
@@ -490,6 +503,28 @@ class DecisionStage:
         if not portfolio_decision:
             ctx.portfolio_decision = None
             return ctx
+
+        # Rule-managed vehicles are never PM targets: the sleeve/sweep would
+        # otherwise fight the bookends (PM "closes" SPY, the sleeve re-buys).
+        reserved = set()
+        for accessor in ("_sweeper", "_core_beta"):
+            fn = getattr(pipeline, accessor, None)
+            obj = fn() if callable(fn) else None
+            sym = getattr(obj, "symbol", None) if obj is not None else None
+            if isinstance(sym, str) and sym:
+                reserved.add(sym.upper())
+        if reserved:
+            kept = []
+            for target in portfolio_decision.targets:
+                if target.symbol.strip().upper() in reserved:
+                    logger.warning(
+                        "Constructor: dropping PM target %s — rule-managed vehicle "
+                        "(core beta / cash sweep), not an LLM position",
+                        target.symbol,
+                    )
+                    continue
+                kept.append(target)
+            portfolio_decision.targets = kept
 
         price_map = {p.symbol: p.current_price for p in positions}
         for target in portfolio_decision.targets:
@@ -567,6 +602,13 @@ class RiskStage:
         rm_positions = positions
         if isinstance(sweeper, CashSweeper):
             rm_positions, _parked = sweeper.split_positions(positions)
+        from src.execution.core_beta import CoreBetaSleeve
+        core = getattr(pipeline, "_core_beta", None)
+        core = core() if callable(core) else None
+        if not isinstance(core, CoreBetaSleeve):
+            core = None
+        if core is not None:
+            rm_positions, _core_pos = core.split_positions(rm_positions)
 
         # Symbol guard
         portfolio_decision.decisions, symbol_blocked_reasons = pipeline._filter_supported_symbols(
@@ -676,6 +718,10 @@ class RiskStage:
         rm_cash = ctx.cash
         if isinstance(sweeper, CashSweeper):
             rm_cash = ctx.cash + sweeper.parked_value(ctx.positions)
+        rm_core_note = ""
+        if core is not None:
+            rm_cash = rm_cash + core.core_value(ctx.positions)
+            rm_core_note = core.note(ctx.positions, total_value)
         verdict, rm_result = pipeline.risk_manager.review(
             portfolio_decision=portfolio_decision,
             positions=rm_positions,
@@ -688,6 +734,7 @@ class RiskStage:
             # ran blind — no equity, no cash, no weights.
             total_value=total_value,
             cash=rm_cash,
+            core_beta_note=rm_core_note,
         )
 
         pipeline.db.insert_agent_log(
@@ -952,6 +999,27 @@ class ExecutionStage:
                                    "use raw cash only): %s", e)
                     freed = 0.0
                 if freed > 0:
+                    positions = ctx.positions
+                    cash = ctx.cash
+                    total_value = ctx.total_value
+            # Core beta sleeve funds what the T-bills could not: single names
+            # always have priority over index beta.
+            from src.execution.core_beta import CoreBetaSleeve
+            core = getattr(pipeline, "_core_beta", None)
+            core = core() if callable(core) else None
+            if isinstance(core, CoreBetaSleeve):
+                planned_notional = sum(
+                    total_value * d.allocation_pct / 100.0
+                    for d in buy_decisions
+                    if d.allocation_pct > 0
+                )
+                try:
+                    freed_core = core.fund_buys(ctx, planned_notional)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("core beta: fund_buys failed (BUYs will use "
+                                   "raw cash only): %s", e)
+                    freed_core = 0.0
+                if freed_core > 0:
                     positions = ctx.positions
                     cash = ctx.cash
                     total_value = ctx.total_value

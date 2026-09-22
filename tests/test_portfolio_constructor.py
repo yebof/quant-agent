@@ -51,9 +51,33 @@ def test_construct_orders_opens_new_position():
     assert d.stop_loss == 95.0
     assert d.take_profit == 115.0
     # allocation bounded by risk budget: $100k × 0.5% = $500 at risk, $5/share →
-    # 100 shares max; 100 shares × $100 = $10k = 10% weight. Target was 8%, so
-    # alloc stays at 8 (under the cap).
-    assert d.allocation_pct == 8.0
+    # 100 shares max; 100 shares × $100 = $10k = 10% weight. Target was 8%, but
+    # 2026-09-23 flat entry sizing clamps any NEW position to 7.5%.
+    assert d.allocation_pct == 7.5
+
+
+def test_construct_orders_caps_new_position_but_not_adds():
+    """Flat entry sizing (2026-09-23 calibration): a NEW position is clamped
+    to max_new_position_pct regardless of conviction; an ADD to a held
+    position is not touched by that cap."""
+    constructor = PortfolioConstructor()
+    analyses = [_analysis("NVDA", entry=100, stop=95, target=115)]
+    price_map = {"NVDA": 100.0}
+    new = constructor.construct_orders(
+        targets=[TargetPosition(symbol="NVDA", target_weight_pct=15.0,
+                                conviction="high", thesis="AI")],
+        positions=[], analyses=analyses, total_value=100_000, price_map=price_map,
+    )
+    assert new[0].action == "BUY" and new[0].allocation_pct == 7.5
+    held = Position(symbol="NVDA", qty=60, avg_entry=90, current_price=100,
+                    market_value=6_000, unrealized_pnl=600, sector="Technology")
+    add = constructor.construct_orders(
+        targets=[TargetPosition(symbol="NVDA", target_weight_pct=9.0,
+                                conviction="high", thesis="AI")],
+        positions=[held], analyses=analyses, total_value=100_000, price_map=price_map,
+    )
+    # Adds are stepped: at most +2.5pp per session (9 − 6 = 3 → capped at 2.5)
+    assert add[0].action == "BUY" and add[0].allocation_pct == 2.5
 
 
 def test_construct_orders_trims_to_target_weight():

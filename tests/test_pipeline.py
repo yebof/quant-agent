@@ -2604,7 +2604,7 @@ def test_pipeline_buys_use_refreshed_cash_after_sell_phase(
     assert buy_kw["symbol"] == "QQQ"
     # Vol-adjusted: equity $10k × 0.5% = $50 risk budget, stop 95 vs entry 100
     # gives $5 risk/share → qty_by_risk = 10 (caps under qty_by_alloc of 30).
-    assert buy_kw["qty"] == 10
+    assert buy_kw["qty"] == 7  # 2026-09-23: NEW positions flat-capped at 7.5% of $10k = $750 → 7 sh
     assert buy_kw["side"] == "buy"
     assert buy_kw["limit_price"] == 100.0
     assert buy_kw["stop_loss_price"] == 95.0

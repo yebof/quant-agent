@@ -53,7 +53,7 @@ _HARD_ANCHORS = (
         "the queued-earnings tag that triggers the 5% BUY cap",
     ),
     (
-        "portfolio_manager.md", "base × rr_mult",
+        "portfolio_manager.md", "base × stale × drawdown",
         "the explicit sizing formula — code-equivalent contract; "
         "changing the multipliers without updating prompt would "
         "produce inconsistent PM behavior across morning vs midday",
@@ -301,7 +301,9 @@ def test_pm_sizing_formula_intact() -> None:
     )
     # The 5 multipliers must all be named — compression that drops
     # any one of them creates a silent sizing inconsistency.
-    for mult in ("base", "rr_mult", "evening", "stale", "drawdown", "queued_cap"):
+    # 2026-09-23: rr_mult / evening size tilts removed (flat entry sizing);
+    # the remaining multipliers must stay named.
+    for mult in ("base", "stale", "drawdown", "queued_cap"):
         assert mult in text, (
             f"portfolio_manager.md sizing formula must keep the "
             f"`{mult}` multiplier named. If you renamed it, also "

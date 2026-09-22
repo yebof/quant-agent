@@ -356,12 +356,20 @@ def _append_trade_session_body(lines: list[str], result: dict) -> None:
                 label = "  🚨FORCE"
             elif action == "EMERGENCY_SELL":
                 label = "  🚨EMER "
+            elif action == "CORE_BETA_SELL":
+                label = "  📐CORE-"
+            elif action == "SWEEP_SELL":
+                label = "  🏦SWEEP-"
             lines.append(f"{label}{_order_summary(o)}")
         for o in buys[:10]:
             action = str(o.get("action", "")).upper() if isinstance(o, dict) else ""
             label = "  BUY   "
             if action == "COVER_SHORT":
                 label = "  🩹COVER"
+            elif action == "CORE_BETA_BUY":
+                label = "  📐CORE+"
+            elif action == "SWEEP_BUY":
+                label = "  🏦SWEEP+"
             lines.append(f"{label}{_order_summary(o)}")
         omitted = max(0, len(buys) - 10) + max(0, len(sells) - 10)
         if omitted:
@@ -869,7 +877,7 @@ def _order_side(order: Any) -> str:
         "FORCE_DELEVER", "PARTIAL_SELL",
     )):
         return "sell"
-    if action in ("BUY", "COVER_SHORT"):
+    if action in ("BUY", "COVER_SHORT", "CORE_BETA_BUY", "SWEEP_BUY"):
         return "buy"
     return ""
 

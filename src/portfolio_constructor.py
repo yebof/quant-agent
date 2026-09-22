@@ -42,6 +42,21 @@ class ConstructorConfig:
     default_stop_atr_multiple: float = 2.0
     # Fallback stop as % of entry when no ATR or suggestion is available.
     fallback_stop_pct: float = 0.05
+    # Hard cap on the weight of a NEW single-name position at entry (a symbol
+    # not currently held). 2026-09-23 forensics: realized round trips by entry
+    # size — <$5k: 68% win / +6.3% avg; $5-10k: 48% / +0.9%; and by PM
+    # conviction — high: 24% win / -1.7% (n=17), medium: 46% / +1.0% (n=56).
+    # Conviction-scaled sizing was destroying value, so entries are flat and
+    # capped here in code (the prompt says 5%; this is the belt). Adds to a
+    # position that is already working are not capped by this.
+    max_new_position_pct: float = 7.5
+    # A holding below this weight is "effectively new" for the cap above (a
+    # 0.2% residual sliver must not unlock a 15% entry). Half the flat 5%.
+    new_position_floor_pct: float = 2.5
+    # Adds to a held name: at most this many pp per session and never above
+    # max_add_ceiling_pct via adds (prompt: +2.5pp per add, 10% ceiling).
+    max_add_step_pct: float = 2.5
+    max_add_ceiling_pct: float = 10.0
 
 
 class PortfolioConstructor:
@@ -117,6 +132,10 @@ class PortfolioConstructor:
                 )
                 if buy_decision is not None:
                     buys.append(buy_decision)
+                elif current_pct > 0:
+                    # Add collapsed by the caps / churn filter — keep the
+                    # audit row so PM's "keep this name" intent is recorded.
+                    buys.append(self._hold_decision(target))
 
         # Canonical ordering: SELLs first (free up cash), then BUYs.
         # Among SELLs: full closes before partials. Among BUYs: by target
@@ -285,7 +304,35 @@ class PortfolioConstructor:
         # delta and every downstream consumer speak the same units. No-op for
         # the ~99% of the universe with multiplier 1.0.
         from src.risk.rules import _gross_multiplier
+        if current_pct < self.cfg.new_position_floor_pct:
+            if target_pct > self.cfg.max_new_position_pct:
+                logger.info(
+                    "Constructor: %s NEW position target %.1f%% capped at %.1f%% "
+                    "(flat entry sizing; conviction=%s, current %.2f%%)",
+                    target.symbol, target_pct, self.cfg.max_new_position_pct,
+                    getattr(target, "conviction", "?"), current_pct,
+                )
+                target_pct = self.cfg.max_new_position_pct
+        else:
+            add_cap = min(current_pct + self.cfg.max_add_step_pct, self.cfg.max_add_ceiling_pct)
+            if target_pct > add_cap:
+                logger.info(
+                    "Constructor: %s ADD target %.1f%% capped at %.1f%% "
+                    "(current %.1f%% + %.1fpp step, %.0f%% ceiling)",
+                    target.symbol, target_pct, add_cap, current_pct,
+                    self.cfg.max_add_step_pct, self.cfg.max_add_ceiling_pct,
+                )
+                target_pct = add_cap
         allocation_pct = (target_pct - current_pct) / _gross_multiplier(target.symbol)
+        if allocation_pct <= 0:
+            return None
+        if (target_pct - current_pct) < self.cfg.min_trade_weight_delta:
+            # The cap collapsed the add below the churn threshold (e.g. held
+            # 9.8% + 10% ceiling → 0.2pp): don't emit dust.
+            logger.info("Constructor: %s add of %.2fpp after caps is below the %.2fpp churn "
+                        "threshold — no order", target.symbol, target_pct - current_pct,
+                        self.cfg.min_trade_weight_delta)
+            return None
         # Pull in vol-adj sizing in a uniform way: ensure qty (computed
         # downstream) doesn't put more than risk_budget_pct of equity at risk.
         # NOTE: alloc_cap_by_risk below is computed in RAW notional terms, so

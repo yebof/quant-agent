@@ -219,6 +219,10 @@ class CashSweeper:
         if not self.enabled():
             return None
         pipeline = self._pipeline
+        # Read open-BUY holds BEFORE cash (review 2026-09-23): a fill landing
+        # between the two reads is then both cash-reduced and hold-counted
+        # (under-park, re-parked next bookend) instead of double-spent.
+        pending = pipeline.broker.open_buy_notional()
         try:
             account = pipeline.broker.get_account()
             positions = pipeline.broker.get_positions()
@@ -262,7 +266,6 @@ class CashSweeper:
         # Alpaca's `cash` does not subtract open-order holds. Sweeping cash
         # that a pending BUY limit needs would make its fill reject later.
         # Unknowable pending notional (query failure) → park nothing.
-        pending = pipeline.broker.open_buy_notional()
         if pending is None:
             logger.warning("cash sweep: open-order query failed — skipping park "
                            "(conservative: unknown pending BUY holds)")

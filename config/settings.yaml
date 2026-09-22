@@ -61,6 +61,29 @@ cash_sweep:
   reserve_pct: 1.0      # % of equity kept as raw cash for fees/slippage
   min_order_usd: 500    # don't churn sub-$500 parking orders
 
+# Regime-conditional core beta sleeve (2026-09-23; src/execution/core_beta.py).
+# While the single-name book is under its deployment target and macro says
+# risk-on, the gap is filled with SPY instead of T-bills. Rule-managed at the
+# session bookends: hidden from every LLM view, credited as fundable cash,
+# sold first to fund single-name BUYs, halved in drawdown, never traded on a
+# daily-loss-breach day, held (no trades) when the macro snapshot is stale.
+# Forensics 04-08→09-21: NAV +5.4% vs SPY +15.0%, avg cash 58%, beta 0.30;
+# parking idle cash in SPY on those days would have added +7.6pp.
+core_beta:
+  enabled: true
+  symbol: "SPY"
+  target_deployment_pct: 75   # fallback; macro position_guidance.target_invested_pct wins
+  regime_fraction:
+    risk-on: 1.0
+    neutral: 0.5
+    transitional: 0.5
+    risk-off: 0.0
+  max_weight_pct: 60
+  rebalance_band_pct: 7.5     # > the 5pp quantum macro's target_invested_pct wobbles in
+  min_order_usd: 500
+  max_regime_age_days: 5
+  drawdown_multiplier: 0.5
+
 trading:
   universe:
     # Index ETF

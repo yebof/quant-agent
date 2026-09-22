@@ -80,8 +80,11 @@ class RiskManagerAgent(BaseAgent):
             if cash is not None:
                 cash_pct = (cash / total_value * 100) if total_value else 0.0
                 cash_bit = f" | Cash: ${cash:,.0f} ({cash_pct:.1f}%)"
+            _cb = (kwargs.get("core_beta_note") or "").strip()
             account_section = (
                 f"## Account\n- Total equity: ${total_value:,.0f}{cash_bit}\n"
+                + (f"- {_cb}\n- Net exposure shown below is SINGLE-NAME only; "
+                   f"the cash figure includes the rule-managed sleeve.\n" if _cb else "")
             )
         elif approx_book > 0:
             account_section = (
@@ -237,7 +240,8 @@ Review these proposed trades and provide your verdict as JSON."""
                news_intel: NewsIntelligenceReport | None = None,
                earnings_analyses: list[dict] | None = None,
                total_value: float | None = None,
-               cash: float | None = None) -> tuple[RiskVerdict | None, "AgentResult"]:
+               cash: float | None = None,
+               core_beta_note: str = "") -> tuple[RiskVerdict | None, "AgentResult"]:
         # audit round 2 #5: total_value / cash are optional so existing call
         # sites keep working; when omitted, build_user_message approximates
         # the book denominator from the sum of position market values.
@@ -246,6 +250,7 @@ Review these proposed trades and provide your verdict as JSON."""
             positions=positions,
             macro_summary=macro_summary,
             rule_violations=rule_violations,
+            core_beta_note=core_beta_note,
             tech_analyses=tech_analyses or [],
             news_intel=news_intel,
             earnings_analyses=earnings_analyses or [],
