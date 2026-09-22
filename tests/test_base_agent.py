@@ -750,11 +750,11 @@ def test_openai_ca_bundle_trusts_relay_ca(monkeypatch, tmp_path):
     ca.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://relay.test/v1")
     monkeypatch.setenv("OPENAI_CA_BUNDLE", str(ca))
-    with patch("openai.OpenAI") as oai_cls, patch("httpx.Client") as hc:
+    with patch("openai.OpenAI") as oai_cls, patch("openai.DefaultHttpxClient") as hc:
         oai_cls.return_value = MagicMock()
         hc.return_value = MagicMock()
         ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64)
-        # httpx client verifies against the pinned CA (NOT verify=False)
+        # http client verifies against the pinned CA (NOT verify=False)
         assert hc.call_args.kwargs.get("verify") == str(ca)
         # and it's handed to the OpenAI SDK as the transport
         assert "http_client" in oai_cls.call_args.kwargs
