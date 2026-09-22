@@ -473,10 +473,17 @@ class BaseAgent(ABC):
             # failover keeps the public trust store. Unset => default public CAs.
             ca_bundle = os.environ.get("OPENAI_CA_BUNDLE", "").strip()
             if ca_bundle:
-                import httpx
+                # Prefer the SDK's own httpx subclass (carries its transport
+                # defaults and tracks whichever httpx flavour the SDK links
+                # against); plain httpx.Client is the fallback.
+                try:
+                    from openai import DefaultHttpxClient as _HttpClient
+                except ImportError:  # pragma: no cover - very old SDKs
+                    import httpx
+                    _HttpClient = httpx.Client
                 self.client = OpenAI(
                     api_key=api_key, base_url=base_url,
-                    http_client=httpx.Client(verify=ca_bundle, timeout=_LLM_HTTP_TIMEOUT),
+                    http_client=_HttpClient(verify=ca_bundle, timeout=_LLM_HTTP_TIMEOUT),
                     max_retries=0,
                 )
             else:
