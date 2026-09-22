@@ -418,6 +418,16 @@ class PromptEditor:
                 report.applied.append(outcome)
                 agents_edited.add(outcome.agent_name)
                 modified_paths.add(Path(outcome.prompt_path))
+                # 2026-09-22 review: the prompt file is already mutated on
+                # disk at this point. Write its audit row NOW so a SIGKILL
+                # (wrapper timeout) between this edit and the end-of-run
+                # commit still leaves a durable trace in edits.jsonl of
+                # what changed; the end-of-run _audit_log skips applied
+                # rows to avoid duplicates.
+                self._audit_log_rows([
+                    {"period": report.period, "kind": "applied",
+                     **outcome.__dict__},
+                ])
 
         # One consolidated git commit if anything actually changed on disk.
         if self._auto_commit and modified_paths and report.applied:
@@ -426,7 +436,7 @@ class PromptEditor:
             )
             report.git_commit = sha
 
-        self._audit_log(report)
+        self._audit_log(report, include_applied=False)
         return report
 
     # -- single-learning driver ---------------------------------------------
@@ -775,20 +785,24 @@ class PromptEditor:
 
     # -- audit + git --------------------------------------------------------
 
-    def _audit_log(self, report: ApplicationReport) -> None:
-        log_path = self.evolution_dir / "edits.jsonl"
+    def _audit_log(
+        self, report: ApplicationReport, *, include_applied: bool = True,
+    ) -> None:
+        """Append the report's rows to edits.jsonl. `include_applied=False`
+        is used by the live-apply path, which already wrote each applied
+        row at the moment of the edit (see apply_reflection)."""
         rows: list[dict] = []
-        ts = datetime.now(tz=timezone.utc).isoformat()
-        for e in report.applied:
-            rows.append({"ts": ts, "period": report.period,
-                         "kind": "applied", **e.__dict__})
+        if include_applied:
+            for e in report.applied:
+                rows.append({"period": report.period,
+                             "kind": "applied", **e.__dict__})
         for r in report.rejected:
-            rows.append({"ts": ts, "period": report.period,
+            rows.append({"period": report.period,
                          "kind": "rejected", **r.__dict__})
         for roll in report.rolled_off:
-            rows.append({"ts": ts, "period": report.period,
+            rows.append({"period": report.period,
                          "kind": "rolled_off", **roll})
-        if not rows:
+        if not rows and not report.applied:
             # audit round 2 (#1): never return without writing. The 2026-Q2
             # production run proposed exactly one learning, meta_reflector
             # dropped it pre-editor (schema over-length), and the empty
@@ -797,17 +811,26 @@ class PromptEditor:
             # audit-log invariant in the module docstring. Write a single
             # marker row so every apply_reflection run is reconstructible.
             rows.append({
-                "ts": ts, "period": report.period, "kind": "empty",
+                "period": report.period, "kind": "empty",
                 "note": (
                     "apply_reflection ran with no applied/rejected/"
                     "rolled_off entries (reflection carried zero "
                     "proposed_learnings by the time it reached the editor)"
                 ),
             })
+        self._audit_log_rows(rows)
+
+    def _audit_log_rows(self, rows: list[dict]) -> None:
+        """Append pre-built rows (ts stamped here) to edits.jsonl. Never
+        raises — an audit-log failure must not fail the apply."""
+        if not rows:
+            return
+        log_path = self.evolution_dir / "edits.jsonl"
+        ts = datetime.now(tz=timezone.utc).isoformat()
         try:
             with log_path.open("a") as f:
                 for row in rows:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    f.write(json.dumps({"ts": ts, **row}, ensure_ascii=False) + "\n")
         except OSError as exc:
             logger.warning("prompt_editor audit log write failed: %s", exc)
 

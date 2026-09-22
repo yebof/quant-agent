@@ -21,9 +21,36 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from src.agents.base import AgentResult, BaseAgent
-from src.models import LossPattern, PromptLearning, QuarterlyMetaReflection
+from src.models import (
+    LossPattern,
+    LossPatternReport,
+    PromptLearning,
+    QuarterlyMetaReflection,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _list_cap(model, field_name: str) -> int | None:
+    """max_length of a list field, read from the Pydantic schema so the
+    truncation here can never drift from the cap the schema enforces."""
+    for meta in model.model_fields[field_name].metadata:
+        ml = getattr(meta, "max_length", None)
+        if ml is not None:
+            return int(ml)
+    return None
+
+
+_str_cap = _list_cap  # same metadata shape for str max_length
+
+
+def _dropped_record(item: dict, error: str) -> dict:
+    return {
+        "agent_name": str(item.get("agent_name") or ""),
+        "operation": str(item.get("operation") or ""),
+        "learning_text": str(item.get("learning_text") or ""),
+        "error": error[:1000],
+    }
 
 PROMPT_PATH = Path(__file__).parent.parent.parent / "config" / "prompts" / "meta_reflector.md"
 
@@ -237,6 +264,9 @@ def _fmt_agent_prompts_snapshot(snapshot: dict | None) -> str:
         key_sections = payload.get("key_sections") or []
         learnings = (payload.get("learnings") or "").strip()
         truncated = payload.get("truncated", False)
+        skipped_sections = [
+            str(h) for h in (payload.get("skipped_sections") or []) if h
+        ]
 
         agent_block: list[str] = [f"### {agent}"]
         if intro:
@@ -264,11 +294,25 @@ def _fmt_agent_prompts_snapshot(snapshot: dict | None) -> str:
                 "agent has no prior auto-evolved entries)"
             )
         if truncated:
-            agent_block.append(
-                "_[snapshot tail-truncated — full prompt exceeds budget; "
-                "if you need content past this cut, flag it and request a "
-                "focused re-run]_"
-            )
+            # 2026-09-22 review: the old wording ("request a focused
+            # re-run") promised a mechanism that does not exist and the
+            # LLM proposed edits anyway. Name the sections it could NOT
+            # see and forbid edits against them instead.
+            if skipped_sections:
+                agent_block.append(
+                    "_[budget-skipped sections: "
+                    + ", ".join(skipped_sections)
+                    + " — these rules are NOT visible to you; if a gap "
+                    "concerns one of these sections, propose NO learning "
+                    "for this agent this quarter]_"
+                )
+            else:
+                agent_block.append(
+                    "_[snapshot truncated for budget — some rules of this "
+                    "agent are NOT visible to you; propose NO learning for "
+                    "this agent unless the gap is clearly outside the "
+                    "sections shown]_"
+                )
         out_lines.append("\n\n".join(agent_block))
     return "\n\n---\n\n".join(out_lines) if out_lines else "(no agents in snapshot)"
 
@@ -420,15 +464,28 @@ the edits compound forward."""
 
     @staticmethod
     def _drop_invalid_meta_lists(parsed: dict) -> dict:
-        """Pre-validate the two list-of-models fields that can fail per-item:
-        `proposed_learnings` (top-level) and
-        `loss_pattern_report.top_patterns` (nested).
+        """Pre-validate the list-of-models fields that can fail per-item
+        (`proposed_learnings`, `loss_pattern_report.top_patterns`) and
+        head-truncate every capped list / string to its schema cap.
 
         Mutates parsed in place. Non-list shapes normalize to []. Bad
         items log a warning naming the agent (for learnings) or the
         root_cause (for loss patterns) so operators can correlate
         against the digest.
+
+        2026-09-22 review: the per-item isolation alone still let ONE
+        over-cap list (a 6th persistent_blindspot, a 4th valid learning,
+        a 2001-char style_self_portrait) fail `QuarterlyMetaReflection(
+        **parsed)` wholesale → status `digest_only`, no editor run, no
+        retry until next quarter. Caps are now enforced here by
+        head-truncation (the prompt orders items by leverage, so the head
+        is the part worth keeping), and every learning that does not
+        reach the editor — schema-invalid OR past the cap of 3 — is
+        recorded in `dropped_learnings` so reflection.json carries the
+        audit trail (the 2026-Q2 proposal left no trace outside
+        agent_logs).
         """
+        dropped: list[dict] = []
         raw_learnings = parsed.get("proposed_learnings")
         if raw_learnings is None:
             pass
@@ -446,6 +503,11 @@ the edits compound forward."""
                         "Meta-reflector: dropping non-dict proposed_learning "
                         "at index %d: %r", i, item,
                     )
+                    dropped.append({
+                        "agent_name": "", "operation": "",
+                        "learning_text": repr(item)[:500],
+                        "error": f"non-dict proposed_learning at index {i}",
+                    })
                     continue
                 try:
                     PromptLearning(**item)
@@ -455,9 +517,46 @@ the edits compound forward."""
                         "Meta-reflector: dropping malformed proposed_learning "
                         "for %s: %s", agent, e,
                     )
+                    dropped.append(_dropped_record(item, f"schema: {e}"))
                     continue
                 valid.append(item)
+            cap = _list_cap(QuarterlyMetaReflection, "proposed_learnings")
+            if cap is not None and len(valid) > cap:
+                logger.warning(
+                    "Meta-reflector: %d valid proposed_learnings exceed the "
+                    "schema cap of %d — keeping the first %d, recording the "
+                    "rest as dropped", len(valid), cap, cap,
+                )
+                for item in valid[cap:]:
+                    dropped.append(_dropped_record(
+                        item, f"beyond proposed_learnings cap of {cap}",
+                    ))
+                valid = valid[:cap]
             parsed["proposed_learnings"] = valid
+        # ASSIGN (never setdefault): the LLM must not be able to inject
+        # entries into the audit record.
+        parsed["dropped_learnings"] = dropped
+
+        # Capped top-level lists / strings — head-truncate instead of
+        # letting the whole reflection fail validation.
+        for field_name in ("persistent_blindspots", "root_cause_hypotheses"):
+            cap = _list_cap(QuarterlyMetaReflection, field_name)
+            val = parsed.get(field_name)
+            if isinstance(val, list) and cap is not None and len(val) > cap:
+                logger.warning(
+                    "Meta-reflector: %s has %d entries > cap %d — "
+                    "head-truncating", field_name, len(val), cap,
+                )
+                parsed[field_name] = val[:cap]
+        portrait = parsed.get("style_self_portrait")
+        portrait_cap = _str_cap(QuarterlyMetaReflection, "style_self_portrait")
+        if (isinstance(portrait, str) and portrait_cap is not None
+                and len(portrait) > portrait_cap):
+            logger.warning(
+                "Meta-reflector: style_self_portrait is %d chars > cap %d "
+                "— clipping", len(portrait), portrait_cap,
+            )
+            parsed["style_self_portrait"] = portrait[:portrait_cap]
 
         lpr = parsed.get("loss_pattern_report")
         if isinstance(lpr, dict):
@@ -481,6 +580,14 @@ the edits compound forward."""
                         )
                         continue
                     valid_patterns.append(item)
+                pcap = _list_cap(LossPatternReport, "top_patterns")
+                if pcap is not None and len(valid_patterns) > pcap:
+                    logger.warning(
+                        "Meta-reflector: %d valid top_patterns exceed the "
+                        "schema cap of %d — head-truncating",
+                        len(valid_patterns), pcap,
+                    )
+                    valid_patterns = valid_patterns[:pcap]
                 lpr["top_patterns"] = valid_patterns
             elif raw_patterns is not None:
                 logger.warning(

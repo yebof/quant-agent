@@ -1112,3 +1112,203 @@ def test_deterministic_escalation_ignores_realtime_loss_when_4pm_small():
     }
     msg = format_session_result("evening", result, 10.0)
     assert "DETERMINISTIC ALERT" not in msg
+
+
+# === review 2026-09-22: auto_meta must never be silent when it is a dict ===
+
+def _evening_with_auto_meta(auto_meta):
+    return {
+        "status": "analyzed", "run_id": "run-e",
+        "analysis": {"risk_rating": "moderate"},
+        "auto_meta": auto_meta,
+    }
+
+
+def test_format_evening_meta_reflected_zero_proposals_renders_line():
+    """The exact 2026-Q2 outcome: meta ran, the only proposal was
+    schema-dropped pre-editor, editor_report is empty. Previously fell
+    through every branch → evening looked like a normal day."""
+    result = _evening_with_auto_meta({
+        "status": "reflected", "period": "2026-Q3",
+        "proposed_learnings_count": 0, "dropped_learnings_count": 1,
+        "editor_report": {"period": "2026-Q3", "applied": [], "rejected": [],
+                          "rolled_off": [], "agents_edited": 0,
+                          "git_commit": None},
+    })
+    msg = format_session_result("evening", result, 30.0)
+    assert (
+        "🧪 meta 2026-Q3: ran, 0 proposal(s) survived schema (1 dropped "
+        "pre-editor — see data/evolution/2026-Q3/reflection.json "
+        "dropped_learnings)"
+    ) in msg
+
+
+def test_format_evening_meta_skipped_calendar_failed_renders_line():
+    result = _evening_with_auto_meta({
+        "status": "skipped", "period": "2026-Q3",
+        "reason": "quarter_end_check_failed",
+    })
+    msg = format_session_result("evening", result, 30.0)
+    assert "🧪 meta 2026-Q3: skipped — quarter_end_check_failed" in msg
+
+
+def test_format_evening_meta_applied_shows_commit_sha():
+    result = _evening_with_auto_meta({
+        "status": "reflected", "period": "2026-Q3",
+        "proposed_learnings_count": 1,
+        "editor_report": {
+            "period": "2026-Q3",
+            "applied": [{"agent_name": "tech_analyst", "operation": "append",
+                         "learning_text": "l1", "content_hash": "h1",
+                         "period": "2026-Q3", "prompt_path": "p"}],
+            "rejected": [], "rolled_off": [], "agents_edited": 1,
+            "git_commit": "0123456789abcdef",
+        },
+    })
+    msg = format_session_result("evening", result, 30.0)
+    assert "🧪 meta 2026-Q3: applied 1 learning(s); rejected 0 commit=0123456" in msg
+
+
+def test_format_evening_meta_applied_without_commit_warns():
+    """Prompts rewritten on disk but auto-commit failed → the `git revert`
+    rollback contract has no sha; operator must be told loudly."""
+    result = _evening_with_auto_meta({
+        "status": "reflected", "period": "2026-Q3",
+        "proposed_learnings_count": 1,
+        "editor_report": {
+            "period": "2026-Q3",
+            "applied": [{"agent_name": "tech_analyst", "operation": "append",
+                         "learning_text": "l1", "content_hash": "h1",
+                         "period": "2026-Q3", "prompt_path": "p"}],
+            "rejected": [], "rolled_off": [], "agents_edited": 1,
+            "git_commit": None,
+        },
+    })
+    msg = format_session_result("evening", result, 30.0)
+    assert "applied 1 learning(s); rejected 0 ⚠️ COMMIT FAILED" in msg
+    assert "git status config/prompts/" in msg
+
+
+def test_format_evening_meta_dropped_count_appended_on_other_branches():
+    result = _evening_with_auto_meta({
+        "status": "reflected", "period": "2026-Q3",
+        "proposed_learnings_count": 1, "dropped_learnings_count": 2,
+        "editor_report": {
+            "period": "2026-Q3", "applied": [],
+            "rejected": [{"agent_name": "tech_analyst", "operation": "append",
+                          "learning_text": "l1", "reason": "jaccard_similarity=0.9",
+                          "period": "2026-Q3"}],
+            "rolled_off": [], "agents_edited": 0, "git_commit": None,
+        },
+    })
+    msg = format_session_result("evening", result, 30.0)
+    assert "🧪 meta 2026-Q3: 0 applied / 1 rejected (see data/evolution/edits.jsonl) (2 dropped pre-editor)" in msg
+
+
+def test_format_evening_meta_calendar_fallback_suffix():
+    result = _evening_with_auto_meta({
+        "status": "reflected", "period": "2026-Q3",
+        "proposed_learnings_count": 0, "calendar_fallback": True,
+        "editor_report": {"period": "2026-Q3", "applied": [], "rejected": [],
+                          "rolled_off": [], "agents_edited": 0,
+                          "git_commit": None},
+    })
+    msg = format_session_result("evening", result, 30.0)
+    assert "(quarter-end decided by weekday fallback — Alpaca calendar failed)" in msg
+
+
+def test_format_evening_every_auto_meta_dict_has_exactly_one_meta_line():
+    shapes = [
+        {"status": "auto_meta_error", "error": "x", "period": "2026-Q3"},
+        {"status": "digest_only", "period": "2026-Q3"},
+        {"status": "skipped", "period": "2026-Q3", "reason": "not_quarter_end"},
+        {"status": "reflected", "period": "2026-Q3", "proposed_learnings_count": 0},
+        {"status": "applied_saved", "period": "2026-Q3", "proposed_learnings_count": 0,
+         "editor_report": {"applied": [], "rejected": [], "git_commit": None}},
+    ]
+    for shape in shapes:
+        msg = format_session_result("evening", _evening_with_auto_meta(shape), 1.0)
+        assert msg.count("🧪 meta") == 1, shape
+
+
+def test_format_meta_cli_calendar_check_failed_notifies():
+    """`--mode meta` stays silent on the routine not_quarter_end skip, but a
+    skip caused by the calendar being unreachable is a failure and pushes."""
+    result = {"status": "skipped", "reason": "quarter_end_check_failed",
+              "run_id": "meta-x"}
+    msg = format_session_result("meta", result, 1.0)
+    assert msg is not None
+    assert "⚠️ quarter-end check FAILED" in msg
+    # routine skip policy unchanged
+    assert format_session_result(
+        "meta", {"status": "skipped", "reason": "not_quarter_end"}, 1.0,
+    ) is None
+
+
+def test_format_meta_cli_reflected_zero_proposals_and_commit_lines():
+    base = {
+        "status": "reflected", "run_id": "meta-q3", "period": "2026-Q3",
+        "proposed_learnings_count": 0, "dropped_learnings_count": 1,
+        "editor_report": {"period": "2026-Q3", "applied": [], "rejected": [],
+                          "rolled_off": [], "agents_edited": 0, "git_commit": None},
+    }
+    msg = format_session_result("meta", base, 5.0)
+    assert "🧪 ran, 0 proposal(s) survived schema (1 dropped pre-editor" in msg
+
+    applied = dict(base, proposed_learnings_count=1, dropped_learnings_count=0)
+    applied["editor_report"] = dict(
+        base["editor_report"],
+        applied=[{"agent_name": "tech_analyst", "operation": "append",
+                  "learning_text": "l", "content_hash": "h",
+                  "period": "2026-Q3", "prompt_path": "p"}],
+        git_commit="deadbeefcafe",
+    )
+    msg = format_session_result("meta", applied, 5.0)
+    assert "learnings: applied=1 rejected=0" in msg
+    assert "commit: deadbee" in msg
+
+    applied["editor_report"]["git_commit"] = None
+    msg = format_session_result("meta", applied, 5.0)
+    assert "⚠️ COMMIT FAILED" in msg
+
+
+@pytest.mark.parametrize(
+    "mode", ["morning", "midday", "close", "evening", "intra_check",
+             "earnings_preprocess"],
+)
+def test_format_broker_error_from_trading_day_gate_notifies_every_mode(mode):
+    """The trading-day gate now returns broker_error (tri-state calendar)
+    instead of pretending it's a holiday. It must push for every mode with
+    the reason — no noise policy may swallow it."""
+    result = {
+        "status": "broker_error", "run_id": f"{mode}-x",
+        "error": "trading calendar unavailable: ReadTimeout",
+    }
+    msg = format_session_result(mode, result, 2.0)
+    assert msg is not None
+    assert "🔴" in msg
+    assert "status: broker_error" in msg
+    assert "error: trading calendar unavailable: ReadTimeout" in msg
+
+
+# === review 2026-09-22: COVER_SHORT (unintended-short guard) intervention ===
+
+@pytest.mark.parametrize("mode", ["morning", "midday", "close"])
+def test_format_cover_short_triggers_intervention_banner(mode):
+    """The session-entry guard buys back an unintended SHORT (qty<0) and
+    records the order with action=COVER_SHORT. It must (a) fire the
+    autonomous-intervention banner, (b) render its own 🩹 label, and (c)
+    count on the BUY side (it is a buy-to-cover, not a sell)."""
+    result = {
+        "status": "executed", "run_id": f"{mode}-x",
+        "orders": [
+            {"symbol": "CCJ", "action": "COVER_SHORT", "qty": 17,
+             "price": 95.71},
+            {"symbol": "NVDA", "action": "BUY", "qty": 5, "price": 100.0},
+        ],
+    }
+    msg = format_session_result(mode, result, 5.0)
+    assert "🚨 AUTONOMOUS INTERVENTION (COVER_SHORT): 1 order(s) on CCJ" in msg
+    assert "🩹 COVER_SHORT (unintended short closed): CCJ" in msg
+    assert "orders: 2  (BUY 2 / SELL 0)" in msg
+    assert "  🩹COVER" in msg and "CCJ" in msg

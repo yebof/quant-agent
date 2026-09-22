@@ -273,7 +273,13 @@ field name; example values inside the JSON example at the end.
   any price-up reading — discipline maintained.
 
 - **`buy_grades`** (list) — Mirror for BUYs. One entry per row in the
-  Recent BUYs block, with `thesis_trajectory` per entry.
+  Recent BUYs block, with `thesis_trajectory` per entry. Each entry
+  MUST also carry `market_relative_move_pct`: copy the `vs SPY:`
+  figure from that BUY's input row verbatim (sign included; NEGATIVE =
+  we underperformed SPY over the holding window = alpha destruction;
+  ~0 = the whole market fell with us). The quarterly digest sums this
+  field into `alpha_destruction_pct`; omit it and the quarter's
+  alpha/systemic split is blank.
 
   **Dual-axis grading rule (same hierarchy as sell_grades — thesis
   axis wins for correct vs wrong; price axis modulates between correct
@@ -511,7 +517,7 @@ $vol $4M + 1d concentration 85% — micro-cap gap-up, no interest."
     {"symbol": "XOM", "sell_date": "2026-04-18", "sell_price": 108.0, "current_price": 106.06, "pct_move_since_sell": -1.8, "grade": "correct", "reason": "Sold on weakening thesis (ceasefire state_change); price confirmed by dropping -1.8% since", "thesis_trajectory_at_sell": "weakening"}
   ],
   "buy_grades": [
-    {"symbol": "NVDA", "buy_date": "2026-04-17", "buy_price": 196.0, "current_price": 210.0, "pct_move_since_buy": 7.1, "grade": "correct", "reason": "AI capex thesis strengthening; Q1 guide confirms acceleration", "thesis_trajectory": "strengthening"}
+    {"symbol": "NVDA", "buy_date": "2026-04-17", "buy_price": 196.0, "current_price": 210.0, "pct_move_since_buy": 7.1, "market_relative_move_pct": 5.8, "grade": "correct", "reason": "AI capex thesis strengthening; Q1 guide confirms acceleration", "thesis_trajectory": "strengthening"}
   ],
   "missed_opportunities": [
     {"symbol": "VST", "move_pct": 22.3, "miss_category": "theme_blindspot", "theme_if_any": "nuclear/power", "theme_durability": "multi_year_secular", "lesson": "News never tagged power/nuclear theme; macro sector 'unknown'; multi-year secular with institutional volume confirmation.", "universe_addition_recommendation": "watch", "universe_addition_reason": "20d $vol $180M, vol_conf 2.1x, 1d concentration 34% (distributed), macro tailwind bullish on energy, forward PE 16.5 (fair)"},

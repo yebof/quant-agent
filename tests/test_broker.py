@@ -262,16 +262,22 @@ def test_is_last_trading_day_of_quarter_short_circuits_non_quarter_month(mock_tc
 
 
 @patch("src.execution.broker.TradingClient")
-def test_is_last_trading_day_of_quarter_false_on_api_error(mock_tc_cls):
-    """Calendar API failure → False (fail-safe: don't trigger the heavy
-    meta-reflection on an incorrect guess)."""
+def test_is_last_trading_day_of_quarter_none_on_api_error(mock_tc_cls, monkeypatch):
+    """Calendar API failure after retries → None (UNKNOWN), not False.
+    2026-09-22 review: False was indistinguishable from "not quarter end",
+    so one Alpaca hiccup silently skipped the once-a-quarter meta run. The
+    pipeline now falls back to the weekday heuristic on None."""
     from datetime import date as _date
+    import src.execution.broker as broker_mod
+    monkeypatch.setattr(broker_mod, "_CALENDAR_RETRY_BASE_S", 0.0)
     mock_client = MagicMock()
     mock_client.get_calendar.side_effect = RuntimeError("calendar 500")
     mock_tc_cls.return_value = mock_client
 
     broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
-    assert broker.is_last_trading_day_of_quarter(on_date=_date(2026, 3, 31)) is False
+    assert broker.is_last_trading_day_of_quarter(on_date=_date(2026, 3, 31)) is None
+    # 3 attempts before giving up
+    assert mock_client.get_calendar.call_count == 3
 
 
 @patch("src.execution.broker.TradingClient")
@@ -652,24 +658,45 @@ def test_is_trading_day_caches_calendar_lookups(mock_tc_cls):
 
 
 @patch("src.execution.broker.TradingClient")
-def test_is_trading_day_does_not_cache_failed_lookup(mock_tc_cls):
-    """A broker-side hiccup (timeout, 503) on the calendar lookup makes
-    is_trading_day defensively return False — but the next call should
-    retry, not silently keep returning False all day. Pin: failed
-    lookups don't poison the cache."""
+def test_is_trading_day_does_not_cache_failed_lookup(mock_tc_cls, monkeypatch):
+    """A sustained broker-side failure on the calendar lookup makes
+    is_trading_day return None (UNKNOWN) — but the next call should
+    retry, not silently keep returning None all day. Pin: failed
+    lookups don't poison the cache. (2026-09-22: was False; the
+    in-process retry now absorbs a single transient blip — see
+    test_is_trading_day_retries_transient_calendar_failure.)"""
     from datetime import date as _date
+    import src.execution.broker as broker_mod
+    monkeypatch.setattr(broker_mod, "_CALENDAR_RETRY_BASE_S", 0.0)
 
     mock_client = MagicMock()
     mock_client.get_calendar.side_effect = [
-        RuntimeError("transient broker hiccup"),
-        [object()],  # second call succeeds
+        RuntimeError("hiccup 1"), RuntimeError("hiccup 2"), RuntimeError("hiccup 3"),
+        [object()],  # next call succeeds
     ]
     mock_tc_cls.return_value = mock_client
 
     broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
     target = _date(2026, 4, 20)
-    assert broker.is_trading_day(target) is False  # transient failure
+    assert broker.is_trading_day(target) is None  # sustained failure → UNKNOWN
     assert broker.is_trading_day(target) is True  # retried, succeeded
+    assert mock_client.get_calendar.call_count == 4
+
+
+@patch("src.execution.broker.TradingClient")
+def test_is_trading_day_retries_transient_calendar_failure(mock_tc_cls, monkeypatch):
+    """One transient 500 must NOT cancel the session: the helper retries
+    in-process and returns the real answer (2026-09-11 midday was lost to a
+    single un-retried 500)."""
+    from datetime import date as _date
+    import src.execution.broker as broker_mod
+    monkeypatch.setattr(broker_mod, "_CALENDAR_RETRY_BASE_S", 0.0)
+    mock_client = MagicMock()
+    mock_client.get_calendar.side_effect = [RuntimeError("500"), [object()]]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    assert broker.is_trading_day(_date(2026, 9, 11)) is True
     assert mock_client.get_calendar.call_count == 2
 
 

@@ -957,3 +957,43 @@ def test_apply_reflection_logs_effective_mode(tmp_path, caplog, enabled, dry_run
                   if "effective mode" in r.getMessage().lower()]
     assert mode_lines, "PromptEditor must log its effective mode at every run"
     assert marker in mode_lines[0], f"expected {marker} in {mode_lines[0]!r}"
+
+
+def test_applied_audit_row_written_before_git_commit_and_not_duplicated(tmp_path):
+    """2026-09-22 review: the applied row used to be written only at the
+    end of apply_reflection (after git commit). A SIGKILL between the
+    prompt-file write and the end of the run left a mutated prompt with
+    zero trace in edits.jsonl. Now the row is written immediately after
+    each edit — and exactly once."""
+    editor = _mk_editor(tmp_path, auto_commit=True)
+    (tmp_path / ".git").mkdir()
+    editor.prompts_dir = tmp_path / "prompts"
+    _seed_prompt(editor.prompts_dir, "tech_analyst", "# x\n")
+    reflection = _mk_reflection("2026-Q1", [_basic_learning()])
+    log_path = tmp_path / "evolution" / "edits.jsonl"
+
+    seen_rows_at_commit: list[dict] = []
+
+    def _side_effect(cmd, *a, **kw):
+        if "commit" in cmd and log_path.exists():
+            seen_rows_at_commit.extend(
+                json.loads(ln) for ln in log_path.read_text().splitlines()
+            )
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = "deadbeef\n" if "rev-parse" in cmd else ""
+        result.stderr = ""
+        return result
+
+    with patch("subprocess.run", side_effect=_side_effect):
+        report = editor.apply_reflection(reflection)
+
+    assert len(report.applied) == 1
+    # Row existed already when git commit ran ...
+    assert any(r["kind"] == "applied" for r in seen_rows_at_commit)
+    # ... and the end-of-run audit did not duplicate it.
+    rows = [json.loads(ln) for ln in log_path.read_text().splitlines()]
+    applied_rows = [r for r in rows if r["kind"] == "applied"]
+    assert len(applied_rows) == 1
+    assert applied_rows[0]["agent_name"] == "tech_analyst"
+    assert "ts" in applied_rows[0]

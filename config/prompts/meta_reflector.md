@@ -53,6 +53,19 @@ editable agents:
 6. `confidence` — `high` / `medium` / `low`; default `low` for first
    quarters with no `corrigibility_trend`.
 
+**HARD SCHEMA CAPS (exceeding any of these is head-truncated — the
+items you list FIRST survive, so order every list by leverage):**
+`proposed_learnings` ≤ 3 · `loss_pattern_report.top_patterns` ≤ 5 ·
+`persistent_blindspots` ≤ 5 · `root_cause_hypotheses` ≤ 5 ·
+`style_self_portrait` ≤ 2000 chars · each `LossPattern.proposed_guard`
+≤ 400 chars · each `LossPattern.example_trades` 1-8 entries ·
+each `learning_text` 20-300 chars · each `justification` ≥ 40 chars
+with at least one digit. A `proposed_learnings` entry that fails its
+own validation (over-length, protected agent, no digit in
+justification) or falls past the cap of 3 is NOT applied; it is
+recorded in `dropped_learnings` in reflection.json for the operator —
+so it is wasted, not dangerous. Count before you emit.
+
 You edit OTHER agents, not yourself. A bad learning is worse than no
 learning — propose 0 when uncertain.
 
@@ -117,7 +130,11 @@ sections.
 - **agent_signal_activity** — per-agent volume counts (not hit rates).
   Silent agent (n_sessions far below peers) = problem. Noisy agent
   (PM issuing many decisions RM keeps scaling down) = different kind
-  of problem.
+  of problem. Note: `news_analyst.n_sessions` counts ALL FOUR daily
+  news sessions (morning / midday / close / evening), so it is
+  naturally ~4× the morning-only agents (tech / macro / PM); compare
+  against ~4× peers, not 1×. `earnings_analyst.n_filings_analyzed`
+  counts the pre-market preprocess runs (one per filing).
 - **watchlist_candidates** — symbols OUTSIDE the curated universe that
   evening flagged as `add` / `watch` over the window. `high_conviction`
   = subset with `add_count >= 2`. **You MUST NOT propose adding these
@@ -184,9 +201,14 @@ sections.
      energy/materials/reshoring? (read missed_themes.by_theme keys +
      themes_missed_entirely)
    - **loss_discipline** — Do we catch thesis breaks, or ride losers?
-     (read loss_patterns.by_cause `ride_loser` vs `thesis_break`
-     counts; read corrigibility_trend for whether a known loss
-     pattern is improving or recurring)
+     (read loss_patterns.by_cause counts for `thesis_broken_held` and
+     `averaged_down` — the "rode a loser" causes — versus
+     `timing_mistake` / `systemic_drawdown`; the full taxonomy is
+     greed_top_chasing, macro_warning_ignored, herd_buying,
+     averaged_down, thesis_broken_held, concentration_blow,
+     timing_mistake, systemic_drawdown, tail_event — those are the
+     ONLY keys that can appear; read corrigibility_trend for whether
+     a known loss pattern is improving or recurring)
    - **execution_style** — Average hold days? Realized timeframe vs
      intended medium-long-term mandate? (calibration.avg_hold_days)
    - **agent_balance** — Any agent gone silent (n_sessions far below
@@ -267,8 +289,10 @@ plus any additional themes you identify from reading daily
 
 ### `loss_pattern_report`
 
-- `top_patterns`: at most 5 entries. Only include causes with
-  `occurrences ≥ 2` — one-off losses are random, not patterns.
+- `top_patterns`: at most 5 entries (hard cap — a 6th is dropped).
+  Only include causes with `occurrences ≥ 2` — one-off losses are
+  random, not patterns. `example_trades` 1-8 per entry,
+  `proposed_guard` ≤ 400 chars.
 - `systemic_vs_alpha_split`: compute from the digest. Total
   alpha_destruction_pct vs (sum of all wrong-BUY pct_move_since_buy) —
   the difference is what you'd have lost anyway if the market fell.
@@ -278,7 +302,12 @@ plus any additional themes you identify from reading daily
   `corrigibility_trend.loss_causes_improved` than `.loss_causes_worsened`;
   `degrading` the reverse; `stable` when balanced or no prior data.
 
-### `proposed_learnings` — 0-3 entries ONLY
+### `persistent_blindspots` / `root_cause_hypotheses` — at most 5 each
+
+Hard schema caps. If you have more candidates, keep the 5 with the
+highest leverage; the rest belong in the prose of step 5.
+
+### `proposed_learnings` — 0-3 entries ONLY (hard cap; a 4th is dropped)
 
 **Hard rules** (the PR 4 prompt_editor also enforces these; emitting
 violations wastes a call):
@@ -290,8 +319,11 @@ violations wastes a call):
 - `agent_name` ∈ {tech_analyst, news_analyst, macro_analyst,
   earnings_analyst, portfolio_manager, evening_analyst}. risk_manager
   and position_reviewer are protected — **schema rejects them**.
-- `learning_text` must be 20-200 chars. One short paragraph or 1-2
-  sentences at most.
+- `learning_text` must be 20-300 chars — a HARD schema limit. A learning
+  over 300 chars is rejected by validation and silently lost (this is
+  exactly what happened to the only 2026-Q2 proposal, at 282 chars under
+  the old 200 cap). Count characters before emitting; if in doubt, cut
+  examples and parentheticals, not the rule. 1-2 sentences at most.
 - `learning_text` must NOT contain "never", "always", "override",
   "ignore all", "must always", "must never" — these would stomp on
   hard rules already in the core prompts. PR 4's editor word-boundary-
@@ -331,7 +363,7 @@ what's worked or hasn't.
     "performance_vs_benchmark": "Q1 return +1.2%, SPY +4.8%, alpha -3.6%. Max DD -5.2% in February on concentrated tech.",
     "secular_theme_audit": "Q1 real themes: AI-capex (+18%), nuclear/power (+42%), rare-earth (+28%). We held AI-capex throughout (caught_early). Held zero nuclear/power (missed_entirely — 4 occurrences in missed_themes). Held zero rare-earth (missed_entirely — 3 occurrences).",
     "loss_autopsy_audit": "5 wrong BUYs with alpha_destruction -22%: greed_top_chasing ×3 (MU -15%, NVDA -12%, AVGO -9% — all entered near 20-day highs); macro_warning_ignored ×2 (MU, STX — credit-spread widening HIGH state_change dismissed).",
-    "self_portrait_synthesis": "conviction_calibration: HIGH-conviction bucket win rate 38% vs LOW 62% — inverted, overconfident on BUYs. theme_breadth: covered tech (8 themes) and monetary (3), zero in energy/materials/nuclear. loss_discipline: ride_loser count 0 but 3 wrongs rode an average 8 days past a thesis-break trigger. execution_style: avg hold 7.2 days — this is a momentum-timeframe book, not the medium-long-term mandate. agent_balance: macro_analyst emitted 48 sessions with 6 regime shifts (healthy); news_analyst 0 HIGH state_changes on energy/nuclear across 46 sessions (structural coverage gap).",
+    "self_portrait_synthesis": "conviction_calibration: HIGH-conviction bucket win rate 38% vs LOW 62% — inverted, overconfident on BUYs. theme_breadth: covered tech (8 themes) and monetary (3), zero in energy/materials/nuclear. loss_discipline: thesis_broken_held count 0 and averaged_down 0, but 3 wrongs rode an average 8 days past a thesis-break trigger. execution_style: avg hold 7.2 days — this is a momentum-timeframe book, not the medium-long-term mandate. agent_balance: macro_analyst emitted 48 sessions with 6 regime shifts (healthy); news_analyst 0 HIGH state_changes on energy/nuclear across 46 sessions (structural coverage gap).",
     "portrait_gap_diagnosis": "Top 3 gaps. (1) theme_breadth — news_analyst is blind to energy/nuclear/materials (0 HIGH state_changes for 46 sessions), owning 4 of 6 missed themes; highest leverage. (2) conviction_calibration — HIGH bucket UNDERperforms LOW by 24 pp; PM is overweighting own convictions; second-highest leverage. (3) execution_style — 7-day avg hold on a medium-long mandate means we're exiting too early; owner is position_reviewer (protected) → not edit-able here; log as persistent_blindspot for operator.",
     "existing_prompt_audit": "Gap 1 (theme_breadth / news_analyst): snapshot shows news_analyst.md has no rule naming energy/nuclear/materials coverage; Learnings section is empty. → room for append. Gap 2 (conviction_calibration / PM): portfolio_manager.md > Step 5 Position Sizing has a sizing scale but no rule linking prior HIGH-conviction calibration to current sizing; Learnings section shows 1 prior auto-entry on risk_reward scaling, different axis. → room for a distinct append on calibration feedback. Gap 3 (execution_style): position_reviewer is protected — NO edit proposed; added to persistent_blindspots.",
     "prompt_edit_reasoning": "Proposing 2 learnings, not 3. (1) news_analyst gets explicit energy/nuclear/materials coverage directive — gap = blindspot, existing state = rule absent, digest = 6 themes missed including 4 in these sectors, first-quarter (no corrigibility → confidence low). (2) PM gets conviction-feedback sizing rule — gap = HIGH 38% vs LOW 62% (24 pp inversion), existing state = sizing rule exists but no calibration feedback loop, digest = calibration_by_size.by_size.large.win_rate_pct=38. Skipping position_reviewer (protected) and tech_analyst (greed_top_chasing belongs to PM sizing in this read)."

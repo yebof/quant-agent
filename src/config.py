@@ -237,9 +237,15 @@ class EvolutionConfig(BaseModel):
     cap, the oldest auto-added entry (by date-tag, not manual) is
     rolled off before the new one is appended."""
 
-    max_learning_chars: int = 200
+    max_learning_chars: int = 300
     """Upper bound per entry. Schema enforces ≥20 already; this is the
-    ≤200 end. Prevents prompt bloat."""
+    ≤300 end. Prevents prompt bloat. MUST equal
+    PromptLearning.learning_text max_length in src/models.py (and the
+    "20-300 chars" rule in config/prompts/meta_reflector.md) — the editor
+    belt and the schema must agree or a learning the schema accepts gets
+    rejected by the editor (200→300 on 2026-09-06 after the 2026-Q2
+    proposal was silently dropped; default synced 2026-09-22; test in
+    tests/test_config.py pins them together)."""
 
     min_justification_chars: int = 40
     """Schema floor on PromptLearning.justification. Echoed here so a

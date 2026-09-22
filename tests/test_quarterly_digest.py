@@ -612,3 +612,74 @@ def test_insight_aggregators_exclude_out_of_window_rows():
     syms = {c["symbol"] for c in wlc["candidates"]}
     assert "INW" in syms
     assert "OUT" not in syms
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-22 review: news / earnings are logged under per-session names
+# ---------------------------------------------------------------------------
+
+def test_agent_signal_activity_counts_news_under_per_session_log_names():
+    """Production writes `news_analyst_{morning,midday,close,evening}` and
+    `earnings_analyst_preprocess` (pipeline.run_news / earnings
+    preprocess); db.get_recent_agent_outputs is an EXACT match. Counting
+    only the bare legacy names reported both agents silent for the whole
+    quarter — and the meta-reflector prompt treats a silent agent as a
+    prompt-edit trigger. Stub db mirrors the exact-match SQL."""
+    db = MagicMock()
+    db.get_daily_pnl.return_value = []
+    db.get_recent_insights.return_value = []
+
+    rows_by_name = {
+        "news_analyst_morning": [
+            {"timestamp": "2026-03-10 09:35:00",
+             "full_response": json.dumps({
+                 "market_sentiment": "cautiously_bullish",
+                 "state_changes": [{"conviction": "HIGH"}, {"conviction": "low"}],
+             })},
+        ],
+        "news_analyst_midday": [
+            {"timestamp": "2026-03-10 13:05:00",
+             "full_response": json.dumps({"market_sentiment": "neutral-to-bearish",
+                                          "state_changes": []})},
+        ],
+        "news_analyst_close": [
+            {"timestamp": "2026-03-10 15:35:00",
+             "full_response": json.dumps({"market_sentiment": "neutral"})},
+        ],
+        "news_analyst_evening": [
+            {"timestamp": "2026-03-10 20:05:00",
+             "full_response": json.dumps({"market_sentiment": "bullish"})},
+        ],
+        # legacy bare-name row still counts
+        "news_analyst": [
+            {"timestamp": "2026-03-09 09:35:00",
+             "full_response": json.dumps({"market_sentiment": "bearish"})},
+        ],
+        "earnings_analyst_preprocess": [
+            {"timestamp": "2026-03-11 08:10:00",
+             "full_response": json.dumps({
+                 "investment_implications": {"sentiment": "bullish"}})},
+            {"timestamp": "2026-03-12 08:10:00",
+             "full_response": json.dumps({
+                 "investment_implications": {"sentiment": "mixed"}})},
+        ],
+    }
+
+    def _agent_outputs(agent_name, limit, before_date=None):
+        return list(rows_by_name.get(agent_name, []))   # exact match only
+    db.get_recent_agent_outputs.side_effect = _agent_outputs
+
+    digest = build_quarterly_digest(
+        db, market=None, period_end=date(2026, 3, 31), lookback_days=30,
+    )
+    news = digest["agent_signal_activity"]["news_analyst"]
+    assert news["n_sessions"] == 5
+    assert news["n_bullish_sessions"] == 2      # cautiously_bullish + bullish
+    assert news["n_bearish_sessions"] == 2      # neutral-to-bearish + bearish
+    assert news["n_neutral_sessions"] == 1
+    assert news["n_state_changes_total"] == 2
+    assert news["n_high_conviction_state_changes"] == 1
+    earn = digest["agent_signal_activity"]["earnings_analyst"]
+    assert earn["n_filings_analyzed"] == 2
+    assert earn["n_bullish"] == 1
+    assert earn["n_mixed"] == 1

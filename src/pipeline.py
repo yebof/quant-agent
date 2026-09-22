@@ -1,5 +1,7 @@
 import logging
 import math
+import os
+import re
 import uuid
 from datetime import date
 from pathlib import Path
@@ -980,6 +982,59 @@ class TradingPipeline:
                 "reject the SELL on held_for_orders)", label, symbol,
             )
             return None
+        # 2026-09-22 review (CCJ 2026-09-01): the caller's qty comes from a
+        # position snapshot taken at session start. Between that snapshot
+        # and this point a GTC stop can fill — 39 of CCJ's 56 shares had
+        # already stopped out before the 09:30 snapshot and the remaining
+        # 17 stopped out during the 12 minutes of LLM work; the SELL 17 then
+        # OPENED a short (-17) that nothing detected for three weeks. Now
+        # that the stops are cancelled nothing can change the position under
+        # us, so re-read it and clamp: qty > live → clamp; live ≤ 0 → the
+        # position is already gone, do not submit at all.
+        live_qty = self._live_long_qty(symbol)
+        if isinstance(live_qty, bool) or not isinstance(live_qty, (int, float)):
+            live_qty = None  # unknown (lookup failed / fully-mocked seam) → snapshot
+        if live_qty is not None:
+            if live_qty <= 0:
+                logger.warning(
+                    "%s: %s position already flat at the broker (live qty=%s, "
+                    "snapshot had %s) — stop must have filled; NOT submitting "
+                    "the SELL (it would open a short)", label, symbol,
+                    self._format_qty(live_qty),
+                    self._format_qty(position_qty_before_sell),
+                )
+                if wal_row_id is not None:
+                    try:
+                        self.db.delete_pending_protection_restore(wal_row_id)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "WAL: failed to discharge row %d for flat %s: %s",
+                            wal_row_id, symbol, exc,
+                        )
+                return None
+            if live_qty < position_qty_before_sell:
+                logger.warning(
+                    "%s: %s position shrank since snapshot (%s → %s, stop fill?) "
+                    "— clamping order qty %s → %s and re-basing the WAL row",
+                    label, symbol, self._format_qty(position_qty_before_sell),
+                    self._format_qty(live_qty), self._format_qty(qty),
+                    self._format_qty(min(qty, live_qty)),
+                )
+                qty = min(qty, live_qty)
+                position_qty_before_sell = live_qty
+                if wal_row_id is not None:
+                    try:
+                        self.db.update_pending_protection_restore(
+                            wal_row_id, position_qty_before_sell=live_qty,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "WAL: failed to re-base row %d qty for %s: %s "
+                            "(finalize may over-reprotect)", wal_row_id,
+                            symbol, exc,
+                        )
+            elif qty > live_qty:
+                qty = live_qty
         try:
             order = self.broker.submit_order(
                 symbol=symbol, qty=qty, side="sell",
@@ -1845,6 +1900,23 @@ class TradingPipeline:
             )
             return False
 
+    def _live_long_qty(self, symbol: str) -> float | None:
+        """Current broker qty for `symbol` via the single-position endpoint
+        (0.0 = Alpaca says not held), or None when the lookup failed /
+        returned something non-numeric — callers then fall back to the
+        snapshot (no worse than before the 2026-09-22 clamp)."""
+        try:
+            qty = self.broker.get_position_qty(symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "live position re-read failed for %s: %s — using snapshot qty",
+                symbol, exc,
+            )
+            return None
+        if isinstance(qty, bool) or not isinstance(qty, (int, float)):
+            return None
+        return float(qty)
+
     @staticmethod
     def _order_accepted(order: dict, symbol: str, side: str) -> bool:
         """Returns True iff the order payload looks like a live broker order.
@@ -1948,12 +2020,37 @@ class TradingPipeline:
                 clamped.append(d)
         return clamped
 
-    def _is_trading_day(self) -> bool:
+    def _is_trading_day(self) -> bool | None:
+        """True / False from the exchange calendar, **None when the calendar
+        could not be queried**. 2026-09-22 review: a failed lookup used to
+        read as "market holiday" — the session exited 0, the wrapper wrote
+        its last-run marker and nothing retried for the rest of the day
+        (midday 2026-09-11 was lost to one Alpaca 500). Session gates now
+        return a retryable `broker_error` on None so the next 30-min tick
+        tries again inside the same window."""
         try:
             return self.broker.is_trading_day()
         except Exception as exc:
-            logger.warning("Trading-day check failed; assuming market closed: %s", exc)
-            return False
+            logger.warning("Trading-day check raised; reporting UNKNOWN: %s", exc)
+            return None
+
+    @staticmethod
+    def _calendar_unavailable_result(run_id: str, session: str, **extra) -> dict:
+        """Retryable result for a session whose trading-day gate could not
+        be decided. `broker_error` is in main.py's retryable set → exit 1 →
+        the OS-timer wrapper does NOT write the last-run marker → the next
+        tick re-runs the session (as long as the ET window is still open)."""
+        logger.error(
+            "%s: trading calendar unavailable after retries — returning "
+            "broker_error so the next tick retries instead of assuming a "
+            "market holiday", session,
+        )
+        return {
+            "status": "broker_error",
+            "error": "trading calendar unavailable (Alpaca calendar query failed after retries)",
+            "run_id": run_id,
+            **extra,
+        }
 
     def _reconcile_fills(self, ctx: RunContext | None = None) -> None:
         """Update trade rows' fill_status by asking the broker for terminal info.
@@ -2804,6 +2901,42 @@ class TradingPipeline:
         out.sort(key=lambda r: r["sell_date"], reverse=True)
         return out[:10]
 
+    @staticmethod
+    def _backfill_market_relative(buy_grades: list, recent_buys: list) -> list:
+        """Fill `BuyGrade.market_relative_move_pct` (when the LLM left it
+        None) from the Python-computed `recent_buys` rows. Key = (symbol,
+        buy_date); falls back to symbol-only when the LLM reformatted the
+        date. Pure — returns a new list of (possibly copied) grades."""
+        by_key: dict = {}
+        by_sym: dict = {}
+        for r in recent_buys or []:
+            if not isinstance(r, dict):
+                continue
+            rel = r.get("market_relative_move_pct")
+            if rel is None:
+                continue
+            sym = (r.get("symbol") or "").upper()
+            by_key[(sym, str(r.get("buy_date") or ""))] = rel
+            by_sym.setdefault(sym, rel)
+        out = []
+        filled = 0
+        for g in buy_grades or []:
+            if getattr(g, "market_relative_move_pct", None) is not None:
+                out.append(g)
+                continue
+            sym = (getattr(g, "symbol", "") or "").upper()
+            rel = by_key.get((sym, str(getattr(g, "buy_date", "") or "")))
+            if rel is None:
+                rel = by_sym.get(sym)
+            if rel is None:
+                out.append(g)
+                continue
+            out.append(g.model_copy(update={"market_relative_move_pct": rel}))
+            filled += 1
+        if filled:
+            logger.info("market_relative back-fill: %d buy grade(s) filled", filled)
+        return out
+
     def _build_recent_buys_for_grading(
         self, lookback_days: int = 5,
         symbols_bars: dict | None = None,
@@ -2818,9 +2951,10 @@ class TradingPipeline:
         Also injects `market_relative_move_pct` per BUY = (our move) −
         (SPY move over same dates). The evening analyst reads this to
         decide whether a losing BUY was alpha-destruction (we
-        under-performed the tape, positive number) vs systemic drawdown
-        (market also fell, ~0 or negative number). Fetched once upfront
-        so we don't round-trip SPY bars per BUY.
+        under-performed the tape → NEGATIVE number, e.g. -6.0 = we lagged
+        SPY by 6 pp) vs systemic drawdown (market fell with us → ~0).
+        Sign: `market_relative = pct_move_since_buy − spy_pct_move`.
+        Fetched once upfront so we don't round-trip SPY bars per BUY.
         """
         try:
             all_rows = self.db.get_trades(limit=200, executed_only=True)
@@ -5228,6 +5362,96 @@ class TradingPipeline:
         )
         return orders
 
+    def _cover_unintended_shorts(self, ctx: RunContext) -> list[dict]:
+        """Session-entry guard: buy-to-cover any position with qty < 0.
+
+        This is a long-only book (inverse ETFs are the only hedge); a
+        negative qty is ALWAYS a bug, never a decision. 2026-09-22 review:
+        CCJ had been short -17 shares since 2026-09-01 — a SELL submitted
+        from a stale snapshot after the GTC stop had already flattened the
+        lot — and nothing in the system detected or closed it for three
+        weeks (the evening analyst kept asking to "cover the residual CCJ
+        short" into the void). `_submit_protected_sell` now clamps to the
+        live qty so this cannot recur; this guard closes anything that
+        still slips through (or pre-dates the fix). Limit 1% above market —
+        fill certainty over price, as in `_force_delever`. Runs BEFORE any
+        LLM stage; refreshes ctx on completion. Action `COVER_SHORT` keeps
+        the row out of BUY-lot calibration and SELL grading.
+        """
+        shorts = [p for p in ctx.positions if p.qty < 0]
+        if not shorts:
+            return []
+        orders: list[dict] = []
+        for p in shorts:
+            qty = abs(float(p.qty))
+            if not p.current_price or p.current_price <= 0:
+                logger.error(
+                    "COVER_SHORT: %s qty=%s has no price — cannot size a cover; "
+                    "close it manually", p.symbol, self._format_qty(p.qty),
+                )
+                continue
+            limit = round(p.current_price * 1.01, 2)
+            logger.error(
+                "UNINTENDED SHORT detected: %s qty=%s @ avg %.2f — buying to "
+                "cover %s @ limit $%.2f (long-only book; a short is always a bug)",
+                p.symbol, self._format_qty(p.qty), p.avg_entry,
+                self._format_qty(qty), limit,
+            )
+            try:
+                # A resting entry BUY for the same symbol would ALSO cover —
+                # cancel it first so we don't end up long by accident.
+                self.broker.cancel_open_entry_orders(symbol=p.symbol)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("COVER_SHORT: entry-order cancel failed for %s: %s",
+                               p.symbol, exc)
+            try:
+                order = self.broker.submit_order(
+                    symbol=p.symbol, qty=qty, side="buy",
+                    limit_price=limit, reference_price=p.current_price,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("COVER_SHORT: submit failed for %s: %s", p.symbol, exc)
+                continue
+            if not self._order_accepted(order, p.symbol, "buy"):
+                continue
+            if isinstance(order, dict):
+                order.setdefault("action", "COVER_SHORT")
+            orders.append(order)
+            try:
+                self.db.insert_trade(
+                    symbol=p.symbol, action="COVER_SHORT", qty=qty,
+                    price=p.current_price,
+                    reasoning=(
+                        f"session-entry guard: unintended short qty="
+                        f"{self._format_qty(p.qty)} (avg {p.avg_entry:.2f}) "
+                        f"buy-to-cover; long-only book"
+                    ),
+                    run_id=ctx.run_id, broker_order_id=order.get("id"),
+                    fill_status="submitted",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("COVER_SHORT: insert_trade failed for %s: %s",
+                             p.symbol, exc)
+            try:
+                self.broker.wait_for_order_terminal(order.get("id"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("COVER_SHORT: wait failed for %s: %s", p.symbol, exc)
+        if orders:
+            try:
+                account = self.broker.get_account()
+                ctx.positions = self.broker.get_positions()
+                ctx.cash = account["cash"]
+                ctx.total_value = account["portfolio_value"]
+                ctx.last_equity = account.get("last_equity", ctx.total_value)
+                still = [p.symbol for p in ctx.positions if p.qty < 0]
+                logger.warning(
+                    "COVER_SHORT complete: %d order(s); post-refresh cash=$%.2f; "
+                    "remaining shorts=%s", len(orders), ctx.cash, still or "none",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("COVER_SHORT: broker refresh failed: %s", exc)
+        return orders
+
     def _force_delever(self, ctx: RunContext) -> list[dict]:
         """Safety net for `allow_margin=False` accounts.
 
@@ -5435,7 +5659,10 @@ class TradingPipeline:
         run_id = ctx.run_id
         logger.info("=== Morning run started: %s ===", run_id)
 
-        if not self._is_trading_day():
+        _td = self._is_trading_day()
+        if _td is None:
+            return self._calendar_unavailable_result(run_id, "Morning", orders=[])
+        if not _td:
             logger.info("Morning run skipped: market closed for non-trading day")
             return {"status": "market_holiday", "orders": [], "run_id": run_id}
 
@@ -5484,6 +5711,8 @@ class TradingPipeline:
             # this session. Refreshes ctx.cash / positions on completion, so
             # every stage below runs on clean truth.
             self._force_delever(ctx)
+            # 1b. Long-only invariant — buy-to-cover any qty<0 (always a bug).
+            self._cover_unintended_shorts(ctx)
             positions = ctx.positions
             cash = ctx.cash
             total_value = ctx.total_value
@@ -5857,7 +6086,12 @@ class TradingPipeline:
         run_id = ctx.run_id
         logger.info("=== %s check: %s ===", session_type.capitalize(), run_id)
 
-        if not self._is_trading_day():
+        _td = self._is_trading_day()
+        if _td is None:
+            return self._calendar_unavailable_result(
+                run_id, session_type.capitalize(), positions=0, orders=[],
+            )
+        if not _td:
             logger.info("%s run skipped: market closed for non-trading day", session_type)
             return {"status": "market_holiday", "positions": 0, "orders": [], "run_id": run_id}
 
@@ -5923,6 +6157,8 @@ class TradingPipeline:
         # 1a. Cash-only safety net — force-sell if the account drifted into
         # margin. Refreshes ctx fields on completion.
         forced_orders = self._force_delever(ctx)
+        # 1b. Long-only invariant — buy-to-cover any qty<0 (always a bug).
+        forced_orders = list(forced_orders) + self._cover_unintended_shorts(ctx)
         if forced_orders:
             # Reconcile immediately so the FORCE_DELEVER rows flip from
             # fill_status='submitted' to 'filled' before the reviewer's
@@ -6205,7 +6441,10 @@ class TradingPipeline:
         run_id = ctx.run_id
         logger.info("=== Earnings preprocessing: %s ===", run_id)
 
-        if not self._is_trading_day():
+        _td = self._is_trading_day()
+        if _td is None:
+            return self._calendar_unavailable_result(run_id, "Earnings preprocess")
+        if not _td:
             logger.info("Earnings preprocess skipped: market closed for non-trading day")
             return {"status": "market_holiday", "run_id": run_id}
 
@@ -6246,8 +6485,8 @@ class TradingPipeline:
             for r in new_reports:
                 try:
                     self.earnings_provider.record_failure(r)
-                except Exception as re:
-                    logger.error("record_failure failed for %s: %s", r.symbol, re)
+                except Exception as rf_exc:  # noqa: BLE001
+                    logger.error("record_failure failed for %s: %s", r.symbol, rf_exc)
             return {"status": "analysis_error", "run_id": run_id, "error": str(e)}
 
         # Match results to reports by (symbol, form_type, filing_date), not
@@ -6271,8 +6510,8 @@ class TradingPipeline:
         for report in failed_reports:
             try:
                 self.earnings_provider.record_failure(report)
-            except Exception as re:
-                logger.error("record_failure failed for %s: %s", report.symbol, re)
+            except Exception as rf_exc:  # noqa: BLE001
+                logger.error("record_failure failed for %s: %s", report.symbol, rf_exc)
 
         # Log each LLM call (parity with the inline bg-thread path).
         analyzed_count = 0
@@ -6341,7 +6580,10 @@ class TradingPipeline:
         run_id = ctx.run_id
         logger.info("=== Intra-session risk check: %s ===", run_id)
 
-        if not self._is_trading_day():
+        _td = self._is_trading_day()
+        if _td is None:
+            return self._calendar_unavailable_result(run_id, "Intra check")
+        if not _td:
             logger.info("Intra check skipped: market closed for non-trading day")
             return {"status": "market_holiday", "run_id": run_id}
 
@@ -6471,7 +6713,10 @@ class TradingPipeline:
         run_id = ctx.run_id
         logger.info("=== Evening report: %s ===", run_id)
 
-        if not self._is_trading_day():
+        _td = self._is_trading_day()
+        if _td is None:
+            return self._calendar_unavailable_result(run_id, "Evening", analysis=None)
+        if not _td:
             logger.info("Evening run skipped: market closed for non-trading day")
             return {"status": "market_holiday", "analysis": None, "run_id": run_id}
 
@@ -6741,6 +6986,18 @@ class TradingPipeline:
         # failed (analysis is None), still record the P&L number so the
         # audit trail is complete — just with empty insights fields.
         if analysis:
+            # 2026-09-22 review: `market_relative_move_pct` is computed in
+            # Python (recent_buys) and rendered into the prompt, but the LLM
+            # was never asked to echo it back, so 309/309 persisted buy
+            # grades carried None and the quarterly digest's
+            # alpha_destruction_pct was always null. Back-fill from the
+            # Python value by (symbol, buy_date), symbol-only as fallback.
+            try:
+                analysis.buy_grades = self._backfill_market_relative(
+                    analysis.buy_grades, recent_buys,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("market_relative back-fill failed: %s", exc)
             self.db.save_evening_snapshot(
                 date=today_str,
                 total_value=total_value, daily_pnl=daily_pnl,
@@ -6925,24 +7182,77 @@ class TradingPipeline:
         Returns None when not quarter-end, a result dict otherwise.
         """
         try:
-            from src.trading_calendar import et_today
+            from src.trading_calendar import et_today, quarter_label
             today = et_today()
-            try:
-                is_last = self.broker.is_last_trading_day_of_quarter(on_date=today)
-            except Exception as e:
-                logger.warning("Evening: meta quarter-end check failed: %s", e)
+            is_last, calendar_fallback = self._quarter_end_gate(today)
+            if is_last is None:
+                # Not a quarter-end month at all — nothing to decide, and the
+                # weekday heuristic already said no. Stay silent (normal day).
                 return None
             if not is_last:
+                if calendar_fallback:
+                    # The calendar could not be queried and the weekday
+                    # heuristic says "not quarter end". Almost certainly a
+                    # normal day, but say so rather than looking like one.
+                    return {
+                        "status": "skipped",
+                        "reason": "quarter_end_check_failed",
+                        "period": quarter_label(today),
+                        "calendar_fallback": True,
+                    }
                 return None
             logger.info(
-                "Evening: today is last trading day of quarter %d-Q%d — "
-                "running auto meta-reflection",
-                today.year, (today.month - 1) // 3 + 1,
+                "Evening: today is last trading day of quarter %s — "
+                "running auto meta-reflection%s",
+                quarter_label(today),
+                " (decided by weekday fallback — Alpaca calendar failed)"
+                if calendar_fallback else "",
             )
-            return self.run_quarterly_meta_reflection(force=False)
+            result = self.run_quarterly_meta_reflection(force=True)
+            if isinstance(result, dict):
+                result["calendar_fallback"] = calendar_fallback
+            return result
         except Exception as e:
             logger.exception("Evening: meta-reflection piggyback failed: %s", e)
             return {"status": "auto_meta_error", "error": str(e)}
+
+    def _quarter_end_gate(self, today) -> tuple[bool | None, bool]:
+        """Decide "is today the last trading day of the quarter?" with a
+        fallback. Returns ``(is_last, calendar_fallback)``:
+
+        - ``(True/False, False)`` — the Alpaca calendar answered.
+        - ``(True/False, True)``  — the calendar query failed after retries
+          (broker returned None / raised) and the answer comes from the
+          cheap weekday heuristic `is_last_business_day_of_quarter`.
+        - ``(None, True)``        — calendar failed AND today is not even in
+          a quarter-end month (heuristic short-circuits) → treat as a
+          normal day.
+
+        2026-09-22 review: the broker used to collapse "query failed" into
+        False, so one Alpaca hiccup at 20:00 ET on quarter-end day silently
+        skipped the once-a-quarter LIVE-APPLY meta run with no line in the
+        evening push and no retry. The heuristic is right on every quarter
+        end that falls on a weekday (2026-09-30 is a Wednesday); it only
+        differs from the calendar when the last weekday is a holiday.
+        """
+        from src.trading_calendar import (
+            _QUARTER_END_MONTHS, is_last_business_day_of_quarter,
+        )
+        try:
+            is_last = self.broker.is_last_trading_day_of_quarter(on_date=today)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("quarter-end check raised: %s", e)
+            is_last = None
+        if is_last is not None:
+            return bool(is_last), False
+        if today.month not in _QUARTER_END_MONTHS:
+            return None, True
+        heuristic = bool(is_last_business_day_of_quarter(today))
+        logger.warning(
+            "quarter-end check: Alpaca calendar unavailable — falling back to "
+            "the weekday heuristic for %s → is_last=%s", today, heuristic,
+        )
+        return heuristic, True
 
     def run_quarterly_meta_reflection(
         self,
@@ -6975,23 +7285,51 @@ class TradingPipeline:
             persist_reflection,
         )
 
+        from src.trading_calendar import quarter_label
+
         today = period_end or et_today()
+        calendar_fallback = False
         if not force:
-            try:
-                is_last = self.broker.is_last_trading_day_of_quarter(on_date=today)
-            except Exception as exc:
-                logger.warning(
-                    "meta reflection skipped: quarter-end check failed (%s); "
-                    "pass --force to override", exc,
-                )
-                return {"status": "skipped", "reason": "quarter_end_check_failed"}
-            if not is_last:
+            is_last, calendar_fallback = self._quarter_end_gate(today)
+            if is_last is None or not is_last:
+                if calendar_fallback:
+                    logger.warning(
+                        "meta reflection skipped: quarter-end check failed "
+                        "(Alpaca calendar unavailable) and the weekday "
+                        "heuristic says %s is not quarter end; pass --force "
+                        "/ --period-end to override", today,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": "quarter_end_check_failed",
+                        "period": quarter_label(today),
+                        "calendar_fallback": True,
+                    }
                 logger.info(
                     "meta reflection skipped: %s is not the last trading "
                     "day of the quarter. Pass --force to run anyway.",
                     today,
                 )
-                return {"status": "skipped", "reason": "not_quarter_end"}
+                return {
+                    "status": "skipped", "reason": "not_quarter_end",
+                    "period": quarter_label(today),
+                }
+
+        # 2026-09-22 review: apply-from-file lane. The editor honoured
+        # EVOLUTION_APPLY_SAVED, but this method did not — a `--mode meta
+        # --force` apply run still made a fresh LLM call and persisted it
+        # OVER the reviewed reflection.json before the editor loaded that
+        # very file, so the editor's cross-check against proposed_edits.json
+        # mismatched and (correctly) applied nothing. The documented
+        # stage → review → apply lane could therefore never succeed. When
+        # the env is set, skip the digest + LLM entirely and hand the SAVED
+        # reflection to the editor; nothing on disk is regenerated.
+        saved_flag = os.getenv("EVOLUTION_APPLY_SAVED", "").strip()
+        if saved_flag and saved_flag != "0":
+            return self._apply_saved_reflection(
+                saved_flag=saved_flag, today=today,
+                evolution_root=evolution_root, prompts_dir=prompts_dir,
+            )
 
         logger.info("=== Quarterly meta-reflection: %s ===", today)
 
@@ -7047,7 +7385,10 @@ class TradingPipeline:
                         if reflection else "parse_error"
                     ),
                     full_response=ev_result.raw_text,
-                    model=self.config.llm.meta_reflector_model,
+                    # The model that actually answered (a failover-served
+                    # reflection is Anthropic, not the configured OpenAI one).
+                    model=getattr(ev_result, "model", None)
+                    or self.config.llm.meta_reflector_model,
                     tokens_used=ev_result.tokens_used,
                     input_tokens=ev_result.input_tokens,
                     output_tokens=ev_result.output_tokens,
@@ -7065,6 +7406,7 @@ class TradingPipeline:
                 "digest_path": str(digest_path),
                 "reflection_path": None,
                 "reflection": None,
+                "calendar_fallback": calendar_fallback,
             }
 
         reflection_path = persist_reflection(reflection, root_dir=evolution_root)
@@ -7078,7 +7420,40 @@ class TradingPipeline:
         # reflection.json contents by hand), we return without touching any
         # prompt file. The editor itself short-circuits to a full-rejection
         # report; we still persist the attempt log for audit continuity.
-        editor_report: dict | None = None
+        editor_report = self._run_prompt_editor(
+            reflection, evolution_root=evolution_root, prompts_dir=prompts_dir,
+        )
+
+        dropped = list(getattr(reflection, "dropped_learnings", None) or [])
+        if dropped:
+            logger.warning(
+                "Meta-reflection %s: %d proposed learning(s) were dropped "
+                "before the editor (schema) — see reflection.json "
+                "dropped_learnings", digest["period"], len(dropped),
+            )
+        return {
+            "status": "reflected",
+            "period": digest["period"],
+            "digest_path": str(digest_path),
+            "reflection_path": str(reflection_path),
+            "reflection": reflection.model_dump(),
+            "proposed_learnings_count": len(reflection.proposed_learnings),
+            "dropped_learnings_count": len(dropped),
+            "editor_report": editor_report,
+            "calendar_fallback": calendar_fallback,
+        }
+
+    def _run_prompt_editor(
+        self,
+        reflection,
+        *,
+        evolution_root: str | Path,
+        prompts_dir: str | Path | None,
+    ) -> dict | None:
+        """Instantiate PromptEditor from config.evolution and apply one
+        reflection. Returns ApplicationReport.to_dict() or None when the
+        editor itself crashed (logged). Shared by the fresh-LLM lane and the
+        apply-saved lane so both honour the same effective mode / guards."""
         try:
             from src.config import EvolutionConfig
             evolution_cfg = getattr(self.config, "evolution", None)
@@ -7100,7 +7475,6 @@ class TradingPipeline:
                 evolution_dir=evolution_root,
             )
             result_obj = editor.apply_reflection(reflection)
-            editor_report = result_obj.to_dict()
             if result_obj.applied:
                 logger.info(
                     "Prompt editor applied %d learning(s) across %d agent(s); "
@@ -7117,17 +7491,68 @@ class TradingPipeline:
                     "First reason: %s",
                     len(result_obj.rejected), result_obj.rejected[0].reason,
                 )
+            return result_obj.to_dict()
         except Exception as exc:
             logger.error("Prompt editor invocation failed: %s", exc, exc_info=True)
+            return None
 
+    def _apply_saved_reflection(
+        self,
+        *,
+        saved_flag: str,
+        today,
+        evolution_root: str | Path,
+        prompts_dir: str | Path | None,
+    ) -> dict:
+        """EVOLUTION_APPLY_SAVED lane: apply the persisted (= human-reviewed)
+        `data/evolution/{period}/reflection.json` WITHOUT regenerating the
+        digest or calling the LLM. `1`/`true`/`yes` → period of `today`
+        (or --period-end); any other value → explicit period label.
+        Fail-safe: a missing/invalid saved file applies nothing."""
+        from src.evolution.prompt_editor import load_saved_reflection
+        from src.trading_calendar import quarter_label
+
+        period = (
+            quarter_label(today)
+            if saved_flag.lower() in ("1", "true", "yes")
+            else saved_flag
+        )
+        logger.warning(
+            "=== Quarterly meta-reflection APPLY-SAVED lane: period=%s "
+            "(EVOLUTION_APPLY_SAVED=%s) — no digest, no LLM call; applying "
+            "the reviewed reflection.json as-is ===", period, saved_flag,
+        )
+        saved = load_saved_reflection(period, evolution_dir=evolution_root)
+        if saved is None:
+            return {
+                "status": "skipped",
+                "reason": "saved_reflection_missing_or_invalid",
+                "period": period,
+                "error": (
+                    f"EVOLUTION_APPLY_SAVED={saved_flag}: no valid "
+                    f"{Path(evolution_root) / period / 'reflection.json'} "
+                    "— nothing applied (fail-safe)"
+                ),
+            }
+        # The editor re-reads the same file under the same env (its own
+        # apply-saved branch + proposed_edits.json cross-check); since we
+        # did not touch the file, the cross-check now matches the reviewed
+        # content. Pass the explicit period so `=1` resolves identically.
+        os.environ["EVOLUTION_APPLY_SAVED"] = period
+        editor_report = self._run_prompt_editor(
+            saved, evolution_root=evolution_root, prompts_dir=prompts_dir,
+        )
+        dropped = list(getattr(saved, "dropped_learnings", None) or [])
         return {
-            "status": "reflected",
-            "period": digest["period"],
-            "digest_path": str(digest_path),
-            "reflection_path": str(reflection_path),
-            "reflection": reflection.model_dump(),
-            "proposed_learnings_count": len(reflection.proposed_learnings),
+            "status": "applied_saved",
+            "period": period,
+            "digest_path": str(Path(evolution_root) / period / "digest.json"),
+            "reflection_path": str(Path(evolution_root) / period / "reflection.json"),
+            "reflection": saved.model_dump(),
+            "proposed_learnings_count": len(saved.proposed_learnings),
+            "dropped_learnings_count": len(dropped),
             "editor_report": editor_report,
+            "calendar_fallback": False,
         }
 
     def run_daily(self) -> dict:

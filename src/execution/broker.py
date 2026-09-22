@@ -16,6 +16,13 @@ from src.models import Position, _ALLOWED_SECTORS, _SECTOR_ALIASES
 
 logger = logging.getLogger(__name__)
 
+# Calendar-lookup retry (2026-09-22 review). alpaca-py only retries 429/504;
+# a 500 / connection error / 30s timeout surfaces immediately. 3 attempts
+# with 2s → 4s backoff (~6s worst case) ride out a blip; tests set the base
+# to 0.
+_CALENDAR_RETRY_ATTEMPTS = 3
+_CALENDAR_RETRY_BASE_S = 2.0
+
 # Index ETFs that have no single sector — bucket them as "Broad".
 _INDEX_ETFS = {"SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "IVV"}
 
@@ -314,7 +321,77 @@ class AlpacaBroker:
             ))
         return positions
 
-    def is_trading_day(self, on_date: date | None = None) -> bool:
+    def _get_calendar_with_retry(
+        self, start: date, end: date, *, attempts: int = _CALENDAR_RETRY_ATTEMPTS,
+    ):
+        """One Alpaca calendar query with a short in-process retry.
+
+        2026-09-22 review: alpaca-py itself only retries 429/504; a 500,
+        a connection error or the 30s HTTP timeout came straight back as
+        an exception, and both calendar helpers below turned that into
+        "market closed" — on 2026-09-11 a single 500 at the 13:00 ET tick
+        cancelled midday for the day. Three quick attempts (2s / 4s) ride
+        out a blip; a sustained outage still raises to the caller, which
+        now reports it as UNKNOWN (None) instead of False.
+        """
+        import time as _time
+        from alpaca.trading.requests import GetCalendarRequest
+        last_exc: Exception | None = None
+        for i in range(max(1, attempts)):
+            try:
+                return self.client.get_calendar(
+                    GetCalendarRequest(start=start, end=end)
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if i < attempts - 1:
+                    delay = _CALENDAR_RETRY_BASE_S * (2 ** i)
+                    logger.warning(
+                        "calendar query %s→%s failed (attempt %d/%d): %s — "
+                        "retrying in %.0fs", start, end, i + 1, attempts, exc, delay,
+                    )
+                    _time.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
+
+    def get_position_qty(self, symbol: str) -> float | None:
+        """Live signed qty for ONE symbol via Alpaca's single-position
+        endpoint. 0.0 when Alpaca says the position does not exist (404),
+        None on any other failure (caller falls back to its snapshot).
+
+        2026-09-22 review (CCJ): used by `_submit_protected_sell` after the
+        protective stops are cancelled — the only moment the position
+        cannot change underneath us — to clamp the SELL qty to what is
+        actually held. The 404-vs-error distinction matters: only a
+        positive "does not exist" may be read as flat; a transport error
+        must not turn a real position into a skipped SELL.
+        """
+        try:
+            pos = self.client.get_open_position(symbol)
+            return float(pos.qty)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            status = getattr(exc, "status_code", None)
+            if status == 404 or "position does not exist" in msg or "not found" in msg:
+                return 0.0
+            logger.warning(
+                "get_position_qty(%s) failed: %s — caller will use its snapshot",
+                symbol, exc,
+            )
+            return None
+
+    def is_trading_day(self, on_date: date | None = None) -> bool | None:
+        """True/False from the exchange calendar; **None when the calendar
+        could not be queried** (transient Alpaca failure after retries).
+
+        2026-09-22 review: this used to return False on failure, which every
+        session gate read as "market holiday" — exit 0, last-run marker
+        written, no retry for the rest of the day (midday 2026-09-11 was lost
+        exactly this way, and the same gate would have silently cancelled the
+        one-shot 2026-09-30 evening + meta-reflection run). None lets the
+        pipeline return a retryable `broker_error` instead. Callers that only
+        do `if not broker.is_trading_day()` still treat None as closed (safe).
+        """
         from src.util.time import et_today
         target_date = on_date or et_today()  # ET trading-day, not host-local
         # Per-date result cache. is_trading_day is hit on every session
@@ -327,27 +404,28 @@ class AlpacaBroker:
         if cached is not None:
             return cached
         try:
-            from alpaca.trading.requests import GetCalendarRequest
-
-            calendar = self.client.get_calendar(
-                GetCalendarRequest(start=target_date, end=target_date)
-            )
+            calendar = self._get_calendar_with_retry(target_date, target_date)
             result = bool(calendar)
         except Exception as exc:
             logger.warning(
-                "Failed to confirm trading calendar for %s; assuming market closed: %s",
+                "Failed to confirm trading calendar for %s after retries; "
+                "reporting UNKNOWN (caller should retry, not assume closed): %s",
                 target_date, exc,
             )
-            # Do NOT cache a failed lookup — caller's session is already
-            # aborted (we returned False) but a transient API hiccup
+            # Do NOT cache a failed lookup — a transient API hiccup
             # shouldn't poison the cache for the rest of the day.
-            return False
+            return None
         self._trading_day_cache[target_date] = result
         return result
 
-    def is_last_trading_day_of_quarter(self, on_date: date | None = None) -> bool:
+    def is_last_trading_day_of_quarter(self, on_date: date | None = None) -> bool | None:
         """True when `on_date` (default today-ET) is the last OPEN session
         of the current quarter — respects holidays and early closes.
+        **None when the calendar could not be queried** (2026-09-22 review:
+        a False here used to be indistinguishable from "not quarter end",
+        so one Alpaca hiccup at 20:00 ET on quarter-end day silently
+        skipped the once-a-quarter meta-reflection; the pipeline now falls
+        back to the weekday heuristic on None).
 
         Uses Alpaca's calendar. For Mar/Jun/Sep/Dec only (other months
         short-circuit to False, saving the API call). Queries the
@@ -371,16 +449,13 @@ class AlpacaBroker:
             next_month_start = _date(target.year, target.month + 1, 1)
         month_end = next_month_start - _td(days=1)
         try:
-            from alpaca.trading.requests import GetCalendarRequest
-            calendar = self.client.get_calendar(
-                GetCalendarRequest(start=target, end=month_end)
-            ) or []
+            calendar = self._get_calendar_with_retry(target, month_end) or []
         except Exception as exc:
             logger.warning(
-                "is_last_trading_day_of_quarter: calendar query failed (%s → %s): %s",
-                target, month_end, exc,
+                "is_last_trading_day_of_quarter: calendar query failed after "
+                "retries (%s → %s): %s — reporting UNKNOWN", target, month_end, exc,
             )
-            return False
+            return None
         if not calendar:
             return False
         # Alpaca returns one entry per trading day in [start, end]. We are the

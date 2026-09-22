@@ -537,3 +537,20 @@ storage:
     cfg = load_config(config_file)
     assert cfg.api_keys.deepseek == "deepseek-key"
     assert cfg.llm.tech_analyst_model == "deepseek-v4-flash"
+
+
+def test_evolution_max_learning_chars_default_matches_schema_cap():
+    """2026-09-22 review: the schema cap (PromptLearning.learning_text
+    max_length) was raised 200→300 on 2026-09-06 but EvolutionConfig's
+    default stayed 200 — a learning the schema accepted would have been
+    rejected by the editor belt under default config. Pin the two
+    together so the drift cannot recur (settings.yaml is the third copy)."""
+    from src.config import EvolutionConfig
+    from src.models import PromptLearning
+
+    schema_cap = None
+    for meta in PromptLearning.model_fields["learning_text"].metadata:
+        if getattr(meta, "max_length", None) is not None:
+            schema_cap = meta.max_length
+    assert schema_cap == 300
+    assert EvolutionConfig().max_learning_chars == schema_cap
