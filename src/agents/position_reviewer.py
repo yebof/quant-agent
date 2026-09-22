@@ -461,6 +461,8 @@ class PositionReviewerAgent(BaseAgent):
 
         # Account + cash.
         cash_pct = f"{cash_balance / total_value * 100:.1f}%" if total_value else "N/A"
+        _cb = (kwargs.get("core_beta_note") or "").strip()
+        core_beta_line = f"\n- {_cb}" if _cb else ""
 
         # Margin mandate (carried over from v2 — sub-dollar threshold).
         allow_margin: bool = bool(kwargs.get("allow_margin", True))
@@ -531,7 +533,7 @@ class PositionReviewerAgent(BaseAgent):
 
 ### Account
 - Total Value: ${total_value:,.2f}
-- Cash: ${cash_balance:,.2f} ({cash_pct})
+- Cash: ${cash_balance:,.2f} ({cash_pct}){core_beta_line}
 
 ### Open Positions
 {positions_text}
@@ -576,11 +578,13 @@ schema."""
                yesterday_insights: dict | None = None,
                recent_performance: dict | None = None,
                already_trimmed_today: set[str] | None = None,
-               allow_margin: bool = True) -> tuple[PositionReview | None, "AgentResult"]:
+               allow_margin: bool = True,
+               core_beta_note: str = "") -> tuple[PositionReview | None, "AgentResult"]:
         result = self.run(
             positions=positions,
             macro_summary=macro_summary,
             cash_balance=cash_balance,
+            core_beta_note=core_beta_note,
             total_value=total_value,
             session_type=session_type,
             position_facts=position_facts or {},

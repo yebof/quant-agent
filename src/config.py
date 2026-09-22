@@ -162,6 +162,44 @@ class CashSweepConfig(BaseModel):
         return v
 
 
+class CoreBetaConfig(BaseModel):
+    """Regime-conditional core beta sleeve (see src/execution/core_beta.py).
+
+    Fills `fraction(regime) × (deployment_target − single_name_pct)` with an
+    index ETF, rule-managed at the session bookends, hidden from LLM views
+    and credited as fundable cash (like the T-bill sweep), sold first to fund
+    single-name BUYs. 2026-09-23: the book averaged 58% cash through a +15%
+    SPY tape at beta 0.30; parking that cash in SPY would have added +7.6pp.
+    """
+    enabled: bool = False
+    symbol: str = "SPY"
+    """Broad-index ETF. Must NOT be a leveraged/inverse product."""
+    target_deployment_pct: float = Field(default=75.0, ge=0, le=100)
+    """Fallback total-deployment target when the macro snapshot carries no
+    position_guidance.target_invested_pct."""
+    regime_fraction: dict[str, float] = Field(default_factory=lambda: {
+        "risk-on": 1.0, "neutral": 0.5, "transitional": 0.5, "risk-off": 0.0,
+    })
+    """Fraction of the deployment gap the sleeve holds per macro regime."""
+    max_weight_pct: float = Field(default=60.0, ge=0, le=100)
+    rebalance_band_pct: float = Field(default=7.5, ge=0, le=50)
+    """No order while |target − current| is inside this band (no churn).
+    7.5 > the 5pp quantum the macro LLM's target_invested_pct wobbles in."""
+    min_order_usd: float = Field(default=500.0, ge=0)
+    max_regime_age_days: int = Field(default=5, ge=1)
+    """A macro snapshot older than this is 'unknown' → the sleeve holds."""
+    drawdown_multiplier: float = Field(default=0.5, ge=0, le=1)
+    """Target multiplier while `_compute_recent_performance` says in_drawdown."""
+
+    @field_validator("symbol")
+    @classmethod
+    def _symbol_nonempty(cls, v: str) -> str:
+        v = (v or "").strip().upper()
+        if not v:
+            raise ValueError("core_beta.symbol must be a non-empty ticker")
+        return v
+
+
 class ScheduleConfig(BaseModel):
     earnings_preprocess: str = "08:00"
     morning: str
@@ -288,6 +326,8 @@ class AppConfig(BaseModel):
     # Optional section — a settings.yaml without it gets a disabled sweeper
     # (enabled=False default), so older configs keep working unchanged.
     cash_sweep: CashSweepConfig = Field(default_factory=CashSweepConfig)
+    # Optional section — absent → disabled sleeve (enabled=False default).
+    core_beta: CoreBetaConfig = Field(default_factory=CoreBetaConfig)
 
     @model_validator(mode="after")
     def _check_llm_provider_keys(self):

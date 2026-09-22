@@ -466,10 +466,12 @@ Overall sentiment: {news_intel.market_sentiment} (confidence: {news_intel.confid
             if facts is not None else ""
         )
 
+        core_beta_note = (kwargs.get("core_beta_note") or "").strip()
+        core_beta_line = f"\n- {core_beta_note}" if core_beta_note else ""
         return f"""## Account Status
 - Total Value: ${total_value:,.2f}
-- Cash Balance: ${cash_balance:,.2f}
-- Invested: ${invested:,.2f} ({invested_pct:.1f}%)
+- Cash Balance: ${cash_balance:,.2f} (includes fundable rule-managed vehicles)
+- Invested (single names): ${invested:,.2f} ({invested_pct:.1f}%){core_beta_line}
 
 ## Current Positions (with entry context + signal trajectory)
 {positions_text}
@@ -532,10 +534,12 @@ Based on all the above (memory of past decisions + environment trajectory + toda
                recent_missed_lessons: str = "",
                recent_loss_pits: str = "",
                facts=None,
-               allow_margin: bool = True) -> tuple[PortfolioDecision | None, "AgentResult"]:
+               allow_margin: bool = True,
+               core_beta_note: str = "") -> tuple[PortfolioDecision | None, "AgentResult"]:
         result = self.run(
             analyses=analyses,
             positions=positions,
+            core_beta_note=core_beta_note,
             macro_analysis=macro_analysis,
             cash_balance=cash_balance,
             total_value=total_value,

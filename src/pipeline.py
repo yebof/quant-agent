@@ -355,6 +355,52 @@ class TradingPipeline:
         # __init__) degrade to a disabled sweeper instead of AttributeError.
         from src.execution.cash_sweep import CashSweeper
         self.cash_sweeper = CashSweeper(pipeline=self)
+        # Regime-conditional core beta sleeve (SPY) — same access pattern.
+        from src.execution.core_beta import CoreBetaSleeve
+        self.core_beta_sleeve = CoreBetaSleeve(pipeline=self)
+
+    def _core_beta(self):
+        """The core beta sleeve, or None when absent/disabled (see _sweeper)."""
+        from src.execution.core_beta import CoreBetaSleeve
+        sleeve = getattr(self, "core_beta_sleeve", None)
+        if not isinstance(sleeve, CoreBetaSleeve):
+            return None
+        try:
+            return sleeve if sleeve.enabled() else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _run_session_bookends(self, ctx: RunContext, *, context: str) -> list[dict]:
+        """Core beta rebalance, THEN T-bill park (the sleeve gets first call on
+        idle cash). Every path that ends a decision cycle — orders executed,
+        PM proposed nothing, RM rejected — runs this; a quiet PM day is
+        exactly when the sleeve matters (review 2026-09-23)."""
+        orders = list(self._rebalance_core_beta(ctx, context=context))
+        sweeper = self._sweeper()
+        if sweeper is not None:
+            try:
+                sweep_order = sweeper.park_excess(ctx)
+                if sweep_order:
+                    orders.append(sweep_order)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("cash sweep: park_excess failed (non-fatal): %s", e)
+        return orders
+
+    def _rebalance_core_beta(self, ctx: RunContext, *, context: str) -> list[dict]:
+        """Bookend hook: move the core beta sleeve toward its regime target.
+        Non-fatal by construction — a sleeve failure never fails a session."""
+        core = self._core_beta()
+        if core is None:
+            return []
+        try:
+            orders = core.rebalance(ctx)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("core beta: rebalance failed at %s bookend (non-fatal): %s", context, e)
+            return []
+        if orders:
+            logger.info("core beta (%s): %d order(s) — %s", context, len(orders),
+                        ", ".join(f"{o.get('action')} {o.get('symbol')}" for o in orders))
+        return orders
 
     def _sweeper(self):
         """The cash sweeper, or None when absent/disabled.
@@ -478,6 +524,14 @@ class TradingPipeline:
                 mv = parked.market_value
                 if isinstance(mv, (int, float)) and math.isfinite(mv) and mv > 0:
                     cash = cash + mv
+        # Core beta sleeve: same contract — hidden from exposure math (it
+        # shrinks 1:1 as single names deploy) and credited as FUNDABLE cash
+        # (ExecutionStage sells it, after the T-bills, before BUYs submit).
+        core = self._core_beta()
+        if core is not None:
+            positions, core_pos = core.split_positions(positions)
+            if core_pos is not None and cash is not None:
+                cash = cash + core.core_value([core_pos])
 
         # Pre-pass: sum the cash SELLs in this session will return. The
         # execution stage always runs SELLs before BUYs and waits for fills,
@@ -811,6 +865,8 @@ class TradingPipeline:
         longs_checked = 0
         sweeper = self._sweeper()
         sweep_symbol = sweeper.symbol if sweeper is not None else None
+        core = self._core_beta()
+        core_symbol = core.symbol if core is not None else None
         for p in positions:
             symbol = getattr(p, "symbol", None)
             try:
@@ -825,6 +881,10 @@ class TradingPipeline:
             # see src/execution/cash_sweep.py) — flagging it every session
             # would train the operator to ignore the 🔴 banner.
             if sweep_symbol is not None and symbol == sweep_symbol:
+                continue
+            # The core beta sleeve is rule-managed index beta: the regime
+            # gate + daily-loss breaker are its exits, not a per-position stop.
+            if core_symbol is not None and symbol == core_symbol:
                 continue
             longs_checked += 1
             try:
@@ -2488,7 +2548,14 @@ class TradingPipeline:
         """
         orders: list[dict] = []
         pending_protections: list[dict] = []
+        sweeper = self._sweeper()
+        core = self._core_beta()
+        _skip_syms = {s for s in (
+            getattr(sweeper, "symbol", None), getattr(core, "symbol", None),
+        ) if s}
         for p in positions:
+            if p.symbol in _skip_syms:
+                continue   # rule-managed vehicles are never auto-trimmed
             if p.qty <= 0 or p.avg_entry <= 0:
                 continue
             cost_basis = p.avg_entry * p.qty
@@ -2858,6 +2925,8 @@ class TradingPipeline:
         # the grading loop under any action name.
         sweeper = self._sweeper()
         sweep_symbol = sweeper.symbol if sweeper is not None else None
+        core = self._core_beta()
+        core_symbol = core.symbol if core is not None else None
         sell_actions = ("SELL", "EMERGENCY_SELL", "FORCE_DELEVER", "REDUCE")
         out: list[dict] = []
         for row in all_rows:
@@ -2874,6 +2943,8 @@ class TradingPipeline:
             sym = row.get("symbol")
             if sweep_symbol is not None and sym == sweep_symbol:
                 continue   # parking churn is not a graded decision
+            if core_symbol is not None and sym == core_symbol:
+                continue   # rule-managed beta is not a graded decision
             sell_price = float(row.get("fill_price") or row.get("price") or 0) or 0.0
             if not sym or sell_price <= 0:
                 continue
@@ -3366,6 +3437,8 @@ class TradingPipeline:
         age_cutoff = now - timedelta(days=min_age_days)
         sweeper = self._sweeper()
         sweep_symbol = sweeper.symbol if sweeper is not None else None
+        core = self._core_beta()
+        core_symbol = core.symbol if core is not None else None
         exits: list[dict] = []
         for row in rows:
             action = (row.get("action") or "").upper()
@@ -3374,6 +3447,8 @@ class TradingPipeline:
             # a ~0% T-bill "move" is noise in a decision-quality audit.
             if sweep_symbol is not None and (row.get("symbol") or "") == sweep_symbol:
                 continue
+            if core_symbol is not None and (row.get("symbol") or "") == core_symbol:
+                continue   # rule-managed beta, not an LLM exit decision
             is_exit = (
                 action in self._EXIT_AUDIT_ACTIONS
                 or action.startswith("PARTIAL_SELL")
@@ -4269,6 +4344,13 @@ class TradingPipeline:
         """
         from datetime import timedelta
         held: set[str] = {s.upper() for s in current_position_symbols if s}
+        # Rule-managed vehicles are hidden from the caller's position list
+        # but ARE held — never let the digest flag SPY/SGOV as a "miss".
+        for accessor in (self._sweeper, self._core_beta):
+            obj = accessor()
+            sym = getattr(obj, "symbol", None) if obj is not None else None
+            if isinstance(sym, str) and sym:
+                held.add(sym.upper())
         try:
             rows = self.db.get_trades(limit=500, executed_only=True)
         except Exception as exc:
@@ -5533,9 +5615,13 @@ class TradingPipeline:
         from src.risk.rules import _effective_multiplier
         sweeper = self._sweeper()
         sweep_symbol = sweeper.symbol if sweeper is not None else None
+        core = self._core_beta()
+        core_symbol = core.symbol if core is not None else None
         def _tier(p):
             if sweep_symbol is not None and p.symbol == sweep_symbol:
                 return -1
+            if core_symbol is not None and p.symbol == core_symbol:
+                return -0.5   # index beta goes before any alpha position
             return 0 if _effective_multiplier(p.symbol) > 0 else 1
         targets = sorted(
             sellable,
@@ -5549,7 +5635,8 @@ class TradingPipeline:
             if projected_proceeds >= deficit:
                 break
             is_sweep = sweep_symbol is not None and p.symbol == sweep_symbol
-            if is_sweep and p.current_price and p.current_price > 0:
+            is_core = core_symbol is not None and p.symbol == core_symbol
+            if (is_sweep or is_core) and p.current_price and p.current_price > 0:
                 # audit round 2: only unpark what the deficit needs (plus a
                 # 2% cushion) — full-liquidating an $80k T-bill balance for a
                 # $200 deficit forced a full re-park at the session bookend,
@@ -5573,7 +5660,8 @@ class TradingPipeline:
             sale = self._submit_protected_sell(
                 symbol=p.symbol, qty=qty, limit_price=sell_limit,
                 reference_price=p.current_price, position_qty_before_sell=p.qty,
-                label="SWEEP_SELL" if is_sweep else "FORCE_DELEVER",
+                label=("SWEEP_SELL" if is_sweep
+                       else "CORE_BETA_SELL" if is_core else "FORCE_DELEVER"),
             )
             if sale is None:
                 continue
@@ -5599,7 +5687,8 @@ class TradingPipeline:
                 )
                 self.db.insert_trade(
                     symbol=p.symbol,
-                    action="SWEEP_SELL" if is_sweep else "FORCE_DELEVER",
+                    action=("SWEEP_SELL" if is_sweep
+                            else "CORE_BETA_SELL" if is_core else "FORCE_DELEVER"),
                     qty=qty,
                     price=p.current_price,
                     reasoning=(
@@ -5857,7 +5946,10 @@ class TradingPipeline:
             if not portfolio_decision.decisions:
                 logger.info("Portfolio manager + Constructor: no trades suggested")
                 return {
-                    "status": "no_trades", "orders": [], "run_id": run_id,
+                    "status": "no_trades",
+                    # A quiet PM still ends with the bookends (sleeve + park).
+                    "orders": self._run_session_bookends(ctx, context="morning"),
+                    "run_id": run_id,
                     "data_status": dict(ctx.data_status),
                     "stop_coverage_gaps": coverage_gaps,
                 }
@@ -5874,22 +5966,26 @@ class TradingPipeline:
             if early_exit is not None:
                 early_exit["run_id"] = run_id
                 early_exit["data_status"] = dict(ctx.data_status)
+                # A decision cycle that produced no orders (PM proposed
+                # nothing / RM rejected) still ends with the bookends: the
+                # core beta sleeve must not sit empty because the PM was
+                # quiet — that was the whole point of it (review 2026-09-23).
+                if early_exit.get("status") in (
+                    "no_trades", "rejected", "hard_risk_block", "symbol_block",
+                ):
+                    bookend_orders = self._run_session_bookends(ctx, context="morning")
+                    if bookend_orders:
+                        early_exit["orders"] = list(early_exit.get("orders") or []) + bookend_orders
                 return early_exit
 
             # Phase 4 #1: execution stage — HOLDs logged, SELLs then BUYs submitted.
             orders = self._execution_stage(ctx)
 
-            # Bookend: park idle cash above the reserve into the sweep vehicle.
-            # After the BUY phase so open BUY limits are subtracted from the
-            # parkable excess (see CashSweeper.park_excess).
-            sweeper = self._sweeper()
-            if sweeper is not None:
-                try:
-                    sweep_order = sweeper.park_excess(ctx)
-                    if sweep_order:
-                        orders.append(sweep_order)
-                except Exception as e:
-                    logger.warning("cash sweep: park_excess failed (non-fatal): %s", e)
+            # Bookends: core beta sleeve (fills whatever deployment gap the
+            # single-name BUYs left, sized by the macro regime), THEN park
+            # idle cash above the reserve into the sweep vehicle (after the
+            # BUY phase so open BUY limits are subtracted from the excess).
+            orders.extend(self._run_session_bookends(ctx, context="morning"))
 
             logger.info("=== Morning run complete: %d orders executed ===", len(orders))
             return {
@@ -6246,9 +6342,16 @@ class TradingPipeline:
         # (emergency liquidate below sells EVERYTHING, parked cash included).
         review_positions = positions
         review_cash = cash
+        core_beta_note = ""
+        core = self._core_beta()
+        if core is not None:
+            review_positions, core_pos = core.split_positions(review_positions)
+            if core_pos is not None:
+                review_cash = review_cash + core.core_value([core_pos])
+            core_beta_note = core.note(positions, total_value)
         sweeper = self._sweeper()
         if sweeper is not None:
-            review_positions, parked = sweeper.split_positions(positions)
+            review_positions, parked = sweeper.split_positions(review_positions)
             # ...and the cash side of that same contract: stripping the
             # vehicle from the position list while showing RAW cash told the
             # reviewer the book was ~all-in with a few hundred dollars spare,
@@ -6258,7 +6361,7 @@ class TradingPipeline:
             if parked is not None:
                 mv = parked.market_value
                 if isinstance(mv, (int, float)) and math.isfinite(mv) and mv > 0:
-                    review_cash = cash + mv
+                    review_cash = review_cash + mv
 
         if review_positions:
             # Sweep any straggler fills before building the reviewer prompt.
@@ -6318,6 +6421,7 @@ class TradingPipeline:
                 cash_balance=review_cash,
                 total_value=total_value,
                 session_type=session_type,
+                core_beta_note=core_beta_note,
                 position_facts=position_facts,
                 morning_trades=morning_trades,
                 news_intel=session_news,
@@ -6405,14 +6509,7 @@ class TradingPipeline:
         # tomorrow's morning bookend. park_excess refreshes account state and
         # subtracts open-BUY holds itself; emergency paths returned earlier and
         # deliberately skip parking.
-        sweeper = self._sweeper()
-        if sweeper is not None:
-            try:
-                sweep_order = sweeper.park_excess(ctx)
-                if sweep_order:
-                    orders.append(sweep_order)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("cash sweep: park_excess failed (non-fatal): %s", e)
+        orders.extend(self._run_session_bookends(ctx, context=session_type))
 
         return {
             "status": "reviewed",
@@ -6758,6 +6855,11 @@ class TradingPipeline:
         sweeper = self._sweeper()
         if sweeper is not None:
             positions, _parked = sweeper.split_positions(positions)
+        core_beta_note = ""
+        core = self._core_beta()
+        if core is not None:
+            core_beta_note = core.note(positions, total_value)
+            positions, _core_pos = core.split_positions(positions)
 
         # Sweep submitted orders before building the evening prompt so
         # canceled/expired orders do not get narrated as real trades, and
@@ -6787,10 +6889,15 @@ class TradingPipeline:
         # decision — narrating it to the evening analyst would feed the
         # learning loops noise (review finding). Fetch extra rows so the
         # filter doesn't shrink the real-trade view.
+        _core_sym = core.symbol if core is not None else None
+        _sweep_sym = sweeper.symbol if sweeper is not None else None
         today_trades = [
             self._actualize_trade_row(t)
             for t in self.db.get_trades(limit=30, today_only=True, executed_only=True)
-            if (t.get("action") or "") not in ("SWEEP_BUY", "SWEEP_SELL")
+            if (t.get("action") or "") not in (
+                "SWEEP_BUY", "SWEEP_SELL", "CORE_BETA_BUY", "CORE_BETA_SELL",
+            )
+            and (t.get("symbol") or "") not in {s for s in (_core_sym, _sweep_sym) if s}
         ][:20]
         # Feed yesterday's insights back so evening can grade its own prior outlook
         # against today's reality — enables calibration over time.
@@ -6887,6 +6994,7 @@ class TradingPipeline:
                 outlook_calibration=outlook_calibration,
                 missed_ops_snapshots=missed_ops_snapshots,
                 thesis_health_context=thesis_health_context,
+                core_beta_note=core_beta_note,
             )
         except Exception as e:
             from src.agents.base import AgentResult

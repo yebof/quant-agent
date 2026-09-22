@@ -350,6 +350,9 @@ class EveningAnalystAgent(BaseAgent):
             f"- {p.symbol}: {p.qty} shares @ ${p.avg_entry:.2f} | Close: ${p.current_price:.2f} | P&L: ${p.unrealized_pnl:.2f} | Sector: {p.sector}"
             for p in positions
         ) if positions else "No open positions."
+        _cb = (kwargs.get("core_beta_note") or "").strip()
+        if _cb:
+            positions_text += f"\n- [rule-managed] {_cb}"
 
         trades_text = "\n".join(
             f"- {t['action']} {t['symbol']}: {t['qty']} shares @ ${t['price']:.2f} — {t.get('reasoning', '')}"
@@ -509,9 +512,11 @@ upcoming events that bear on held theses. Respond as JSON matching
                 outlook_calibration: dict | None = None,
                 missed_ops_snapshots: list | None = None,
                 thesis_health_context: dict | None = None,
+                core_beta_note: str = "",
                 ) -> tuple[EveningReport | None, "AgentResult"]:
         result = self.run(
             positions=positions,
+            core_beta_note=core_beta_note,
             macro_summary=macro_summary,
             total_value=total_value,
             daily_pnl=daily_pnl,

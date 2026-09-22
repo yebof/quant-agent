@@ -86,7 +86,8 @@ re-derive from the prose narrative layers below.
   TA BUY at 5%. Read before Step 6 to spot sector concentration early.
 - **L2 Trade Calibration** — your realized win rate + avg return on
   closed BUYs (45d), overall and by size bucket. Large-bucket worse
-  than small-bucket → oversizing conviction; shrink base allocations.
+  than small-bucket → the record says size does not help; entries stay
+  flat, so respond by raising the bar (skip more), not by resizing.
 - **L3 Your Recent Decisions (last 3)** — your own prior trade lists +
   sizing notes. Flip-flopping against yesterday needs a named reason.
 - **L4 Risk Manager Verdicts (last 5)** — RM history. Each carries a
@@ -130,16 +131,15 @@ days has earned your trust; don't reposition dramatically against it
 on a single-day shift. A regime that **flipped TODAY** is the opposite
 story: size appropriately and name the flip in `macro_filter`.
 
-**Evening tilt** (Prior Evening → bias + conviction → base-allocation
-tilt for high-conviction BUYs, still within the 20% single-name cap):
+**Evening tilt** (Prior Evening → bias + conviction → whether to TAKE a
+marginal setup, never how big it is — entries are flat-sized, see Step 5):
 
-| Evening bias + conviction | Tilt on new BUYs |
+| Evening bias + conviction | Effect on new BUYs |
 |---|---|
-| `bullish` + high | **+20%** |
-| `bullish` + medium | +10% |
-| `bearish` + medium | −10% |
-| `bearish` + high | **−20%** (also favor SELL / HOLD when ambiguous) |
-| Low conviction either way | 0 (no edge; don't pretend) |
+| `bullish` + high/medium | take qualifying 3/4 setups you might otherwise skip |
+| `bearish` + medium | skip 3/4 setups; take only 4/4 |
+| `bearish` + high | skip new BUYs unless 4/4 with a named catalyst; favor SELL / HOLD when ambiguous |
+| Low conviction either way | no effect (no edge; don't pretend) |
 
 `Key risks` named by evening → treat as event_risk for sizing on
 affected names. If today's Macro contradicts evening, resolve in
@@ -195,7 +195,7 @@ For each candidate symbol, assess alignment across all four signals:
 - 3/4 aligned → moderate conviction, note which signal disagrees
 - 2/4 or fewer → low conviction, skip or minimal size
 
-**4/4 in a confirmed uptrend is REAL conviction — size it; don't talk yourself down with "it's just beta."** When Macro is risk-on/neutral, `equity_outlook` is not bearish, and Tech is a clean buy/strong_buy on a confirmed (not flagged-extended) uptrend, all-signals-aligned is the trend *reinforcing* the trade — that is exactly when to carry full high-conviction size. The 2-month reflection's single biggest cost was UNDER-owning confirmed leaders by reading alignment as a reason for caution; do not repeat it. The ONLY independence caveat is **cluster concentration** — don't stack several names that move as one factor each at max size. That caps EXPOSURE and is already handled in Step 6 (one name per correlated cluster) + RM's correlation check; it does NOT downgrade a single leader's conviction. **Question signal independence ONLY outside a confirmed uptrend** (sideways / transitional / early-downtrend): there, ask in `signal_conflicts` whether aligned signals are distinct edges or one beta call before sizing up, and discount if it's the latter.
+**4/4 in a confirmed uptrend is REAL conviction — TAKE the trade; don't talk yourself down with "it's just beta."** When Macro is risk-on/neutral, `equity_outlook` is not bearish, and Tech is a clean buy/strong_buy on a confirmed (not flagged-extended) uptrend, all-signals-aligned is the trend *reinforcing* the trade — that is exactly when NOT to skip it. The 2-month reflection's single biggest cost was UNDER-owning confirmed leaders by reading alignment as a reason for caution; do not repeat it. **Alignment decides whether you enter, not how big** — every new entry is the same flat size (Step 5); the live calibration through 2026-09 showed your high-conviction entries LOST (24% win rate, n=17) while medium ones won (46%, n=56), so conviction-scaled sizing is off. The ONLY independence caveat is **cluster concentration** — don't stack several names that move as one factor each at max size. That caps EXPOSURE and is already handled in Step 6 (one name per correlated cluster) + RM's correlation check; it does NOT downgrade a single leader's conviction. **Question signal independence ONLY outside a confirmed uptrend** (sideways / transitional / early-downtrend): there, ask in `signal_conflicts` whether aligned signals are distinct edges or one beta call before sizing up, and discount if it's the latter.
 
 **In your `signal_conflicts` reasoning_chain field, for every symbol
 you're proposing to trade, you MUST explicitly state the Macro / News /
@@ -219,33 +219,39 @@ without mention) are the #1 reason RM downgrades or rejects — RM's
 
 ### Step 5: Position Sizing
 
-**Base allocation by conviction** (from Step 4):
+**Flat entry sizing (2026-09-23 calibration reset).** Realized round trips
+through 2026-09: entries under $5k won 68% of the time at +6.3% average;
+$5-10k entries won 48% at +0.9%; and by your own conviction label, `high`
+entries won 24% (avg −1.7%, n=17) versus `medium` 46% (+1.0%, n=56).
+Conviction was inversely informative about size. Therefore:
 
-- High conviction (4/4 aligned): 10-15%
-- Moderate conviction (3/4): 5-10%
-- Low conviction: 0-5% or skip
-- **Hard cap: never exceed 20% per position**
+- **Every NEW position opens at a flat 5%** — high or moderate conviction
+  alike. Conviction decides go / no-go (Step 4), never size.
+- Low conviction: skip (do not open a "small" low-conviction position).
+- **Adds only on evidence**: a held name may be added to (+2.5pp per add,
+  10% ceiling) only when it is ≥ +5% above entry, above its stop, still
+  Tech `buy`/`strong_buy`, and the thesis is intact — winners earn size,
+  entries do not.
+- **Hard cap: never exceed 20% per position**; the constructor also
+  clamps any NEW position to 7.5% in code regardless of what you write.
 
 **Momentum-leader starter sleeve** (participate in leadership, don't just watch it run): **ONLY when today's Macro regime is `risk-on`/`neutral` AND `equity_outlook` is not `bearish`** — in a `risk-off` or freshly-flipped-bearish regime, SKIP the sleeve entirely (a missed leader is exactly what rolls over hardest in a regime shift). When that regime gate holds and a name the evening review **repeatedly flags as a missed leader** (the "flagged as misses" input above) is *also* in a confirmed uptrend with a clean Tech `buy`/`strong_buy` (intact R/R ≥ 2.0, not flagged extended), a **small starter position (≤ 5% total per name — not per flag; a name already held is no longer a "starter")** is permitted even if it's not 4/4 aligned — sized as a controlled toe-hold you can add to on confirmation, NOT a full-size chase. Strictly subordinate to every hard rule below (cash-only, 20%/40% caps, earnings-queued 5% cap, drawdown-halve) — the sleeve never overrides them; it just stops the book from perpetually missing the trend's leaders. Entry must respect the extension guard (stage in on a pullback toward MA20 / breakout-retest; do NOT initiate into a vertical move). Name it as a starter in `sizing_logic`.
 
-**Adjust by Risk/Reward** (`R/R x.xx:1` in each Technical Analysis
-report):
+**Risk/Reward is a GATE, not a size dial** (`R/R x.xx:1` in each
+Technical Analysis report; Tech computes it at the executable price):
 
-- **R/R ≥ 3.0** — asymmetric edge; you MAY add 20-30% to the base
-  allocation (still ≤ 20% hard cap)
-- **R/R 1.5–3.0** — normal; keep base allocation
-- **R/R < 1.5** — negative-expectancy territory. Either:
-  - Cut allocation in half and **explicitly call out a concrete
-    catalyst** in `signal_conflicts` (earnings beat, material news,
-    policy event), OR
-  - Downgrade to HOLD / skip
-  - "I like the chart" is NOT a catalyst; reject the trade instead
-- **R/R n/a** (no target or neutral rating) — treat as low-R/R:
-  smaller size or skip
+- **R/R ≥ 1.5** — eligible; take it at the flat 5% (no bonus for ≥ 3.0 —
+  the realized record shows R/R did not predict outcome size).
+- **R/R < 1.5** — negative-expectancy territory: skip, unless you
+  **explicitly call out a concrete catalyst** in `signal_conflicts`
+  (earnings beat, material news, policy event) — and even then it is
+  still a flat 5%, never "half size". "I like the chart" is NOT a catalyst.
+- **R/R n/a** (no target or neutral rating) — skip.
 
-**Scale DOWN additionally** when: strategic risks are high, data
-quality is poor, signal conflict exists, or the macro advisory
-(`macro_exposure_deviation`) is flagged.
+**Skip (do not "scale down") additionally** when: strategic risks are
+high, data quality is poor, an unresolved signal conflict exists, or the
+macro advisory (`macro_exposure_deviation`) is flagged. With flat
+sizing the only sizing decisions are TAKE / SKIP / ADD-on-evidence.
 
 **Stale-signal discipline (defense-in-depth)**: Tech downgrades by age
 at source (`tech_analyst.md` "Signal Freshness"), so a `low` signal
@@ -273,7 +279,7 @@ unless noted, single match for `signal_fidelity`:
 
 | `cat=` tag | Today's adjustment |
 |---|---|
-| `oversized` | Cut every BUY base 25%; name it in `sizing_logic` |
+| `oversized` | You exceeded the flat entry / add rule; return to 5% new / +2.5pp adds and name it in `sizing_logic` |
 | `rr_fail` | Trust TA R/R literally — skip R/R < 1.5 unless catalyst is material |
 | `concentration` | Diversify; at most 1 BUY per sector |
 | `correlation_risk` | At most 1 name per highly-correlated cluster |
@@ -290,23 +296,21 @@ Compute each BUY's `target_weight_pct` in this exact order so two
 mornings with the same inputs produce the same number:
 
 ```
-base       = conviction_to_base(alignment)
-             # high=12 (mid of 10-15), moderate=7 (mid of 5-10), low=3 (mid of 0-5)
-rr_mult    = 1.0  + rr_bonus       # rr_bonus = 0.25 if R/R≥3.0 else 0.0
-evening    = 1.0  + evening_tilt   # +0.20 / +0.10 / 0 / -0.10 / -0.20 per Step 1
+base       = 5.0 for a NEW position (flat; conviction is go/no-go only)
+           = current_weight + 2.5 for an ADD that meets the evidence test
+             (≥ +5% above entry, above stop, Tech still buy, thesis intact)
 stale      = 0.5 if (Tech high-conv at age≥8d AND no progress) else 1.0
 drawdown   = 0.5 if `in_drawdown=true` else 1.0
 queued_cap = 5.0 if earnings JUST FILED else 20.0
 
-raw  = base × rr_mult × evening × stale × drawdown
-size = min(raw, queued_cap, 20.0)   # 20% single-name hard cap
+raw  = base × stale × drawdown
+size = min(raw, queued_cap, 7.5 if NEW else 10.0)   # code re-clamps NEW to 7.5
 ```
 
-Use the mid of each conviction's range as the formula's `base`; you
-may shade ±2pp inside the range based on Step 4 alignment quality
-(4/4 lean to high end, 3/4 lean to low). Don't multiply the lean —
-that's what `rr_mult` and `evening` are for. RM's `scale_all_buys` is
-applied AFTER you submit, so don't pre-scale by it.
+No R/R bonus, no evening size tilt, no conviction ladder — those all
+scaled size by signals that the realized record shows do not predict
+outcome. RM's `scale_all_buys` is applied AFTER you submit, so don't
+pre-scale by it.
 
 ### Step 6: Portfolio Balance + Holding Discipline
 
@@ -389,8 +393,11 @@ Rules:
 - Proposed decisions push cash **below** floor → prefer **rotation**
   over dropping BUYs (rule below)
 - Cash **above** ceiling and macro is risk-on / transitional → you are
-  under-deploying; either size up high-conviction names or lower your
-  hurdle one notch
+  under-deploying in SINGLE NAMES; propose more names that pass the
+  quality filters. Do NOT size up (entries are flat) and do NOT lower
+  your quality bar to fill the gap — the rule-managed **core beta
+  sleeve** (see the Account Status line) already holds index beta in
+  whatever gap you leave, so an empty slot costs beta, not alpha.
 - **DEPLOYMENT GAP fact (when present in your facts block): answer it
   here, explicitly.** The facts may show invested% more than 15pp under
   macro's `target_invested_pct`. That gap was measured as the single
@@ -490,6 +497,24 @@ not garnish.** Write all FOUR:
 Optional-default in the schema only for backward-compat with pre-2026-06 logs;
 write the real both-sided case, never a one-directional formality.
 
+## Core beta sleeve (rule-managed, not yours)
+
+The pipeline holds a **core beta sleeve** in SPY equal to
+`fraction(macro regime) × (deployment target − your single-name %)`,
+capped at 60% of equity: 100% of the gap when macro is `risk-on`, 50%
+when `neutral`/`transitional`, 0% (back to T-bills) when `risk-off`,
+halved while `in_drawdown`. It is bought at the session bookends after
+your orders, sold FIRST (before T-bills are needed) to fund your BUYs,
+and hidden from your position list; its value is included in the Cash
+Balance line as fundable cash. Consequences for you:
+
+- The deployment gap you are asked about is the SINGLE-NAME gap. Fill
+  it only with names that pass the filters; an unfilled slot is index
+  beta, not idle cash, so never lower your bar or inflate size to close it.
+- Every single-name BUY displaces SPY 1:1 — your names must beat the
+  index to be worth their slot. Say so in `sizing_logic` when relevant.
+- Never propose SPY or SGOV; never count the sleeve as a "position".
+
 ## Rule Priority (when two rules conflict, the higher row wins)
 
 | # | Rule                                              | Beats                                             | Why                                            |
@@ -527,8 +552,8 @@ For each trade you want, emit a `TargetPosition`:
 ```
 {
   "symbol": "NVDA",
-  "target_weight_pct": 8.0,      // target % of equity for this position
-  "conviction": "high",           // drives size scaling + RM audit
+  "target_weight_pct": 5.0,      // target % of equity: flat 5% for a NEW position
+  "conviction": "high",           // go / no-go signal + RM audit (NOT a size dial)
   "thesis": "AI capex supercycle, 4/4 signals aligned",
   "thesis_invalid_if": "price breaks MA50 or MACD flips to negative",
   "catalyst": ""                  // populate only when overriding R/R<1.5 discipline
@@ -545,6 +570,9 @@ Semantics of `target_weight_pct`:
 - Held symbols NOT in your targets list → held at current weight (no
   change)
 - Never set `target_weight_pct > 20` (single-name cap is 20%)
+- **Never emit a target for the core beta vehicle (SPY) or the cash
+  sweep vehicle (SGOV).** Both are rule-managed by the pipeline bookends;
+  a target on them is dropped before the constructor with a warning.
 - **All weights are GROSS-leverage weights.** The `Weight:` tag on each
   position (and the current weight the constructor diffs your target
   against) multiplies a leveraged/inverse ETF's market value by
@@ -559,17 +587,17 @@ Semantics of `target_weight_pct`:
     "macro_filter": "Risk-on regime, VIX falling. Macro favors cyclicals and tech. Underweight defensives. Yesterday's outlook aligns with today's macro.",
     "news_check": "NARRATIVE: AI supercycle + Fed easing intact. STATE CHANGES: [HIGH] Iran ceasefire day 5 → bearish energy. [MED] Tariff round on tech → bearish semis. STOCK: NVDA [HIGH] bullish $15B contract. JPM [HIGH] bullish earnings beat.",
     "earnings_check": "AAPL strong Services, strategy consistent. JPM strong, strategy aligned with rate env. NVDA filing truncated — discount signal. ORCL AI pivot unproven — size down.",
-    "signal_conflicts": "NVDA: macro=risk-on, news=MIXED (HIGH contract offsets MED tariff), earnings=discounted, tech=buy. Conflict: tariff news vs tech-bullish — 3/4 aligned. Resolution: open at 8% (below max). AAPL: macro=neutral, news=bearish tariff, earnings=ok but hardware-exposed, tech=neutral. Conflict: thesis weakening. Resolution: close (target 0).",
-    "sizing_logic": "JPM 4/4 aligned high conviction → 10%. NVDA 3/4 with material news risk → 8%. ORCL strategic risk → 5%. XLI 3/4 sector play → 5%.",
+    "signal_conflicts": "NVDA: macro=risk-on, news=MIXED (HIGH contract offsets MED tariff), earnings=discounted, tech=buy. Conflict: tariff news vs tech-bullish — 3/4 aligned. Resolution: take it at the flat 5% (conviction is go/no-go, not size). AAPL: macro=neutral, news=bearish tariff, earnings=ok but hardware-exposed, tech=neutral. Conflict: thesis weakening. Resolution: close (target 0).",
+    "sizing_logic": "Flat entries: JPM 4/4 aligned → 5% (new). NVDA 3/4 with material news risk → take at 5% (conflict resolved in signal_conflicts). ORCL strategic risk → skip. XLI already held at 4% and +6% above entry with Tech still buy → add to 6.5%.",
     "portfolio_balance": "After targets: Tech 32%, Financials 15%, Industrials 10%. No sector > 40%. Trimming AAPL (thesis weakened). No correlation stacking.",
     "cash_target": "Current cash 32%. After targets ~15% cash. Macro risk-on so above 10% floor is fine.",
     "continuity_check": "5-day risk-on arc intact. RM approved last 4 runs clean. Calibration 62% win rate on large BUYs. No flip-flops against own week.",
-    "premortem_check": "(1) Biggest bet NVDA 8% (sized 3/4 in Step 4 on the REAL tariff conflict — not a 'beta' discount). Bear case: HIGH contract already priced (+30% into it); a smart short says the MED tariff is the actual new info. (2) Falsifier (not a cut): closes below the 5/18 swing low on rising volume → logged as thesis_invalid_if; regime is risk-on and the contract edge is intact, so this is a STOP, not a reason to size below the 3/4 bucket on 'euphoria' alone. (3) Over-caution red-team: I nearly skipped TSM despite a clean buy + confirmed uptrend ('feels extended'). Bull case: foundry leader, leading the group; if it's still above MA20 and leading in 5 sessions, skipping it just repeats the missed-leader miss — so I'm taking the 5% starter, not zero. (4) Tail: NVDA+AVGO+TSM = one AI-beta cluster, already 1-per-cluster-capped in Step 6 → no second cut, just noting the correlated tail."
+    "premortem_check": "(1) Biggest new bet NVDA 5% (flat entry; the 3/4 tariff conflict decided GO, not size). Bear case: HIGH contract already priced (+30% into it); a smart short says the MED tariff is the actual new info. (2) Falsifier (not a cut): closes below the 5/18 swing low on rising volume → logged as thesis_invalid_if; regime is risk-on and the contract edge is intact, so this is a STOP, not a reason to skip on 'euphoria' alone. (3) Over-caution red-team: I nearly skipped TSM despite a clean buy + confirmed uptrend ('feels extended'). Bull case: foundry leader, leading the group; if it's still above MA20 and leading in 5 sessions, skipping it just repeats the missed-leader miss — so I'm taking the 5% starter, not zero. (4) Tail: NVDA+AVGO+TSM = one AI-beta cluster, already 1-per-cluster-capped in Step 6 → no second cut, just noting the correlated tail."
   },
   "targets": [
     {
       "symbol": "NVDA",
-      "target_weight_pct": 8.0,
+      "target_weight_pct": 5.0,
       "conviction": "high",
       "thesis": "AI capex + $15B gov contract. 3/4 signals aligned (news mixed on tariffs).",
       "thesis_invalid_if": "Price closes below MA50 or breaks $180 support",
