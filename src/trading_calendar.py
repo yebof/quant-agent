@@ -42,6 +42,7 @@ SESSION_WINDOWS: dict[str, tuple[int, int]] = {
     "midday":              (780, 870),   # 13:00 - 14:30 ET  (position reviewer, patient)
     "close":               (930, 960),   # 15:30 - 16:00 ET  (position reviewer, act-on-trigger; 30min width guarantees a 30-min launchd tick lands inside regardless of phase)
     "evening":             (1200, 1320), # 20:00 - 22:00 ET  (reporting only)
+    "earnings_catchup":    (965, 1195),  # 16:05 - 19:55 ET  (post-close: analyze filings that dropped intraday or were budget-skipped at 08:00, so next morning is fully cached)
 }
 
 

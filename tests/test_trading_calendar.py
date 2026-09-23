@@ -78,6 +78,7 @@ def test_is_weekday_weekday_vs_weekend():
         ("midday",              780, 870),
         ("close",               930, 960),
         ("evening",            1200, 1320),
+        ("earnings_catchup",    965, 1195),
     ],
 )
 def test_session_windows_cover_documented_ranges(mode, lo_min, hi_min):

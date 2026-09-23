@@ -177,25 +177,51 @@ class EarningsDataProvider:
                     report.symbol, report.form_type,
                     prior_filing_date, report.filing_date,
                 )
-            attempts = int(entry.get("failed_attempts", 0)) + 1
-            entry["filing_date"] = report.filing_date
-            entry["form_type"] = report.form_type
-            entry["local_path"] = report.filing_path
-            entry["failed_attempts"] = attempts
-            if attempts >= max_attempts:
-                entry["abandoned"] = True
-                entry["abandoned_at"] = et_now().isoformat()
-                abandoned = True
-                logger.error(
-                    "Abandoning earnings analysis for %s %s (%s) after %d attempts",
-                    report.symbol, report.form_type, report.filing_date, attempts,
-                )
-            else:
+            # One strike per filing per ET day (2026-09-24): the wrapper now
+            # retries a budget-partial / killed session on every 30-min tick
+            # (08:00, 08:30, 09:00 plus the 16:05-19:55 catch-up ticks), so a
+            # filing that fails transiently three ticks in a row would be
+            # abandoned for the quarter within an hour. Strikes are meant to
+            # be "three separate days", so a repeat failure on the same day
+            # is logged but does not advance the counter.
+            today = et_today().isoformat()
+            same_filing = (prior_filing_date == report.filing_date)
+            if same_filing and entry.get("last_failed_date") == today \
+                    and int(entry.get("failed_attempts", 0) or 0) > 0:
                 logger.warning(
-                    "Earnings analysis for %s %s failed (attempt %d/%d); will retry next session",
-                    report.symbol, report.form_type, attempts, max_attempts,
+                    "Earnings analysis for %s %s (%s) failed again today — strike "
+                    "already recorded for %s (attempt %d/%d); not advancing the counter",
+                    report.symbol, report.form_type, report.filing_date, today,
+                    int(entry.get("failed_attempts", 0) or 0), max_attempts,
                 )
-            self.manifest[key] = entry
+                entry["filing_date"] = report.filing_date
+                entry["form_type"] = report.form_type
+                entry["local_path"] = report.filing_path
+                self.manifest[key] = entry
+                strike_recorded = False   # save happens AFTER the lock (save_manifest re-locks)
+            else:
+                strike_recorded = True
+            if strike_recorded:
+                attempts = int(entry.get("failed_attempts", 0)) + 1
+                entry["filing_date"] = report.filing_date
+                entry["form_type"] = report.form_type
+                entry["local_path"] = report.filing_path
+                entry["failed_attempts"] = attempts
+                entry["last_failed_date"] = today
+                if attempts >= max_attempts:
+                    entry["abandoned"] = True
+                    entry["abandoned_at"] = et_now().isoformat()
+                    abandoned = True
+                    logger.error(
+                        "Abandoning earnings analysis for %s %s (%s) after %d attempts",
+                        report.symbol, report.form_type, report.filing_date, attempts,
+                    )
+                else:
+                    logger.warning(
+                        "Earnings analysis for %s %s failed (attempt %d/%d); will retry next session",
+                        report.symbol, report.form_type, attempts, max_attempts,
+                    )
+                self.manifest[key] = entry
         self.save_manifest()
         return abandoned
 

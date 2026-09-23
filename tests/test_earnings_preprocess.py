@@ -52,7 +52,10 @@ def test_preprocess_analyzes_new_filings_synchronously(tmp_path):
     assert result["confirmed"] == 1
 
     earnings_provider.check_and_fetch.assert_called_once()
-    earnings_analyst.analyze_reports.assert_called_once_with([new_filing])
+    # 2026-09-24: the call now carries the commit hook / budget / worker
+    # kwargs; the positional report list is the contract this test pins.
+    assert earnings_analyst.analyze_reports.call_count == 1
+    assert earnings_analyst.analyze_reports.call_args.args[0] == [new_filing]
     earnings_provider.confirm_filing.assert_called_once_with(new_filing)
 
 
@@ -83,11 +86,17 @@ def test_preprocess_skips_when_market_closed(tmp_path):
     pipeline.earnings_provider.check_and_fetch.assert_not_called()
 
 
-def test_record_failure_abandons_after_max_attempts_with_et_timestamp(tmp_path):
+def test_record_failure_abandons_after_max_attempts_with_et_timestamp(tmp_path, monkeypatch):
     """When a filing's LLM analysis fails 3 times, it is marked abandoned with
     an ET-tzaware ISO timestamp (not naive UTC). Every other day/session key
     in the system is ET — drifting to UTC on this one field desyncs
     operator-facing logs from trading-day reality."""
+    # 2026-09-24: strikes are one-per-filing-per-ET-day; advance the clock
+    # one day per record_failure call so consecutive strikes still count.
+    import itertools as _it, src.data.earnings as _earn
+    from datetime import date as _date, timedelta as _td
+    _days = _it.count()
+    monkeypatch.setattr(_earn, "et_today", lambda: _date(2026, 4, 20) + _td(days=next(_days)))
     from src.data.earnings import EarningsDataProvider, EarningsReport
 
     provider = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
@@ -125,7 +134,7 @@ def test_record_failure_abandons_after_max_attempts_with_et_timestamp(tmp_path):
     assert parsed.utcoffset() == et_offset_at_that_instant
 
 
-def test_record_failure_resets_retry_budget_when_filing_date_changes(tmp_path):
+def test_record_failure_resets_retry_budget_when_filing_date_changes(tmp_path, monkeypatch):
     """Codex r11 P2: the manifest is keyed by symbol+form_type, but a single
     key spans every quarter's 10-Q. Without a filing_date check, Q1's 3
     failures (abandoned) leave failed_attempts=3 / abandoned=True in the
@@ -135,6 +144,12 @@ def test_record_failure_resets_retry_budget_when_filing_date_changes(tmp_path):
     Pin: when prior_filing_date differs from incoming, reset
     failed_attempts to 0 and clear abandoned/abandoned_at. Q2 then gets
     its full 3-attempt budget."""
+    # 2026-09-24: strikes are one-per-filing-per-ET-day; advance the clock
+    # one day per record_failure call so consecutive strikes still count.
+    import itertools as _it, src.data.earnings as _earn
+    from datetime import date as _date, timedelta as _td
+    _days = _it.count()
+    monkeypatch.setattr(_earn, "et_today", lambda: _date(2026, 4, 20) + _td(days=next(_days)))
     from src.data.earnings import EarningsDataProvider, EarningsReport
 
     provider = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
@@ -172,9 +187,15 @@ def test_record_failure_resets_retry_budget_when_filing_date_changes(tmp_path):
     assert "abandoned_at" not in entry
 
 
-def test_record_failure_does_not_reset_within_same_filing_date(tmp_path):
+def test_record_failure_does_not_reset_within_same_filing_date(tmp_path, monkeypatch):
     """Sanity: the reset only fires across filing_dates. Multiple failures
     on the SAME filing_date must accumulate normally."""
+    # 2026-09-24: strikes are one-per-filing-per-ET-day; advance the clock
+    # one day per record_failure call so consecutive strikes still count.
+    import itertools as _it, src.data.earnings as _earn
+    from datetime import date as _date, timedelta as _td
+    _days = _it.count()
+    monkeypatch.setattr(_earn, "et_today", lambda: _date(2026, 4, 20) + _td(days=next(_days)))
     from src.data.earnings import EarningsDataProvider, EarningsReport
 
     provider = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))

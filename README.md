@@ -39,7 +39,8 @@ with `scripts/run_if_et_window.sh` for ET-window gating and a cross-mode
 session lock. Each session has its own cadence + scope:
 
 ```
-08:00-09:15  earnings_preprocess  (once/day, pre-market)
+08:00-09:15  earnings_preprocess  (once/day, pre-market; budgeted — leftovers continue next tick)
+16:05-19:55  earnings_catchup     (every 30-min tick, post-close: analyze filings that dropped intraday or were budget-skipped)
              └─ Earnings Analyst runs LLM on newly-filed 10-Q/10-K — the
                 ONLY session that calls the earnings LLM. Writes analysis
                 to disk + confirms filing. Hot sessions below only READ
@@ -223,22 +224,23 @@ chmod 600 .env
 
   **Per-mode noise policy** (so the operator gets signal, not noise):
   - `morning` / `midday` / `close` / `evening`: always notify on completion (status + run_id + orders + degraded-data flag + elapsed).
-  - `earnings_preprocess`: notify only when filings were analyzed; silent on `nothing_new` / `market_holiday` / transient SEC `fetch_error`.
+  - `earnings_preprocess` / `earnings_catchup`: notify only when filings were analyzed or the run is `partial` (⏳ budget reached, lists queued symbols); silent on `nothing_new` / `market_holiday` / transient SEC `fetch_error`.
   - `intra_check`: silent on the 14 OK ticks per trading day; notifies loudly when the circuit breaker fires (`emergency_sold` / `hard_risk_block`).
   - `meta`: silent on `not_quarter_end`; notifies on actual reflection runs.
   - Any session that raises an exception: always notifies, regardless of mode policy.
 
 ### Production deployment
 
-Either OS-level scheduler can drive the 6 sessions; both wrap `scripts/run_if_et_window.sh` so the actual ET-window / last-run / cross-mode-lock logic is shared.
+Either OS-level scheduler can drive the 7 sessions; both wrap `scripts/run_if_et_window.sh` so the actual ET-window / last-run / cross-mode-lock logic is shared.
 
 **Linux (systemd, recommended for headless server / Tailscale-reachable hosts)**
 
-The repo ships with a template unit + timer at `~/.config/systemd/user/quant-agent@.service` / `quant-agent@.timer`. Enable all 6 instances and turn on user-lingering so they fire when the user isn't logged in:
+The repo ships with a template unit + timer at `~/.config/systemd/user/quant-agent@.service` / `quant-agent@.timer`. Enable all 7 instances and turn on user-lingering so they fire when the user isn't logged in:
 
 ```bash
 systemctl --user enable --now \
   quant-agent@earnings_preprocess.timer \
+  quant-agent@earnings_catchup.timer \
   quant-agent@morning.timer \
   quant-agent@intra_check.timer \
   quant-agent@midday.timer \
@@ -286,7 +288,8 @@ python main.py --mode daily      # P&L history CSV -> Telegram document
 ```
 
 **Automated scheduling**: the production path is a 30-min OS-level timer (systemd `quant-agent@.timer` on Linux, launchd plist on macOS) that calls `scripts/run_if_et_window.sh <mode>` for each session. The wrapper checks the current **US/Eastern** wall clock against the target window, applies the cross-mode session lock (one heavy LLM session at a time, except `intra_check` which is exempt), and skips if the mode already ran today. Runs the right session at the right ET moment regardless of the host's timezone — handy when traveling. Windows (Mon-Fri ET, authoritative Python table at `src/trading_calendar.py` `SESSION_WINDOWS`, locked to the bash wrapper by `test_trading_calendar.py`):
-- `earnings_preprocess` 08:00-09:15 ET — pre-market LLM analysis of fresh 10-Q/10-K filings
+- `earnings_preprocess` 08:00-09:15 ET — pre-market LLM analysis of fresh 10-Q/10-K filings (priority-ordered, 3 concurrent, 12-min budget; a `partial` run exits 3 so the next tick continues the queue)
+- `earnings_catchup` 16:05-19:55 ET — same job on every post-close tick (guard-less like `intra_check`): drains filings that dropped intraday or were budget-skipped, so next morning is fully cached
 - `morning` 09:30-12:00 ET — research + trading
 - `intra_check` 09:30-16:00 ET — every 30min tick; stateless circuit-breaker (no LLM)
 - `midday` 13:00-14:30 ET — position review + real trailing stops (patient disposition)
@@ -391,7 +394,7 @@ pytest tests/ -v    # 874 tests
 
 ### Hot / Cold Earnings Path
 
-LLM analysis of 10-Q/10-K filings runs **only** in the pre-market `earnings_preprocess` window (08:00-09:15 ET). Hot sessions (morning / midday / evening) are read-only consumers: `_load_earnings_analyses` surfaces the cached analysis for already-confirmed filings, and any filing that preprocess missed appears as a `queued=True` placeholder — PM then caps the BUY at 5% regardless of conviction. No background threads in hot sessions, no session-time LLM token spend on earnings.
+LLM analysis of 10-Q/10-K filings runs **only** in the two cold earnings sessions — pre-market `earnings_preprocess` (08:00-09:15 ET) and post-close `earnings_catchup` (16:05-19:55 ET). Hot sessions (morning / midday / evening) are read-only consumers: `_load_earnings_analyses` surfaces the cached analysis for already-confirmed filings, and any filing that preprocess missed appears as a `queued=True` placeholder — PM then caps the BUY at 5% regardless of conviction. No background threads in hot sessions, no session-time LLM token spend on earnings.
 
 ### Evening earnings deep-dive (value-investor lens)
 
