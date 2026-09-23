@@ -205,6 +205,72 @@ trading:
     # Data Center REITs (AI infra exposure — interconnect + hyperscale)
     - EQIX   # Equinix (global #1 interconnection / colocation)
     - DLR    # Digital Realty (hyperscale data-center REIT)
+    # ---- 2026-09-24 expansion: quality + coverage (55 names) ----
+    # Mega-cap / software platforms
+    - TSLA   # Tesla (autos/energy storage/robotics — highest-beta mega cap)
+    - NOW    # ServiceNow (enterprise workflow — best-in-class software compounder)
+    - ADBE   # Adobe (creative/document software — AI monetisation bellwether)
+    - PANW   # Palo Alto Networks (cybersecurity platform leader)
+    - CRWD   # CrowdStrike (endpoint / cloud security)
+    - PLTR   # Palantir (AI/analytics platforms; gov + commercial)
+    # Semiconductor equipment / AI infrastructure
+    - ASML   # ASML (EUV lithography monopoly)
+    - AMAT   # Applied Materials (#1 wafer-fab equipment)
+    - LRCX   # Lam Research (etch/deposition — memory capex)
+    - QCOM   # Qualcomm (mobile/auto/edge AI silicon)
+    - ANET   # Arista (AI data-center networking)
+    - VRT    # Vertiv (data-center power & cooling — pure AI-capex play)
+    # Healthcare breadth (pharma / devices / tools / biotech)
+    - ABBV   # AbbVie (immunology; Humira→Skyrizi/Rinvoq transition done)
+    - MRK    # Merck (Keytruda oncology franchise)
+    - TMO    # Thermo Fisher (life-science tools bellwether)
+    - ISRG   # Intuitive Surgical (robotic surgery monopoly)
+    - VRTX   # Vertex (cystic fibrosis franchise + pain pipeline)
+    - NVO    # Novo Nordisk (GLP-1 duopoly with LLY)
+    # Financials breadth
+    - AXP    # American Express (premium consumer credit)
+    - BLK    # BlackRock (asset-management scale + ETF flows)
+    - MS     # Morgan Stanley (wealth mgmt + IB cycle)
+    - SPGI   # S&P Global (ratings/indices/data — toll booth)
+    - COIN   # Coinbase (crypto exchange — digital-asset cycle exposure)
+    - IBIT   # iShares Bitcoin Trust (spot BTC — asset-class coverage)
+    # Consumer breadth
+    - BKNG   # Booking (global travel demand)
+    - TJX    # TJX (off-price retail — resilient consumer)
+    - LOW    # Lowe's (housing/home-improvement cycle, pairs with HD)
+    - UBER   # Uber (mobility/delivery platform; autonomy optionality)
+    - PEP    # PepsiCo (staples — snacks + beverages)
+    # Industrials / defense / rails
+    - LMT    # Lockheed Martin (defense prime)
+    - RTX    # RTX (aerospace + defense; engines)
+    - NOC    # Northrop Grumman (defense; B-21 / space)
+    - GD     # General Dynamics (defense + Gulfstream)
+    - EMR    # Emerson (automation / process control)
+    - UNP    # Union Pacific (rail — freight cycle bellwether)
+    # Energy infrastructure / power / utilities
+    - LNG    # Cheniere (US LNG export leader)
+    - WMB    # Williams (natural-gas pipelines — data-center gas demand)
+    - KMI    # Kinder Morgan (midstream gas)
+    - SO     # Southern Company (regulated utility; nuclear Vogtle)
+    - DUK    # Duke Energy (regulated utility; defensive yield)
+    - TLN    # Talen Energy (nuclear + gas power — AI data-center PPAs)
+    - FSLR   # First Solar (US-made utility-scale solar)
+    # Materials / metals
+    - FCX    # Freeport-McMoRan (copper — electrification/AI grid demand)
+    - NEM    # Newmont (gold miner — real-asset hedge)
+    - SHW    # Sherwin-Williams (coatings; housing/industrial quality compounder)
+    # Real estate income
+    - O      # Realty Income (net-lease REIT — rate-sensitive income)
+    # Macro / international / thematic ETFs (hedges + coverage the single names lack)
+    - GLD    # Gold
+    - TLT    # 20y+ Treasuries (duration / rate-cut expression)
+    - EFA    # Developed ex-US equities
+    - EEM    # Emerging markets
+    - FXI    # China large caps
+    - INDA   # India
+    - EWJ    # Japan
+    - XBI    # Biotech (equal-weight — early-stage biotech cycle)
+    - URA    # Uranium miners (completes the nuclear-fuel chain with CCJ)
   # CALENDAR days of OHLCV history — market.get_ohlcv does
   # `start = today - timedelta(days=lookback_days)`, so the usable BAR count is
   # only ~69% of this (120 gave ~82 bars).

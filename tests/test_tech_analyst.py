@@ -183,12 +183,12 @@ def test_tech_analyst_auto_chunks_large_batch(mock_cls, sample_indicators, sampl
         for s in syms
     ]
 
-    # Each chunked call returns a 25-item valid array (reuse a single template).
-    call_counter = {"n": 0}
-
+    # Each chunked call returns a valid array for exactly the symbols in ITS
+    # request (chunks run concurrently since 2026-09-24, so call order is
+    # not a reliable way to tell chunks apart).
     def _chunk_response(**kw):
-        call_counter["n"] += 1
-        chunk_syms = syms[:25] if call_counter["n"] == 1 else syms[25:]
+        content = json.dumps(kw.get("messages", ""))
+        chunk_syms = [s for s in syms if s in content]
         arr = [json.loads(_valid_response_for(s))[0] for s in chunk_syms]
         resp = MagicMock()
         resp.content = [MagicMock(text=json.dumps(arr))]
