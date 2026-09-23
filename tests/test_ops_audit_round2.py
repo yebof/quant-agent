@@ -717,3 +717,41 @@ def test_wrapper_non_intra_success_still_pings(tmp_path):
     log = (tmp_path / "curl.log").read_text()
     assert "https://hc-ping.example/uuid-1" in log
     assert "/fail" not in log
+
+
+# ---------------- 2026-09-24: partial exit code + guard-less earnings_catchup ----------------
+
+def test_wrapper_partial_exit_3_keeps_queue_without_failure_semantics(tmp_path):
+    """Exit 3 (= `partial`): no last-run marker (next tick continues the
+    queue), no /fail ping, no KILLED push, wrapper exits 0 (unit stays green)."""
+    env = _wrapper_env(tmp_path, "exit 3")
+    env |= {"HEALTHCHECKS_URL": "https://hc-ping.example/uuid-1",
+            "ET_HOUR_OVERRIDE": "08", "ET_MIN_OVERRIDE": "30"}   # earnings_preprocess window
+    result = _run_wrapper(env, "earnings_preprocess")
+    assert result.returncode == 0, result.stderr
+    assert "partial" in result.stderr
+    assert not (tmp_path / "cache" / "last-earnings_preprocess").exists()
+    log_file = tmp_path / "curl.log"
+    assert not log_file.exists() or "/fail" not in log_file.read_text()
+    assert "KILLED" not in result.stderr
+
+
+def test_wrapper_earnings_catchup_is_guardless_and_does_not_success_ping(tmp_path):
+    """earnings_catchup must run on EVERY tick of its window (like
+    intra_check): no last-run marker, no success ping that would pin the
+    shared healthcheck green."""
+    marker = tmp_path / "ran.log"
+    env = _wrapper_env(tmp_path, f"echo run >> {marker}\nexit 0")
+    env |= {"HEALTHCHECKS_URL": "https://hc-ping.example/uuid-1",
+            "ET_HOUR_OVERRIDE": "16", "ET_MIN_OVERRIDE": "30"}   # catch-up window
+    r1 = _run_wrapper(env, "earnings_catchup")
+    r2 = _run_wrapper(env, "earnings_catchup")
+    assert r1.returncode == 0 and r2.returncode == 0
+    assert marker.read_text().count("run") == 2               # second tick still ran
+    assert not (tmp_path / "cache" / "last-earnings_catchup").exists()
+    log_file = tmp_path / "curl.log"
+    assert not log_file.exists() or "hc-ping.example" not in log_file.read_text()
+    # ...and outside the window it does nothing.
+    env["ET_HOUR_OVERRIDE"], env["ET_MIN_OVERRIDE"] = "15", "45"
+    r3 = _run_wrapper(env, "earnings_catchup")
+    assert r3.returncode == 0 and marker.read_text().count("run") == 2

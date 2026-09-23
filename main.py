@@ -28,6 +28,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 _RETRYABLE_RESULT_STATUSES = frozenset(
     {"broker_error", "fetch_error", "analysis_error"}
 )
+# `partial` (2026-09-24): earnings preprocess hit its wall-clock budget with
+# filings still queued. Everything analysed so far is committed per filing,
+# so the wrapper must (a) skip its last-run marker so the next 30-min tick
+# continues the queue, but (b) NOT treat it as a failure (no /fail
+# healthcheck ping, no failed systemd unit). A distinct exit code carries
+# that distinction; scripts/run_if_et_window.sh handles it explicitly.
+_PARTIAL_EXIT_CODE = 3
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +58,7 @@ def main():
         "--mode",
         choices=[
             "live", "once", "morning", "midday", "close", "evening",
-            "intra_check", "earnings_preprocess", "meta", "daily",
+            "intra_check", "earnings_preprocess", "earnings_catchup", "meta", "daily",
         ],
         default="once", help="Run mode",
     )
@@ -172,7 +179,10 @@ def main():
             result = pipeline.run_evening()
         elif args.mode == "intra_check":
             result = pipeline.run_intra_check()
-        elif args.mode == "earnings_preprocess":
+        elif args.mode in ("earnings_preprocess", "earnings_catchup"):
+            # earnings_catchup (16:05-19:55 ET) is the same job under a
+            # separate last-run guard: it drains filings that dropped during
+            # the day or that the 08:00 run left queued for budget.
             result = pipeline.run_earnings_preprocess()
         elif args.mode == "meta":
             result = pipeline.run_quarterly_meta_reflection(
@@ -217,6 +227,13 @@ def main():
     # notification has already been sent — the operator still gets
     # the FAILED push, the wrapper just doesn't mark the slot done.
     status = result.get("status") if isinstance(result, dict) else None
+    if status == "partial":
+        logger.info(
+            "Session %s ended with status 'partial' — exiting %d so the wrapper "
+            "continues the queue on the next tick without marking a failure.",
+            args.mode, _PARTIAL_EXIT_CODE,
+        )
+        sys.exit(_PARTIAL_EXIT_CODE)
     if status in _RETRYABLE_RESULT_STATUSES:
         logger.warning(
             "Session %s ended with retryable status %r — exiting non-zero "

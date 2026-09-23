@@ -7,7 +7,9 @@ trading.
 
 Per-mode noise policy (see `format_session_result`):
   - morning / midday / close / evening: always notify on completion
-  - earnings_preprocess: notify only when filings were analyzed
+  - earnings_preprocess / earnings_catchup: notify only when filings were
+    analyzed, or when the run is `partial` (⏳ budget reached; lists the
+    symbols still queued); silent on nothing_new / market_holiday / fetch_error
     (skip "nothing_new" — happens most pre-market days)
   - intra_check: notify only on emergency action (skip the 14
     silent OK ticks per trading day)
@@ -184,7 +186,7 @@ def format_session_result(
     # === Per-mode noise policy ===
     if mode == "intra_check" and status in ("ok", "market_holiday"):
         return None  # silent — would otherwise be 14 pings/day
-    if mode == "earnings_preprocess" and status in (
+    if mode in ("earnings_preprocess", "earnings_catchup") and status in (
         "market_holiday", "nothing_new", "fetch_error",
     ):
         # nothing_new is the common case (most pre-market days have
@@ -240,7 +242,7 @@ def format_session_result(
         _append_trade_session_body(lines, result)
     elif mode == "evening":
         _append_evening_body(lines, result)
-    elif mode == "earnings_preprocess":
+    elif mode in ("earnings_preprocess", "earnings_catchup"):
         _append_earnings_body(lines, result)
     elif mode == "intra_check":
         _append_intra_check_body(lines, result)
@@ -758,6 +760,14 @@ def _append_earnings_body(lines: list[str], result: dict) -> None:
     confirmed = result.get("confirmed", 0)
     failed = result.get("failed", 0)
     lines.append(f"analyzed: {analyzed}  confirmed: {confirmed}  failed: {failed}")
+    skipped = int(result.get("skipped") or 0)
+    if skipped:
+        syms = ", ".join((result.get("skipped_symbols") or [])[:8])
+        more = "" if skipped <= 8 else f" +{skipped - 8}"
+        lines.append(
+            f"⏳ budget reached: {skipped} filing(s) still queued ({syms}{more}) — "
+            f"next tick continues; PM sizes them at the 5% just-filed cap meanwhile"
+        )
 
 
 def _append_intra_check_body(lines: list[str], result: dict) -> None:
@@ -855,6 +865,8 @@ def _status_emoji(status: str) -> str:
     # reflection step itself failed (LLM exception / parse error). The
     # learning loop is half-broken until next quarter — operator should
     # notice via 🟡 rather than skim past a green check.
+    if status == "partial":
+        return "⏳"
     if status in ("emergency_sold", "hard_risk_block", "digest_only"):
         return "🟡"
     if "error" in status or status in ("rejected", "failed"):

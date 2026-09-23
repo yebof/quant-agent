@@ -2,10 +2,44 @@ import logging
 import math
 import os
 import re
+import time
 import uuid
 from datetime import date
 from pathlib import Path
 from src.trading_calendar import et_now, et_today, session_date_key
+
+# Earnings preprocess throughput knobs (2026-09-24). Budget = wall-clock after
+# session start past which no NEW filing analysis is started (in-flight ones
+# finish; each is bounded by the LLM timeout). 720s leaves ~8 min of the
+# wrapper's 1200s kill for fetch + drains + in-flight completion.
+_EARNINGS_BUDGET_DEFAULT_S = 720.0
+_EARNINGS_WORKERS_DEFAULT = 3
+
+
+def _earnings_budget_s() -> float:
+    raw = os.environ.get("QUANT_AGENT_EARNINGS_BUDGET_S", "").strip()
+    try:
+        val = float(raw) if raw else _EARNINGS_BUDGET_DEFAULT_S
+    except ValueError:
+        val = _EARNINGS_BUDGET_DEFAULT_S
+    return val if val > 0 else _EARNINGS_BUDGET_DEFAULT_S
+
+
+def _earnings_workers() -> int:
+    """Concurrent filing analyses. Clamped to the OpenAI semaphore: a worker
+    above the semaphore passes the deadline check, then blocks on the
+    semaphore and starts its LLM call AFTER the budget — the budget only
+    bounds STARTS when workers ≤ semaphore."""
+    from src.agents.base import _OPENAI_MAX_CONCURRENT
+    raw = os.environ.get("QUANT_AGENT_EARNINGS_WORKERS", "").strip()
+    try:
+        val = int(raw) if raw else _EARNINGS_WORKERS_DEFAULT
+    except ValueError:
+        val = _EARNINGS_WORKERS_DEFAULT
+    cap = max(1, int(_OPENAI_MAX_CONCURRENT))
+    if val > cap:
+        logger.info("earnings workers %d clamped to the LLM semaphore (%d)", val, cap)
+    return max(1, min(val, cap))
 
 from pydantic import ValidationError
 
@@ -6521,6 +6555,62 @@ class TradingPipeline:
             "stop_coverage_gaps": coverage_gaps,
         }
 
+    def _prioritize_earnings_reports(self, reports: list) -> list:
+        """Order new filings so a budget-limited run analyses what can move
+        today's decisions first: held positions > symbols in the PM's last
+        two target lists > symbols with an actionable tech rating > the
+        rest; newest filing first within a tier. Every lookup is best-effort
+        — a failure just degrades to the original order."""
+        if len(reports) <= 1:
+            return list(reports)
+        held: set[str] = set()
+        watch: set[str] = set()
+        actionable: set[str] = set()
+        try:
+            held = {p.symbol.upper() for p in self.broker.get_positions() if p.qty > 0}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("earnings priority: positions unavailable: %s", e)
+        try:
+            import json as _json
+            rows = self.db.get_recent_agent_outputs(agent_name="portfolio_manager", limit=2)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("earnings priority: PM targets unavailable: %s", e)
+            rows = []
+        for row in rows or []:
+            try:
+                data = _json.loads(row.get("full_response") or "{}")
+                for tgt in (data.get("targets") or []):
+                    if isinstance(tgt, dict) and tgt.get("symbol"):
+                        watch.add(str(tgt["symbol"]).upper())
+            except Exception:  # noqa: BLE001 — one bad row loses only its own targets
+                continue
+        try:
+            for sym, meta in (self.tech_store.load() or {}).items():
+                if (meta or {}).get("rating") in ("strong_buy", "buy", "sell", "strong_sell"):
+                    actionable.add(str(sym).upper())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("earnings priority: tech ratings unavailable: %s", e)
+
+        def _tier(r) -> int:
+            s = (getattr(r, "symbol", "") or "").upper()
+            if s in held:
+                return 0
+            if s in watch:
+                return 1
+            if s in actionable:
+                return 2
+            return 3
+
+        newest_first = sorted(reports, key=lambda r: getattr(r, "filing_date", "") or "", reverse=True)
+        ordered = sorted(newest_first, key=_tier)   # stable: keeps newest-first within a tier
+        if ordered and ordered != list(reports):
+            logger.info(
+                "earnings priority: %s",
+                ", ".join(f"{r.symbol}(t{_tier(r)})" for r in ordered[:12])
+                + (" …" if len(ordered) > 12 else ""),
+            )
+        return ordered
+
     def run_earnings_preprocess(self) -> dict:
         """Pre-market earnings analysis — the ONLY place that calls the LLM
         for 10-Q/10-K filings.
@@ -6536,6 +6626,7 @@ class TradingPipeline:
         """
         ctx = RunContext.start("earnings_preprocess")
         run_id = ctx.run_id
+        t_start = time.monotonic()
         logger.info("=== Earnings preprocessing: %s ===", run_id)
 
         _td = self._is_trading_day()
@@ -6569,53 +6660,36 @@ class TradingPipeline:
             logger.info("Earnings preprocess: no new filings, nothing to analyze.")
             return {"status": "nothing_new", "run_id": run_id, "count": 0}
 
+        # 2026-09-24 throughput redesign. With 156 symbols a filing-season
+        # day brings 15-18 new 10-Qs; at ~55s each the old sequential loop
+        # committed NOTHING until every analysis had finished, so the
+        # wrapper's 20-min kill threw away all of it and the 3-strike counter
+        # (explicit failures only) never advanced — the same day repeated
+        # three ticks in a row with zero analyses banked. Now: priority
+        # order (held > PM targets > actionable tech > rest), a wall-clock
+        # budget after which no NEW analysis starts, N concurrent workers,
+        # and a per-filing commit hook. Anything not started is returned as
+        # `partial` (retryable → the next tick continues where we left off).
+        new_reports = self._prioritize_earnings_reports(new_reports)
+        budget_s = _earnings_budget_s()
+        workers = _earnings_workers()
+        deadline = t_start + budget_s
         logger.info(
-            "Earnings preprocess: analyzing %d new filings: %s",
-            len(new_reports),
+            "Earnings preprocess: analyzing %d new filings (budget %.0fs, %d workers): %s",
+            len(new_reports), budget_s, workers,
             ", ".join(r.symbol for r in new_reports),
         )
-        try:
-            results = self.earnings_analyst.analyze_reports(new_reports)
-        except Exception as e:
-            logger.error("Earnings preprocess: LLM analysis failed: %s", e, exc_info=True)
-            # Record failures so the retry bounds kick in for each filing.
-            for r in new_reports:
-                try:
-                    self.earnings_provider.record_failure(r)
-                except Exception as rf_exc:  # noqa: BLE001
-                    logger.error("record_failure failed for %s: %s", r.symbol, rf_exc)
-            return {"status": "analysis_error", "run_id": run_id, "error": str(e)}
 
-        # Match results to reports by (symbol, form_type, filing_date), not
-        # just symbol. Same-symbol multiple-form-day is rare but real
-        # (10-Q + 10-K can land the same fiscal-year-end day). Symbol-only
-        # matching meant a successful 10-K silently flagged a failed 10-Q
-        # as confirmed and never consumed its retry budget — the failed
-        # filing would then be re-queued every preprocess run forever.
         def _filing_key(symbol: str, form_type: str | None, filing_date: str | None):
             return (symbol, form_type, filing_date)
 
-        successful_keys = {
-            _filing_key(res["symbol"], res.get("form_type"), res.get("filing_date"))
-            for res in results
-            if res.get("is_new")
-        }
-        failed_reports = [
-            r for r in new_reports
-            if _filing_key(r.symbol, r.form_type, r.filing_date) not in successful_keys
-        ]
-        for report in failed_reports:
-            try:
-                self.earnings_provider.record_failure(report)
-            except Exception as rf_exc:  # noqa: BLE001
-                logger.error("record_failure failed for %s: %s", report.symbol, rf_exc)
+        committed: set[tuple] = set()
+        counters = {"analyzed": 0, "confirmed": 0}
 
-        # Log each LLM call (parity with the inline bg-thread path).
-        analyzed_count = 0
-        for res in results:
+        def _log_result(res: dict) -> None:
             agent_result = res.get("agent_result")
             if agent_result is None:
-                continue
+                return
             sym = res.get("symbol", "?")
             analysis = res.get("analysis") or {}
             sentiment = (analysis.get("investment_implications") or {}).get("sentiment", "?")
@@ -6629,7 +6703,8 @@ class TradingPipeline:
                         f"sentiment={sentiment}" if res.get("analysis") else "parse_error"
                     ),
                     full_response=agent_result.raw_text,
-                    model=self.config.llm.earnings_analyst_model,
+                    model=getattr(agent_result, "model", None)
+                    or self.config.llm.earnings_analyst_model,
                     tokens_used=agent_result.tokens_used,
                     input_tokens=agent_result.input_tokens,
                     output_tokens=agent_result.output_tokens,
@@ -6637,31 +6712,117 @@ class TradingPipeline:
                 )
             except Exception as e:
                 logger.error("Earnings preprocess: log insert failed for %s: %s", sym, e)
-            analyzed_count += 1
+            counters["analyzed"] += 1
 
-        # Confirm filings. Do this AFTER logging so a crash between the two
-        # leaves the filing still "new" for the next preprocess run.
-        # Match by (symbol, form_type, filing_date) to avoid confirming a
-        # failed 10-Q on the back of a successful same-day 10-K.
-        confirmed = 0
-        for r in new_reports:
-            if _filing_key(r.symbol, r.form_type, r.filing_date) in successful_keys:
+        def _commit(res: dict, report) -> None:
+            """Per-filing commit: log, then confirm — so a kill between the
+            two leaves the filing still `new` for the next run."""
+            key = _filing_key(res["symbol"], res.get("form_type"), res.get("filing_date"))
+            if key in committed:
+                return
+            _log_result(res)
+            try:
+                self.earnings_provider.confirm_filing(report)
+                counters["confirmed"] += 1
+            except Exception as e:
+                logger.warning("confirm_filing failed for %s: %s", report.symbol, e)
+            committed.add(key)
+
+        ticked: set[tuple] = set()
+
+        def _tick_failure(report) -> None:
+            """3-strike tick, at most once per filing per run, on the caller
+            thread as the failure arrives (a kill later in the run must not
+            lose the strike the way the old post-loop tick did)."""
+            key = _filing_key(report.symbol, report.form_type, report.filing_date)
+            if key in ticked or key in committed:
+                return
+            ticked.add(key)
+            try:
+                self.earnings_provider.record_failure(report)
+            except Exception as rf_exc:  # noqa: BLE001
+                logger.error("record_failure failed for %s: %s", report.symbol, rf_exc)
+
+        outcome: dict = {}
+        try:
+            results = self.earnings_analyst.analyze_reports(
+                new_reports, on_result=_commit, on_failure=_tick_failure,
+                deadline=deadline, max_workers=workers, outcome=outcome,
+            )
+        except Exception as e:
+            logger.error("Earnings preprocess: LLM analysis failed: %s", e, exc_info=True)
+            # Tick every filing that was neither committed nor already ticked
+            # so the retry bounds still apply; filings the per-filing hook
+            # already confirmed stay confirmed.
+            for r in new_reports:
+                _tick_failure(r)
+            if committed:
+                return {
+                    "status": "partial", "run_id": run_id, "error": str(e),
+                    "analyzed": counters["analyzed"], "confirmed": counters["confirmed"],
+                    "failed": len(ticked), "skipped": 0, "skipped_symbols": [],
+                    "budget_s": budget_s, "workers": workers,
+                }
+            return {"status": "analysis_error", "run_id": run_id, "error": str(e)}
+
+        # Match results to reports by (symbol, form_type, filing_date), not
+        # just symbol. Same-symbol multiple-form-day is rare but real
+        # (10-Q + 10-K can land the same fiscal-year-end day).
+        results = list(results or [])
+        skipped = [r for r in (outcome.get("skipped") or []) if r is not None]
+        skipped_keys = {_filing_key(r.symbol, r.form_type, r.filing_date) for r in skipped}
+        successful_keys = {
+            _filing_key(res["symbol"], res.get("form_type"), res.get("filing_date"))
+            for res in results
+            if res.get("is_new")
+        }
+        # Skipped-by-budget filings are neither successes nor failures: they
+        # stay `new` (no record_failure) and the next tick starts with them.
+        failed_reports = [
+            r for r in new_reports
+            if _filing_key(r.symbol, r.form_type, r.filing_date) not in successful_keys
+            and _filing_key(r.symbol, r.form_type, r.filing_date) not in skipped_keys
+        ]
+        for report in failed_reports:
+            _tick_failure(report)   # no-op for keys the on_failure hook already ticked
+
+        # Anything the per-filing hook did not commit (a mocked analyst that
+        # never calls on_result, or a hook failure) is committed here — log
+        # first, confirm after, same ordering rationale as the hook.
+        for res in results:
+            key = _filing_key(res["symbol"], res.get("form_type"), res.get("filing_date"))
+            if key in committed or not res.get("is_new"):
+                continue
+            _log_result(res)
+            report = next(
+                (r for r in new_reports
+                 if _filing_key(r.symbol, r.form_type, r.filing_date) == key), None,
+            )
+            if report is not None:
                 try:
-                    self.earnings_provider.confirm_filing(r)
-                    confirmed += 1
+                    self.earnings_provider.confirm_filing(report)
+                    counters["confirmed"] += 1
                 except Exception as e:
-                    logger.warning("confirm_filing failed for %s: %s", r.symbol, e)
+                    logger.warning("confirm_filing failed for %s: %s", report.symbol, e)
+            committed.add(key)
 
+        status = "partial" if skipped else "preprocessed"
         logger.info(
-            "Earnings preprocess complete: %d analyzed, %d confirmed, %d failed",
-            analyzed_count, confirmed, len(failed_reports),
+            "Earnings preprocess complete (%s): %d analyzed, %d confirmed, %d failed, "
+            "%d skipped for budget (%.0fs elapsed of %.0fs)",
+            status, counters["analyzed"], counters["confirmed"], len(failed_reports),
+            len(skipped), time.monotonic() - t_start, budget_s,
         )
         return {
-            "status": "preprocessed",
+            "status": status,
             "run_id": run_id,
-            "analyzed": analyzed_count,
-            "confirmed": confirmed,
+            "analyzed": counters["analyzed"],
+            "confirmed": counters["confirmed"],
             "failed": len(failed_reports),
+            "skipped": len(skipped),
+            "skipped_symbols": [r.symbol for r in skipped],
+            "budget_s": budget_s,
+            "workers": workers,
         }
 
     def run_intra_check(self) -> dict:

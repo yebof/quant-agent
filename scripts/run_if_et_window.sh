@@ -7,13 +7,13 @@
 # share this script so the system fires at correct US market times regardless
 # of the host's timezone — survives the user flying across continents.
 #
-# Usage: run_if_et_window.sh <earnings_preprocess|morning|intra_check|midday|evening>
+# Usage: run_if_et_window.sh <earnings_preprocess|morning|intra_check|midday|close|evening|earnings_catchup>
 
 set -eu
 
 MODE="${1:-}"
 if [[ -z "$MODE" ]]; then
-    echo "usage: $0 <earnings_preprocess|morning|intra_check|midday|evening>" >&2
+    echo "usage: $0 <earnings_preprocess|morning|intra_check|midday|close|evening|earnings_catchup>" >&2
     exit 2
 fi
 
@@ -70,6 +70,7 @@ fi
 # tests/test_trading_calendar.py asserts this table matches that one —
 # don't edit one without the other.
 # earnings_preprocess: 08:00-09:15 ET (pre-market, analyze fresh filings)
+# earnings_catchup   : 16:05-19:55 ET (post-close, drain intraday / budget-skipped filings; same python mode logic, distinct last-run guard)
 # morning            : 09:30-12:00 ET (pre-market / early session, wide for late-wake grace)
 # intra_check        : 09:30-16:00 ET (flash-crash circuit breaker, fires every 30min tick; NOT subject to once-per-day guard — stateless, all actions idempotent)
 # midday             : 13:00-14:30 ET (position reviewer, afternoon patience)
@@ -82,6 +83,7 @@ case "$MODE" in
     midday)              LO=780; HI=870  ;;
     close)               LO=930; HI=960  ;;
     evening)             LO=1200; HI=1320 ;;
+    earnings_catchup)    LO=965;  HI=1195 ;;
     *) echo "unknown mode: $MODE" >&2; exit 2 ;;
 esac
 
@@ -96,7 +98,13 @@ fi
 # once-per-day guard is skipped and no last-run file is written for it.
 LAST_FILE="${LAST_RUN_DIR}/last-${MODE}"
 NOW_UNIX="${NOW_UNIX_OVERRIDE:-$(date +%s)}"
-if [[ "$MODE" != "intra_check" && -f "$LAST_FILE" ]]; then
+# earnings_catchup is guard-less too (2026-09-24): it must sweep EDGAR on every
+# tick of its 16:05-19:55 window so a filing that drops at 17:00 is analysed
+# by 17:30, not tomorrow. Confirmed filings are never re-analysed, so the
+# extra ticks cost an EDGAR metadata sweep and zero LLM spend.
+GUARDLESS=0
+if [[ "$MODE" == "intra_check" || "$MODE" == "earnings_catchup" ]]; then GUARDLESS=1; fi
+if [[ "$GUARDLESS" -eq 0 && -f "$LAST_FILE" ]]; then
     LAST_VALUE="$(cat "$LAST_FILE" 2>/dev/null || echo 0)"
     LAST_DATE="${LAST_VALUE%% *}"
     # Primary guard: never fire the same mode twice in the same ET session date.
@@ -223,9 +231,9 @@ ping_healthcheck() {
 }
 
 if "$TIMEOUT" --kill-after=30 1200 "$PYTHON" main.py --mode "$MODE"; then
-    # intra_check is intentionally guard-less (see last-run guard block above) —
-    # we don't write the marker for it, so the next 30-min tick can fire freely.
-    if [[ "$MODE" != "intra_check" ]]; then
+    # intra_check / earnings_catchup are guard-less (see last-run guard block
+    # above) — no marker, so the next 30-min tick can fire freely.
+    if [[ "$GUARDLESS" -eq 0 ]]; then
         echo "${ET_DATE} ${NOW_UNIX}" > "$LAST_FILE"
     fi
     # audit round 2 (#43): do NOT success-ping for intra_check. All six
@@ -234,12 +242,22 @@ if "$TIMEOUT" --kill-after=30 1200 "$PYTHON" main.py --mode "$MODE"; then
     # die — defeating the dead-man's switch this ping exists for. Failure
     # pings (below) still fire for ALL modes, intra_check included, so a
     # crashing circuit breaker is still visible externally.
-    if [[ "$MODE" != "intra_check" ]]; then
+    if [[ "$GUARDLESS" -eq 0 ]]; then
         ping_healthcheck
     fi
     exit 0
 else
     STATUS=$?
+fi
+
+# Exit 3 = `partial` (2026-09-24): the earnings session hit its wall-clock
+# budget with filings still queued. Everything analysed is already committed
+# per filing; the only thing we want is NO last-run marker so the next tick
+# continues the queue. It is not a failure: no /fail ping, no KILLED push,
+# clean exit so the systemd oneshot unit stays green.
+if [[ "$STATUS" -eq 3 ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ${MODE} partial (budget reached) — not updating last-run guard; next tick continues the queue" >&2
+    exit 0
 fi
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ${MODE} failed with status ${STATUS}; not updating last-run guard" >&2

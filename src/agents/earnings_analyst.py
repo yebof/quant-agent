@@ -6,6 +6,8 @@ For existing filings: returns previously saved analysis.
 
 import json
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
 from pathlib import Path
@@ -54,16 +56,52 @@ class EarningsAnalystAgent(BaseAgent):
 
 Analyze this filing and respond with JSON. Cite specific numbers from the text above."""
 
-    def analyze_reports(self, reports: list[EarningsReport]) -> list[dict]:
+    def analyze_reports(
+        self,
+        reports: list[EarningsReport],
+        *,
+        on_result=None,
+        on_failure=None,
+        deadline: float | None = None,
+        max_workers: int = 1,
+        outcome: dict | None = None,
+    ) -> list[dict]:
         """Analyze all reports. Only schema-validated analyses are returned.
 
-        Returns list of {symbol, analysis_dict, agent_result_or_none}.
-        """
-        results = []
+        Returns list of {symbol, analysis_dict, agent_result_or_none, is_new,
+        form_type, filing_date} — same shape as before.
 
-        for report in reports:
+        2026-09-24 (earnings throughput):
+        - `on_result(res, report)` is invoked on the CALLER's thread as each
+          NEW analysis completes, so the pipeline can commit (agent_log +
+          confirm_filing) per filing instead of only after the whole batch.
+          A wrapper kill mid-batch then loses at most the in-flight calls.
+        - `deadline` is a time.monotonic() instant: a filing whose analysis
+          has not STARTED by then is SKIPPED (listed in outcome["skipped"]),
+          not failed — it stays `is_new` for the next tick and does not tick
+          the 3-strike counter.
+        - `max_workers` > 1 runs analyses concurrently (bounded further by
+          the per-provider LLM semaphore in base.py). Submission order is
+          preserved, so the caller's priority order is honoured.
+        `outcome` (optional dict) receives {"skipped": [...], "failed": [...]}.
+        """
+        results: list[dict] = []
+        # When the caller passes `outcome` it owns failure accounting (the
+        # pipeline ticks record_failure exactly once per failed filing);
+        # only the legacy call shape ticks the seam from in here.
+        caller_owns_failures = outcome is not None
+        if outcome is None:
+            outcome = {}
+        outcome.setdefault("skipped", [])
+        outcome.setdefault("failed", [])
+        if not reports:
+            return results
+
+        def _task(report):
+            if deadline is not None and time.monotonic() >= deadline:
+                return "skipped", report, []
             try:
-                results.extend(self._analyze_one(report))
+                return "ok", report, self._analyze_one(report)
             except Exception as e:  # noqa: BLE001 — audit round 2: one bad
                 # filing (corrupt text, LLM error escaping _analyze_new, disk
                 # failure in _save_analysis) must not abort the WHOLE batch —
@@ -71,10 +109,63 @@ Analyze this filing and respond with JSON. Cite specific numbers from the text a
                 # while record_failure never ticked for them.
                 logger.error("earnings: analysis failed for %s %s — isolating: %s",
                              report.symbol, report.form_type, e)
+                return "failed", report, []
+
+        def _consume(status, report, res_list):
+            if status == "skipped":
+                outcome["skipped"].append(report)
+                return
+            if status == "failed":
+                outcome["failed"].append(report)
+                if on_failure is not None:
+                    try:
+                        on_failure(report)          # caller-thread 3-strike tick
+                    except Exception as e:  # noqa: BLE001
+                        logger.error("earnings: on_failure hook failed for %s: %s", report.symbol, e)
+                elif not caller_owns_failures:
+                    try:
+                        self.earnings_provider_record_failure(report)
+                    except Exception:  # noqa: BLE001
+                        pass
+                return
+            results.extend(res_list)
+            if on_result is not None:
+                for res in res_list:
+                    if not res.get("is_new"):
+                        continue
+                    try:
+                        on_result(res, report)
+                    except Exception as e:  # noqa: BLE001 — a commit hook
+                        # failure must not lose the analysis itself; the
+                        # caller's post-loop can still confirm from `results`.
+                        logger.error("earnings: on_result hook failed for %s: %s",
+                                     report.symbol, e)
+
+        workers = max(1, min(int(max_workers or 1), len(reports)))
+        if workers == 1:
+            for report in reports:
+                _consume(*_task(report))
+            return results
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_task, r) for r in reports]   # FIFO = priority order
+            for fut in as_completed(futures):
                 try:
-                    self.earnings_provider_record_failure(report)
-                except Exception:  # noqa: BLE001
-                    pass
+                    status, report, res_list = fut.result()
+                except Exception as e:  # noqa: BLE001 — _task already isolates;
+                    logger.error("earnings: worker crashed: %s", e)   # belt only
+                    continue
+                _consume(status, report, res_list)
+        # Report skipped/failed in submission (= priority) order, not completion order.
+        pos = {id(r): i for i, r in enumerate(reports)}
+        outcome["skipped"].sort(key=lambda r: pos.get(id(r), 0))
+        outcome["failed"].sort(key=lambda r: pos.get(id(r), 0))
+        if outcome["skipped"]:
+            logger.warning(
+                "earnings: budget reached — %d filing(s) not started this run "
+                "(remain queued): %s", len(outcome["skipped"]),
+                ", ".join(r.symbol for r in outcome["skipped"]),
+            )
         return results
 
     def earnings_provider_record_failure(self, report) -> None:

@@ -910,8 +910,14 @@ def test_pm_renders_calibration_section():
         assert "avg return +3.20%" in msg
 
 
-def test_earnings_record_failure_abandons_after_max_attempts(tmp_path):
+def test_earnings_record_failure_abandons_after_max_attempts(tmp_path, monkeypatch):
     """Third failure flips `abandoned=True` and returns True from record_failure."""
+    # 2026-09-24: strikes are one-per-filing-per-ET-day; advance the clock
+    # one day per record_failure call so consecutive strikes still count.
+    import itertools as _it, src.data.earnings as _earn
+    from datetime import date as _date, timedelta as _td
+    _days = _it.count()
+    monkeypatch.setattr(_earn, "et_today", lambda: _date(2026, 4, 20) + _td(days=next(_days)))
     from src.data.earnings import EarningsDataProvider, EarningsReport
 
     provider = EarningsDataProvider(data_dir=str(tmp_path / "earnings"))
