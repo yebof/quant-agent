@@ -34,7 +34,10 @@ REQUEST_DELAY = 0.12  # SEC rate limit: 10 req/s
 # whenever a new ETF is added there.
 ETFS = {"SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLV", "XLI", "XLP",
         "XLY", "XLU", "XLRE", "XLB", "SMH", "SOXX", "DRAM", "CHPX",
-        "SH", "SDS", "PSQ", "SQQQ"}
+        "SH", "SDS", "PSQ", "SQQQ",
+        # 2026-09-24 universe expansion: macro / international / thematic
+        "GLD", "TLT", "IBIT", "EFA", "EEM", "FXI", "INDA", "EWJ", "XBI", "URA",
+        "SGOV"}
 
 
 @dataclass

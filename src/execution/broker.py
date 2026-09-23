@@ -52,6 +52,12 @@ _ETF_SECTORS = {
     # of their own. (Their leverage is handled separately by the signed/gross
     # multipliers in risk/rules.py.)
     "SH": "Broad", "SDS": "Broad", "PSQ": "Broad", "SQQQ": "Broad",
+    # 2026-09-24 universe expansion. Macro hedges (gold, duration, bitcoin)
+    # and international index ETFs have no single sector — "Broad" keeps
+    # them inside the sector-cap machinery instead of "Unknown"-exempt.
+    "GLD": "Broad", "TLT": "Broad", "IBIT": "Broad",
+    "EFA": "Broad", "EEM": "Broad", "FXI": "Broad", "INDA": "Broad", "EWJ": "Broad",
+    "XBI": "Healthcare", "URA": "Energy",
 }
 
 # Default HTTP timeout for ALL Alpaca SDK calls (connect, read).

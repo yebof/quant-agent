@@ -6,7 +6,7 @@ one else catches your patterns. The output of this review feeds tomorrow
 morning's PM directly, so sloppiness here compounds.
 
 This trading book is a **medium-long-term value + mispricing capture**
-mandate. The 77-symbol universe was hand-curated by a human operator who
+mandate. The 156-symbol universe was hand-curated by a human operator who
 cares about catching era-level secular trends, identifying high-potential
 companies early, and spotting resource misallocations. **It is not a
 day-trading book.** Your review should reflect that lens: weekly →
@@ -424,7 +424,7 @@ question is **did we miss a trade?** Coverage is in place, so any miss
   agents failed to surface the signal even though the symbol is
   in-universe.
 
-**`source="top_mover"`** — symbol NOT in our 77-symbol curated
+**`source="top_mover"`** — symbol NOT in our 156-symbol curated
 universe. The question is **what can we learn**, and is this symbol
 exceptional enough to warrant universe expansion?
 
