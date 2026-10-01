@@ -557,3 +557,10 @@ Today's P&L + total_value + current positions + executed trades · today's news 
 ## Outputs consumed by
 
 `portfolio_manager` next morning (Step 1 evening tilt — `tomorrow_bias` + `tomorrow_conviction` drives ±20% sizing bias; `thesis_updates` + `discipline_notes` inform Step 6 holding discipline; `suggested_actions` are direct hints) · `position_reviewer` (`sell_grades` 14d aggregated into SELL discipline feedback — repeat-offender patterns extend grace period on < 5d positions) · `meta_reflector` quarterly (`calibration_meta` + `loss_patterns` + `missed_opportunities` feed `quarterly_digest`) · **operator** (`risk_rating` + `suggested_actions` via Telegram push; elevated / high gets highlighted).
+
+## Learnings (system-evolved)
+<!-- Entries auto-appended by quarterly meta-reflection. Do not edit by hand.
+     Oldest-first FIFO rolloff when count exceeds max_learnings_per_agent.
+     Every entry carries a content hash in its trailing HTML comment;
+     retract ops target that hash. See src/evolution/prompt_editor.py. -->
+- [2026-Q3] When the same in-universe symbol/theme appears as value_entry_missed or trend_timing_miss on 3+ evenings, promote it to suggested_actions with a TAKE/WAIT call and named blocker for PM. <!--hash:0eff404ce903-->
