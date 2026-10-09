@@ -8,5 +8,11 @@ build/
 .venv/
 /data/
 .env
+.env.*
+!.env.example
+.tmp_*
 .DS_Store
 *.log
+*.log.[0-9]*
+/logs/
+/logs-archive-*/
