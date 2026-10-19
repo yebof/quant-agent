@@ -1,6 +1,6 @@
 [project]
 name = "quant-agent"
-version = "0.1.0"
+version = "0.3.0"
 description = "LLM-agent quantitative trading system for US stocks"
 authors = [
     {name = "Yebo Feng", email = "fengyebo@gmail.com"},
