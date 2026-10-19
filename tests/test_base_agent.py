@@ -1080,3 +1080,140 @@ def test_llm_semaphore_released_after_success_and_failure(monkeypatch):
         with pytest.raises(Exception):
             ConcreteAgent(api_key="k", model="gpt-5.5", max_tokens=64).run(data="x")
     assert base_mod._OPENAI_LLM_SEMAPHORE._value == start
+
+
+# --- Claude primary (claude-opus-5-5) + configured cross-provider fallback ---
+
+def test_claude_primary_fails_over_to_configured_openai_model(monkeypatch):
+    """Claude primary exhausts retries → ONE call on the configured OpenAI
+    fallback model with the fallback key; result carries that model."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+    anth = MagicMock()
+    anth.messages.create.side_effect = ConnectionError("anthropic down")
+    oai = _openai_stream_mock()
+    with patch("anthropic.Anthropic", return_value=anth), \
+         patch("openai.OpenAI", return_value=oai) as oai_cls:
+        agent = ConcreteAgent(api_key="ak", model="claude-opus-5-5", max_tokens=64,
+                              fallback_api_key="ok", fallback_model="gpt-6.1-sol")
+        result = agent.run(data="x")
+    assert result.raw_text == '{"result": "ok"}'
+    assert result.model == "gpt-6.1-sol"
+    assert anth.messages.create.call_count == 2
+    oai.chat.completions.create.assert_called_once()
+    assert oai.chat.completions.create.call_args.kwargs["model"] == "gpt-6.1-sol"
+    assert oai_cls.call_args.kwargs["api_key"] == "ok"
+
+
+def test_claude_primary_without_fallback_key_does_not_fail_over(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "1")
+    anth = MagicMock()
+    anth.messages.create.side_effect = ConnectionError("anthropic down")
+    oai = _openai_stream_mock()
+    with patch("anthropic.Anthropic", return_value=anth), patch("openai.OpenAI", return_value=oai):
+        agent = ConcreteAgent(api_key="ak", model="claude-opus-5-5", max_tokens=64,
+                              fallback_api_key="", fallback_model="gpt-6.1-sol")
+        with pytest.raises(ConnectionError):
+            agent.run(data="x")
+    oai.chat.completions.create.assert_not_called()
+
+
+def test_claude_refusal_skips_retries_and_fails_over(monkeypatch):
+    """stop_reason=refusal: partial text is discarded, the same prompt is not
+    retried, and the configured fallback answers."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    refused = _good_anthropic_response(text='{"decisions": [')
+    refused.stop_reason = "refusal"
+    anth = MagicMock()
+    anth.messages.create.return_value = refused
+    oai = _openai_stream_mock()
+    with patch("anthropic.Anthropic", return_value=anth), patch("openai.OpenAI", return_value=oai):
+        agent = ConcreteAgent(api_key="ak", model="claude-opus-5-5", max_tokens=64,
+                              fallback_api_key="ok", fallback_model="gpt-6.1-sol")
+        result = agent.run(data="x")
+    anth.messages.create.assert_called_once()
+    assert result.model == "gpt-6.1-sol"
+    assert result.raw_text == '{"result": "ok"}'
+
+
+def test_anthropic_thinking_blocks_are_not_the_answer(mock_anthropic):
+    """Opus 5.5 always thinks: the first content block is a thinking block
+    with no `text`. Only text blocks form the answer."""
+    from types import SimpleNamespace
+    resp = _good_anthropic_response()
+    resp.content = [SimpleNamespace(type="thinking", thinking="", signature="sig"),
+                    MagicMock(text='{"result": "ok"}')]
+    mock_anthropic.messages.create.return_value = resp
+    agent = ConcreteAgent(api_key="k", model="claude-opus-5-5", max_tokens=64)
+    assert agent.run(data="x").raw_text == '{"result": "ok"}'
+
+
+def test_anthropic_request_sets_effort_and_no_sampling_params(mock_anthropic, monkeypatch):
+    """Opus 5.5 rejects temperature/top_p/budget_tokens and defaults effort to
+    medium — effort is sent explicitly (default high, env-overridable)."""
+    agent = ConcreteAgent(api_key="k", model="claude-opus-5-5", max_tokens=64)
+    agent.run(data="x")
+    kwargs = mock_anthropic.messages.create.call_args.kwargs
+    assert kwargs["output_config"] == {"effort": "high"}
+    for banned in ("temperature", "top_p", "top_k", "thinking"):
+        assert banned not in kwargs
+    monkeypatch.setenv("QUANT_AGENT_ANTHROPIC_EFFORT", "medium")
+    agent.run(data="x")
+    assert mock_anthropic.messages.create.call_args.kwargs["output_config"] == {"effort": "medium"}
+    monkeypatch.setenv("QUANT_AGENT_ANTHROPIC_EFFORT", "bogus")
+    agent.run(data="x")
+    assert mock_anthropic.messages.create.call_args.kwargs["output_config"] == {"effort": "high"}
+
+
+@pytest.mark.real_anthropic_stream
+def test_anthropic_call_is_streamed():
+    anth = MagicMock()
+    stream = anth.messages.stream.return_value.__enter__.return_value
+    stream.get_final_message.return_value = _good_anthropic_response()
+    with patch("anthropic.Anthropic", return_value=anth):
+        agent = ConcreteAgent(api_key="k", model="claude-opus-5-5", max_tokens=128000)
+        result = agent.run(data="x")
+    assert result.raw_text == '{"result": "ok"}'
+    anth.messages.stream.assert_called_once()
+    assert anth.messages.stream.call_args.kwargs["max_tokens"] == 128000
+    anth.messages.create.assert_not_called()
+
+
+@pytest.mark.real_anthropic_stream
+def test_anthropic_stream_cut_without_stop_reason_is_retryable_error(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("QUANT_AGENT_MAX_RETRIES", "2")
+    from src.agents.base import LLMStreamInterruptedError
+    cut = _good_anthropic_response()
+    cut.stop_reason = None
+    anth = MagicMock()
+    anth.messages.stream.return_value.__enter__.return_value.get_final_message.return_value = cut
+    with patch("anthropic.Anthropic", return_value=anth):
+        agent = ConcreteAgent(api_key="k", model="claude-opus-5-5", max_tokens=64)
+        with pytest.raises(LLMStreamInterruptedError):
+            agent.run(data="x")
+    assert anth.messages.stream.call_count == 2
+
+
+def test_mid_stream_overload_is_retryable_but_bad_request_is_not():
+    """SSE `error` events arrive after the HTTP 200 → SDK raises a generic
+    APIStatusError with status_code=200; classify by error type instead."""
+    from src.agents.base import LLMRefusalError, _is_retryable
+
+    class APIStatusError(Exception):
+        def __init__(self, err_type):
+            self.status_code = 200
+            self.body = {"type": "error", "error": {"type": err_type, "message": "x"}}
+
+    assert _is_retryable(APIStatusError("overloaded_error"))
+    assert _is_retryable(APIStatusError("api_error"))
+    assert not _is_retryable(APIStatusError("invalid_request_error"))
+    assert not _is_retryable(LLMRefusalError("declined"))
+
+
+def test_explicit_fallback_equal_to_primary_is_disabled():
+    with patch("anthropic.Anthropic"):
+        agent = ConcreteAgent(api_key="k", model="claude-opus-5-5", max_tokens=64,
+                              fallback_api_key="k", fallback_model="claude-opus-5-5")
+    assert agent._fallback_model is None

@@ -62,6 +62,23 @@ class LLMConfig(BaseModel):
     position_reviewer_max_tokens: int | None = None
     evening_analyst_max_tokens: int | None = None
     meta_reflector_max_tokens: int | None = None
+    # Cross-provider failover model. When an agent's primary call fails
+    # (retries exhausted, or non-retryably: quota, dead key, Claude refusal)
+    # BaseAgent makes ONE call on this model. `fallback_model` is the global
+    # default; `<agent>_fallback_model` overrides it. Unset everywhere =>
+    # legacy: a non-Anthropic primary fails over to claude-opus-4-7, a Claude
+    # primary has no failover. Its key is not required at load time — a
+    # missing key just disables failover (logged), as before.
+    fallback_model: str | None = None
+    tech_analyst_fallback_model: str | None = None
+    news_analyst_fallback_model: str | None = None
+    macro_analyst_fallback_model: str | None = None
+    earnings_analyst_fallback_model: str | None = None
+    portfolio_manager_fallback_model: str | None = None
+    risk_manager_fallback_model: str | None = None
+    position_reviewer_fallback_model: str | None = None
+    evening_analyst_fallback_model: str | None = None
+    meta_reflector_fallback_model: str | None = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -109,6 +126,12 @@ class LLMConfig(BaseModel):
         if override is not None:
             return override
         return self.max_tokens
+
+    def get_fallback_model(self, agent_name: str) -> str | None:
+        """Failover model for `agent_name`: the per-agent override, else the
+        global `fallback_model`, else None (BaseAgent's legacy default)."""
+        override = getattr(self, f"{agent_name}_fallback_model", None)
+        return override or self.fallback_model or None
 
 
 class RiskConfig(BaseModel):
@@ -337,6 +360,9 @@ class AppConfig(BaseModel):
 
         for field_name, model_name in self.llm.model_dump().items():
             if not field_name.endswith("_model"):
+                continue
+            # Fallback models are optional and key-optional (see LLMConfig).
+            if field_name.endswith("fallback_model"):
                 continue
             # DeepSeek check FIRST: deepseek-* models don't match the OpenAI
             # prefixes, but bucketing by elimination ("anything not OpenAI is

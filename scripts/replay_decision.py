@@ -58,8 +58,17 @@ def build_agent(agent_name: str, config):
         key = config.api_keys.openai
     else:
         key = config.api_keys.anthropic
+    fallback = config.llm.get_fallback_model(base)
+    if fallback is None:
+        fb_key = config.api_keys.anthropic
+    elif _is_deepseek_model(fallback):
+        fb_key = config.api_keys.deepseek
+    elif _is_openai_model(fallback):
+        fb_key = config.api_keys.openai
+    else:
+        fb_key = config.api_keys.anthropic
     return Cls(api_key=key, model=model, max_tokens=max_tokens,
-               fallback_api_key=config.api_keys.anthropic)
+               fallback_model=fallback, fallback_api_key=fb_key)
 
 
 def main() -> None:
