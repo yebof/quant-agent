@@ -445,7 +445,8 @@ def test_llm_config_defaults_are_current_claude_model():
     from src.cost_table import estimate_cost
     defaults = {
         f: LLMConfig.model_fields[f].default
-        for f in LLMConfig.model_fields if f.endswith("_model")
+        for f in LLMConfig.model_fields
+        if f.endswith("_model") and not f.endswith("fallback_model")
     }
     assert set(defaults.values()) == {"claude-opus-4-7"}, defaults
     # and the default is actually priced (cost won't show $?.??)
@@ -554,3 +555,28 @@ def test_evolution_max_learning_chars_default_matches_schema_cap():
             schema_cap = meta.max_length
     assert schema_cap == 300
     assert EvolutionConfig().max_learning_chars == schema_cap
+
+
+def test_get_fallback_model_prefers_per_agent_override():
+    from src.config import LLMConfig
+    cfg = LLMConfig(max_tokens=4096, fallback_model="gpt-6.1-sol",
+                    meta_reflector_fallback_model="gpt-6-astra")
+    assert cfg.get_fallback_model("portfolio_manager") == "gpt-6.1-sol"
+    assert cfg.get_fallback_model("meta_reflector") == "gpt-6-astra"
+    assert LLMConfig(max_tokens=4096).get_fallback_model("portfolio_manager") is None
+
+
+def test_fallback_model_does_not_require_its_key_at_load(tmp_path, monkeypatch):
+    """A missing key for the FALLBACK provider disables failover; it must not
+    fail config load the way a missing PRIMARY key does. Uses the real
+    settings.yaml (Claude primaries + OpenAI fallbacks) with no OpenAI key."""
+    from src.config import load_config
+    real = Path(__file__).resolve().parent.parent / "config" / "settings.yaml"
+    for k, v in {"ANTHROPIC_API_KEY": "a", "OPENAI_API_KEY": "", "FRED_API_KEY": "f",
+                 "ALPACA_API_KEY": "k", "ALPACA_SECRET_KEY": "s",
+                 "DEEPSEEK_API_KEY": ""}.items():
+        monkeypatch.setenv(k, v)
+    cfg = load_config(real)
+    assert cfg.llm.portfolio_manager_model == "claude-opus-5-5"
+    assert cfg.llm.get_fallback_model("portfolio_manager") == "gpt-6.1-sol"
+    assert cfg.llm.get_fallback_model("meta_reflector") == "gpt-6-astra"

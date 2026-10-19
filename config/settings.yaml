@@ -11,15 +11,19 @@ alpaca:
   paper: true
 
 llm:
-  tech_analyst_model: "gpt-5.5"
-  news_analyst_model: "gpt-5.5"
-  macro_analyst_model: "gpt-5.5"
-  earnings_analyst_model: "gpt-5.5"
-  portfolio_manager_model: "gpt-5.5"
-  risk_manager_model: "gpt-5.5"
-  position_reviewer_model: "gpt-5.5"
-  evening_analyst_model: "gpt-5.5"
-  # Global fallback — any per-agent override below takes precedence.
+  tech_analyst_model: "claude-opus-5-5"
+  news_analyst_model: "claude-opus-5-5"
+  macro_analyst_model: "claude-opus-5-5"
+  earnings_analyst_model: "claude-opus-5-5"
+  portfolio_manager_model: "claude-opus-5-5"
+  risk_manager_model: "claude-opus-5-5"
+  position_reviewer_model: "claude-opus-5-5"
+  evening_analyst_model: "claude-opus-5-5"
+  # Failover: when a primary call fails (retries exhausted, quota, dead key,
+  # Claude refusal) the agent makes ONE call on its fallback model. Global
+  # default here; `<agent>_fallback_model` overrides (meta_reflector below).
+  fallback_model: "gpt-6.1-sol"
+  # Global max_tokens — any per-agent override below takes precedence.
   max_tokens: 128000
   # Per-agent caps. Set generously so no agent silently truncates: PM and
   # Evening emit the heaviest outputs (7-step / 6-step CoT + many list fields);
@@ -33,8 +37,9 @@ llm:
   position_reviewer_max_tokens: 128000
   evening_analyst_max_tokens: 128000
   # Meta-reflector runs once per quarter (--mode meta). Dense digest input
-  # + structured QuarterlyMetaReflection output; gpt-5.5 by default.
-  meta_reflector_model: "gpt-5.5"
+  # + structured QuarterlyMetaReflection output; Opus 5.5, gpt-6-astra failover.
+  meta_reflector_model: "claude-opus-5-5"
+  meta_reflector_fallback_model: "gpt-6-astra"
   meta_reflector_max_tokens: 128000
 
 risk:

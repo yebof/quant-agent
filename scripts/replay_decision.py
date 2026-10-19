@@ -58,8 +58,17 @@ def build_agent(agent_name: str, config):
         key = config.api_keys.openai
     else:
         key = config.api_keys.anthropic
+    fallback = config.llm.get_fallback_model(base)
+    if fallback is None:
+        fb_key = config.api_keys.anthropic
+    elif _is_deepseek_model(fallback):
+        fb_key = config.api_keys.deepseek
+    elif _is_openai_model(fallback):
+        fb_key = config.api_keys.openai
+    else:
+        fb_key = config.api_keys.anthropic
     return Cls(api_key=key, model=model, max_tokens=max_tokens,
-               fallback_api_key=config.api_keys.anthropic)
+               fallback_model=fallback, fallback_api_key=fb_key)
 
 
 def main() -> None:
@@ -100,6 +109,9 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001 — operator tool; surface, don't crash the batch
             print(f"  replay FAILED: {type(e).__name__}: {e}\n")
             continue
+        if result.model != agent.model:
+            print(f"  !! answered by FAILOVER model {result.model}, not {agent.model} — "
+                  "this diff does not reflect the configured model")
         if args.agent == "portfolio_manager":
             diff = diff_pm_targets(d.full_response, result.raw_text)
             tag = "MATERIALLY DIFFERENT" if diff["materially_different"] else "same decision shape"

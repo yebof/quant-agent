@@ -272,23 +272,31 @@ class TradingPipeline:
                 return config.api_keys.openai
             return config.api_keys.anthropic
 
+        def _fallback_kwargs(agent: str) -> dict:
+            """Failover model + the key for ITS provider (not the primary's)."""
+            model = config.llm.get_fallback_model(agent)
+            if model is None:
+                # Legacy default target (claude-opus-4-7) is an Anthropic model.
+                return {"fallback_api_key": config.api_keys.anthropic}
+            return {"fallback_model": model, "fallback_api_key": _key_for(model)}
+
         self.tech_analyst = TechAnalystAgent(
             api_key=_key_for(config.llm.tech_analyst_model),
             model=config.llm.tech_analyst_model,
             max_tokens=config.llm.get_max_tokens("tech_analyst"),
-            fallback_api_key=config.api_keys.anthropic,
+            **_fallback_kwargs("tech_analyst"),
         )
         self.portfolio_manager = PortfolioManagerAgent(
             api_key=_key_for(config.llm.portfolio_manager_model),
             model=config.llm.portfolio_manager_model,
             max_tokens=config.llm.get_max_tokens("portfolio_manager"),
-            fallback_api_key=config.api_keys.anthropic,
+            **_fallback_kwargs("portfolio_manager"),
         )
         self.risk_manager = RiskManagerAgent(
             api_key=_key_for(config.llm.risk_manager_model),
             model=config.llm.risk_manager_model,
             max_tokens=config.llm.get_max_tokens("risk_manager"),
-            fallback_api_key=config.api_keys.anthropic,
+            **_fallback_kwargs("risk_manager"),
         )
         self.risk_engine = RiskRuleEngine(RiskConfig(
             max_position_pct=config.risk.max_position_pct,
@@ -308,25 +316,25 @@ class TradingPipeline:
             api_key=_key_for(config.llm.position_reviewer_model),
             model=config.llm.position_reviewer_model,
             max_tokens=config.llm.get_max_tokens("position_reviewer"),
-            fallback_api_key=config.api_keys.anthropic,
+            **_fallback_kwargs("position_reviewer"),
         )
         self.evening_analyst = EveningAnalystAgent(
             api_key=_key_for(config.llm.evening_analyst_model),
             model=config.llm.evening_analyst_model,
             max_tokens=config.llm.get_max_tokens("evening_analyst"),
-            fallback_api_key=config.api_keys.anthropic,
+            **_fallback_kwargs("evening_analyst"),
         )
         self.news_analyst = NewsAnalystAgent(
             api_key=_key_for(config.llm.news_analyst_model),
             model=config.llm.news_analyst_model,
             max_tokens=config.llm.get_max_tokens("news_analyst"),
-            fallback_api_key=config.api_keys.anthropic,
+            **_fallback_kwargs("news_analyst"),
         )
         self.macro_analyst = MacroAnalystAgent(
             api_key=_key_for(config.llm.macro_analyst_model),
             model=config.llm.macro_analyst_model,
             max_tokens=config.llm.get_max_tokens("macro_analyst"),
-            fallback_api_key=config.api_keys.anthropic,
+            **_fallback_kwargs("macro_analyst"),
         )
         self.news_provider = NewsDataProvider()
         self.news_store = NewsStore()
@@ -336,13 +344,13 @@ class TradingPipeline:
             api_key=_key_for(config.llm.earnings_analyst_model),
             model=config.llm.earnings_analyst_model,
             max_tokens=config.llm.get_max_tokens("earnings_analyst"),
-            fallback_api_key=config.api_keys.anthropic,
+            **_fallback_kwargs("earnings_analyst"),
         )
         self.meta_reflector = MetaReflectorAgent(
             api_key=_key_for(config.llm.meta_reflector_model),
             model=config.llm.meta_reflector_model,
             max_tokens=config.llm.get_max_tokens("meta_reflector"),
-            fallback_api_key=config.api_keys.anthropic,
+            **_fallback_kwargs("meta_reflector"),
         )
         self.earnings_provider = EarningsDataProvider()
         self.broker = AlpacaBroker(
@@ -4951,7 +4959,7 @@ class TradingPipeline:
                 input_message=result.user_message,
                 output_summary=f"sentiment={intel_report.market_sentiment}, changes={len(intel_report.state_changes)}" if intel_report else "parse_error",
                 full_response=result.raw_text,
-                model=self.config.llm.news_analyst_model,
+                model=result.model,
                 tokens_used=result.tokens_used,
                 input_tokens=result.input_tokens,
                 output_tokens=result.output_tokens,
@@ -6480,7 +6488,7 @@ class TradingPipeline:
                 input_message=md_result.user_message,
                 output_summary=review.overall_assessment if review else "parse_error",
                 full_response=md_result.raw_text,
-                model=self.config.llm.position_reviewer_model,
+                model=md_result.model,
                 tokens_used=md_result.tokens_used,
                 input_tokens=md_result.input_tokens,
                 output_tokens=md_result.output_tokens,
@@ -7179,7 +7187,7 @@ class TradingPipeline:
                 else ("analysis_error" if analysis_error else "parse_error")
             ),
             full_response=ev_result.raw_text,
-            model=self.config.llm.evening_analyst_model,
+            model=ev_result.model,
             tokens_used=ev_result.tokens_used,
             input_tokens=ev_result.input_tokens,
             output_tokens=ev_result.output_tokens,
@@ -7655,7 +7663,7 @@ class TradingPipeline:
                     ),
                     full_response=ev_result.raw_text,
                     # The model that actually answered (a failover-served
-                    # reflection is Anthropic, not the configured OpenAI one).
+                    # reflection is the fallback model, not the configured one).
                     model=getattr(ev_result, "model", None)
                     or self.config.llm.meta_reflector_model,
                     tokens_used=ev_result.tokens_used,

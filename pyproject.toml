@@ -14,7 +14,7 @@ dependencies = [
     # HTTP stack to `httpx2`, which broke a fresh CI install (httpx gone) and
     # would put an untested SDK rewrite into production on the next
     # reinstall. Bump deliberately, with a smoke test against the live API.
-    "anthropic>=0.40.0,<1",
+    "anthropic>=0.100.0,<1",  # output_config.effort + stop_details on messages.stream
     "yfinance>=0.2.40",
     "fredapi>=0.5.2",
     "alpaca-py>=0.30.0",

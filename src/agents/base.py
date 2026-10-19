@@ -198,7 +198,7 @@ def _int_env(name: str, default: int) -> int:
 # queue behind a wedged relay slot.
 _OPENAI_MAX_CONCURRENT = _int_env("QUANT_AGENT_MAX_CONCURRENT_LLM", 3)
 _OPENAI_LLM_SEMAPHORE = threading.Semaphore(_OPENAI_MAX_CONCURRENT)
-_ANTHROPIC_MAX_CONCURRENT = 4
+_ANTHROPIC_MAX_CONCURRENT = _int_env("QUANT_AGENT_MAX_CONCURRENT_ANTHROPIC", 4)
 _ANTHROPIC_LLM_SEMAPHORE = threading.Semaphore(_ANTHROPIC_MAX_CONCURRENT)
 
 
@@ -209,7 +209,10 @@ _ANTHROPIC_LLM_SEMAPHORE = threading.Semaphore(_ANTHROPIC_MAX_CONCURRENT)
 # truncated=True, NOT trigger retry/failover (truncation never fails over —
 # see CLAUDE.md). insufficient_system_resource is DeepSeek-specific: the
 # inference system ran out of resources and returned a cut-off body on a 200.
-_TRUNCATION_FINISH_REASONS = ("max_tokens", "length", "insufficient_system_resource")
+_TRUNCATION_FINISH_REASONS = (
+    "max_tokens", "length", "insufficient_system_resource",
+    "model_context_window_exceeded",  # Anthropic: input + output hit the window
+)
 
 
 class LLMEmptyResponseError(RuntimeError):
@@ -226,6 +229,13 @@ class LLMStreamInterruptedError(RuntimeError):
     was cut mid-generation (relay/proxy drop, no error frame). Partial text
     is NOT a success: a half-emitted PM decision parses like 'no trades'.
     Retryable."""
+
+
+class LLMRefusalError(RuntimeError):
+    """Anthropic stop_reason='refusal': a safety classifier declined the
+    request. Any text before the decline is partial and must not be parsed
+    as a decision. NOT retryable (the same prompt is declined again) — goes
+    straight to the cross-provider failover."""
 
 
 def _estimate_tokens(text: str) -> int:
@@ -256,14 +266,49 @@ def _is_deepseek_model(model: str) -> bool:
     return any(model.startswith(p) for p in _DEEPSEEK_PREFIXES)
 
 
-# Cross-provider failover target. When a non-Anthropic primary (OpenAI or
-# DeepSeek) call ultimately fails — quota exhausted (the 2026-05-11 incident),
-# DeepSeek 402 insufficient balance, dead key, sustained outage — the agent
-# retries ONCE on Anthropic with this model so the trading
-# session survives instead of dying. claude-opus-4-7 is the last production-
-# proven Claude model AND is priced in src.cost_table (so cost stays honest).
-# Hardcoded (not per-agent config) so the failover target can't silently drift.
+def _is_anthropic_model(model: str) -> bool:
+    return not (_is_deepseek_model(model) or _is_openai_model(model))
+
+
+# Legacy cross-provider failover target, used only when no fallback model is
+# configured (llm.fallback_model / llm.<agent>_fallback_model). When a
+# non-Anthropic primary (OpenAI or DeepSeek) call ultimately fails — quota
+# exhausted (the 2026-05-11 incident), DeepSeek 402 insufficient balance, dead
+# key, sustained outage — the agent retries ONCE on Anthropic with this model
+# so the trading session survives instead of dying. claude-opus-4-7 is
+# production-proven AND priced in src.cost_table (so cost stays honest).
 _FALLBACK_MODEL = "claude-opus-4-7"
+
+
+# Claude effort (output_config.effort). Thinking can't be disabled on
+# claude-opus-5-5 and its API default effort is `medium` — one level below the
+# `high` every earlier Opus defaults to — so effort is the only depth control
+# and is sent explicitly. `high` also leaves claude-opus-4-7 at its own default.
+# QUANT_AGENT_ANTHROPIC_EFFORT overrides (e.g. `medium` if sessions run long).
+_ANTHROPIC_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_DEFAULT_ANTHROPIC_EFFORT = "high"
+# Claude models that 400 on output_config.effort (it arrived with Opus 4.5).
+_NO_EFFORT_PREFIXES = ("claude-haiku-4-5", "claude-sonnet-4-5", "claude-3")
+
+
+def _anthropic_effort() -> str:
+    raw = os.environ.get("QUANT_AGENT_ANTHROPIC_EFFORT", "").strip().lower()
+    if raw in _ANTHROPIC_EFFORT_LEVELS:
+        return raw
+    if raw:
+        logger.warning(
+            "QUANT_AGENT_ANTHROPIC_EFFORT=%r is not one of %s; using %s",
+            raw, "/".join(_ANTHROPIC_EFFORT_LEVELS), _DEFAULT_ANTHROPIC_EFFORT,
+        )
+    return _DEFAULT_ANTHROPIC_EFFORT
+
+
+# Mid-stream SSE `error` events arrive after the HTTP 200, so the SDK raises a
+# generic APIStatusError carrying status_code=200 — the status check in
+# _is_retryable would call an overload non-retryable. Classify by error type.
+_RETRYABLE_STREAM_ERROR_TYPES = frozenset({
+    "overloaded_error", "api_error", "rate_limit_error",
+})
 
 
 # Exception class names that are always transient regardless of any status
@@ -297,6 +342,14 @@ def _is_retryable(exc: Exception) -> bool:
     (preserves the prior catch-all behavior for genuinely unexpected
     local/network errors).
     """
+    if isinstance(exc, LLMRefusalError):
+        # A safety decline repeats on the same prompt — straight to failover.
+        return False
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("type") in _RETRYABLE_STREAM_ERROR_TYPES:
+            return True
     if type(exc).__name__ in _RETRYABLE_EXC_NAMES:
         return True
     status = getattr(exc, "status_code", None)
@@ -430,68 +483,87 @@ class AgentResult:
         return None
 
 
+def _anthropic_final_message(client, **params):
+    """Stream one Messages request and return the accumulated final Message."""
+    with client.messages.stream(**params) as stream:
+        return stream.get_final_message()
+
+
+def _build_client(model: str, api_key: str):
+    """SDK client for `model`'s provider (primary and failover share this).
+
+    max_retries=0 on EVERY SDK client construction: both SDKs default to
+    2 internal retries on 429/5xx (incl. the relay's CF 524) with their
+    own backoff, silently turning each _execute() attempt into ~3 HTTP
+    calls (~380s under sustained 524s) and invalidating the retry-budget
+    math documented at _DEFAULT_MAX_RETRIES. The agent-level loop in
+    _execute() is the SINGLE owner of retry policy.
+    """
+    if _is_deepseek_model(model):
+        # OpenAI-compatible endpoint at a custom base_url with the DeepSeek key.
+        from openai import OpenAI
+        return OpenAI(api_key=api_key, base_url=_DEEPSEEK_BASE_URL,
+                      timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
+    if _is_openai_model(model):
+        from openai import OpenAI
+        # OPENAI_BASE_URL lets OpenAI traffic go through an OpenAI-compatible
+        # relay/proxy (a "中转站") instead of api.openai.com — same chat/
+        # completions wire format, just a different host + key. Empty/unset
+        # => the SDK's default (api.openai.com). Read explicitly (not via the
+        # SDK's own env magic) so it's visible + testable. The base_url must
+        # include the API path prefix the relay serves (e.g. .../v1).
+        base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
+        # OPENAI_CA_BUNDLE: trust a private CA for the relay's HTTPS (e.g. a
+        # relay behind Caddy's internal CA, whose self-signed chain the
+        # public trust store rejects). Path to a PEM of trust anchors (the
+        # relay's root CA). We still FULLY verify — cert chain + hostname/IP
+        # (the relay's leaf carries the IP in its SAN) — just against this CA
+        # instead of certifi. Scoped to the OpenAI client ONLY; Anthropic
+        # keeps the public trust store. Unset => default public CAs.
+        ca_bundle = os.environ.get("OPENAI_CA_BUNDLE", "").strip()
+        if ca_bundle:
+            # Prefer the SDK's own httpx subclass (carries its transport
+            # defaults and tracks whichever httpx flavour the SDK links
+            # against); plain httpx.Client is the fallback.
+            try:
+                from openai import DefaultHttpxClient as _HttpClient
+            except ImportError:  # pragma: no cover - very old SDKs
+                import httpx
+                _HttpClient = httpx.Client
+            return OpenAI(
+                api_key=api_key, base_url=base_url,
+                http_client=_HttpClient(verify=ca_bundle, timeout=_LLM_HTTP_TIMEOUT),
+                max_retries=0,
+            )
+        return OpenAI(api_key=api_key, base_url=base_url,
+                      timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
+    from anthropic import Anthropic
+    return Anthropic(api_key=api_key, timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
+
+
 class BaseAgent(ABC):
     def __init__(self, api_key: str, model: str, max_tokens: int = 4096,
-                 fallback_api_key: str = ""):
+                 fallback_api_key: str = "", fallback_model: str | None = None):
         self.model = model
         self.max_tokens = max_tokens
         self._use_deepseek = _is_deepseek_model(model)
         self._use_openai = _is_openai_model(model)
-        # Anthropic key for failover to Anthropic. Used when the primary is a
-        # non-Anthropic provider (OpenAI OR DeepSeek) — a Claude primary's
-        # fallback would hit the same provider, so run() no-ops it. Passing it
-        # for a Claude primary is harmless, NOT an error, so a future "switch
-        # back to Claude" can't crash construction. Empty => failover disabled.
+        # Failover target: the configured fallback_model, else (legacy) the
+        # Anthropic _FALLBACK_MODEL for a non-Anthropic primary. A Claude
+        # primary with no configured fallback has none — failing over to the
+        # same model is pointless, so that case is a no-op, NOT an error.
+        fallback = (fallback_model or "").strip() or None
+        if fallback is None and not _is_anthropic_model(model):
+            fallback = _FALLBACK_MODEL
+        self._fallback_model = fallback if fallback != model else None
+        # Key for the fallback model's provider. Empty => failover disabled.
         self._fallback_api_key = (fallback_api_key or "").strip()
-
-        # max_retries=0 on EVERY SDK client construction: both SDKs default to
-        # 2 internal retries on 429/5xx (incl. the relay's CF 524) with their
-        # own backoff, silently turning each _execute() attempt into ~3 HTTP
-        # calls (~380s under sustained 524s) and invalidating the retry-budget
-        # math documented at _DEFAULT_MAX_RETRIES. The agent-level loop in
-        # _execute() is the SINGLE owner of retry policy.
-        if self._use_deepseek:
-            # OpenAI-compatible endpoint at a custom base_url with the DeepSeek key.
-            from openai import OpenAI
-            self.client = OpenAI(api_key=api_key, base_url=_DEEPSEEK_BASE_URL,
-                                 timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
-        elif self._use_openai:
-            from openai import OpenAI
-            # OPENAI_BASE_URL lets OpenAI traffic go through an OpenAI-compatible
-            # relay/proxy (a "中转站") instead of api.openai.com — same chat/
-            # completions wire format, just a different host + key. Empty/unset
-            # => the SDK's default (api.openai.com). Read explicitly (not via the
-            # SDK's own env magic) so it's visible + testable. The base_url must
-            # include the API path prefix the relay serves (e.g. .../v1).
-            base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
-            # OPENAI_CA_BUNDLE: trust a private CA for the relay's HTTPS (e.g. a
-            # relay behind Caddy's internal CA, whose self-signed chain the
-            # public trust store rejects). Path to a PEM of trust anchors (the
-            # relay's root CA). We still FULLY verify — cert chain + hostname/IP
-            # (the relay's leaf carries the IP in its SAN) — just against this CA
-            # instead of certifi. Scoped to the OpenAI client ONLY; the Anthropic
-            # failover keeps the public trust store. Unset => default public CAs.
-            ca_bundle = os.environ.get("OPENAI_CA_BUNDLE", "").strip()
-            if ca_bundle:
-                # Prefer the SDK's own httpx subclass (carries its transport
-                # defaults and tracks whichever httpx flavour the SDK links
-                # against); plain httpx.Client is the fallback.
-                try:
-                    from openai import DefaultHttpxClient as _HttpClient
-                except ImportError:  # pragma: no cover - very old SDKs
-                    import httpx
-                    _HttpClient = httpx.Client
-                self.client = OpenAI(
-                    api_key=api_key, base_url=base_url,
-                    http_client=_HttpClient(verify=ca_bundle, timeout=_LLM_HTTP_TIMEOUT),
-                    max_retries=0,
-                )
-            else:
-                self.client = OpenAI(api_key=api_key, base_url=base_url,
-                                     timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
-        else:
-            from anthropic import Anthropic
-            self.client = Anthropic(api_key=api_key, timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
+        if self._fallback_model and fallback_model and not self._fallback_api_key:
+            logger.warning(
+                "Agent model %s: fallback model %s is configured but its API key "
+                "is empty — failover disabled.", model, self._fallback_model,
+            )
+        self.client = _build_client(model, api_key)
 
     @property
     @abstractmethod
@@ -581,20 +653,18 @@ class BaseAgent(ABC):
         # Model that actually produced the output — primary unless failover wins.
         actual_model = self.model
         if primary_error is not None:
-            # Primary (OpenAI or DeepSeek) failed after retries. Try ONE Anthropic
-            # call so a quota/balance/auth/outage on the primary keeps the session
-            # alive (DeepSeek 402 "Insufficient Balance" is the exact analog of the
-            # OpenAI quota incident this was built for). Single-shot (no retry) to
-            # stay inside the session window. Only when the primary is a
-            # non-Anthropic provider and a fallback key is configured; otherwise
-            # re-raise (a Claude primary failing over to Claude is pointless).
+            # Primary failed after retries (or non-retryably: quota, dead key,
+            # DeepSeek 402, Claude refusal). Try ONE call on the fallback model
+            # so the session survives (the 2026-05-11 OpenAI-quota incident is
+            # what this was built for). Single-shot (no retry) to stay inside
+            # the session window. No fallback model or no key => re-raise.
             failover = None
-            if (self._use_openai or self._use_deepseek) and self._fallback_api_key:
+            if self._fallback_model and self._fallback_api_key:
                 failover = self._try_failover(user_message, primary_error)
             if failover is None:
                 raise primary_error
             raw_text, input_tokens, output_tokens, finish_reason = failover
-            actual_model = _FALLBACK_MODEL
+            actual_model = self._fallback_model
 
         # Truncation detection: a max_tokens / length cutoff means the output
         # is incomplete, NOT a deliberate "no action". Flag + log loudly so a
@@ -649,16 +719,23 @@ class BaseAgent(ABC):
         )
 
     def _anthropic_call(self, client, model: str, user_message: str) -> tuple[str, int, int, str | None]:
-        """One Anthropic messages.create against an arbitrary client+model.
+        """One streamed Anthropic Messages call against an arbitrary client+model.
 
-        Shared by the primary path (_call_anthropic) and the provider-agnostic
-        failover to Anthropic (_try_failover) so both use the identical request shape +
+        Shared by the primary path (_call_anthropic) and the failover
+        (_try_failover) so both use the identical request shape +
         usage/finish-reason extraction. System prompt is sent as an ephemeral
         cache breakpoint (static per agent → cheaper + lower latency; no-op
         below the cache minimum, safe unconditionally).
+
+        STREAMED for the same reason as _call_openai: with thinking always on
+        (claude-opus-5-5) a PM / evening generation can run past
+        _LLM_HTTP_TIMEOUT before a non-streamed body sends its first byte;
+        streamed, that timeout is per-chunk (ping events keep it alive).
+        Only `text` blocks are the answer — thinking blocks come first.
         """
         with _ANTHROPIC_LLM_SEMAPHORE:
-            response = client.messages.create(
+            response = _anthropic_final_message(
+                client,
                 model=model,
                 max_tokens=self.max_tokens,
                 system=[{
@@ -667,12 +744,29 @@ class BaseAgent(ABC):
                     "cache_control": {"type": "ephemeral"},
                 }],
                 messages=[{"role": "user", "content": user_message}],
+                **({} if model.startswith(_NO_EFFORT_PREFIXES)
+                   else {"output_config": {"effort": _anthropic_effort()}}),
             )
         in_tok, out_tok = _extract_anthropic_usage(response, self.name)
         finish_reason = getattr(response, "stop_reason", None)
         if not isinstance(finish_reason, str):
-            finish_reason = None
-        if not response.content or not hasattr(response.content[0], "text"):
+            # A streamed message that never got its message_delta = the
+            # connection was cut mid-generation; partial text is not a result.
+            raise LLMStreamInterruptedError(
+                "Anthropic stream ended without stop_reason — connection cut "
+                "mid-generation; partial output discarded"
+            )
+        if finish_reason == "refusal":
+            details = getattr(response, "stop_details", None)
+            raise LLMRefusalError(
+                f"Anthropic {model} declined the request (stop_reason=refusal, "
+                f"category={getattr(details, 'category', None)})"
+            )
+        text = "".join(
+            block.text for block in (response.content or [])
+            if isinstance(getattr(block, "text", None), str)
+        )
+        if not text:
             if finish_reason in _TRUNCATION_FINISH_REASONS:
                 # Legit truncation (whole budget burned before any text) —
                 # surface as truncated '', don't retry/fail over.
@@ -681,42 +775,50 @@ class BaseAgent(ABC):
             raise LLMEmptyResponseError(
                 f"Anthropic returned empty content (stop_reason={finish_reason})"
             )
-        return (response.content[0].text, in_tok, out_tok, finish_reason)
+        return (text, in_tok, out_tok, finish_reason)
 
     def _call_anthropic(self, user_message: str) -> tuple[str, int, int, str | None]:
         return self._anthropic_call(self.client, self.model, user_message)
 
+    def _call_model(self, client, model: str, user_message: str) -> tuple[str, int, int, str | None]:
+        if _is_deepseek_model(model):
+            return self._deepseek_call(client, model, user_message)
+        if _is_openai_model(model):
+            return self._openai_call(client, model, user_message)
+        return self._anthropic_call(client, model, user_message)
+
     def _try_failover(self, user_message: str, primary_error: Exception):
-        """Primary provider (OpenAI or DeepSeek) failed → attempt ONE Anthropic
-        call with the fallback model. Returns the (text, in_tok, out_tok,
-        finish_reason) tuple on success, or None on failure (caller re-raises
-        the original primary error). Single-shot: the primary already burned its
-        retry budget, so a
-        second full budget here could blow the session window. Loud logging
-        either way — a provider failover is an event the operator must see.
+        """Primary model failed → attempt ONE call on self._fallback_model
+        (any provider). Returns the (text, in_tok, out_tok, finish_reason)
+        tuple on success, or None on failure (caller re-raises the original
+        primary error). Single-shot: the primary already burned its retry
+        budget, so a second full budget here could blow the session window.
+        Loud logging either way — a failover is an event the operator must see.
         """
+        fallback = self._fallback_model
         logger.error(
             "Agent %s: primary model %s failed after retries (%s) — failing over "
-            "to %s on Anthropic.", self.name, self.model, primary_error, _FALLBACK_MODEL,
+            "to %s.", self.name, self.model, primary_error, fallback,
         )
         try:
-            from anthropic import Anthropic
-            client = Anthropic(api_key=self._fallback_api_key,
-                               timeout=_LLM_HTTP_TIMEOUT, max_retries=0)
-            result = self._anthropic_call(client, _FALLBACK_MODEL, user_message)
+            client = _build_client(fallback, self._fallback_api_key)
+            result = self._call_model(client, fallback, user_message)
             logger.warning(
                 "Agent %s: FAILOVER to %s SUCCEEDED (in=%d out=%d) — session "
-                "continues on Anthropic.", self.name, _FALLBACK_MODEL, result[1], result[2],
+                "continues on the fallback model.", self.name, fallback, result[1], result[2],
             )
             return result
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "Agent %s: failover to %s also FAILED: %s. Re-raising the "
-                "original primary error.", self.name, _FALLBACK_MODEL, exc,
+                "original primary error.", self.name, fallback, exc,
             )
             return None
 
     def _call_openai(self, user_message: str) -> tuple[str, int, int, str | None]:
+        return self._openai_call(self.client, self.model, user_message)
+
+    def _openai_call(self, client, model: str, user_message: str) -> tuple[str, int, int, str | None]:
         """OpenAI path is STREAMED on purpose. The OPENAI_BASE_URL relay sits
         behind Cloudflare, whose ~120s Proxy Read Timeout (HTTP 524) kills any
         call that sends zero bytes until the model finishes — and PM / tech /
@@ -731,8 +833,8 @@ class BaseAgent(ABC):
         concurrency cap) until the last chunk is read.
         """
         with _OPENAI_LLM_SEMAPHORE:
-            stream = self.client.chat.completions.create(
-                model=self.model,
+            stream = client.chat.completions.create(
+                model=model,
                 max_completion_tokens=self.max_tokens,
                 messages=[
                     {"role": "system", "content": self.system_prompt},
@@ -795,12 +897,15 @@ class BaseAgent(ABC):
             )
         return (content, in_tok, out_tok, finish_reason)
 
-    def _deepseek_max_output(self) -> int:
+    def _deepseek_max_output(self, model: str | None = None) -> int:
         """Clamp ceiling for this DeepSeek model. DeepSeek REJECTS (does not
         clamp) a max_tokens above the model limit, so we cap client-side."""
-        return _DEEPSEEK_MAX_OUTPUT.get(self.model, _DEEPSEEK_DEFAULT_CEILING)
+        return _DEEPSEEK_MAX_OUTPUT.get(model or self.model, _DEEPSEEK_DEFAULT_CEILING)
 
     def _call_deepseek(self, user_message: str) -> tuple[str, int, int, str | None]:
+        return self._deepseek_call(self.client, self.model, user_message)
+
+    def _deepseek_call(self, client, model: str, user_message: str) -> tuple[str, int, int, str | None]:
         """DeepSeek via the OpenAI SDK (custom base_url). Three deltas vs
         _call_openai:
           1. Sends `max_tokens` (DeepSeek ignores OpenAI's `max_completion_tokens`
@@ -814,9 +919,9 @@ class BaseAgent(ABC):
         Usage is OpenAI-shaped (prompt_tokens / completion_tokens) → reuse
         _extract_openai_usage.
         """
-        response = self.client.chat.completions.create(
-            model=self.model,
-            max_tokens=min(self.max_tokens, self._deepseek_max_output()),
+        response = client.chat.completions.create(
+            model=model,
+            max_tokens=min(self.max_tokens, self._deepseek_max_output(model)),
             messages=[
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": user_message},

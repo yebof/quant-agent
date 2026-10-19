@@ -42,3 +42,43 @@ def _isolate_cwd(tmp_path, monkeypatch):
     # assertions. Tests that exercise relay routing set them via monkeypatch.
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_CA_BUNDLE", raising=False)
+    monkeypatch.delenv("QUANT_AGENT_ANTHROPIC_EFFORT", raising=False)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_anthropic_stream: exercise base._anthropic_final_message itself "
+        "instead of routing Mock clients through messages.create",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _anthropic_mock_clients_answer_via_create(request, monkeypatch):
+    """Anthropic calls are streamed (`client.messages.stream(...)` →
+    `get_final_message()`), but most agent tests are about retry / failover /
+    parsing, not transport, and configure a Mock client's
+    `messages.create.return_value` / `.side_effect`. Route Mock clients through
+    `messages.create(**params)` so those stubs (and their call_args /
+    call_count assertions) keep meaning "one Anthropic request". A stub
+    response without a string stop_reason is treated as a clean `end_turn`.
+    Tests of the streaming seam itself opt out with
+    @pytest.mark.real_anthropic_stream.
+    """
+    if request.node.get_closest_marker("real_anthropic_stream"):
+        return
+    from unittest.mock import Mock
+
+    import src.agents.base as base
+
+    real = base._anthropic_final_message
+
+    def _final(client, **params):
+        if not isinstance(client, Mock):
+            return real(client, **params)
+        response = client.messages.create(**params)
+        if not isinstance(getattr(response, "stop_reason", None), str):
+            response.stop_reason = "end_turn"
+        return response
+
+    monkeypatch.setattr(base, "_anthropic_final_message", _final)
