@@ -1676,3 +1676,116 @@ def test_place_entry_protection_swallows_stop_submit_failure(mock_tc_cls):
     broker.get_order_fill_info = MagicMock(return_value={"filled_qty": 10.0})
 
     assert broker.place_entry_protection("NVDA", "e1", 90.0) is None  # no raise
+
+
+# --- Class-share symbol translation (BRK-B ↔ BRK.B) -------------------------
+# The universe/yfinance/DB use `BRK-B`; Alpaca only knows `BRK.B`. Every BUY
+# of BRK-B went `submit_failed` (asset "BRK-B" not found) until the broker
+# translated at its boundary.
+
+
+@patch("src.execution.broker.TradingClient")
+def test_submit_order_sends_dot_form_and_echoes_dash_form(mock_tc_cls):
+    mock_client = MagicMock()
+    mock_order = MagicMock()
+    mock_order.id = "o-1"
+    mock_order.status = "accepted"
+    mock_order.symbol = "BRK.B"
+    mock_client.submit_order.return_value = mock_order
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    result = broker.submit_order("BRK-B", 10, "buy", limit_price=525.68)
+
+    request = mock_client.submit_order.call_args[0][0]
+    assert request.symbol == "BRK.B"
+    assert result["symbol"] == "BRK-B"
+
+
+@patch("src.execution.broker._get_sector", return_value="Financial Services")
+@patch("src.execution.broker.TradingClient")
+def test_get_positions_maps_dot_form_back_to_universe_symbol(mock_tc_cls, mock_sector):
+    mock_client = MagicMock()
+    mock_client.get_all_positions.return_value = [
+        _make_mock_position("BRK.B", 10, 525.0, 530.0, 5300.0, 50.0),
+    ]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    positions = broker.get_positions()
+
+    assert positions[0].symbol == "BRK-B"
+    mock_sector.assert_called_once_with("BRK-B")  # yfinance wants the dash form
+
+
+@patch("src.execution.broker.TradingClient")
+def test_stop_helpers_query_and_submit_dot_form(mock_tc_cls):
+    stop = MagicMock(); stop.id = "stop-1"
+    stop.order_type = "stop_limit"; stop.side = "sell"
+    stop.qty = "10"; stop.stop_price = "510.00"; stop.limit_price = "495.00"
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [stop]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    ok, specs = broker.snapshot_protective_stops("BRK-B")
+    assert ok and len(specs) == 1
+    assert mock_client.get_orders.call_args.kwargs["filter"].symbols == ["BRK.B"]
+
+    broker._submit_stop_limit_order("BRK-B", qty=10, stop_price=510.0)
+    assert mock_client.submit_order.call_args[0][0].symbol == "BRK.B"
+
+
+@patch("src.execution.broker.TradingClient")
+def test_get_position_qty_and_close_position_use_dot_form(mock_tc_cls):
+    mock_client = MagicMock()
+    mock_client.get_open_position.return_value = MagicMock(qty="10")
+    mock_client.close_position.return_value = MagicMock(id="c-1", status="accepted")
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    assert broker.get_position_qty("BRK-B") == 10.0
+    mock_client.get_open_position.assert_called_once_with("BRK.B")
+    broker.close_position("BRK-B")
+    mock_client.close_position.assert_called_once_with("BRK.B")
+
+
+@patch("src.execution.broker.TradingClient")
+def test_get_latest_price_requests_and_reads_dot_form(mock_tc_cls):
+    mock_tc_cls.return_value = MagicMock()
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    data_client = MagicMock()
+    data_client.get_stock_latest_trade.return_value = {"BRK.B": MagicMock(price=526.1)}
+    broker._data_client = data_client
+
+    assert broker.get_latest_price("BRK-B") == 526.1
+    req = data_client.get_stock_latest_trade.call_args[0][0]
+    assert req.symbol_or_symbols == "BRK.B"
+
+
+@patch("src.execution.broker.TradingClient")
+def test_list_recent_orders_filters_dot_form_and_returns_dash_form(mock_tc_cls):
+    o = MagicMock(); o.id = "o-9"; o.side = "buy"; o.qty = "10"
+    o.symbol = "BRK.B"; o.status = "filled"
+    mock_client = MagicMock()
+    mock_client.get_orders.return_value = [o]
+    mock_tc_cls.return_value = mock_client
+
+    broker = AlpacaBroker(api_key="test", secret_key="test", paper=True)
+    out = broker.list_recent_orders("BRK-B", "buy", after=None)
+
+    assert mock_client.get_orders.call_args.kwargs["filter"].symbols == ["BRK.B"]
+    assert out[0]["symbol"] == "BRK-B"
+
+
+@patch("alpaca.data.historical.screener.ScreenerClient")
+@patch("src.execution.broker.TradingClient")
+def test_get_top_movers_maps_class_shares_to_dash_form(mock_tc_cls, mock_screener_cls):
+    mock_tc_cls.return_value = MagicMock()
+    mover = MagicMock(); mover.symbol = "BF.B"; mover.percent_change = 9.1; mover.price = 40.0
+    mock_screener = MagicMock()
+    mock_screener.get_market_movers.return_value = MagicMock(gainers=[mover])
+    mock_screener_cls.return_value = mock_screener
+
+    broker = AlpacaBroker(api_key="k", secret_key="s", paper=True)
+    assert broker.get_top_movers(n=5)[0]["symbol"] == "BF-B"
