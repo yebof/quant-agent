@@ -1,6 +1,10 @@
 [project]
 name = "quant-agent"
-version = "0.3.0"
+# Derived from the latest git tag by setuptools-scm (see [tool.setuptools_scm]):
+# a tagged commit builds as that release (v0.3.0 -> 0.3.0), later commits as
+# the next dev version (0.3.1.devN+g<sha>). Cut a release by tagging; don't
+# edit a version here.
+dynamic = ["version"]
 description = "LLM-agent quantitative trading system for US stocks"
 authors = [
     {name = "Yebo Feng", email = "fengyebo@gmail.com"},
@@ -49,5 +53,9 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=68.0", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+# Used when there is no git metadata (e.g. a GitHub "Download ZIP" tarball).
+fallback_version = "0.0.0+unknown"

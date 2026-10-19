@@ -16,6 +16,10 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+        with:
+          # Full history + tags so setuptools-scm derives the real version
+          # (a shallow clone has no tag to describe from).
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
