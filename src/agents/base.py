@@ -198,7 +198,7 @@ def _int_env(name: str, default: int) -> int:
 # queue behind a wedged relay slot.
 _OPENAI_MAX_CONCURRENT = _int_env("QUANT_AGENT_MAX_CONCURRENT_LLM", 3)
 _OPENAI_LLM_SEMAPHORE = threading.Semaphore(_OPENAI_MAX_CONCURRENT)
-_ANTHROPIC_MAX_CONCURRENT = 4
+_ANTHROPIC_MAX_CONCURRENT = _int_env("QUANT_AGENT_MAX_CONCURRENT_ANTHROPIC", 4)
 _ANTHROPIC_LLM_SEMAPHORE = threading.Semaphore(_ANTHROPIC_MAX_CONCURRENT)
 
 
@@ -209,7 +209,10 @@ _ANTHROPIC_LLM_SEMAPHORE = threading.Semaphore(_ANTHROPIC_MAX_CONCURRENT)
 # truncated=True, NOT trigger retry/failover (truncation never fails over —
 # see CLAUDE.md). insufficient_system_resource is DeepSeek-specific: the
 # inference system ran out of resources and returned a cut-off body on a 200.
-_TRUNCATION_FINISH_REASONS = ("max_tokens", "length", "insufficient_system_resource")
+_TRUNCATION_FINISH_REASONS = (
+    "max_tokens", "length", "insufficient_system_resource",
+    "model_context_window_exceeded",  # Anthropic: input + output hit the window
+)
 
 
 class LLMEmptyResponseError(RuntimeError):
@@ -284,6 +287,8 @@ _FALLBACK_MODEL = "claude-opus-4-7"
 # QUANT_AGENT_ANTHROPIC_EFFORT overrides (e.g. `medium` if sessions run long).
 _ANTHROPIC_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 _DEFAULT_ANTHROPIC_EFFORT = "high"
+# Claude models that 400 on output_config.effort (it arrived with Opus 4.5).
+_NO_EFFORT_PREFIXES = ("claude-haiku-4-5", "claude-sonnet-4-5", "claude-3")
 
 
 def _anthropic_effort() -> str:
@@ -739,7 +744,8 @@ class BaseAgent(ABC):
                     "cache_control": {"type": "ephemeral"},
                 }],
                 messages=[{"role": "user", "content": user_message}],
-                output_config={"effort": _anthropic_effort()},
+                **({} if model.startswith(_NO_EFFORT_PREFIXES)
+                   else {"output_config": {"effort": _anthropic_effort()}}),
             )
         in_tok, out_tok = _extract_anthropic_usage(response, self.name)
         finish_reason = getattr(response, "stop_reason", None)

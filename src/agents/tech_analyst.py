@@ -180,7 +180,7 @@ Current close: {current_price}""")
         # so flag the gap.
         chunk_costs: list[float] = []
         any_unknown_cost = False
-        last_model = self.model
+        chunk_models: list[str] = []
 
         def _run_chunk(chunk):
             return self._analyze_chunk(
@@ -215,7 +215,7 @@ Current close: {current_price}""")
                     any_unknown_cost = True
                 else:
                     chunk_costs.append(chunk_result.cost_usd)
-                last_model = chunk_result.model
+                chunk_models.append(chunk_result.model)
 
         merged_cost: float | None
         if any_unknown_cost or not chunk_costs:
@@ -226,7 +226,10 @@ Current close: {current_price}""")
         merged_result = AgentResult(
             raw_text="\n\n".join(combined_raw),
             tokens_used=total_tokens,
-            model=last_model,
+            # Distinct models across chunks ("a+b" when some chunks failed over),
+            # so agent_logs shows a partial failover instead of whichever
+            # chunk happened to finish last.
+            model="+".join(sorted(set(chunk_models))) or self.model,
             user_message="\n\n".join(combined_msg),
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,

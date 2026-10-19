@@ -7663,7 +7663,7 @@ class TradingPipeline:
                     ),
                     full_response=ev_result.raw_text,
                     # The model that actually answered (a failover-served
-                    # reflection is Anthropic, not the configured OpenAI one).
+                    # reflection is the fallback model, not the configured one).
                     model=getattr(ev_result, "model", None)
                     or self.config.llm.meta_reflector_model,
                     tokens_used=ev_result.tokens_used,

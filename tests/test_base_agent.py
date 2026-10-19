@@ -1217,3 +1217,15 @@ def test_explicit_fallback_equal_to_primary_is_disabled():
         agent = ConcreteAgent(api_key="k", model="claude-opus-5-5", max_tokens=64,
                               fallback_api_key="k", fallback_model="claude-opus-5-5")
     assert agent._fallback_model is None
+
+
+def test_effort_not_sent_to_models_that_reject_it(mock_anthropic):
+    agent = ConcreteAgent(api_key="k", model="claude-haiku-4-5", max_tokens=64)
+    agent.run(data="x")
+    assert "output_config" not in mock_anthropic.messages.create.call_args.kwargs
+
+
+def test_context_window_stop_reason_counts_as_truncation(mock_anthropic):
+    mock_anthropic.messages.create.return_value.stop_reason = "model_context_window_exceeded"
+    agent = ConcreteAgent(api_key="k", model="claude-opus-5-5", max_tokens=64)
+    assert agent.run(data="x").truncated is True

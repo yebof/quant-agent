@@ -274,3 +274,34 @@ def test_tech_analyst_chunked_merged_cost_sums_when_model_priced(
     assert abs(merged.cost_usd - expected) < 0.01
     assert merged.input_tokens == 80_000 * 2
     assert merged.output_tokens == 12_000 * 2
+
+
+@patch("anthropic.Anthropic")
+def test_tech_analyst_chunked_model_lists_every_answering_model(
+    mock_cls, sample_indicators, sample_bars, monkeypatch,
+):
+    """One chunk failed over, one didn't: the merged model must show both,
+    not whichever chunk happened to finish last."""
+    from src.agents.base import AgentResult
+
+    syms = [f"SYM{i:02d}" for i in range(50)]
+    data = [
+        {"symbol": s,
+         "bars": sample_bars,
+         "indicators": TechnicalIndicators(**{**sample_indicators.model_dump(), "symbol": s})}
+        for s in syms
+    ]
+    agent = TechAnalystAgent(api_key="test", model="claude-opus-5-5")
+
+    def _execute(user_message):
+        first = "SYM00" in user_message
+        chunk_syms = syms[:25] if first else syms[25:]
+        arr = [json.loads(_valid_response_for(s))[0] for s in chunk_syms]
+        return AgentResult(raw_text=json.dumps(arr), tokens_used=2,
+                           model="gpt-6.1-sol" if first else "claude-opus-5-5",
+                           user_message=user_message, input_tokens=1, output_tokens=1,
+                           cost_usd=0.01)
+
+    monkeypatch.setattr(agent, "_execute", _execute)
+    _, merged = agent.analyze_batch(data)
+    assert merged.model == "claude-opus-5-5+gpt-6.1-sol"
