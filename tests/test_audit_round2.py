@@ -175,14 +175,41 @@ def test_shift_stops_down_preserves_per_lot_levels(mock_tc_cls):
         _stop_order("s1", 340.0, qty=10), _stop_order("s2", 350.0, qty=16),
     ])
     b.cancel_snapshotted_stops = MagicMock(return_value=True)
-    b._restore_stop_orders = MagicMock(return_value=(2, []))
+    b._submit_stop_limit_order = MagicMock(side_effect=[
+        {"id": "0b9d2f6e-0000-4000-8000-000000000001", "status": "new"},
+        {"id": "0b9d2f6e-0000-4000-8000-000000000002", "status": "new"},
+    ])
 
     out = b.shift_stops_down("GE", 0.51)
 
     assert out is not None and out["shifted"] == 2
-    shifted_specs = b._restore_stop_orders.call_args[0][1]
-    assert sorted(s["stop_price"] for s in shifted_specs) == [339.49, 349.49]
-    assert sorted(s["qty"] for s in shifted_specs) == [10, 16]
+    calls = [c.kwargs for c in b._submit_stop_limit_order.call_args_list]
+    assert sorted(c["stop_price"] for c in calls) == [339.49, 349.49]
+    assert sorted(c["qty"] for c in calls) == [10, 16]
+    # The audit row needs a REAL broker id, not the old `shift-GE` pseudo id
+    # that fill reconciliation could never resolve.
+    assert out["id"] == "0b9d2f6e-0000-4000-8000-000000000001"
+
+
+@patch("src.execution.broker.TradingClient")
+def test_shift_stops_down_restores_original_level_when_reprice_fails(mock_tc_cls):
+    b, client = _broker(mock_tc_cls)
+    b._list_open_sell_stop_orders = MagicMock(return_value=[
+        _stop_order("s1", 340.0, qty=10), _stop_order("s2", 350.0, qty=16),
+    ])
+    b.cancel_snapshotted_stops = MagicMock(return_value=True)
+    b._submit_stop_limit_order = MagicMock(side_effect=[
+        RuntimeError("alpaca 500"),
+        {"id": "0b9d2f6e-0000-4000-8000-000000000002", "status": "new"},
+    ])
+    b._restore_stop_orders = MagicMock(return_value=(1, []))
+
+    out = b.shift_stops_down("GE", 0.51)
+
+    assert out["shifted"] == 1 and out["total"] == 2
+    assert out["id"] == "0b9d2f6e-0000-4000-8000-000000000002"
+    restored_specs = b._restore_stop_orders.call_args[0][1]
+    assert len(restored_specs) == 1 and restored_specs[0]["stop_price"] == 340.0
 
 
 # ---------- coverage repair sees the in-flight BUY ----------
@@ -377,3 +404,46 @@ def test_earnings_batch_isolates_one_bad_filing():
                        side_effect=[RuntimeError("boom"), [{"symbol": "AAPL"}]]):
         out = agent.analyze_reports([bad, good])
     assert out == [{"symbol": "AAPL"}], "the good filing must survive the bad one"
+
+
+# ---------- fill reconciliation drops non-broker order ids ----------
+
+def test_reconcile_fills_clears_pseudo_order_id_instead_of_querying(tmp_path):
+    """Pre-fix ex-div TRAIL_STOP rows carry `shift-KO` as broker_order_id.
+    Alpaca can never resolve it, so reconcile used to re-query (and warn)
+    every session forever. It must clear the id once, leave fill_status
+    alone, and still reconcile real ids normally."""
+    from src.storage.db import Database
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    real_id = "2ea8febf-8eb2-4af0-9282-80c06daa0529"
+    db.insert_trade(symbol="KO", action="TRAIL_STOP", qty=200, price=61.29,
+                    reasoning="ex-div", run_id="r0", stop_loss=61.29,
+                    broker_order_id="shift-KO", fill_status="submitted")
+    db.insert_trade(symbol="SGOV", action="SWEEP_BUY", qty=9, price=100.6,
+                    reasoning="sweep", run_id="r0",
+                    broker_order_id=real_id, fill_status="submitted")
+
+    p = TradingPipeline.__new__(TradingPipeline)
+    p.db = db
+    p.broker = MagicMock()
+    p.broker.get_order_fill_info.side_effect = lambda oid: (
+        {"status": "invalid_id", "filled_qty": 0.0, "filled_avg_price": 0.0}
+        if oid == "shift-KO"
+        else {"status": "filled", "filled_qty": 9.0, "filled_avg_price": 100.59}
+    )
+
+    p._reconcile_fills()
+
+    rows = {r["symbol"]: r for r in db.get_trades(limit=10)}
+    assert rows["KO"]["broker_order_id"] is None
+    assert rows["KO"]["fill_status"] == "submitted"
+    assert rows["SGOV"]["fill_status"] == "filled"
+    assert db.get_unreconciled_orders() == []
+
+
+@patch("src.execution.broker.TradingClient")
+def test_get_order_fill_info_flags_non_uuid_without_api_call(mock_tc_cls):
+    b, client = _broker(mock_tc_cls)
+    assert b.get_order_fill_info("shift-KO")["status"] == "invalid_id"
+    client.get_order_by_id.assert_not_called()

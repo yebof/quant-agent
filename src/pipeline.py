@@ -2191,6 +2191,20 @@ class TradingPipeline:
             if info is None:
                 continue
             status = info.get("status") or ""
+            if status == "invalid_id":
+                # Not an Alpaca order id (e.g. the pre-2026-10-20 ex-div
+                # pseudo id `shift-KO`): the broker can never resolve it, so
+                # drop the id instead of re-querying it every session.
+                try:
+                    self.db.clear_broker_order_id(order_id)
+                    logger.info(
+                        "reconcile_fills: cleared non-broker order id %r "
+                        "(trade %s %s) — nothing to reconcile",
+                        order_id, row.get("symbol"), row.get("action"),
+                    )
+                except Exception as e:
+                    logger.warning("reconcile_fills: could not clear %r: %s", order_id, e)
+                continue
             fill_qty = info.get("filled_qty") or None
             fill_price = info.get("filled_avg_price") or None
             if status in terminal_ok:
