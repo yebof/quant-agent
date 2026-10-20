@@ -483,6 +483,29 @@ class AgentResult:
         return None
 
 
+def load_logged_json(text: str | None):
+    """`json.loads` for a stored `agent_logs.full_response`.
+
+    The memory builders (PM L5/L6, reviewer history, thesis trajectory,
+    quarterly digest, ...) re-read past agent outputs from the DB. GPT
+    returned bare JSON; Claude Opus 5.5 wraps it in a ```json fence, so a
+    plain json.loads failed on 100% of Opus rows from 2026-10-19 and every
+    builder silently skipped them — memory went blind one day at a time.
+    Fast path stays plain json.loads; on failure fall back to the same
+    fence/fragment extraction the agents use live (AgentResult.parse_json).
+    Raises json.JSONDecodeError when nothing parses, so callers' existing
+    except-and-warn paths are unchanged.
+    """
+    text = text or "{}"
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        parsed = AgentResult(raw_text=text, tokens_used=0, model="").parse_json()
+        if parsed is None:
+            raise
+        return parsed
+
+
 def _anthropic_final_message(client, **params):
     """Stream one Messages request and return the accumulated final Message."""
     with client.messages.stream(**params) as stream:

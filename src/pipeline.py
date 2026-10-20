@@ -50,6 +50,7 @@ from src.data.news import NewsDataProvider
 from src.data.news_store import NewsStore
 from src.data.macro_store import MacroStore
 from src.data.tech_store import TechStore
+from src.agents.base import load_logged_json
 from src.agents.tech_analyst import TechAnalystAgent
 # Re-exported for backward-compat with tests that patch
 # `src.pipeline.compute_indicators` (the name historically lived here).
@@ -2757,7 +2758,7 @@ class TradingPipeline:
         for row in reversed(rows):  # oldest→newest
             ts = (row.get("timestamp") or "")[:10]
             try:
-                data = json.loads(row.get("full_response") or "{}")
+                data = load_logged_json(row.get("full_response"))
             except (json.JSONDecodeError, TypeError) as e:
                 # PM's L5 layer reads RM history to self-calibrate.
                 # Silently dropping a corrupt full_response row makes PM
@@ -2768,6 +2769,8 @@ class TradingPipeline:
                     "rm_recent_verdicts: JSON parse failed for row %s: %s",
                     ts or "?", e,
                 )
+                continue
+            if not isinstance(data, dict):
                 continue
             approved = data.get("approved")
             mods = data.get("modifications") or []
@@ -2807,7 +2810,7 @@ class TradingPipeline:
         for row in reversed(rows):  # oldest→newest
             ts = (row.get("timestamp") or "")[:10]
             try:
-                data = json.loads(row.get("full_response") or "{}")
+                data = load_logged_json(row.get("full_response"))
             except (json.JSONDecodeError, TypeError) as e:
                 # PM's L6 layer reads its own recent decision history to
                 # spot flip-flops. A silent skip on JSON corruption hides
@@ -2816,6 +2819,8 @@ class TradingPipeline:
                     "pm_recent_decisions: JSON parse failed for row %s: %s",
                     ts or "?", e,
                 )
+                continue
+            if not isinstance(data, dict):
                 continue
             # Phase 2: new schema emits `targets` (target weights + thesis);
             # older logs in the DB carry `decisions` (legacy TradeDecision).
@@ -3939,7 +3944,7 @@ class TradingPipeline:
         by_sym: dict[str, list[str]] = {}
         for row in rows:
             try:
-                data = _json.loads(row.get("full_response") or "{}")
+                data = load_logged_json(row.get("full_response"))
             except (_json.JSONDecodeError, TypeError):
                 continue
             for a in _tech_analyses_from_data(data):
@@ -4456,7 +4461,7 @@ class TradingPipeline:
             if not ts_date or ts_date < cutoff_str:
                 continue
             try:
-                data = _json.loads(row.get("full_response") or "{}")
+                data = load_logged_json(row.get("full_response"))
             except (_json.JSONDecodeError, TypeError):
                 continue
             for a in _tech_analyses_from_data(data):
@@ -4754,9 +4759,10 @@ class TradingPipeline:
         f.rm_verdicts_seen = len(rm_rows)
         for row in rm_rows:
             try:
-                import json as _json
-                data = _json.loads(row.get("full_response") or "{}")
+                data = load_logged_json(row.get("full_response"))
             except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
                 continue
             scale = data.get("scale_all_buys", 1.0)
             try:
@@ -6204,8 +6210,10 @@ class TradingPipeline:
         for row in reversed(rows):  # oldest → newest
             ts = (row.get("timestamp") or "")[:16]
             try:
-                data = _json.loads(row.get("full_response") or "{}")
+                data = load_logged_json(row.get("full_response"))
             except (_json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(data, dict):
                 continue
             actions = data.get("actions") or []
             if not isinstance(actions, list):
@@ -6600,7 +6608,7 @@ class TradingPipeline:
             rows = []
         for row in rows or []:
             try:
-                data = _json.loads(row.get("full_response") or "{}")
+                data = load_logged_json(row.get("full_response"))
                 for tgt in (data.get("targets") or []):
                     if isinstance(tgt, dict) and tgt.get("symbol"):
                         watch.add(str(tgt["symbol"]).upper())

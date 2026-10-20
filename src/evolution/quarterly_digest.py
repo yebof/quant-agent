@@ -36,6 +36,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from src.agents.base import load_logged_json
+
 if TYPE_CHECKING:
     from src.data.market import MarketDataProvider
     from src.storage.db import Database
@@ -751,7 +753,7 @@ def _iter_agent_logs_in_window(
             continue
         raw = row.get("full_response") or "{}"
         try:
-            data = json.loads(raw)
+            data = load_logged_json(raw)
         except (json.JSONDecodeError, TypeError):
             continue
         yield row, data

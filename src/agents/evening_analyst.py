@@ -29,6 +29,15 @@ from src.models import (
 
 logger = logging.getLogger(__name__)
 
+
+def _max_length(model, field: str) -> int | None:
+    """The `max_length` declared on a pydantic field (single source of truth)."""
+    for meta in model.model_fields[field].metadata:
+        cap = getattr(meta, "max_length", None)
+        if cap is not None:
+            return cap
+    return None
+
 PROMPT_PATH = Path(__file__).parent.parent.parent / "config" / "prompts" / "evening_analyst.md"
 
 
@@ -641,6 +650,20 @@ upcoming events that bear on held theses. Respond as JSON matching
                     "entry at index %d: %r", i, item,
                 )
                 continue
+            # Over-long prose is truncated, not dropped: Opus 5.5 writes
+            # longer lessons than gpt-5.5 did, and on 2026-10-19 four real
+            # misses (MU/LRCX/AMAT/RKLB) were thrown away for a few chars
+            # over the cap. A clipped lesson keeps the classified miss.
+            for field in ("lesson", "universe_addition_reason"):
+                cap = _max_length(MissedOpportunity, field)
+                text = item.get(field)
+                if cap and isinstance(text, str) and len(text) > cap:
+                    logger.info(
+                        "Evening analyst: truncating missed_opportunities %s for "
+                        "%s (%d > %d chars)", field, item.get("symbol"),
+                        len(text), cap,
+                    )
+                    item[field] = text[: cap - 1].rstrip() + "…"
             try:
                 MissedOpportunity(**item)
             except ValidationError as e:
