@@ -80,3 +80,22 @@ def test_quarterly_digest_reads_fenced_opus_rows(tmp_path):
         db, "portfolio_manager", today - timedelta(days=30), today,
     ))
     assert len(rows) == 1 and rows[0][1] == {"targets": []}
+
+
+def test_memory_builders_skip_non_dict_rows(tmp_path):
+    """The fallback can recover a bare list from a malformed row; the
+    dict-shaped builders must skip it instead of raising AttributeError."""
+    db = _db_with_rows(tmp_path, "risk_manager", [[1, 2, 3]])
+    db.insert_agent_log(
+        agent_name="portfolio_manager", run_id="p0", input_summary="",
+        input_message="", output_summary="", full_response=_fenced(["x"]),
+        model="claude-opus-5-5", tokens_used=1,
+    )
+    db.conn.execute(
+        "UPDATE agent_logs SET timestamp = datetime('now', '-1 day') WHERE run_id = 'p0'"
+    )
+    db.conn.commit()
+    p = TradingPipeline.__new__(TradingPipeline)
+    p.db = db
+    assert p._build_rm_recent_verdicts(limit=5) == ""
+    assert p._build_pm_recent_decisions(limit=3) == ""

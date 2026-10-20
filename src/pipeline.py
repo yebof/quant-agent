@@ -2770,6 +2770,8 @@ class TradingPipeline:
                     ts or "?", e,
                 )
                 continue
+            if not isinstance(data, dict):
+                continue
             approved = data.get("approved")
             mods = data.get("modifications") or []
             scale = data.get("scale_all_buys", 1.0)
@@ -2817,6 +2819,8 @@ class TradingPipeline:
                     "pm_recent_decisions: JSON parse failed for row %s: %s",
                     ts or "?", e,
                 )
+                continue
+            if not isinstance(data, dict):
                 continue
             # Phase 2: new schema emits `targets` (target weights + thesis);
             # older logs in the DB carry `decisions` (legacy TradeDecision).
@@ -4755,9 +4759,10 @@ class TradingPipeline:
         f.rm_verdicts_seen = len(rm_rows)
         for row in rm_rows:
             try:
-                import json as _json
                 data = load_logged_json(row.get("full_response"))
             except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
                 continue
             scale = data.get("scale_all_buys", 1.0)
             try:
@@ -6207,6 +6212,8 @@ class TradingPipeline:
             try:
                 data = load_logged_json(row.get("full_response"))
             except (_json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(data, dict):
                 continue
             actions = data.get("actions") or []
             if not isinstance(actions, list):
