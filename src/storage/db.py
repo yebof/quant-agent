@@ -516,6 +516,20 @@ class Database:
             self.conn.commit()
             return cur.rowcount or 0
 
+    def clear_broker_order_id(self, broker_order_id: str) -> int:
+        """NULL out a broker_order_id that can never be looked up at the
+        broker (not an Alpaca UUID), so fill reconciliation stops
+        re-querying it every session. fill_status is left untouched —
+        readers see the row exactly as before. Returns rows updated.
+        """
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE trades SET broker_order_id = NULL WHERE broker_order_id = ?",
+                (broker_order_id,),
+            )
+            self.conn.commit()
+            return cur.rowcount or 0
+
     def get_unreconciled_orders(self, run_id: str | None = None) -> list[dict]:
         """Trade rows with broker_order_id set but fill_status still 'submitted'.
 

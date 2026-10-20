@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import date
 
@@ -1068,7 +1069,16 @@ class AlpacaBroker:
 
         Used by Phase 3 reconciliation. The caller decides whether the
         returned status is terminal; this method does not block / poll.
+
+        An id that is not an Alpaca order UUID can never be resolved; it
+        returns {"status": "invalid_id"} without an API call so the caller
+        can stop re-querying it (the pre-2026-10-20 ex-div rows stored the
+        pseudo id `shift-{symbol}` and warned every session for months).
         """
+        try:
+            uuid.UUID(str(order_id))
+        except ValueError:
+            return {"status": "invalid_id", "filled_qty": 0.0, "filled_avg_price": 0.0}
         try:
             order = self.client.get_order_by_id(order_id)
         except Exception as exc:
@@ -1559,28 +1569,46 @@ class AlpacaBroker:
             return None
         if not self.cancel_snapshotted_stops(symbol, specs):
             return None   # rollback already handled inside
-        shifted = [{
-            **spec,
-            "stop_price": _quantize_price(spec["stop_price"] - amount),
-            "limit_price": (_quantize_price(spec["limit_price"] - amount)
-                            if spec.get("limit_price") else None),
-        } for spec in specs]
-        restored, failed = self._restore_stop_orders(symbol, shifted)
+        # Submit each shifted stop ourselves (rather than via
+        # _restore_stop_orders) so we hold the REAL Alpaca order id: the
+        # caller records it as the TRAIL_STOP row's broker_order_id. The old
+        # pseudo id `shift-{symbol}` was never an Alpaca UUID, so fill
+        # reconciliation re-queried it every session forever (CEG/MSFT/KO
+        # rows since 2026-08, ~240 "badly formed hexadecimal UUID" warnings
+        # in October alone).
+        restored = 0
+        first_id: str | None = None
+        failed = 0
+        for spec in specs:
+            try:
+                order = self._submit_stop_limit_order(
+                    symbol=symbol,
+                    qty=spec["qty"],
+                    stop_price=_quantize_price(spec["stop_price"] - amount),
+                    limit_price=(_quantize_price(spec["limit_price"] - amount)
+                                 if spec.get("limit_price") else None),
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                logger.error(
+                    "shift_stops_down: failed to re-place %s stop @ $%.2f qty=%s: %s "
+                    "— restoring the original level", symbol,
+                    spec["stop_price"] - amount, spec["qty"], exc,
+                )
+                # Protection at the old level beats no protection.
+                self._restore_stop_orders(symbol, [spec])
+                continue
+            restored += 1
+            if first_id is None and order.get("id"):
+                first_id = order["id"]
         if failed:
-            # Put the ORIGINAL levels back for whatever couldn't be shifted —
-            # protection at the old level beats no protection.
-            originals = [s for s in specs if any(
-                f.get("qty") == s["qty"] and abs(f.get("stop_price", 0) -
-                (s["stop_price"] - amount)) < 0.02 for f in failed)]
-            if originals:
-                self._restore_stop_orders(symbol, originals)
             logger.error(
                 "shift_stops_down: %d/%d stop(s) failed to shift for %s — "
-                "originals restored where possible", len(failed), len(specs), symbol,
+                "originals restored where possible", failed, len(specs), symbol,
             )
         if restored <= 0:
             return None
-        return {"id": f"shift-{symbol}", "status": "accepted", "symbol": symbol,
+        return {"id": first_id, "status": "accepted", "symbol": symbol,
                 "shifted": restored, "total": len(specs)}
 
     def replace_stop_loss(
