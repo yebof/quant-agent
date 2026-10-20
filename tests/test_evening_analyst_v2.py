@@ -629,3 +629,25 @@ def test_drop_invalid_missed_opportunities_logs_bad_entries(caplog):
     assert any("CMCSA" in rec.message for rec in caplog.records), (
         f"warning must mention CMCSA; got {[r.message for r in caplog.records]}"
     )
+
+
+def test_overlong_missed_opportunity_lesson_is_truncated_not_dropped():
+    """2026-10-19: Opus wrote MU/LRCX/AMAT/RKLB lessons a little over the
+    400-char cap and all four classified misses were discarded. Clip the
+    prose instead so the miss itself survives."""
+    from src.agents.evening_analyst import EveningAnalystAgent
+    from src.models import MissedOpportunity
+
+    entry = _valid_missed_opportunity_dict("MU")
+    entry["lesson"] = "Cheapest quality name in the group. " * 20   # ~720 chars
+    entry["universe_addition_reason"] = "x" * 450
+    parsed = _valid_evening_json()
+    parsed["missed_opportunities"] = [entry]
+
+    out = EveningAnalystAgent._drop_invalid_missed_opportunities(parsed)
+
+    assert [m["symbol"] for m in out["missed_opportunities"]] == ["MU"]
+    kept = out["missed_opportunities"][0]
+    assert len(kept["lesson"]) <= 400 and kept["lesson"].endswith("…")
+    assert len(kept["universe_addition_reason"]) <= 400
+    MissedOpportunity(**kept)
