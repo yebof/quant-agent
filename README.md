@@ -412,6 +412,20 @@ Drives the creative direction and ongoing feature development of the system — 
 
 If this repository was useful for your own work — academic, professional, or personal — a star is appreciated and a citation/mention is even better.
 
+## Citation
+
+The system is described in the paper [*Governed Self-Evolution for Autonomous Investing: A Multi-Agent LLM System with an Invariant Core*](https://arxiv.org/abs/2610.30557) (arXiv:2610.30557). If you use this code or build on its design, please cite:
+
+```bibtex
+@article{feng2026governed,
+  title   = {Governed Self-Evolution for Autonomous Investing: A Multi-Agent LLM System with an Invariant Core},
+  author  = {Feng, Yebo and Dai, Jingyang and Pan, Liangrui and Lau, Nelson and Xu, Jiahua and Liu, Yang},
+  journal = {arXiv preprint arXiv:2610.30557},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2610.30557}
+}
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
